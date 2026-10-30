@@ -45,7 +45,7 @@ class ShutdownTests(unittest.TestCase):
                 process.kill()
                 process.wait(timeout=10)
 
-    def start(self, injection=None):
+    def start(self, injection=None, extra_args=()):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
@@ -64,7 +64,7 @@ class ShutdownTests(unittest.TestCase):
             '--pqc-identity-dir', str(self.root / 'server'), '--pqc-node-id', 'shutdown-server',
             '--pqc-trusted-pub', str(self.root / 'client/qihse_dsa_pub.pem'), '--pqc-require',
             '--admin-peer-node-id', 'shutdown-client',
-            '--admin-peer-dsa-pub', str(self.root / 'client/qihse_dsa_pub.pem')],
+            '--admin-peer-dsa-pub', str(self.root / 'client/qihse_dsa_pub.pem'), *extra_args],
             env=env, stdout=log, stderr=log)
         self.processes.append(process)
         deadline = time.monotonic() + 20
@@ -121,6 +121,60 @@ bool qihse_kv_sync_store(void *store) {
         self.assertEqual(session.execute_resp('GET', 'shutdown:ack'), b'$13\r\ndurable-value\r\n')
         process.terminate()
         self.assertEqual(process.wait(timeout=15), 0)
+
+    def test_startup_hold_preserves_ownership_until_operator_resume(self):
+        # Reserve an absent peer's endpoints so no unrelated listener can answer.
+        with socket.socket() as missing, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bus:
+            missing.bind(('127.0.0.1', 0))
+            bus.bind(('127.0.0.1', 0))
+            peer_port = missing.getsockname()[1]
+            peer_bus = bus.getsockname()[1]
+            process, session, _ = self.start(extra_args=(
+                '--failover-start-paused', '--slot-range', '0-8191',
+                '--node', f'1:127.0.0.1:{peer_port}:{peer_bus}',
+                '--slot-range-of', '1:8192-16383'))
+
+            def nodes():
+                reply = session.execute_resp('CLUSTER', 'NODES')
+                self.assertTrue(reply.startswith(b'$'), reply)
+                header, payload = reply.split(b'\r\n', 1)
+                length = int(header[1:])
+                self.assertEqual(payload[length:], b'\r\n')
+                lines = payload[:length].splitlines()
+                peer = next(line for line in lines if
+                            f'127.0.0.1:{peer_port}@{peer_bus}'.encode() in line)
+                local = next(line for line in lines if b'myself' in line)
+                return peer, local
+
+            # Default bus timeout is 5000 ms. Observe the actual failed state,
+            # then keep checking ownership past another health-check cycle.
+            deadline = time.monotonic() + 12
+            while True:
+                peer, local = nodes()
+                self.assertIn(b'8192-16383', peer.split())
+                self.assertIn(b'0-8191', local.split())
+                if b'fail' in peer.split()[2].split(b','):
+                    break
+                self.assertLess(time.monotonic(), deadline, peer)
+                time.sleep(.1)
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                peer, local = nodes()
+                self.assertIn(b'8192-16383', peer.split())
+                self.assertIn(b'0-8191', local.split())
+                time.sleep(.1)
+            self.assertEqual(session.execute_resp('CLUSTER', 'FAILOVER.RESUME'), b'+RESUMED\r\n')
+            self.assertEqual(session.execute_resp('CLUSTER', 'FAILOVER.RESUME'), b'+ALREADY-RUNNING\r\n')
+            deadline = time.monotonic() + 10
+            while True:
+                peer, local = nodes()
+                if b'0-16383' in local.split():
+                    self.assertNotIn(b'8192-16383', peer.split())
+                    break
+                self.assertLess(time.monotonic(), deadline, (peer, local))
+                time.sleep(.1)
+            process.terminate()
+            self.assertEqual(process.wait(timeout=15), 0)
 
     def test_sync_failure_is_not_success(self):
         process, session, log = self.start('fail')

@@ -55,6 +55,16 @@ typedef struct {
 } qihse_cluster_failover_config_t;
 
 qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_failover_config_t* config);
+/* Startup-only ownership hold. create_paused installs it before the worker
+ * starts. pause_startup is for a coordinator not yet exposed to bus callbacks
+ * or manual promotion; it rejects one that has already received either.
+ * This is NOT a live drain, write fence, or gossip/GC fence. */
+qihse_cluster_failover_t* qihse_cluster_failover_create_paused(const qihse_cluster_failover_config_t* config);
+bool qihse_cluster_failover_pause_startup(qihse_cluster_failover_t* fo);
+bool qihse_cluster_failover_is_paused(qihse_cluster_failover_t* fo);
+/* Trusted embedding control: returns true only when a hold was released.
+ * Externally reachable callers must authenticate/authorize the release. */
+bool qihse_cluster_failover_resume(qihse_cluster_failover_t* fo);
 void qihse_cluster_failover_destroy(qihse_cluster_failover_t* fo);
 
 /*

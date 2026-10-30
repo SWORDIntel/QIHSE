@@ -582,6 +582,7 @@ static void usage(const char* argv0) {
         "          (--node INDEX:HOST:PORT:BUS-PORT [--node …] | --join HOST:BUS-PORT [--join …])\n"
         "          [--slot-range FIRST-LAST] [--slot-range-of INDEX:FIRST-LAST]\n"
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
+        "          [--failover-start-paused] (until Operator CLUSTER FAILOVER.RESUME)\n"
         "  Durable principal authority: QIHSE_AUTH_MODE=standalone, QIHSE_AUTH_ACTION=provision|recover.\n"
         "  Required QIHSE_AUTH_ suffixes: STATE_DIR, BOOTSTRAP_FILE, AUTHORITY_ID, NODE_ID, EPOCH,\n"
         "  RECIPIENT_PUBLIC_KEY, RECIPIENT_PRIVATE_KEY, SIGNER_PUBLIC_KEY, SIGNER_PRIVATE_KEY,\n"
@@ -1442,6 +1443,7 @@ int main(int argc, char** argv) {
     size_t migration_peer_count = 0u;
     const char* data_dir = NULL;
     bool enable_scatter = false;
+    bool failover_start_paused = false;
     size_t max_clients = 4096u;
     peer_spec_t peers[MAX_PEERS];
     size_t peer_count = 0;
@@ -1514,6 +1516,8 @@ int main(int argc, char** argv) {
             operator_password_arg = argv[++i];
         } else if (strcmp(a, "--dir") == 0 && i + 1 < argc) {
             data_dir = argv[++i];
+        } else if (strcmp(a, "--failover-start-paused") == 0) {
+            failover_start_paused = true;
         } else if (strcmp(a, "--enable-scatter") == 0) {
             enable_scatter = true;
         } else if (strcmp(a, "--max-clients") == 0 && i + 1 < argc) {
@@ -2455,6 +2459,14 @@ int main(int argc, char** argv) {
     if (!server) {
         fprintf(stderr, "qihse-cluster-daemon: server create failed (bind %s port %u): %s\n",
                 bind, port, strerror(errno));
+        if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
+        if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
+        return 1;
+    }
+    if (failover_start_paused &&
+        !qihse_resp_server_start_failover_paused(server, startup_operator)) {
+        fprintf(stderr, "qihse-cluster-daemon: startup failover hold requires authenticated system Operator and an unstarted coordinator\n");
+        qihse_resp_server_destroy(server);
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
         if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
         return 1;

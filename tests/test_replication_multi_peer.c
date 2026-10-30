@@ -16,10 +16,12 @@
 #include <unistd.h>
 
 #include "qihse_auth.h"
+#include "core/qihse_auth_internal.h"
 #include "qihse_pqc_crypto.h"
 #include "qihse_qkp.h"
 #include "qihse_resp_wire.h"
 #include "qihse_resp_engine.h"
+#include "qihse_cluster_failover.h"
 
 /* Freeze the pre-peer-list public layout: adding peers must not grow config. */
 typedef struct {
@@ -296,6 +298,12 @@ static void peer_data(real_client_t *client) {
     const char *auth[] = {"AUTH", "GODMODE_OP", PASSWORD};
     const char *migration[] = {"CLUSTER", "MOVESLOTS", "1", "127.0.0.1", "1"};
     const char *status[] = {"REPL.STATUS"};
+    const char *resume[] = {"CLUSTER", "FAILOVER.RESUME"};
+    const char *failover[] = {"CLUSTER", "FAILOVER", "TAKEOVER"};
+    denied(client, 2u, resume);
+    reply = command(client, 3u, failover, NULL);
+    assert(strcmp(reply, "-NOPERM command is outside the authenticated service capability\r\n") == 0);
+    free(reply);
     denied(client, 2u, get);
     denied(client, 3u, set);
     denied(client, 1u, asking);
@@ -305,7 +313,198 @@ static void peer_data(real_client_t *client) {
     denied(client, 1u, status);
 }
 
+static int held_failback(void *user, uint16_t first, uint16_t last,
+                         uint16_t target, char *err, size_t cap) {
+    (void)first; (void)last; (void)target; (void)err; (void)cap;
+    __atomic_add_fetch((unsigned *)user, 1u, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static void startup_coordinator_hold(void) {
+    qihse_cluster_topology_t *topology = qihse_cluster_topology_create();
+    assert(topology);
+    qihse_cluster_node_t node = {0};
+    node.role = QIHSE_CLUSTER_NODE_PRIMARY;
+    strcpy(node.host, "127.0.0.1");
+    node.port = 7100u;
+    node.bus_port = 17100u;
+    node.healthy = true;
+    node.primary_index = QIHSE_CLUSTER_NODE_NONE;
+    uint16_t old, local, owner;
+    qihse_cluster_node_id_from_seed("held-old", 8u, node.id);
+    assert(qihse_cluster_topology_upsert_node(topology, &node, &old));
+    node.port++;
+    node.bus_port++;
+    qihse_cluster_node_id_from_seed("held-local", 10u, node.id);
+    assert(qihse_cluster_topology_upsert_node(topology, &node, &local));
+    assert(qihse_cluster_topology_assign_range(topology, 0u, 99u, old));
+    unsigned calls = 0u;
+    qihse_cluster_failover_config_t cfg = {0};
+    cfg.topology = topology;
+    cfg.local_node_index = local;
+    cfg.failback_fn = held_failback;
+    cfg.failback_user_data = &calls;
+    cfg.failback_stable_ms = 1u;
+    cfg.failback_poll_ms = 20u;
+    qihse_cluster_failover_t *fo = qihse_cluster_failover_create_paused(&cfg);
+    assert(fo && qihse_cluster_failover_is_paused(fo));
+    assert(!qihse_cluster_failover_promote(fo, old, local));
+    qihse_cluster_failover_on_fail_cb(topology, old, fo);
+    assert(qihse_cluster_failover_handle(fo, old) == QIHSE_CLUSTER_NODE_NONE);
+    assert(qihse_cluster_failover_events(fo) == 0u);
+    assert(qihse_cluster_topology_get_slot(topology, 0u, &owner, NULL, NULL));
+    assert(owner == old);
+    /* Ownership gossip is outside this hold. Its debt must survive release. */
+    assert(qihse_cluster_topology_assign_range(topology, 0u, 99u, local));
+    qihse_cluster_failover_on_takeover_cb(topology, old, 0u, 99u, fo);
+    usleep(100000u);
+    assert(__atomic_load_n(&calls, __ATOMIC_ACQUIRE) == 0u);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);
+    assert(qihse_cluster_failover_resume(fo));
+    assert(!qihse_cluster_failover_resume(fo));
+    assert(!qihse_cluster_failover_pause_startup(fo));
+    for (unsigned i = 0; i < 100u &&
+         qihse_cluster_failover_pending_failbacks(fo); i++) usleep(20000u);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);
+    assert(__atomic_load_n(&calls, __ATOMIC_ACQUIRE) == 1u);
+    assert(qihse_cluster_failover_promote(fo, old, local));
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topology);
+}
+
+static void held_wire_manual_failover(const qihse_resp_server_config_t *base,
+    qihse_user_t *op, const identity_t *source, const identity_t *client) {
+    qihse_cluster_topology_t *topology = qihse_cluster_topology_create();
+    assert(topology);
+    qihse_cluster_node_t node = {0};
+    node.role = QIHSE_CLUSTER_NODE_PRIMARY;
+    node.primary_index = QIHSE_CLUSTER_NODE_NONE;
+    node.healthy = true;
+    strcpy(node.host, "127.0.0.1");
+    node.port = 7100u;
+    node.bus_port = 17100u;
+    uint16_t local, primary;
+    qihse_cluster_node_id_from_seed("held-wire-local", 15u, node.id);
+    assert(qihse_cluster_topology_upsert_node(topology, &node, &local));
+    node.port++;
+    node.bus_port++;
+    qihse_cluster_node_id_from_seed("held-wire-peer", 14u, node.id);
+    assert(qihse_cluster_topology_upsert_node(topology, &node, &primary));
+    assert(qihse_cluster_topology_assign_range(topology, 0u, 99u, local));
+    assert(qihse_cluster_topology_assign_range(topology, 100u,
+        QIHSE_CLUSTER_SLOT_COUNT - 1u, primary));
+    qihse_resp_server_config_t cfg = *base;
+    cfg.topology = topology;
+    cfg.local_node_index = local;
+    qihse_resp_server_t *server = qihse_resp_server_create(&cfg);
+    assert(server && qihse_resp_server_start_failover_paused(server, op));
+    real_client_t *wire = connect_peer(server, client, source, "unknown");
+    auth_root(wire);
+    const char *failover[] = {"CLUSTER", "FAILOVER", "TAKEOVER"};
+    char *reply = command(wire, 3u, failover, NULL);
+    assert(strcmp(reply, "-ERR failover is paused during startup\r\n") == 0);
+    free(reply);
+    qihse_cluster_node_t current;
+    assert(qihse_cluster_topology_get_node(topology, local, &current));
+    assert(current.role == QIHSE_CLUSTER_NODE_PRIMARY);
+    const char *replicate[] = {"CLUSTER", "REPLICATE", node.id};
+    reply = command(wire, 3u, replicate, NULL);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    /* Even an authenticated root Operator cannot bypass the coordinator by
+     * first changing the held primary into a replica. Check canonical state. */
+    const char *options[] = {NULL, "FORCE", "TAKEOVER"};
+    for (size_t i = 0u; i < 3u; i++) {
+        failover[2] = options[i];
+        reply = command(wire, i ? 3u : 2u, failover, NULL);
+        assert(strcmp(reply, "-ERR failover is paused during startup\r\n") == 0);
+        free(reply);
+        assert(qihse_cluster_topology_get_node(topology, local, &current));
+        assert(current.role == QIHSE_CLUSTER_NODE_REPLICA &&
+               current.primary_index == primary);
+        assert(qihse_cluster_topology_get_node(topology, primary, &current));
+        assert(current.role == QIHSE_CLUSTER_NODE_PRIMARY);
+        for (uint16_t slot = 0u; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
+            uint16_t owner;
+            assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
+            assert(owner == (slot < 100u ? local : primary));
+        }
+    }
+    const char *resume[] = {"CLUSTER", "FAILOVER.RESUME"};
+    reply = command(wire, 2u, resume, NULL);
+    assert(strcmp(reply, "+RESUMED\r\n") == 0);
+    free(reply);
+    reply = command(wire, 3u, failover, NULL);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    assert(qihse_cluster_topology_get_node(topology, local, &current));
+    assert(current.role == QIHSE_CLUSTER_NODE_PRIMARY &&
+           current.primary_index == QIHSE_CLUSTER_NODE_NONE);
+    for (uint16_t slot = 0u; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
+        uint16_t owner;
+        assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
+        assert(owner == local);
+    }
+    close_peer(wire);
+    qihse_resp_server_destroy(server);
+    /* A server without a coordinator retains the compatibility behavior. */
+    cfg.enable_failover = false;
+    server = qihse_resp_server_create(&cfg);
+    assert(server);
+    wire = connect_peer(server, client, source, "unknown");
+    auth_root(wire);
+    reply = command(wire, 3u, replicate, NULL);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    reply = command(wire, 3u, failover, NULL);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    assert(qihse_cluster_topology_get_node(topology, local, &current));
+    assert(current.role == QIHSE_CLUSTER_NODE_PRIMARY);
+    close_peer(wire);
+    qihse_resp_server_destroy(server);
+    qihse_cluster_topology_destroy(topology);
+}
+
+static void embedded_execute_closes_startup(const qihse_resp_server_config_t *base,
+                                           qihse_user_t *op) {
+    qihse_resp_server_config_t cfg = *base;
+    cfg.enable_uwp_bridge = true;
+    qihse_resp_server_t *server = qihse_resp_server_create(&cfg);
+    assert(server);
+    qihse_resp_arg_t ping = {(const uint8_t *)"PING", 4u};
+    uint8_t *reply = NULL;
+    size_t length = 0u;
+    /* Invalid invocations do not enter a session or consume startup. */
+    assert(!qihse_resp_server_execute(server, NULL, 1u, &ping, &reply, &length));
+    assert(qihse_resp_server_start_failover_paused(server, op));
+    qihse_resp_server_destroy(server);
+    server = qihse_resp_server_create(&cfg);
+    assert(server);
+    qihse_resp_arg_t get[] = {
+        {(const uint8_t *)"GET", 3u}, {(const uint8_t *)KEY, sizeof(KEY) - 1u}
+    };
+    assert(qihse_resp_server_execute(server, op, 2u, get, &reply, &length));
+    assert(reply[0] == '$' && memmem(reply, length, PAYLOAD, strlen(PAYLOAD)));
+    free(reply);
+    assert(!qihse_resp_server_start_failover_paused(server, op));
+    qihse_resp_server_stop(server);
+    assert(!qihse_resp_server_start_failover_paused(server, op));
+    assert(!qihse_resp_server_execute(server, op, 1u, &ping, &reply, &length));
+    qihse_resp_server_destroy(server);
+    /* Admission is permanent even when the invoked command returns an error. */
+    server = qihse_resp_server_create(&cfg);
+    assert(server);
+    qihse_resp_arg_t unknown = {(const uint8_t *)"NOT.A.COMMAND", 13u};
+    assert(qihse_resp_server_execute(server, op, 1u, &unknown, &reply, &length));
+    assert(length > 0u && reply[0] == '-');
+    free(reply);
+    assert(!qihse_resp_server_start_failover_paused(server, op));
+    qihse_resp_server_destroy(server);
+}
+
 int main(void) {
+    startup_coordinator_hold();
     char root[] = "build/replication-multi-peer-XXXXXX";
     assert(mkdtemp(root));
     char data[512];
@@ -369,6 +568,7 @@ int main(void) {
     cfg.store = store;
     cfg.port = 0u;
     cfg.auth_required = true;
+    cfg.enable_failover = true;
     cfg.pqc.require = true;
     cfg.pqc.node_id = "source";
     cfg.pqc.dsa_key_path = source.dsa;
@@ -381,6 +581,8 @@ int main(void) {
     cfg.replication_service_principal = service;
     cfg.replicate_globs = globs;
     cfg.replicate_glob_count = 1u;
+    held_wire_manual_failover(&cfg, op, &source, &second);
+    embedded_execute_closes_startup(&cfg, op);
     const qihse_qkp_replication_peer_t peers[] = {
         {"first", first.pub}, {"second", second.pub}
     };
@@ -390,6 +592,21 @@ int main(void) {
     check_session(&cfg.pqc, peers, 2u, &source, &wrong, "second", false);
     qihse_resp_server_t *server = qihse_resp_server_create(&cfg);
     assert(server);
+    /* Pointer identity and current shadow authority, not caller-owned fields,
+     * must authorize this pre-listen ownership hold. */
+    qihse_user_t forged = *op;
+    qihse_user_t *revoked = qihse_auth_create_user(op, 74u, QIHSE_ROLE_OPERATOR,
+        0u, 0u, "MultiPeerRevoked123!", false);
+    assert(revoked);
+    assert(qihse_auth_authenticate_id(74u, "MultiPeerRevoked123!") == revoked);
+    assert(qihse_auth_destroy_user(op, 74u));
+    assert(!qihse_resp_server_start_failover_paused(NULL, op));
+    assert(!qihse_resp_server_start_failover_paused(server, NULL));
+    assert(!qihse_resp_server_start_failover_paused(server, &forged));
+    assert(!qihse_resp_server_start_failover_paused(server, revoked));
+    assert(!qihse_resp_server_start_failover_paused(server, tenant_op));
+    assert(!qihse_resp_server_start_failover_paused(server, low));
+    assert(qihse_resp_server_start_failover_paused(server, op));
     assert(!qihse_resp_server_add_replication_peer(server, "second", second.pub, NULL));
     assert(!qihse_resp_server_add_replication_peer(server, "second", second.pub, low));
     assert(!qihse_resp_server_add_replication_peer(server, "second", second.pub, tenant_op));
@@ -411,6 +628,7 @@ int main(void) {
     assert(added == QIHSE_QKP_MAX_REPLICATION_PEERS);
     assert(!qihse_resp_server_add_replication_peer(server, "overflow", second.pub, op));
     assert(qihse_resp_server_start(server));
+    assert(!qihse_resp_server_start_failover_paused(server, op));
     real_client_t *a = connect_peer(server, &first, &source, "first");
     real_client_t *b = connect_peer(server, &second, &source, "second");
     peer_data(a);
@@ -440,7 +658,30 @@ int main(void) {
     peer_data(a);
     real_client_t *unknown = connect_peer(server, &second, &source, "unknown");
     deny_data_plane(unknown);
+    const char *resume[] = {"CLUSTER", "FAILOVER.RESUME"};
+    denied(unknown, 2u, resume);
+    const char *tenant_auth[] = {"AUTH", qihse_user_get_username(tenant_op), "MultiPeerTenant123!"};
+    char *auth_reply = command(unknown, 3u, tenant_auth, NULL);
+    assert(strcmp(auth_reply, "+OK\r\n") == 0); free(auth_reply);
+    denied(unknown, 2u, resume);
+    const char *low_auth[] = {"AUTH", qihse_user_get_username(low), "MultiPeerLow123!"};
+    auth_reply = command(unknown, 3u, low_auth, NULL);
+    assert(strcmp(auth_reply, "+OK\r\n") == 0); free(auth_reply);
+    denied(unknown, 2u, resume);
+    qihse_user_t *revoked_session = qihse_auth_create_user(op, 75u,
+        QIHSE_ROLE_OPERATOR, 0u, 0u, "MultiPeerSession123!", false);
+    assert(revoked_session);
+    const char *session_auth[] = {"AUTH", qihse_user_get_username(revoked_session),
+                                  "MultiPeerSession123!"};
+    auth_reply = command(unknown, 3u, session_auth, NULL);
+    assert(strcmp(auth_reply, "+OK\r\n") == 0); free(auth_reply);
+    assert(qihse_auth_destroy_user(op, 75u));
+    denied(unknown, 2u, resume);
     auth_root(unknown);
+    auth_reply = command(unknown, 2u, resume, NULL);
+    assert(strcmp(auth_reply, "+RESUMED\r\n") == 0); free(auth_reply);
+    auth_reply = command(unknown, 2u, resume, NULL);
+    assert(strcmp(auth_reply, "+ALREADY-RUNNING\r\n") == 0); free(auth_reply);
     deny_data_plane(unknown);
     const char *get[] = {"GET", KEY};
     char *reply = command(unknown, 2u, get, NULL);
@@ -457,7 +698,9 @@ int main(void) {
     deny_data_plane(a);
     deny_data_plane(b);
     close_peer(a); close_peer(b);
-    qihse_resp_server_stop(server); qihse_resp_server_destroy(server);
+    qihse_resp_server_stop(server);
+    assert(!qihse_resp_server_start_failover_paused(server, op));
+    qihse_resp_server_destroy(server);
 
     /* A valid configured low-clearance context is not a NULL-auth test. */
     cfg.replication_service_principal = low;
@@ -465,6 +708,12 @@ int main(void) {
     assert(server);
     assert(qihse_resp_server_add_replication_peer(server, "first", first_alias, op));
     assert(qihse_resp_server_add_replication_peer(server, "second", second.pub, op));
+    /* The accepted-fd embedding seam also permanently closes startup, even
+     * when the server has not opened a listening socket yet. */
+    a = connect_peer(server, &first, &source, "first");
+    denied(a, 2u, resume);
+    assert(!qihse_resp_server_start_failover_paused(server, op));
+    close_peer(a);
     assert(qihse_resp_server_start(server));
     a = connect_peer(server, &first, &source, "first");
     b = connect_peer(server, &second, &source, "second");
@@ -481,6 +730,10 @@ int main(void) {
     assert(qihse_user_get_id(low) == 72u && qihse_user_get_role(low) == QIHSE_ROLE_GUEST);
     close_peer(a); close_peer(b);
     qihse_resp_server_stop(server); qihse_resp_server_destroy(server);
+    /* A replication context cannot acquire release authority by being
+     * configured as an Operator: server creation rejects that configuration. */
+    cfg.replication_service_principal = op;
+    assert(qihse_resp_server_create(&cfg) == NULL);
     qihse_kv_store_destroy(store);
     puts("replication multi-peer real QKP/source authorization: OK");
     return 0;

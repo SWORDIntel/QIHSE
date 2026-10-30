@@ -365,6 +365,7 @@ struct qihse_resp_server {
     qihse_qkp_replication_peer_t replication_peers[QIHSE_QKP_MAX_REPLICATION_PEERS];
     size_t replication_peer_count;
     bool replication_peers_frozen;
+    bool failover_startup_closed;
     /* R4 replicated namespaces (REPL.*): globs whose keys are sovereign-
      * local on every node, plus the anti-entropy bookkeeping REPL.STATUS
      * renders. repl_lock guards the whole list. */
@@ -15578,12 +15579,29 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             break;
         case QIHSE_SWAR4('C', 'L', 'U', 'S'):
             if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER")) {
+                if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "FAILOVER.RESUME")) {
+                    if (request->argc != 2) return qihse_resp_wrong_arity(session, "cluster failover.resume");
+                    if (!session->server->auth_required || !session->user ||
+                        !qihse_auth_user_is_active(session->user) ||
+                        qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+                        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+                        return qihse_resp_error(session, "NOPERM active system Operator required");
+                    if (!session->server->failover)
+                        return qihse_resp_error(session, "ERR failover is not configured");
+                    bool resumed = qihse_cluster_failover_resume(session->server->failover);
+                    return qihse_resp_simple(session, resumed ? "RESUMED" : "ALREADY-RUNNING");
+                }
                 if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
                     return qihse_resp_handle_moveslots(session, request);
                 }
                 if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "RECLAIM")) {
                     return qihse_resp_handle_reclaim(session, request);
                 }
+                /* The compatibility handler promotes and assigns slots directly,
+                 * without entering the server's failover coordinator. */
+                if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "FAILOVER") &&
+                    qihse_cluster_failover_is_paused(session->server->failover))
+                    return qihse_resp_error(session, "ERR failover is paused during startup");
                 qihse_resp_cluster_context_t context = { session->server->topology, qihse_resp_cluster_output, session,
                                                          qihse_resp_cluster_owner_cb, session->server };
                 return qihse_resp_cluster_dispatch(&context, request->argc, request->argv);
@@ -16708,6 +16726,22 @@ done:
     return ok;
 }
 
+bool qihse_resp_server_start_failover_paused(
+        qihse_resp_server_t* server, const qihse_user_t* authenticated_grantor) {
+    if (!server) return false;
+    pthread_mutex_lock(&server->state_lock);
+    bool ok = !server->failover_startup_closed &&
+        !server->replication_peers_frozen && !server->running &&
+        server->listen_fd < 0 && !server->stopping && !server->active_clients &&
+        server->auth_required && authenticated_grantor &&
+        qihse_auth_user_is_active(authenticated_grantor) &&
+        qihse_user_get_tenant_id(authenticated_grantor) == QIHSE_TENANT_SYSTEM &&
+        qihse_user_get_role(authenticated_grantor) == QIHSE_ROLE_OPERATOR &&
+        qihse_cluster_failover_pause_startup(server->failover);
+    pthread_mutex_unlock(&server->state_lock);
+    return ok;
+}
+
 bool qihse_resp_server_start(qihse_resp_server_t* server) {
     if (!server) {
         errno = EINVAL;
@@ -16723,8 +16757,8 @@ bool qihse_resp_server_start(qihse_resp_server_t* server) {
         errno = EALREADY;
         return false;
     }
-    server->stopping = false;
-    server->listen_fd = qihse_resp_open_listener(server);
+    server->failover_startup_closed = true;
+    server->stopping = false; server->listen_fd = qihse_resp_open_listener(server);
     if (server->listen_fd < 0) {
         pthread_mutex_unlock(&server->state_lock);
         fprintf(stderr, "qihse: resp listener %s:%u unavailable: %s\n",
@@ -16775,8 +16809,8 @@ bool qihse_resp_server_run(qihse_resp_server_t* server) {
         errno = EALREADY;
         return false;
     }
-    server->stopping = false;
-    server->listen_fd = qihse_resp_open_listener(server);
+    server->failover_startup_closed = true;
+    server->stopping = false; server->listen_fd = qihse_resp_open_listener(server);
     if (server->listen_fd < 0) {
         pthread_mutex_unlock(&server->state_lock);
         fprintf(stderr, "qihse: resp listener %s:%u unavailable: %s\n",
@@ -16991,6 +17025,7 @@ bool qihse_resp_server_handle_client_fd(qihse_resp_server_t* server, int client_
         errno = EBUSY;
         return false;
     }
+    server->failover_startup_closed = true;
     client->next = server->clients;
     server->clients = client;
     ++server->active_clients;
@@ -17048,6 +17083,16 @@ bool qihse_resp_server_execute(qihse_resp_server_t* server, qihse_user_t* user,
         errno = EACCES;
         return false;
     }
+    pthread_mutex_lock(&server->state_lock);
+    if (server->stopping) {
+        pthread_mutex_unlock(&server->state_lock);
+        errno = EBUSY;
+        return false;
+    }
+    /* Embedded execution enters a session without opening a listener. Serialize
+     * its startup boundary with the hold setter, just like accepted sockets. */
+    server->failover_startup_closed = true;
+    pthread_mutex_unlock(&server->state_lock);
     qihse_resp_session_t session;
     memset(&session, 0, sizeof(session));
     session.server = server;

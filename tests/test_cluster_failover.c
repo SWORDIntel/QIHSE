@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 static void make_node(qihse_cluster_node_t* node, const char* id_seed, const char* host, uint16_t port, uint16_t bus_port,
                       qihse_cluster_node_role_t role, uint16_t primary_index) {
@@ -475,7 +476,7 @@ static void test_failback_on_remote_takeover(void) {
     fcfg.topology = topo; fcfg.local_node_index = ic;
     fcfg.failback_fn = fb_cb; fcfg.failback_user_data = &probe;
     fcfg.failback_stable_ms = 150; fcfg.failback_poll_ms = 40;
-    qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&fcfg);
+    qihse_cluster_failover_t* fo = qihse_cluster_failover_create_paused(&fcfg);
     assert(fo);
 
     qihse_cluster_bus_config_t bcfg; memset(&bcfg, 0, sizeof(bcfg));
@@ -504,7 +505,13 @@ static void test_failback_on_remote_takeover(void) {
     assert(qihse_cluster_topology_get_slot(topo, 50, &o, &st, NULL) && o == ic);
     assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);   /* ledgered via the bus */
 
+    /* Gossip must queue debt even under the hold, without making a late
+     * startup pause legal. Release must preserve that debt for handback. */
+    assert(qihse_cluster_failover_is_paused(fo));
+    assert(!qihse_cluster_failover_pause_startup(fo));
+    assert(probe.calls == 0);
     qihse_cluster_topology_set_node_health(topo, ia, true);
+    assert(qihse_cluster_failover_resume(fo));
     fb_wait_t w = { fo, &probe, topo, 50, ia, 1 };
     assert(wait_for(fb_owner_is, &w, 3000));
     assert(wait_for(fb_count_reached, &w, 3000));
@@ -514,6 +521,100 @@ static void test_failback_on_remote_takeover(void) {
     qihse_cluster_failover_destroy(fo);
     qihse_cluster_topology_destroy(topo);
     printf("PASS successor ledgers and fails back a takeover decided by another node\n");
+}
+
+/* Exercise the real bus mutex, not a stand-in: injection holds it while the
+ * callback runs, and promotion takes the failover mutex before broadcasting.
+ * Barriers overlap those paths repeatedly; the watchdog bounds an ABBA hang. */
+typedef struct {
+    qihse_cluster_failover_t* fo;
+    qihse_cluster_bus_t* bus;
+    qihse_cluster_topology_t* topo;
+    uint16_t owner, promotion_owner;
+    pthread_barrier_t gate;
+    uint8_t datagram[QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(qihse_cluster_bus_slot_update_t)];
+    unsigned callbacks;
+} takeover_race_t;
+
+static void takeover_race_cb(qihse_cluster_topology_t* topo, uint16_t previous,
+                              uint16_t first, uint16_t last, void* user) {
+    takeover_race_t* race = user;
+    race->callbacks++;
+    pthread_barrier_wait(&race->gate);
+    qihse_cluster_failover_on_takeover_cb(topo, previous, first, last, race->fo);
+}
+
+static void* takeover_race_inject(void* user) {
+    takeover_race_t* race = user;
+    for (unsigned i = 0; i < 128; i++) {
+        /* Separate ranges guarantee that promotion cannot consume the gossip
+         * range. The end-of-round barrier fences each topology reset. */
+        assert(qihse_cluster_topology_assign_range(race->topo, 0, 99, race->owner));
+        assert(qihse_cluster_topology_assign_range(race->topo, 100, 199, race->promotion_owner));
+        assert(qihse_cluster_bus_inject(race->bus, race->datagram,
+                                        sizeof(race->datagram), "127.0.0.1", 17000));
+        pthread_barrier_wait(&race->gate);
+    }
+    return NULL;
+}
+
+static void test_takeover_promotion_lock_order(void) {
+    takeover_race_t race; memset(&race, 0, sizeof(race));
+    race.topo = qihse_cluster_topology_create();
+    assert(race.topo);
+    qihse_cluster_node_t owner, local, other;
+    make_node(&owner, "lock-owner", "127.0.0.1", 7000, 17000,
+              QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&local, "lock-local", "127.0.0.1", 7001, 17001,
+              QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    uint16_t self;
+    assert(qihse_cluster_topology_upsert_node(race.topo, &owner, &race.owner));
+    assert(qihse_cluster_topology_upsert_node(race.topo, &local, &self));
+    make_node(&other, "lock-other-owner", "127.0.0.1", 7002, 17002,
+              QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    assert(qihse_cluster_topology_upsert_node(race.topo, &other, &race.promotion_owner));
+    qihse_cluster_topology_set_node_health(race.topo, race.owner, false);
+    qihse_cluster_topology_set_node_health(race.topo, race.promotion_owner, false);
+    qihse_cluster_bus_config_t bcfg; memset(&bcfg, 0, sizeof(bcfg));
+    bcfg.topology = race.topo; bcfg.local_node_index = self;
+    race.bus = qihse_cluster_bus_create(&bcfg);
+    assert(race.bus);
+    fb_probe_t probe; memset(&probe, 0, sizeof(probe));
+    probe.topo = race.topo;
+    qihse_cluster_failover_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = race.topo; cfg.bus = race.bus; cfg.local_node_index = self;
+    cfg.failback_fn = fb_cb; cfg.failback_user_data = &probe;
+    race.fo = qihse_cluster_failover_create(&cfg);
+    assert(race.fo);
+    assert(pthread_barrier_init(&race.gate, NULL, 2) == 0);
+    qihse_cluster_bus_set_takeover_callback(race.bus, takeover_race_cb, &race);
+    qihse_cluster_bus_slot_update_t upd; memset(&upd, 0, sizeof(upd));
+    upd.start = 0; upd.end = 99; upd.owner_index = self;
+    memcpy(upd.owner_id, local.id, QIHSE_CLUSTER_NODE_ID_LEN + 1u);
+    upd.config_epoch = 0; /* Static announcements remain valid across rounds. */
+    uint32_t header[] = { QIHSE_CLUSTER_BUS_MAGIC, QIHSE_BUS_MSG_SLOT_UPDATE,
+                          99, (uint32_t)sizeof(upd) };
+    memcpy(race.datagram, header, sizeof(header));
+    memcpy(race.datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &upd, sizeof(upd));
+    pthread_t injector;
+    alarm(20);
+    assert(pthread_create(&injector, NULL, takeover_race_inject, &race) == 0);
+    for (unsigned i = 0; i < 128; i++) {
+        pthread_barrier_wait(&race.gate); /* callback now holds the real bus lock */
+        assert(qihse_cluster_failover_promote(race.fo, race.promotion_owner, self));
+        pthread_barrier_wait(&race.gate);
+    }
+    assert(pthread_join(injector, NULL) == 0);
+    alarm(0);
+    assert(race.callbacks == 128);
+    assert(qihse_cluster_failover_pending_failbacks(race.fo) == 2u);
+    assert(!qihse_cluster_failover_pause_startup(race.fo));
+    assert(probe.calls == 0);
+    pthread_barrier_destroy(&race.gate);
+    qihse_cluster_failover_destroy(race.fo);
+    qihse_cluster_bus_destroy(race.bus);
+    qihse_cluster_topology_destroy(race.topo);
+    printf("PASS real-bus takeover and promotion lock-order regression\n");
 }
 
 /* When a non-coordinator (or asymmetry-deferred cycle) sees on_fail first,
@@ -572,6 +673,7 @@ int main(void) {
     test_failback_skips_dedicated_replica();
     test_failback_respects_resplit_range();
     test_failback_on_remote_takeover();
+    test_takeover_promotion_lock_order();
     test_non_coordinator_does_not_trip_cooldown();
     printf("cluster failover tests passed\n");
     return 0;

@@ -16,6 +16,13 @@ bool qihse_resp_server_add_replication_peer(
     qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
     const qihse_user_t* authenticated_grantor);
 
+/* Before first listener/session only; requires an active authenticated system
+ * Operator and config.enable_failover. Holds automatic/manual promotion and
+ * failback until authenticated CLUSTER FAILOVER.RESUME. No live drain, write,
+ * gossip or GC fencing is provided. Rejected after any listen attempt. */
+bool qihse_resp_server_start_failover_paused(
+    qihse_resp_server_t* server, const qihse_user_t* authenticated_grantor);
+
 #ifdef __cplusplus
 }
 #endif

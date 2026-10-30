@@ -464,6 +464,85 @@ static void test_transport_key_derivation(void) {
     printf("PASS transport key derivation\n");
 }
 
+static void silent_peer_failed(qihse_cluster_topology_t* topology,
+                               uint16_t node_index, void* user_data) {
+    (void)topology;
+    uint16_t* failed = (uint16_t*)user_data;
+    __atomic_store_n(failed, node_index, __ATOMIC_RELEASE);
+}
+
+static void test_silent_peer_health(void) {
+    assert(qihse_cluster_bus_check_health(NULL) == 0);
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo);
+
+    /* Reserve an endpoint that receives UDP but never answers the bus. */
+    int silent_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(silent_fd >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(silent_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    socklen_t addr_len = sizeof(addr);
+    assert(getsockname(silent_fd, (struct sockaddr*)&addr, &addr_len) == 0);
+
+    qihse_cluster_node_t local, peer, check;
+    make_node(&local, "silent-local", "127.0.0.1", 7000, 17382);
+    make_node(&peer, "silent-peer", "127.0.0.1", 7001, ntohs(addr.sin_port));
+    uint16_t local_idx, peer_idx;
+    assert(qihse_cluster_topology_upsert_node(topo, &local, &local_idx));
+    assert(qihse_cluster_topology_upsert_node(topo, &peer, &peer_idx));
+    uint16_t failed = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_bus_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = topo;
+    cfg.local_node_index = local_idx;
+    cfg.bind_address = "127.0.0.1";
+    cfg.bus_port = local.bus_port;
+    cfg.heartbeat_ms = 50;
+    cfg.timeout_ms = 100;
+    cfg.on_fail = silent_peer_failed;
+    cfg.on_fail_user_data = &failed;
+    qihse_cluster_bus_t* bus = qihse_cluster_bus_create(&cfg);
+    assert(bus);
+    assert(qihse_cluster_bus_check_health(bus) == 0);
+    assert(qihse_cluster_topology_get_node(topo, peer_idx, &check));
+    assert(check.healthy);
+    assert(qihse_cluster_bus_start(bus));
+    for (unsigned i = 0; i < 100 &&
+         __atomic_load_n(&failed, __ATOMIC_ACQUIRE) == QIHSE_CLUSTER_NODE_NONE; i++) {
+        sleep_ms(20);
+    }
+    qihse_cluster_bus_stop(bus);
+    assert(__atomic_load_n(&failed, __ATOMIC_ACQUIRE) == peer_idx);
+    assert(qihse_cluster_topology_get_node(topo, peer_idx, &check));
+    assert(!check.healthy);
+    assert(qihse_cluster_topology_get_node(topo, local_idx, &check));
+    assert(check.healthy);
+    qihse_cluster_bus_stats_t stats;
+    qihse_cluster_bus_stats(bus, &stats);
+    assert(stats.received == 0);
+    assert(stats.nodes_marked_unhealthy == 1);
+
+    /* First direct contact must revive even a peer never previously seen. */
+    uint8_t datagram[QIHSE_CLUSTER_BUS_HEADER_SIZE + QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    uint32_t header[] = {QIHSE_CLUSTER_BUS_MAGIC, QIHSE_BUS_MSG_PONG,
+                         peer_idx, QIHSE_CLUSTER_NODE_ID_LEN + 1u};
+    memcpy(datagram, header, sizeof(header));
+    memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, peer.id, sizeof(peer.id));
+    assert(qihse_cluster_bus_inject(bus, datagram, sizeof(datagram),
+                                  "127.0.0.1", peer.bus_port));
+    assert(qihse_cluster_topology_get_node(topo, peer_idx, &check));
+    assert(check.healthy);
+    assert(qihse_cluster_bus_check_health(bus) == 0);
+
+    qihse_cluster_bus_destroy(bus);
+    qihse_cluster_topology_destroy(topo);
+    close(silent_fd);
+    printf("PASS silent peer health and first-contact revival\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -477,6 +556,7 @@ int main(void) {
     test_transport_key_derivation();
     test_veiled_framing();
     test_live_udp_roundtrip();
+    test_silent_peer_health();
     printf("cluster bus tests passed\n");
     return 0;
 }

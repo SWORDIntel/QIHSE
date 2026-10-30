@@ -37,6 +37,8 @@ struct qihse_cluster_failover {
     qihse_cluster_bus_t* bus;
     uint16_t local_node_index;
     bool single_coordinator;
+    bool startup_paused;
+    bool activity_started;
     uint64_t failover_events;
     uint64_t last_attempt_ms;
     pthread_mutex_t lock;
@@ -58,10 +60,12 @@ struct qihse_cluster_failover {
 
 static void* fo_failback_main(void* arg);
 
-qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_failover_config_t* config) {
+static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t* config,
+                                            bool paused) {
     if (!config || !config->topology) return NULL;
     qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)calloc(1, sizeof(*fo));
     if (!fo) return NULL;
+    fo->startup_paused = paused;
     fo->topology = config->topology;
     fo->bus = config->bus;
     fo->local_node_index = config->local_node_index;
@@ -90,6 +94,46 @@ qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_fail
         }
     }
     return fo;
+}
+
+qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_failover_config_t* config) {
+    return fo_create(config, false);
+}
+
+qihse_cluster_failover_t* qihse_cluster_failover_create_paused(const qihse_cluster_failover_config_t* config) {
+    return fo_create(config, true);
+}
+
+bool qihse_cluster_failover_pause_startup(qihse_cluster_failover_t* fo) {
+    if (!fo) return false;
+    pthread_mutex_lock(&fo->lock);
+    /* Takeover callbacks run under the bus lock and may only take the leaf
+     * ledger lock. Serialize the hold with debt insertion here instead. Once
+     * the worker drains debt, activity_started already forbids a late hold. */
+    pthread_mutex_lock(&fo->ledger_lock);
+    bool ok = !fo->activity_started && fo->ledger_count == 0;
+    if (ok) fo->startup_paused = true;
+    pthread_mutex_unlock(&fo->ledger_lock);
+    pthread_mutex_unlock(&fo->lock);
+    return ok;
+}
+
+bool qihse_cluster_failover_resume(qihse_cluster_failover_t* fo) {
+    if (!fo) return false;
+    pthread_mutex_lock(&fo->lock);
+    bool changed = fo->startup_paused;
+    fo->startup_paused = false;
+    fo->activity_started = true;
+    pthread_mutex_unlock(&fo->lock);
+    return changed;
+}
+
+bool qihse_cluster_failover_is_paused(qihse_cluster_failover_t* fo) {
+    if (!fo) return false;
+    pthread_mutex_lock(&fo->lock);
+    bool paused = fo->startup_paused;
+    pthread_mutex_unlock(&fo->lock);
+    return paused;
 }
 
 void qihse_cluster_failover_destroy(qihse_cluster_failover_t* fo) {
@@ -204,7 +248,7 @@ static void fo_ledger_record(qihse_cluster_failover_t* fo, uint16_t failed,
     pthread_mutex_unlock(&fo->ledger_lock);
 }
 
-bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
+static bool fo_promote_locked(qihse_cluster_failover_t* fo,
                                     uint16_t failed_primary_index,
                                     uint16_t replica_index) {
     if (!fo || !fo->topology) return false;
@@ -254,10 +298,27 @@ bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
     return true;
 }
 
+bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
+                                    uint16_t failed_primary_index,
+                                    uint16_t replica_index) {
+    if (!fo) return false;
+    pthread_mutex_lock(&fo->lock);
+    fo->activity_started = true;
+    bool ok = !fo->startup_paused &&
+        fo_promote_locked(fo, failed_primary_index, replica_index);
+    pthread_mutex_unlock(&fo->lock);
+    return ok;
+}
+
 uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
                                        uint16_t failed_node_index) {
     if (!fo || !fo->topology) return QIHSE_CLUSTER_NODE_NONE;
     pthread_mutex_lock(&fo->lock);
+    fo->activity_started = true;
+    if (fo->startup_paused) {
+        pthread_mutex_unlock(&fo->lock);
+        return QIHSE_CLUSTER_NODE_NONE;
+    }
     /* cooldown: while a dead node REMAINS unhealthy the bus re-fires on_fail
      * every cycle; promote is idempotent but the broadcasts are not free.
      * Stamp last_attempt_ms only after passing the coordinator and asymmetry
@@ -317,7 +378,7 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
     }
 
     fo->last_attempt_ms = fo_now_ms();
-    bool promoted = qihse_cluster_failover_promote(fo, failed_node_index, replica);
+    bool promoted = fo_promote_locked(fo, failed_node_index, replica);
     if (promoted) {
         fo->failover_events++;
         fprintf(stderr, "qihse-cluster-failover: node %u failed; node %u takes its slots%s\n",
@@ -353,10 +414,19 @@ static bool fo_slot_is_ours(const qihse_cluster_failover_t* fo, uint32_t slot) {
 /* One pass over the ledger: for every entry whose owner has been continuously
  * healthy long enough, hand the slots we STILL own back to it. */
 static void fo_failback_pass(qihse_cluster_failover_t* fo) {
+    if (qihse_cluster_failover_is_paused(fo)) return;
     uint64_t now = fo_now_ms();
     pthread_mutex_lock(&fo->ledger_lock);
     size_t n = fo->ledger_count;
     pthread_mutex_unlock(&fo->ledger_lock);
+    pthread_mutex_lock(&fo->lock);
+    /* An empty pass may have begun before the before-listen hold was set.
+     * Recheck after reading the ledger; once work exists, live pausing is
+     * forbidden rather than pretending to drain an in-flight handoff. */
+    if (n) fo->activity_started = true;
+    bool paused = fo->startup_paused;
+    pthread_mutex_unlock(&fo->lock);
+    if (paused) return;
 
     for (size_t i = 0; i < n && !__atomic_load_n(&fo->stop, __ATOMIC_ACQUIRE); i++) {
         fo_ledger_entry_t e;
@@ -448,6 +518,9 @@ void qihse_cluster_failover_on_takeover_cb(qihse_cluster_topology_t* topology,
     (void)topology;
     qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)user_data;
     if (!fo || !fo->failback_fn) return;
+    /* Called with the bus lock held: never acquire fo->lock here, since
+     * promotion holds it while broadcasting. Gossip is not fenced by the
+     * hold: retain the debt, but the worker must not transfer until release. */
     fo_ledger_record(fo, previous_owner_index, start, end);
 }
 

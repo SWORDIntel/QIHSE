@@ -1734,7 +1734,7 @@ size_t qihse_cluster_bus_poll(qihse_cluster_bus_t* bus) {
 }
 
 size_t qihse_cluster_bus_check_health(qihse_cluster_bus_t* bus) {
-    if (!bus || !bus->last_seen_ms) return 0;
+    if (!bus) return 0;
     uint64_t now = qihse_bus_now_ms();
     size_t marked = 0;
     qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
@@ -1743,7 +1743,8 @@ size_t qihse_cluster_bus_check_health(qihse_cluster_bus_t* bus) {
     for (size_t i = 0; i < count; i++) {
         uint16_t idx = nodes[i].index;
         if (idx == bus->local_node_index) continue;
-        uint64_t last_seen = idx < bus->last_seen_capacity ? bus->last_seen_ms[idx] : 0;
+        uint64_t last_seen = bus->last_seen_ms && idx < bus->last_seen_capacity
+                                 ? bus->last_seen_ms[idx] : 0;
         if (last_seen == 0) {
             /* Never heard from this node directly. That used to mean
              * "skip forever", which made a corpse learned only through

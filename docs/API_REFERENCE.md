@@ -1301,6 +1301,52 @@ make APPROVED; enrollment remains the gate, and the durable accessors re-read
 the identity record, so a discovered-but-unenrolled node resolves to nothing
 usable. Nothing may treat this UUID as evidence of identity.
 
+### 8.8a Startup failover hold — `include/qihse_cluster_failover.h`
+
+A staged restart can retain canonical slot ownership while configured peers are
+still absent. Start `qihse-cluster-daemon --failover-start-paused` to install the
+hold **before the first listen**; normal startup remains unpaused.
+
+Embedding APIs:
+
+- `bool qihse_resp_server_start_failover_paused(server, authenticated_grantor)`
+  (`include/qihse_resp_engine.h`) requires failover enabled, authentication enabled,
+  and an actual active authenticated SYSTEM-domain Operator. NULL, forged,
+  revoked, low-role and foreign-tenant handles are rejected. Call before the first
+  listen/client handling; stopping a server does not reopen this startup window.
+- `qihse_cluster_failover_create_paused(config)` constructs a held coordinator
+  before its worker starts. `qihse_cluster_failover_pause_startup(fo)` is only for
+  startup: the embedding caller must ensure the coordinator has not been exposed
+  to bus callbacks or manual promotion. It is not a runtime pause operation.
+- `qihse_cluster_failover_is_paused(fo)` observes the hold;
+  `bool qihse_cluster_failover_resume(fo)` releases it and returns whether it had
+  been paused. These coordinator controls are trusted in-process APIs; external
+  adapters must enforce authorization before calling them.
+
+On a real authenticated SYSTEM Operator connection, send:
+
+```text
+CLUSTER FAILOVER.RESUME
+```
+
+The exact RESP reply is `+RESUMED\r\n`, or `+ALREADY-RUNNING\r\n` on a repeated
+release. Unauthenticated sessions, tenant Operators, lower roles and pinned
+replication principals cannot release the hold. Failure detection continues
+while held; after release, normal failover can take over an already-failed peer.
+
+**This is a startup ownership hold, not a live drain.** It blocks coordinator
+promotion and failback, not writes, gossip ownership updates, migration, or
+reclaim/GC. Pair it with an independent client-ingress fence and the correct
+canonical ownership journals on every restarting node. Verify the restored
+ownership/peer state before releasing the hold; do not use it as a data or
+maintenance fence.
+
+Regression coverage: `make test-cluster-daemon-shutdown` uses real pinned QKP,
+an absent peer past the default 5000 ms detection window, retained canonical
+ranges, and takeover after Operator release. `make test-replication-multi-peer`
+covers setter authority/lifetime checks and release denial on real replication
+and low-authority sessions.
+
 ### 8.9 Scoped consensus — `include/qihse_consensus.h`
 
 Source: `src/federation/qihse_consensus.c`.
