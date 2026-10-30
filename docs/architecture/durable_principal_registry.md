@@ -1,120 +1,108 @@
-# Durable principal registry and cluster replay
+# Durable principal registry
 
-## Current behavior
+> **Standalone maintenance update:** see [PRINCIPAL_MIGRATION.md](../PRINCIPAL_MIGRATION.md)
+> and `include/qihse_auth_maintenance.h`. The implementation below is explicit
+> standalone durable authority, distinct from principal consensus.
+> Standalone state is never a consensus prefix or an automatic fallback.
+> Deployment activation remains blocked by the current LAN ownership/GC conflict;
+> no primary has been stopped/replaced and no DIRECTEYE or production SQL changes
+> are part of this work. This is a source-contract description, not build/test
+> evidence or a claim of operational acceptance.
 
-`qihse_auth_init()` clears the `users` and `authz_states` arrays and creates
-only system Operator (ID 0). `qihse_auth_create_user()`,
-`qihse_auth_create_tenant_user()`, `qihse_auth_modify_user()`,
-`qihse_auth_destroy_user()`, token updates, and object ACL updates change those
-arrays only. `qihse_cluster_daemon` calls `qihse_auth_init()` before creating
-the KV store or consensus mesh. Therefore an account created through these APIs
-is neither durable across restart nor present on another node. A database row
-that merely records account details does not change the authoritative QIHSE
-authentication table.
+## Implemented standalone authority
 
-Do not enable account creation for durable or clustered identities on the
-assumption that current KV replication will reconstruct this table.
+The source maintenance API in `include/qihse_auth_maintenance.h` distinguishes
+`DISABLED` (legacy volatile), `STANDALONE` (permanent local durable authority)
+and `CONSENSUS` (not a supported principal authority). Unsupported selection
+fails; standalone must never be inferred from a failed consensus startup.
+Ordinary KV replication does not reconstruct the authoritative auth table.
 
-## Required committed state
+`qihse_auth_maintenance_start()` is one-shot protected startup before ordinary
+auth initialization/listeners. Provision and recover are distinct actions.
+Provision refuses existing state and creates a fresh history unless an explicit
+same-authority history is supplied to prepare a relocation target. Recovery binds
+to an expected history, node, epoch and minimum generation; it must not silently
+initialize a fresh registry on missing/invalid state.
 
-Use one ordered, quorum-committed principal log for a cluster history. Every
-mutation carries a unique request ID, the expected registry generation, the
-authenticated actor ID and actor generation, and a canonical versioned record.
-The record must include:
+`qihse_auth_bootstrap_provision()` creates a private bootstrap verifier file
+without overwriting an existing file. Recovery uses an opaque startup capability,
+not a fake root principal or `NULL` actor bypass. Live maintenance requires an
+authoritative full-clearance/full-SCI system Operator satisfying its verifier
+and hardware-token policy. Transfer never replaces protected UID 0.
 
-- User ID, tenant ID, username, role, classification, SCI bits,
-  `can_create_users`, hardware-token requirement and registered credential ID.
-- Password verifier version, algorithm, work factor, salt, and verifier bytes.
-  Never log or replicate a plaintext password. Protect this log and its
-  snapshots as secret-bearing data, including in backups.
-- Object ACL entries and a monotonically increasing per-principal generation.
-- Explicit tombstones for deletion and revocation. IDs must not be reused
-  while an older generation could be replayed or presented.
+`core/qihse_auth_durable.c` takes an exclusive local state-directory lock.
+Commit writes a unique private pending file, synchronizes it, renames to
+`authority.state` and synchronizes the directory before success/publication.
+Auth mutators stage state through the durable gate before acknowledging changes:
+account, password, ACL, token-policy and lockout updates cannot be in-memory-only successes in
+durable mode. Failure fences readiness rather than reopening volatile auth.
 
-The system Operator bootstrap is a separate local recovery mechanism. The
-committed registry must not silently replace its credential with one from an
-untrusted or different cluster history.
+### Session and handle invalidation
 
-## Mutation ordering
+In durable mode, a successful generation-changing policy mutation installs a
+new registered handle and its authoritative shadow state under the auth write
+lock. This covers password/bootstrap, username, clearance/SCI, delegation,
+hardware-token requirement/enrollment and object ACL changes. Every previous
+target handle fails authoritative resolution, including sessions that check
+only liveness rather than an optional saved generation. UID 0 is not exempt:
+a root session becomes stale after changing its own security policy and must
+reauthenticate. Adapters must not silently refresh an old session by UID.
+Creation returns the current registered handle; a subsequent policy change
+invalidates that handle too. Transient hardware-token presence and lockout
+counters do not rotate policy handles. Legacy volatile mode retains its
+in-place pointer semantics.
 
-The existing privilege checks in `create_user_internal()` and
-`qihse_auth_modify_user()` apply before proposal, using the authoritative
-current actor and target state. The same checks must be repeated at ordered
-apply time against the committed predecessor state. This prevents an actor
-whose authority was revoked between proposal and commit from creating or
-promoting a principal. In particular, `can_create_users` delegates creation
-only and must never grant role, clearance, SCI, tenant, or token-policy
-authority above the creator. The `modify_user()` path currently allows any
-Operator to alter a same-tenant target's clearance and SCI; the committed
-apply path must preserve that explicit policy and never infer Operator power
-from `can_create_users`.
+Replacement allocation and retirement-capacity checks precede durable commit;
+OOM or exhausted retirement capacity publishes and commits nothing. Publication
+has no remaining allocation/failure point. Ordinary mutations perform standalone
+disk I/O under the existing lifecycle/auth locks, never consensus I/O. Import
+uses the same retirement mechanism for all previous nonroot handles, including
+unchanged accounts. Scoped borrow counts move with each retired allocation;
+release of an old borrow cannot decrement a replacement principal's count.
 
-Return success only after the operation commits and applies locally. If there
-is no quorum or the node is fenced, reject the mutation rather than granting
-temporary local authority. Append failure, stale expected generation, or
-duplicate request ID must leave the auth table unchanged. Treat an exact
-duplicate request as idempotent and a conflicting duplicate as an error.
+The shared process-lifetime retirement pool is bounded to `MAX_USERS` (65,536)
+allocations across policy rotation, deletion and import. Exhaustion rejects a
+mutation/import before disk commit; restart/recovery resets this process-local
+budget without resurrecting sessions. Retired allocations are never freed or
+reused, preventing dangling raw handles and allocator-address aliasing. They
+also remain immutable: even when scoped references reach zero, legacy unscoped
+readers and borrowed string pointers cannot be proven quiescent. Cleansing at
+that point would introduce a data race. Consequently their bounded old policy
+and verifier payloads remain resident until process exit, not plaintext
+passwords; process memory and dumps remain secret-bearing. Safely reclaiming
+or cleansing these allocations earlier requires a broader lifetime-tracked API,
+not a generation-check convention imposed on optional callers.
 
-All auth mutations need to use this path, including password rotation,
-username changes, ACL grants/revocations, token enrollment and revocation,
-and destruction. The present C APIs expose direct in-memory writes; leaving
-even one reachable path outside the commit gate would allow diverging
-authority.
+The archive contract uses explicit bounded portable encoding, ML-KEM-1024,
+AES-256-GCM and ML-DSA-87 with explicit recipient/signer keys, SHA-384 DER
+SubjectPublicKeyInfo pins, and authenticated source/target
+authority/history/node/epoch/generation, purpose and archive ID bindings. It is
+not a native-structure or process-memory dump. Protect verifiers, keys, bootstrap,
+archives and backups as secret-bearing artifacts. Local durable envelopes alone
+include encrypted mutable UID-0 state bound to the immutable provisioning anchor;
+transfer images exclude root identity/verifier/policy and root-derived bootstrap
+binding. Principal generations, tombstones and lockout state survive recovery;
+sessions, verifier caches and
+`hardware_token_present` do not. Authentication and token presence must be
+established again. Import is a new local generation and must not resurrect a
+tombstone or relax an existing hardware-token requirement.
 
-## Startup, rejoin, and reads
+Import carries a nonzero request ID and a bounded durable retry receipt in the
+same authority state. An identical lost-ACK retry uses the original expected
+position, binding and ciphertext; conflicting reuse fails. A later position
+alone is not proof of that request's success.
 
-On startup, validate the cluster history ID and a protected registry snapshot,
-then replay the ordered committed suffix. Validate lengths, enum values,
-verifier parameters, unique IDs/usernames, tenant boundaries, ACL bounds,
-generations, checksums, and commit-prefix proof before materializing accounts.
-Reconstruct `users`, `authz_states`, username map, and token-policy fast-path
-flag from the same validated state. Never replay a partial record. Restore
-role, clearance, SCI, tenant, token policy, password verifier, and ACL as one
-atomic principal version.
+This provides local crash consistency and explicit stale-generation checking,
+**not entire-volume rollback protection**. Rolling back state, keys, bootstrap
+and the configured generation floor together can restore old coherent authority.
+No external monotonic witness is supplied. A local file lock also cannot fence
+a copied authority on another machine. See the migration runbook for coherent
+recovery, external fencing and cutover restrictions.
 
-Until the node has caught up to the committed authority index and holds a
-valid lease/fence for this cluster history, it may not authenticate a
-non-bootstrap principal or serve classified reads/writes under a cached
-principal. If replay fails or a committed tombstone is missing, startup is
-readiness-failed; falling back to a previous snapshot is not permitted. Rejoin
-must compare the committed prefix and discard divergent uncommitted tails.
-The relay/standby node uses the same log and readiness rule even when it is
-not a normal write destination.
+## Consensus boundary
 
-Authentication and permission checks must resolve a presented handle against
-the applied principal generation; a pre-revocation pointer cannot stay valid
-after a committed tombstone or change. The current `resolve_authoritative_user_locked()`
-compares a pointer against a live table entry, but the durable implementation
-also needs a generation and cluster-history binding for rejoin and recreation.
-
-## Integration boundary
-
-### Local record format staged
-
-`core/qihse_principal_record.{h,c}` defines an inert `QPR1` canonical payload
-codec for future committed principal mutations. It carries a request ID,
-expected registry generation, actor identity and generation, target generation,
-a full PUT principal with password verifier and ACL entries, or an explicit
-DELETE tombstone. Decode rejects oversized or trailing records, unsupported
-versions, malformed account fields, and noncanonical strings. This codec is
-not connected to the auth APIs or cluster daemon: encoding a record is not
-authorization, and decoding one is not replay proof. Until ordered
-commit/replay and readiness fencing are implemented, QIHSE accounts remain
-volatile. The payload includes verifier material, so any consensus log or
-snapshot that stores it must be protected as a secret-bearing artifact.
-
-The consensus mesh currently exposes proposals and committed reads, but auth
-mutations do not use it and daemon initialization precedes mesh creation.
-Implement a registry service after mesh startup and before listener readiness,
-then inject it into the auth mutation APIs. This service owns snapshot/replay,
-the commit/apply index, and the readiness fence. A local-only file snapshot is
-not an acceptable substitute: it cannot preserve revocation ordering or
-multi-node consistency. Nor can periodic key pulls establish an authoritative
-order for create, modify, and delete.
-
-Before merging a new wire/adapter path, add the required automated
-low-clearance/high-data negative authorization test and run it in CI per
-`AGENTS.md`. Also cover restart, partial-record recovery, stale snapshot,
-concurrent mutation, revocation, partition/rejoin, and duplicate request IDs
-before enabling persistent accounts. This document is a design gate; no live
-registry or replay is enabled by it.
+The `QPR1` codec in `core/qihse_principal_record.{h,c}` is not an
+authenticated committed prefix. Standalone durability does not supply quorum
+ordering, partition/rejoin authority, or cross-node revocation fencing. Do not
+advertise those guarantees or substitute local state automatically for failed
+principal-consensus capability.

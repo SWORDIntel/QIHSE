@@ -37,6 +37,7 @@ SAFE = frozenset({
     "test-aimem-replay-recovery", "test-aimem-qh05-08",
     "test-aimem-scope-index", "test-aimem-qh08", "test-aimem-qh08-resp",
     "test-fabric-jobs", "test-persist",
+    "test-auth-durable", "test-auth-archive", "test-auth-maintenance",
 })
 
 

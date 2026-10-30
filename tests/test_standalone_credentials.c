@@ -60,8 +60,11 @@ int main(void) {
     assert(tenant_id == 71u);
 
     assert(qihse_auth_init());
+    qihse_user_t* startup_operator = qihse_auth_authenticate_id(
+        0u, credentials.operator_password);
+    assert(startup_operator);
     qihse_user_t* service = standalone_bootstrap_aimem_service(
-        credentials.aimem_service_password, tenant_id, user_id);
+        startup_operator, credentials.aimem_service_password, tenant_id, user_id);
     assert(service);
     assert(qihse_user_get_id(service) == user_id);
     assert(qihse_user_get_tenant_id(service) == tenant_id);

@@ -596,6 +596,11 @@ qihse_user_t* qihse_keystone_feed_identity_provision(const qihse_user_t* creator
         return NULL;
     }
 
+    indexer = qihse_auth_authenticate_id(user_id, plaintext_password);
+    if (!indexer) {
+        (void)qihse_auth_destroy_user(creator, user_id);
+        return NULL;
+    }
     if (!ks_feed_binding_add(user_id, tenant_id)) {
         (void)qihse_auth_destroy_user(creator, user_id);
         return NULL;

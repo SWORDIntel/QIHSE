@@ -28,6 +28,12 @@ typedef struct {
     qihse_user_t principal;
 } qihse_principal_record_t;
 
+/* Validate durable principal fields without fabricating a mutation record.
+ * allow_root permits only a system/full-clearance Operator UID0 for a
+ * separately trusted local bootstrap codec. The record codec below still
+ * forbids UID0. This grants no authorization. */
+bool qihse_principal_fields_valid(const qihse_user_t* user, bool allow_root);
+
 /* Returns false for malformed, unsupported, or noncanonical records. The
  * decoder clears out before returning failure. Neither function performs
  * authorization or commits a mutation. */

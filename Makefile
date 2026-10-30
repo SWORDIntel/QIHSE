@@ -182,6 +182,8 @@ QIHSE_TRINARY_SWEEP_BENCH_ITERS?=1
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
 SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.c core/qihse_rate_limit.c core/qihse_quota.c \
+            core/qihse_principal_record.c core/qihse_auth_maintenance.c core/qihse_auth_durable.c \
+            core/qihse_auth_archive.c core/qihse_auth_archive_crypto.c \
             src/broad_oak/qihse_search.c src/broad_oak/qihse_hnsw.c \
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
@@ -400,6 +402,20 @@ test-kv-restore-durability: lib
 	  QIHSE_KV_RESTORE_DURABILITY_DIR="$$work" LD_LIBRARY_PATH=. ./tests/test_kv_restore_durability
 
 test-serial: test-kv-restore-durability
+
+.PHONY: test-auth-durable test-auth-archive test-auth-maintenance
+test-auth-durable: lib
+	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_auth_durable tests/test_auth_durable.c $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_auth_durable
+
+test-auth-archive: lib
+	$(CC) $(CFLAGS) -o tests/test_auth_archive tests/test_auth_archive.c $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_auth_archive
+
+test-auth-maintenance: lib redis-server admin-cli
+	LD_LIBRARY_PATH=. python3 tests/test_auth_maintenance.py
+
+test-serial: test-auth-durable test-auth-archive test-auth-maintenance
 
 test-aimem-legacy-inventory: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_legacy_inventory tests/test_aimem_legacy_inventory.c -L. -lqihse $(LDFLAGS)
@@ -1800,7 +1816,7 @@ pristine: clean workspace-clean
 
 # Public C API roots and their local-header closure, not source/data internals.
 PREFIX ?= /usr/local
-PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_rate_limit.h \
+PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_limit.h \
     qihse_hetero.h qihse_math.h qihse_instr.h qihse_search.h \
     qihse_vector_db.h qihse_uwp.h qihse_uwp_tls.h qihse_uwp_metrics.h \
     qihse_kv_store.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
@@ -1825,15 +1841,16 @@ install-headers: $(addprefix include/,$(PUBLIC_API_HEADERS)) $(PUBLIC_API_TRANSI
 	    install -D -m 644 "$$h" "$(DESTDIR)$(PREFIX)/include/$$h" || exit $$?; \
 	done
 
-install-runtime: check-runtime-deps libqihse.so backup-cli
+install-runtime: check-runtime-deps libqihse.so backup-cli admin-cli
 	@install -d "$(DESTDIR)$(PREFIX)/lib" "$(DESTDIR)$(PREFIX)/bin"
 	@install -m 755 libqihse.so "$(DESTDIR)$(PREFIX)/lib/libqihse.so"
 	@install -m 755 qihse-backup "$(DESTDIR)$(PREFIX)/bin/qihse-backup"
+	@install -m 755 qihse-admin-cli "$(DESTDIR)$(PREFIX)/bin/qihse-admin-cli"
 
 install: install-runtime install-headers
 	@echo "Installed public C API and library into $(DESTDIR)$(PREFIX)"
 
-test-public-api-install: libqihse.so backup-cli
+test-public-api-install: libqihse.so backup-cli admin-cli
 	python3 tests/test_public_api_install.py
 
 install-host:

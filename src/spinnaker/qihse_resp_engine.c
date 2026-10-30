@@ -32,6 +32,7 @@
  * builds is non-authoritative by construction (auth resolves principals by
  * pointer identity) and can never carry more than unclassified access. */
 #include "qihse_auth_internal.h"
+#include "qihse_auth_maintenance.h"
 #include "qihse_machine_auth.h"
 #include "qihse_audit.h"
 #include "qihse_ingest_guard.h"
@@ -512,6 +513,10 @@ typedef struct { const char* name; qihse_resp_cmd_fn fn; uint32_t flags; } qihse
 static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"asking", 1, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"auth", -2, QIHSE_COMMAND_FAST, 0, 0, 0},
+    {"authority.capabilities", 1, QIHSE_COMMAND_ADMIN | QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"authority.export", 3, QIHSE_COMMAND_ADMIN | QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"authority.import", 5, QIHSE_COMMAND_ADMIN | QIHSE_COMMAND_WRITE, 0, 0, 0},
+    {"authority.checkpoint", 2, QIHSE_COMMAND_ADMIN | QIHSE_COMMAND_WRITE, 0, 0, 0},
     {"bundle.chunk", 3, QIHSE_COMMAND_READONLY, 0, 0, 0},
     {"bundle.prepare", -2, QIHSE_COMMAND_READONLY, 0, 0, 0},
     {"client", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
@@ -10783,6 +10788,184 @@ static bool dsp_type(qihse_resp_session_t* session, const qihse_resp_request_t* 
     return qihse_resp_simple(session, exists ? "string" : "none");
 }
 
+/* One-shot ciphertext transport is deliberately below the RESP request bound.
+ * No transfer handle is an authority token, and no state lives in the session. */
+#define QIHSE_AUTHORITY_WIRE_MAX (8u * 1024u * 1024u)
+
+static bool qihse_resp_authority_unhex(const qihse_resp_arg_t* arg,
+                                      uint8_t* out, size_t count) {
+    if (arg->len != count * 2u) return false;
+    for (size_t i = 0; i < count; i++) {
+        unsigned value = 0;
+        for (size_t j = 0; j < 2u; j++) {
+            uint8_t c = arg->data[i * 2u + j];
+            unsigned n = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+                         c >= 'a' && c <= 'f' ? (unsigned)(c - 'a') + 10u :
+                         c >= 'A' && c <= 'F' ? (unsigned)(c - 'A') + 10u : 16u;
+            if (n > 15u) return false;
+            value = value * 16u + n;
+        }
+        out[i] = (uint8_t)value;
+    }
+    return true;
+}
+
+static void qihse_resp_authority_position_decode(const uint8_t bytes[48],
+                                                qihse_auth_position_t* out) {
+    memcpy(out->history, bytes, 16u);
+    memcpy(out->node, bytes + 16u, 16u);
+    out->epoch = out->generation = 0u;
+    for (size_t i = 0; i < 8u; i++) {
+        out->epoch = (out->epoch << 8u) | bytes[32u + i];
+        out->generation = (out->generation << 8u) | bytes[40u + i];
+    }
+}
+
+static bool qihse_resp_authority_position_parse(const qihse_resp_arg_t* arg,
+                                                qihse_auth_position_t* out) {
+    uint8_t bytes[48];
+    if (!qihse_resp_authority_unhex(arg, bytes, sizeof(bytes))) return false;
+    qihse_resp_authority_position_decode(bytes, out);
+    return true;
+}
+
+static uint32_t qihse_resp_authority_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24u) | ((uint32_t)p[1] << 16u) |
+           ((uint32_t)p[2] << 8u) | p[3];
+}
+
+static qihse_auth_maintenance_status_t qihse_resp_authority_transfer(
+    const qihse_user_t* actor, const qihse_resp_arg_t* arg,
+    qihse_auth_archive_config_t* out) {
+    if (arg->len != 253u) return QIHSE_AUTH_MAINT_INVALID;
+    const uint8_t* p = arg->data;
+    qihse_auth_archive_binding_t binding = {0};
+    binding.version = qihse_resp_authority_be32(p);
+    binding.purpose = qihse_resp_authority_be32(p + 4u);
+    uint32_t mode = qihse_resp_authority_be32(p + 8u);
+    if (binding.version != QIHSE_AUTH_ARCHIVE_VERSION ||
+        binding.purpose != QIHSE_AUTH_ARCHIVE_PURPOSE_TRANSFER ||
+        (mode != QIHSE_AUTH_AUTHORITY_STANDALONE && mode != QIHSE_AUTH_AUTHORITY_CONSENSUS) ||
+        p[156] > 1u) return QIHSE_AUTH_MAINT_INVALID;
+    binding.mode = (qihse_auth_authority_mode_t)mode;
+    memcpy(binding.source_authority, p + 12u, 16u);
+    qihse_resp_authority_position_decode(p + 28u, &binding.source);
+    memcpy(binding.target_authority, p + 76u, 16u);
+    qihse_resp_authority_position_decode(p + 92u, &binding.target);
+    memcpy(binding.archive_id, p + 140u, 16u);
+    binding.allow_node_relocation = p[156] != 0u;
+    return qihse_auth_maintenance_transfer_config(actor, &binding, p + 157u, p + 205u, out);
+}
+
+static bool qihse_resp_authority_position(qihse_resp_session_t* session,
+                                          const qihse_auth_position_t* pos) {
+    static const char hex[] = "0123456789abcdef";
+    uint8_t bytes[48];
+    char text[96];
+    memcpy(bytes, pos->history, 16u);
+    memcpy(bytes + 16u, pos->node, 16u);
+    for (size_t i = 0; i < 8u; i++) {
+        bytes[32u + i] = (uint8_t)(pos->epoch >> (56u - 8u * i));
+        bytes[40u + i] = (uint8_t)(pos->generation >> (56u - 8u * i));
+    }
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        text[i * 2u] = hex[bytes[i] >> 4u];
+        text[i * 2u + 1u] = hex[bytes[i] & 15u];
+    }
+    return qihse_resp_bulk(session, text, sizeof(text));
+}
+
+static bool qihse_resp_authority_error(qihse_resp_session_t* session,
+                                      qihse_auth_maintenance_status_t status) {
+    char error[128];
+    snprintf(error, sizeof(error), "ERR AUTHORITY_%s",
+             qihse_auth_maintenance_status_string(status));
+    return qihse_resp_error(session, error);
+}
+
+static bool qihse_resp_handle_authority(qihse_resp_session_t* session,
+                                        const qihse_resp_request_t* request) {
+    /* The authority repeats this live gate under its own lock, including the
+     * full clearance/SCI/HWT ceiling. Never substitute UID0 or peer claims. */
+    if ((session->auth_kind != QIHSE_RESP_AUTH_LOCAL_PRINCIPAL &&
+         session->auth_kind != QIHSE_RESP_AUTH_QKP_ADMIN) ||
+        !session->user || !qihse_auth_user_is_active(session->user) ||
+        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR ||
+        !qihse_auth_can_access(session->user, UINT16_MAX, UINT16_MAX))
+        return qihse_resp_error(session, "NOPERM live full-ceiling Operator required");
+    if (session->in_multi)
+        return qihse_resp_error(session, "ERR authority maintenance is not allowed in MULTI");
+    qihse_auth_maintenance_caps_t caps;
+    qihse_auth_maintenance_status_t status =
+        qihse_auth_maintenance_capabilities(session->user, &caps);
+    if (status != QIHSE_AUTH_MAINT_OK) return qihse_resp_authority_error(session, status);
+    size_t wire_limit = session->server->max_request_bytes > 1024u ?
+        session->server->max_request_bytes - 1024u : 0u;
+    if (wire_limit > QIHSE_AUTHORITY_WIRE_MAX) wire_limit = QIHSE_AUTHORITY_WIRE_MAX;
+    if (!wire_limit) caps.export_supported = caps.import_supported = false;
+    if (session->server->max_request_bytes < 256u) caps.checkpoint_supported = false;
+    if (qihse_resp_command_is(request, "AUTHORITY.CAPABILITIES")) {
+        if (request->argc != 1u) return qihse_resp_wrong_arity(session, "authority.capabilities");
+        return qihse_resp_array(session, 8u) &&
+            qihse_resp_bulk_text(session, "QIHSE_AUTHORITY_V1") &&
+            qihse_resp_integer(session, caps.mode) && qihse_resp_integer(session, caps.ready) &&
+            qihse_resp_integer(session, caps.export_supported) &&
+            qihse_resp_integer(session, caps.import_supported) &&
+            qihse_resp_integer(session, caps.checkpoint_supported) &&
+            qihse_resp_integer(session, (int64_t)wire_limit) &&
+            qihse_resp_authority_position(session, &caps.position);
+    }
+    bool exporting = qihse_resp_command_is(request, "AUTHORITY.EXPORT");
+    bool importing = qihse_resp_command_is(request, "AUTHORITY.IMPORT");
+    if (!exporting && !importing && !qihse_resp_command_is(request, "AUTHORITY.CHECKPOINT"))
+        return qihse_resp_error(session, "ERR unknown authority command");
+    if (((exporting || importing) && !wire_limit) ||
+        (!exporting && !importing && session->server->max_request_bytes < 256u))
+        return qihse_resp_authority_error(session, QIHSE_AUTH_MAINT_LIMIT);
+    if (request->argc != (importing ? 5u : exporting ? 3u : 2u))
+        return qihse_resp_wrong_arity(session, "authority maintenance");
+    qihse_auth_position_t expected, result;
+    if (!qihse_resp_authority_position_parse(&request->argv[1], &expected))
+        return qihse_resp_error(session, "ERR invalid authority position (expected 96 hex digits)");
+    qihse_auth_archive_config_t transfer;
+    if (exporting || importing) {
+        status = qihse_resp_authority_transfer(session->user,
+            &request->argv[importing ? 3u : 2u], &transfer);
+        if (status != QIHSE_AUTH_MAINT_OK) return qihse_resp_authority_error(session, status);
+    }
+    if (exporting) {
+        qihse_auth_sealed_t* sealed = NULL;
+        status = qihse_auth_maintenance_export(session->user, &expected, &transfer, &sealed);
+        if (status != QIHSE_AUTH_MAINT_OK) return qihse_resp_authority_error(session, status);
+        size_t length = qihse_auth_sealed_size(sealed);
+        bool ok;
+        if (!length || length > wire_limit)
+            ok = qihse_resp_authority_error(session, QIHSE_AUTH_MAINT_LIMIT);
+        else {
+            /* Revalidate after the potentially expensive snapshot, before disclosure. */
+            status = qihse_auth_maintenance_capabilities(session->user, &caps);
+            ok = status == QIHSE_AUTH_MAINT_OK ?
+                qihse_resp_bulk(session, qihse_auth_sealed_data(sealed), length) :
+                qihse_resp_authority_error(session, status);
+        }
+        qihse_auth_sealed_free(sealed);
+        return ok;
+    }
+    if (importing) {
+        uint8_t request_id[16];
+        if (!qihse_resp_authority_unhex(&request->argv[2], request_id, sizeof(request_id)))
+            return qihse_resp_error(session, "ERR invalid request identity (expected 32 hex digits)");
+        if (!request->argv[4].len || request->argv[4].len > wire_limit)
+            return qihse_resp_authority_error(session, QIHSE_AUTH_MAINT_LIMIT);
+        status = qihse_auth_maintenance_import(session->user, &expected, request_id,
+            &transfer, request->argv[4].data, request->argv[4].len, &result);
+    } else {
+        status = qihse_auth_maintenance_checkpoint(session->user, &expected, &result);
+    }
+    return status == QIHSE_AUTH_MAINT_OK ? qihse_resp_authority_position(session, &result) :
+        qihse_resp_authority_error(session, status);
+}
+
 static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"get", qihse_resp_handle_get, DSP_KEY_1KV},
     {"set", qihse_resp_handle_set, DSP_BUSY_WRITE | DSP_KEY_1KV},
@@ -10896,6 +11079,10 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"blpop", dsp_blpop, DSP_BUSY_WRITE},
     {"brpop", dsp_brpop, DSP_BUSY_WRITE},
     {"brpoplpush", dsp_brpoplpush, DSP_BUSY_WRITE},
+    {"authority.capabilities", qihse_resp_handle_authority, DSP_ADMIN},
+    {"authority.export", qihse_resp_handle_authority, DSP_ADMIN},
+    {"authority.import", qihse_resp_handle_authority, DSP_ADMIN | DSP_BUSY_WRITE},
+    {"authority.checkpoint", qihse_resp_handle_authority, DSP_ADMIN | DSP_BUSY_WRITE},
 };
 
 #define RESP_DISPATCH_MAP_CAP 256u
@@ -15297,6 +15484,11 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         (strncasecmp((const char*)request->argv[0].data, "ARTIFACT.", 9u) == 0 ||
          strncasecmp((const char*)request->argv[0].data, "FORENSIC.", 9u) == 0))
         return qihse_resp_error(session, "ERR artifact transfer is not allowed in MULTI");
+    if (session->in_multi && request->argv[0].len >= 10u &&
+        strncasecmp((const char*)request->argv[0].data, "AUTHORITY.", 10u) == 0) {
+        session->multi_dirty = true;
+        return qihse_resp_error(session, "ERR authority maintenance is not allowed in MULTI");
+    }
     /* MULTI queueing: if in a transaction, queue all commands except EXEC/DISCARD/MULTI/WATCH/UNWATCH */
     if (session->in_multi &&
         !(dispatch_entry && (dispatch_entry->flags & DSP_MULTI_OK))) {
@@ -15522,7 +15714,9 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     session.query_type = QIHSE_QUERY_TYPE_OTHER;
     if (!server->auth_required) {
         session.user = server->unauthenticated_user;
-        session.auth_kind = QIHSE_RESP_AUTH_LOCAL_PRINCIPAL;
+        /* An explicitly insecure default context is not an authenticated
+         * principal and cannot enter authority maintenance. */
+        session.auth_kind = QIHSE_RESP_AUTH_NONE;
     }
     if (pthread_mutex_init(&session.io_lock, NULL) != 0) return false;
     session.id = __atomic_add_fetch(&server->next_client_id, 1u, __ATOMIC_RELAXED);

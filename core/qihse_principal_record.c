@@ -89,10 +89,13 @@ static bool bounded_string(const char* value, size_t size, bool nonempty,
     return true;
 }
 
-static bool valid_put(const qihse_principal_record_t* record) {
-    const qihse_user_t* user = &record->principal;
-    if (record->target_id == 0u || record->target_id >= 65536u ||
-        user->user_id != record->target_id ||
+bool qihse_principal_fields_valid(const qihse_user_t* user, bool allow_root) {
+    if (!user || user->user_id >= 65536u ||
+        (user->user_id == 0u && (!allow_root ||
+         user->role != QIHSE_ROLE_OPERATOR ||
+         user->tenant_id != QIHSE_TENANT_SYSTEM ||
+         user->classification_level != UINT16_MAX ||
+         user->sci_compartments != UINT16_MAX)) ||
         user->tenant_id == QIHSE_TENANT_INVALID ||
         user->role > QIHSE_ROLE_GUEST ||
         !bounded_string(user->username, sizeof(user->username), true, false) ||
@@ -122,6 +125,12 @@ static bool valid_put(const qihse_principal_record_t* record) {
         }
     }
     return true;
+}
+
+static bool valid_put(const qihse_principal_record_t* record) {
+    return record->target_id != 0u &&
+           record->principal.user_id == record->target_id &&
+           qihse_principal_fields_valid(&record->principal, false);
 }
 
 static bool valid_record(const qihse_principal_record_t* record) {

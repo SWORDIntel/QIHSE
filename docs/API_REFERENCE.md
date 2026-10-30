@@ -1,7 +1,8 @@
 # QIHSE API Reference
 
-> **Status: implemented** — every C function in this reference is declared in a
-> header under `include/` and is exported by the built `libqihse.so`; the Python
+> **Status: implemented** — except the explicitly source-only standalone
+> maintenance subsection (§7.1), every C function in this reference is declared
+> in a header under `include/` and was checked against the built `libqihse.so`; the Python
 > surface is read from `python/qihse/`. Nothing here is transcribed from a design
 > document. The sections that describe something not built are marked `planned`
 > or `partial` in place ([§12](#12-known-gaps-and-unverified-areas)).
@@ -756,6 +757,119 @@ Password verifier cache:
 
 
 ---
+
+### 7.1 Standalone principal maintenance — `include/qihse_auth_maintenance.h`
+
+**Source contract; deployment not activated.** This subsection is checked against
+source, not a claim that an old running binary or the previously built shared
+object exports it. Discover capability on the actual running source first; an
+old process without supported export cannot be migrated losslessly by restarting
+it. See [PRINCIPAL_MIGRATION.md](PRINCIPAL_MIGRATION.md).
+
+| API | Contract |
+|---|---|
+| `qihse_auth_bootstrap_provision(file, username, password, requires_hardware_token, credential_id, can_create_users)` | Offline create-only private bootstrap verifier; never a plaintext-password dump. |
+| `qihse_auth_maintenance_start(config, &recovery)` | One-shot protected pre-serve provision/recovery before ordinary auth initialization. |
+| `qihse_auth_maintenance_recovery_release(recovery)` | Revoke the startup recovery capability. |
+| `qihse_auth_maintenance_capabilities(actor, &caps)` | Authenticated mode/readiness/export/import/checkpoint support and position. |
+| `qihse_auth_maintenance_transfer_config(actor, binding, recipient_pin, signer_pin, &config)` | Authenticate and resolve pinned configured transfer keys; returned file paths are borrowed, not supplied by wire clients. |
+| `qihse_auth_maintenance_export(actor, expected, transfer, &sealed)` | Bounded encrypted portable archive with explicit key/binding configuration. |
+| `qihse_auth_maintenance_checkpoint(actor, expected, &position)` | Durable local checkpoint at an exact expected position. |
+| `qihse_auth_maintenance_import(actor, expected, request_id, transfer, sealed, sealed_len, &position)` | Durable import with nonzero 16-byte request identity and retry receipt. |
+| `qihse_auth_maintenance_recover_import(recovery, expected, request_id, transfer, sealed, sealed_len, &position)` | Same import through an opaque protected startup capability, not `NULL` authorization. |
+| `qihse_auth_sealed_data/size/free(sealed)` | Borrow immutable ciphertext bytes/length; explicitly free the owning sealed object. |
+| `qihse_auth_maintenance_status_string(status)` | Stable status text; callers must distinguish errors from success. |
+
+A `qihse_auth_position_t` contains 16-byte history, 16-byte node, epoch and
+generation. It is not a consensus index. `qihse_auth_startup_config_t` selects
+explicit authority mode/action, private state directory/bootstrap, local
+`archive_keys`, separate `transfer_keys`, authority ID, node/epoch, expected
+recovery history and minimum generation. Transfer support is directional:
+export requires recipient-public/signer-private; import requires
+recipient-private/signer-public, with both explicit pins. Absent transfer keys
+do not disable local durability; they disable the corresponding transfer
+capability. Live export/import resolve configured transfer keys and ignore
+caller-supplied host paths.
+`DISABLED` is legacy volatile; `STANDALONE` is permanent local durability;
+`CONSENSUS` is unsupported principal authority, not an automatic fallback.
+
+`qihse_auth_archive_config_t` carries explicit recipient/signing key files,
+SHA-384 DER SubjectPublicKeyInfo pins and a binding: version, purpose
+(`DURABLE` or `TRANSFER`), mode, source/target authorities and positions,
+archive ID and explicit node-relocation permission. No implicit key lookup or
+process-layout serialization is part of the contract. Archives are capped by
+`QIHSE_AUTH_ARCHIVE_MAX_BYTES` (160 MiB).
+
+Maintenance requires an authoritative full-clearance/full-SCI system Operator
+with a verifier and any required hardware-token presence. Import cannot replace
+protected UID 0 or resurrect tombstones; it is not a token-policy relaxation
+route. Sessions, caches and hardware-token presence are not restored.
+
+Status values are `OK`, `INVALID`, `DENIED`, `UNSUPPORTED`, `NOT_READY`,
+`CONFLICT`, `IO`, `CORRUPT`, `LIMIT`, `UNCERTAIN`. An uncertain result is not
+proof of non-commit. An identical lost-ACK import retry preserves the original
+request ID, expected position, binding and ciphertext; the durable receipt
+returns its recorded result and conflicting reuse fails. The bounded receipt
+ledger cannot silently evict history to admit another request.
+
+Durable-before-ACK and readiness fencing cover auth mutations in standalone
+mode. Local crash consistency is **not entire-volume rollback protection** and
+is not cross-host fencing or principal consensus. No operational rollout is
+claimed; current LAN ownership/GC conflicts block activation.
+
+#### RESP/QKP maintenance grammar
+
+Source: `src/spinnaker/qihse_resp_engine.c` authority handler and
+`tools/qihse_admin_cli.c`. Commands execute against the actual authenticated
+session actor and are rejected in `MULTI`; there are no server-side transfer
+handles, resumable chunks or restored sessions.
+
+```text
+AUTHORITY.CAPABILITIES
+AUTHORITY.EXPORT <expected-position-hex96> <descriptor-binary253>
+AUTHORITY.IMPORT <expected-position-hex96> <request-id-hex32> <descriptor-binary253> <ciphertext>
+AUTHORITY.CHECKPOINT <expected-position-hex96>
+```
+
+Capability reply is the eight-element RESP array
+`["QIHSE_AUTHORITY_V1", mode, ready, export, import, checkpoint, max_ciphertext_bytes, position_hex]`;
+mode/flags/limit are integers, marker/position are bulk strings. Positions encode
+`history[16] || node[16] || epoch_BE64 || generation_BE64` as 96 hex digits
+(output lowercase). Export returns a ciphertext bulk string; import/checkpoint
+return a position bulk string. Maintenance errors use `ERR AUTHORITY_<status>`;
+authentication/authorization errors are not unsupported-capability results.
+
+The exact 253-byte descriptor is:
+
+| Offset | Field |
+|---:|---|
+| 0, 4, 8 | Version, purpose, mode (each BE32) |
+| 12 | Source authority (16 bytes) |
+| 28 | Source position (48 binary bytes) |
+| 76 | Target authority (16 bytes) |
+| 92 | Target position (48 binary bytes) |
+| 140 | Archive ID (16 bytes) |
+| 156 | Allow-node-relocation byte (0 or 1) |
+| 157 | Recipient SHA-384 SPKI pin (48 bytes) |
+| 205 | Signer SHA-384 SPKI pin (48 bytes) |
+
+Transfer uses version 1, purpose 2, standalone mode 1. The descriptor carries
+no host paths. The API validates the binding/pins and resolves server-configured
+transfer keys. Source/target must share authority/history and epoch; moving to
+a different node requires explicit relocation. Import rejects an older source
+generation than the destination and preserves local tombstones/lockout floors.
+
+The one-shot wire ciphertext ceiling is **8 MiB**, distinct from the C archive
+ceiling of 160 MiB. Oversize export returns `LIMIT`, never truncation. Larger
+archives have no supported chunk/resume path in this wire contract.
+
+`qihse-admin-cli` adds `--authority-capabilities`, `--authority-export FILE`,
+`--authority-import FILE`, `--authority-checkpoint`, `--expected-position HEX`,
+`--request-id HEX` and `--transfer-config FILE` atop its normal authenticated QKP
+connection. Import/checkpoint require expected position; import requires request
+ID; export/import require a private 253-byte descriptor file. Capability
+negotiation precedes maintenance. Unsupported export is exit 6,
+`UNSUPPORTED_EXPORT_API`, without restarting or mutating the source.
 
 ## 8. Additional public C surfaces
 

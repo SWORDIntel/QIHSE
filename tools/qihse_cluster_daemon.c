@@ -20,6 +20,7 @@
  */
 #include "qihse_resp_wire.h"
 #include "qihse_auth.h"
+#include "qihse_auth_maintenance.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ownership_journal.h"
@@ -56,6 +57,231 @@
 #include <openssl/rand.h>
 
 #define MAX_PEERS 64u
+
+/* Durable authority is opt-in and never inferred from federation or data paths.
+ * Keep this startup-only parser identical in the two standalone entry points. */
+static bool daemon_auth_hex(const char* text, uint8_t* out, size_t size) {
+    if (!text || strlen(text) != size * 2u) return false;
+    unsigned nonzero = 0u;
+    for (size_t i = 0; i < size; ++i) {
+        unsigned value = 0u;
+        for (size_t j = 0; j < 2u; ++j) {
+            unsigned char c = (unsigned char)text[i * 2u + j];
+            unsigned digit;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10u;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10u;
+            else return false;
+            value = value * 16u + digit;
+        }
+        out[i] = (uint8_t)value;
+        nonzero |= value;
+    }
+    return nonzero != 0u;
+}
+
+static bool daemon_auth_number(const char* text, uint64_t* out) {
+    if (!text || !*text) return false;
+    uint64_t value = 0u;
+    for (const char* p = text; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        unsigned digit = (unsigned)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    *out = value;
+    return value != 0u;
+}
+
+static bool daemon_auth_startup(const char* password, bool auth_required,
+                                bool consensus_requested, bool* durable,
+                                uint32_t* startup_user_id) {
+    static const char* const fields[] = {
+        "QIHSE_AUTH_ACTION", "QIHSE_AUTH_STATE_DIR", "QIHSE_AUTH_BOOTSTRAP_FILE",
+        "QIHSE_AUTH_BOOTSTRAP_USERNAME", "QIHSE_AUTH_NODE_ID", "QIHSE_AUTH_EPOCH",
+        "QIHSE_AUTH_AUTHORITY_ID", "QIHSE_AUTH_HISTORY_ID", "QIHSE_AUTH_MIN_GENERATION",
+        "QIHSE_AUTH_RECIPIENT_PUBLIC_KEY", "QIHSE_AUTH_RECIPIENT_PRIVATE_KEY",
+        "QIHSE_AUTH_SIGNER_PUBLIC_KEY", "QIHSE_AUTH_SIGNER_PRIVATE_KEY",
+        "QIHSE_AUTH_RECIPIENT_PIN", "QIHSE_AUTH_SIGNER_PIN",
+        "QIHSE_AUTH_TRANSFER_RECIPIENT_PUBLIC_KEY", "QIHSE_AUTH_TRANSFER_RECIPIENT_PRIVATE_KEY",
+        "QIHSE_AUTH_TRANSFER_SIGNER_PUBLIC_KEY", "QIHSE_AUTH_TRANSFER_SIGNER_PRIVATE_KEY",
+        "QIHSE_AUTH_TRANSFER_RECIPIENT_PIN", "QIHSE_AUTH_TRANSFER_SIGNER_PIN",
+        "QIHSE_AUTH_STARTUP_USER_ID"
+    };
+    *durable = false;
+    *startup_user_id = 0u;
+    const char* selected = getenv("QIHSE_AUTH_STARTUP_USER_ID");
+    if (selected) {
+        uint64_t id = 0u;
+        if (!daemon_auth_number(selected, &id) || id >= 65536u) {
+            fprintf(stderr, "auth authority: QIHSE_AUTH_STARTUP_USER_ID must be decimal 1..65535; unset selects UID 0\n");
+            return false;
+        }
+        *startup_user_id = (uint32_t)id;
+    }
+    const char* mode = getenv("QIHSE_AUTH_MODE");
+    if (!mode) {
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            if (getenv(fields[i])) {
+                fprintf(stderr, "auth authority: %s requires explicit QIHSE_AUTH_MODE\n", fields[i]);
+                return false;
+            }
+        }
+        return true;
+    }
+    if (strcmp(mode, "consensus") == 0 ||
+        (strcmp(mode, "standalone") == 0 && consensus_requested)) {
+        fprintf(stderr, "auth authority: consensus durability UNSUPPORTED; no standalone fallback\n");
+        return false;
+    }
+    if (strcmp(mode, "standalone") != 0 || !auth_required || !password || !*password) {
+        fprintf(stderr, "auth authority: explicit standalone mode requires authenticated startup and operator password\n");
+        return false;
+    }
+    qihse_auth_startup_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.mode = QIHSE_AUTH_AUTHORITY_STANDALONE;
+    const char* action = getenv("QIHSE_AUTH_ACTION");
+    if (action && strcmp(action, "provision") == 0) config.action = QIHSE_AUTH_START_PROVISION;
+    else if (action && strcmp(action, "recover") == 0) config.action = QIHSE_AUTH_START_RECOVER;
+    else {
+        fprintf(stderr, "auth authority: QIHSE_AUTH_ACTION must be provision or recover\n");
+        return false;
+    }
+    if (config.action == QIHSE_AUTH_START_PROVISION && *startup_user_id != 0u) {
+        fprintf(stderr, "auth authority: provision requires UID 0; unset QIHSE_AUTH_STARTUP_USER_ID (selection is recover-only)\n");
+        return false;
+    }
+    const char* paths[] = {
+        getenv("QIHSE_AUTH_STATE_DIR"), getenv("QIHSE_AUTH_BOOTSTRAP_FILE"),
+        getenv("QIHSE_AUTH_RECIPIENT_PUBLIC_KEY"), getenv("QIHSE_AUTH_RECIPIENT_PRIVATE_KEY"),
+        getenv("QIHSE_AUTH_SIGNER_PUBLIC_KEY"), getenv("QIHSE_AUTH_SIGNER_PRIVATE_KEY")
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        if (!paths[i] || !*paths[i]) {
+            fprintf(stderr, "auth authority: explicit state/bootstrap and all recipient/signer key paths required\n");
+            return false;
+        }
+    }
+    config.state_directory = paths[0];
+    config.bootstrap_file = paths[1];
+    config.archive_keys.recipient_public_file = paths[2];
+    config.archive_keys.recipient_private_file = paths[3];
+    config.archive_keys.signer_public_file = paths[4];
+    config.archive_keys.signer_private_file = paths[5];
+    if (!daemon_auth_hex(getenv("QIHSE_AUTH_NODE_ID"), config.node, sizeof(config.node)) ||
+        !daemon_auth_hex(getenv("QIHSE_AUTH_AUTHORITY_ID"), config.authority_id, sizeof(config.authority_id)) ||
+        !daemon_auth_hex(getenv("QIHSE_AUTH_RECIPIENT_PIN"), config.archive_keys.recipient_pin, sizeof(config.archive_keys.recipient_pin)) ||
+        !daemon_auth_hex(getenv("QIHSE_AUTH_SIGNER_PIN"), config.archive_keys.signer_pin, sizeof(config.archive_keys.signer_pin)) ||
+        !daemon_auth_number(getenv("QIHSE_AUTH_EPOCH"), &config.epoch)) {
+        fprintf(stderr, "auth authority: nonzero node/authority hex32, SPKI SHA384 pins hex96 and decimal epoch required\n");
+        return false;
+    }
+    const char* transfer_paths[] = {
+        getenv("QIHSE_AUTH_TRANSFER_RECIPIENT_PUBLIC_KEY"),
+        getenv("QIHSE_AUTH_TRANSFER_RECIPIENT_PRIVATE_KEY"),
+        getenv("QIHSE_AUTH_TRANSFER_SIGNER_PUBLIC_KEY"),
+        getenv("QIHSE_AUTH_TRANSFER_SIGNER_PRIVATE_KEY")
+    };
+    const char* transfer_recipient_pin = getenv("QIHSE_AUTH_TRANSFER_RECIPIENT_PIN");
+    const char* transfer_signer_pin = getenv("QIHSE_AUTH_TRANSFER_SIGNER_PIN");
+    bool transfer_requested = transfer_recipient_pin || transfer_signer_pin;
+    for (size_t i = 0; i < sizeof(transfer_paths) / sizeof(transfer_paths[0]); ++i) {
+        if (transfer_paths[i]) {
+            transfer_requested = true;
+            if (!*transfer_paths[i]) {
+                fprintf(stderr, "auth authority: empty transfer key path\n");
+                return false;
+            }
+        }
+    }
+    if (transfer_requested) {
+        if (!daemon_auth_hex(transfer_recipient_pin, config.transfer_keys.recipient_pin, sizeof(config.transfer_keys.recipient_pin)) ||
+            !daemon_auth_hex(transfer_signer_pin, config.transfer_keys.signer_pin, sizeof(config.transfer_keys.signer_pin)) ||
+            (!!transfer_paths[0] != !!transfer_paths[3]) ||
+            (!!transfer_paths[1] != !!transfer_paths[2]) ||
+            (!transfer_paths[0] && !transfer_paths[1])) {
+            fprintf(stderr, "auth authority: transfer requires explicit pins and export recipient-public/signer-private or import recipient-private/signer-public pair\n");
+            return false;
+        }
+        config.transfer_keys.recipient_public_file = transfer_paths[0];
+        config.transfer_keys.recipient_private_file = transfer_paths[1];
+        config.transfer_keys.signer_public_file = transfer_paths[2];
+        config.transfer_keys.signer_private_file = transfer_paths[3];
+    }
+    const char* username = getenv("QIHSE_AUTH_BOOTSTRAP_USERNAME");
+    if (config.action == QIHSE_AUTH_START_RECOVER) {
+        if (username ||
+            !daemon_auth_hex(getenv("QIHSE_AUTH_HISTORY_ID"), config.expected_history, sizeof(config.expected_history)) ||
+            !daemon_auth_number(getenv("QIHSE_AUTH_MIN_GENERATION"), &config.minimum_generation)) {
+            fprintf(stderr, "auth authority: recover requires nonzero HISTORY_ID hex32 and MIN_GENERATION decimal; no BOOTSTRAP_USERNAME\n");
+            return false;
+        }
+    } else if (!username || !*username || getenv("QIHSE_AUTH_MIN_GENERATION") ||
+               (getenv("QIHSE_AUTH_HISTORY_ID") &&
+                !daemon_auth_hex(getenv("QIHSE_AUTH_HISTORY_ID"), config.expected_history, sizeof(config.expected_history)))) {
+        fprintf(stderr, "auth authority: provision requires BOOTSTRAP_USERNAME, no MIN_GENERATION, and optional nonzero HISTORY_ID hex32\n");
+        return false;
+    }
+    qihse_auth_maintenance_status_t status;
+    if (config.action == QIHSE_AUTH_START_PROVISION) {
+        status = qihse_auth_bootstrap_provision(config.bootstrap_file, username, password,
+                                               false, "", true);
+        if (status != QIHSE_AUTH_MAINT_OK) {
+            fprintf(stderr, "auth authority: create-only bootstrap provision failed: %s\n",
+                    qihse_auth_maintenance_status_string(status));
+            return false;
+        }
+    }
+    qihse_auth_recovery_t* recovery = NULL;
+    status = qihse_auth_maintenance_start(&config, &recovery);
+    /* The typed startup capability must not escape into listener state. */
+    qihse_auth_maintenance_recovery_release(recovery);
+    if (status != QIHSE_AUTH_MAINT_OK) {
+        fprintf(stderr, "auth authority: %s failed: %s (no volatile fallback or reset)\n",
+                action, qihse_auth_maintenance_status_string(status));
+        return false;
+    }
+    *durable = true;
+    return true;
+}
+
+static bool daemon_auth_report(qihse_user_t* actor, bool durable,
+                               uint32_t startup_user_id) {
+    if (!durable) {
+        fprintf(stderr, "auth authority: volatile legacy; durable maintenance unsupported\n");
+        return true;
+    }
+    if (!actor || !qihse_auth_user_is_active(actor) ||
+        qihse_user_get_id(actor) != startup_user_id ||
+        qihse_user_get_role(actor) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(actor) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_classification(actor) != UINT16_MAX ||
+        qihse_user_get_sci(actor) != UINT16_MAX) {
+        fprintf(stderr, "auth authority: selected startup actor must be an active full-clearance/SCI system Operator\n");
+        return false;
+    }
+    qihse_auth_maintenance_caps_t caps;
+    qihse_auth_maintenance_status_t status = qihse_auth_maintenance_capabilities(actor, &caps);
+    if (status != QIHSE_AUTH_MAINT_OK || !caps.ready ||
+        caps.mode != QIHSE_AUTH_AUTHORITY_STANDALONE) {
+        fprintf(stderr, "auth authority: authenticated durable readiness check failed; no HWT bypass. "
+                "For HWT-required root, select an existing authorized service Operator with "
+                "QIHSE_AUTH_STARTUP_USER_ID and its own QIHSE_OPERATOR_PASSWORD; "
+                "prepare that identity before requiring HWT on root\n");
+        return false;
+    }
+    fprintf(stderr, "auth authority: standalone ready history=");
+    for (size_t i = 0; i < sizeof(caps.position.history); ++i)
+        fprintf(stderr, "%02x", (unsigned)caps.position.history[i]);
+    fprintf(stderr, " epoch=%llu generation=%llu export=%u import=%u checkpoint=%u\n",
+            (unsigned long long)caps.position.epoch,
+            (unsigned long long)caps.position.generation,
+            (unsigned)caps.export_supported, (unsigned)caps.import_supported,
+            (unsigned)caps.checkpoint_supported);
+    return true;
+}
+
 
 typedef struct {
     unsigned int index;
@@ -237,7 +463,20 @@ static void operator_credential_clear_environment(void) {
     (void)unsetenv("QIHSE_OPERATOR_PASSWORD");
 }
 
-static qihse_user_t* replication_service_principal_create(uint32_t user_id) {
+static qihse_user_t* replication_service_principal_create(
+        qihse_user_t* startup_operator, uint32_t user_id) {
+    if (!startup_operator || !qihse_auth_user_is_active(startup_operator) ||
+        qihse_user_get_role(startup_operator) != QIHSE_ROLE_OPERATOR)
+        return NULL;
+    qihse_user_t* existing = qihse_auth_get_user(user_id);
+    if (existing)
+        return qihse_auth_user_is_active(existing) &&
+            qihse_user_get_role(existing) == QIHSE_ROLE_ANALYST &&
+            qihse_user_get_tenant_id(existing) == QIHSE_TENANT_SYSTEM &&
+            qihse_user_get_classification(existing) == UINT16_MAX &&
+            qihse_user_get_sci(existing) == UINT16_MAX &&
+            !qihse_user_requires_hardware_token(existing) &&
+            !qihse_user_can_create_users(existing) ? existing : NULL;
     unsigned char random_secret[32];
     char one_time_password[sizeof(random_secret) * 2u + 1u];
     static const char hex[] = "0123456789abcdef";
@@ -250,7 +489,7 @@ static qihse_user_t* replication_service_principal_create(uint32_t user_id) {
     }
     one_time_password[sizeof(one_time_password) - 1u] = '\0';
     principal = qihse_auth_create_user(
-        qihse_auth_get_user(0u), user_id, QIHSE_ROLE_ANALYST,
+        startup_operator, user_id, QIHSE_ROLE_ANALYST,
         UINT16_MAX, UINT16_MAX, one_time_password, false);
 
 done:
@@ -262,9 +501,21 @@ done:
 /* Tenant-scoped, non-Operator machine principal for MACHINEAUTH-over-QKP
  * admin access (see tools/qihse_admin_cli.c). The MACHINEAUTH handler
  * refuses system-tenant and Operator principals, so this must be a tenant
- * user. Idempotent across restarts: create returns the existing principal. */
-static qihse_user_t* machine_service_principal_create(uint32_t tenant_id,
-                                                      uint32_t user_id) {
+ * user. A recovered principal must match the configured service policy. */
+static qihse_user_t* machine_service_principal_create(
+        qihse_user_t* startup_operator, uint32_t tenant_id, uint32_t user_id) {
+    if (!startup_operator || !qihse_auth_user_is_active(startup_operator) ||
+        qihse_user_get_role(startup_operator) != QIHSE_ROLE_OPERATOR)
+        return NULL;
+    qihse_user_t* existing = qihse_auth_get_user(user_id);
+    if (existing)
+        return qihse_auth_user_is_active(existing) &&
+            qihse_user_get_role(existing) == QIHSE_ROLE_ANALYST &&
+            qihse_user_get_tenant_id(existing) == tenant_id &&
+            qihse_user_get_classification(existing) == UINT16_MAX &&
+            qihse_user_get_sci(existing) == UINT16_MAX &&
+            !qihse_user_requires_hardware_token(existing) &&
+            !qihse_user_can_create_users(existing) ? existing : NULL;
     unsigned char random_secret[32];
     char one_time_password[sizeof(random_secret) * 2u + 1u];
     static const char hex[] = "0123456789abcdef";
@@ -277,7 +528,7 @@ static qihse_user_t* machine_service_principal_create(uint32_t tenant_id,
     }
     one_time_password[sizeof(one_time_password) - 1u] = '\0';
     principal = qihse_auth_create_tenant_user(
-        qihse_auth_get_user(0u), tenant_id, user_id, QIHSE_ROLE_ANALYST,
+        startup_operator, tenant_id, user_id, QIHSE_ROLE_ANALYST,
         UINT16_MAX, UINT16_MAX, one_time_password, false);
 
 done:
@@ -329,6 +580,18 @@ static void usage(const char* argv0) {
         "          (--node INDEX:HOST:PORT:BUS-PORT [--node …] | --join HOST:BUS-PORT [--join …])\n"
         "          [--slot-range FIRST-LAST] [--slot-range-of INDEX:FIRST-LAST]\n"
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
+        "  Durable principal authority: QIHSE_AUTH_MODE=standalone, QIHSE_AUTH_ACTION=provision|recover.\n"
+        "  Required QIHSE_AUTH_ suffixes: STATE_DIR, BOOTSTRAP_FILE, AUTHORITY_ID, NODE_ID, EPOCH,\n"
+        "  RECIPIENT_PUBLIC_KEY, RECIPIENT_PRIVATE_KEY, SIGNER_PUBLIC_KEY, SIGNER_PRIVATE_KEY,\n"
+        "  RECIPIENT_PIN, SIGNER_PIN (SPKI SHA384 hex96; identities hex32; epoch decimal>0).\n"
+        "  Provision also requires BOOTSTRAP_USERNAME; recover requires HISTORY_ID and MIN_GENERATION.\n"
+        "  Provision history is fresh unless HISTORY_ID supplied; no MIN_GENERATION on provision.\n"
+        "  No bootstrap username on recover; private dirs/keys must preexist. Consensus unsupported.\n"
+        "  Recover-only QIHSE_AUTH_STARTUP_USER_ID: existing full system Operator, decimal 1..65535;\n"
+        "  unset selects UID 0. QIHSE_OPERATOR_PASSWORD is the selected identity's own password.\n"
+        "  Prepare that service identity before root HWT is required; no HWT bypass or fallback.\n"
+        "  Optional QIHSE_AUTH_TRANSFER_ keys/pins are separate: both pins and complete export\n"
+        "  (RECIPIENT_PUBLIC_KEY,SIGNER_PRIVATE_KEY) or import (RECIPIENT_PRIVATE_KEY,SIGNER_PUBLIC_KEY).\n"
         "          (the shared credential authenticates clients and derives\n"
         "           independent bus and overlay transport keys)\n"
         "          [--node-key PATH] [--require-signed-ops]\n"
@@ -1702,21 +1965,29 @@ int main(int argc, char** argv) {
         }
         setenv("QIHSE_DATA_DIR", data_dir, 1);
     }
-    if (operator_password && strlen(operator_password) >= 12) {
+    bool durable_auth = false;
+    uint32_t startup_user_id = 0u;
+    if (!daemon_auth_startup(operator_password, operator_password != NULL,
+                             consensus_configured, &durable_auth, &startup_user_id)) {
+        operator_credential_clear_environment();
+        operator_credential_release();
+        return 2;
+    }
+    if (!durable_auth && operator_password && strlen(operator_password) >= 12) {
         setenv("QIHSE_OPERATOR_PASSWORD", operator_password, 1);
-    } else if (operator_password) {
+    } else if (!durable_auth && operator_password) {
         /* qihse_auth_bootstrap_operator() refuses passwords under 12 chars.
          * Continuing would enable auth_required with no usable verifier:
          * every AUTH would fail with WRONGPASS and nothing would say why. */
         fprintf(stderr, "qihse-cluster-daemon: --operator-password must be at least 12 characters\n");
         return 2;
     }
-    if (!qihse_auth_init()) {
+    if (!durable_auth && !qihse_auth_init()) {
         operator_credential_clear_environment();
         fprintf(stderr, "qihse-cluster-daemon: auth init failed\n");
         return 1;
     }
-    if (operator_password && strlen(operator_password) >= 12) {
+    if (!durable_auth && operator_password && strlen(operator_password) >= 12) {
         if (!qihse_auth_bootstrap_operator(operator_password)) {
             /* Already bootstrapped on a previous run: re-init with the
              * password in the environment so the operator verifier matches,
@@ -1732,7 +2003,7 @@ int main(int argc, char** argv) {
     }
     qihse_user_t* startup_operator = NULL;
     if (operator_password) {
-        startup_operator = qihse_auth_authenticate_id(0u, operator_password);
+        startup_operator = qihse_auth_authenticate_id(startup_user_id, operator_password);
         if (!startup_operator || !qihse_auth_user_is_active(startup_operator) ||
             qihse_user_get_role(startup_operator) != QIHSE_ROLE_OPERATOR ||
             qihse_user_get_tenant_id(startup_operator) != QIHSE_TENANT_SYSTEM) {
@@ -1743,9 +2014,13 @@ int main(int argc, char** argv) {
         }
     }
     operator_credential_clear_environment();
+    if (!daemon_auth_report(startup_operator, durable_auth, startup_user_id)) {
+        operator_credential_release();
+        return 1;
+    }
 
     qihse_user_t* replication_service_principal = replication_configured
-        ? replication_service_principal_create(replication_principal_id) : NULL;
+        ? replication_service_principal_create(startup_operator, replication_principal_id) : NULL;
     if (replication_configured && !replication_service_principal) {
         fprintf(stderr, "qihse-cluster-daemon: could not provision replication service principal %u\n",
                 (unsigned)replication_principal_id);
@@ -1757,7 +2032,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "qihse-cluster-daemon: --machine-principal-id requires a nonzero --machine-principal-tenant\n");
             return 1;
         }
-        if (!machine_service_principal_create(machine_principal_tenant,
+        if (!machine_service_principal_create(startup_operator, machine_principal_tenant,
                                              machine_principal_id)) {
             fprintf(stderr, "qihse-cluster-daemon: could not provision machine principal %u (tenant %u)\n",
                     (unsigned)machine_principal_id, (unsigned)machine_principal_tenant);
@@ -1974,7 +2249,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "qihse-cluster-daemon: consensus record path is too long\n");
             return 2;
         }
-        qihse_user_t* system_principal = qihse_auth_get_user(0u);
+        qihse_user_t* system_principal = startup_operator;
         consensus_blobs = qihse_blob_store_create(blob_dir);
         if (!system_principal || !consensus_blobs ||
             !qihse_consensus_blob_context_init(&consensus_blob_context, consensus_blobs,
@@ -2147,7 +2422,7 @@ int main(int argc, char** argv) {
                             "directory; FTS.SAVE/FTS.LOAD stay disabled\n");
         } else {
             config.fts_persist_directory = fts_dir;
-            config.fts_autoload_principal = qihse_auth_get_user(0u);
+            config.fts_autoload_principal = startup_operator;
             if (!config.fts_autoload_principal)
                 fprintf(stderr, "qihse-cluster-daemon: no system principal; FTS autoload "
                                 "disabled\n");
@@ -2292,7 +2567,7 @@ int main(int argc, char** argv) {
             if (gc_pending && !g_stop) {
                 gc_ticks++;
                 if (gc_ticks >= 50u) { /* 5 s settle after listener bind */
-                    qihse_user_t* op = qihse_auth_get_user(0u);
+                    qihse_user_t* op = startup_operator;
                     bool has_more = false;
                     if (op && qihse_cluster_topology_is_covered(topology)) {
                         size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded(

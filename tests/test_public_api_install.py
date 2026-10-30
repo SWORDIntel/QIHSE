@@ -53,8 +53,9 @@ class PublicAPIInstall(unittest.TestCase):
             self.assertFalse((stage / "usr/local").exists())
             self.assertFalse((sdk / "src").exists())
             self.assertTrue((sdk / "bin/qihse-backup").is_file())
+            self.assertTrue((sdk / "bin/qihse-admin-cli").is_file())
             # Do not let an omitted SQL/pgwire root silently skip its compile check.
-            required = {"qihse.h", "qihse_schema.h", "qihse_table_store.h",
+            required = {"qihse.h", "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
@@ -85,7 +86,12 @@ class PublicAPIInstall(unittest.TestCase):
             cpp_source = work / "kv_consumer.cpp"
             cpp_source.write_text(
                 '#include <qihse/qihse_kv_store.h>\n'
+                '#include <qihse/qihse_auth_maintenance.h>\n'
                 'int main() {\n'
+                '    qihse_auth_maintenance_status_t (*volatile capabilities)(\n'
+                '        const qihse_user_t *, qihse_auth_maintenance_caps_t *) =\n'
+                '        qihse_auth_maintenance_capabilities;\n'
+                '    if (!capabilities) return 2;\n'
                 '    qihse_kv_store_t *(*volatile create_user)(qihse_user_t *) =\n'
                 '        qihse_kv_store_create_user;\n'
                 '    return create_user ? 0 : 1;\n'

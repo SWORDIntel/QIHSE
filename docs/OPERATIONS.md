@@ -853,6 +853,103 @@ normal mutation or rebuild paths; they do not require a blanket conversion.
 
 ---
 
+### 3.8 Principal maintenance and migration gate
+
+The [principal migration runbook](PRINCIPAL_MIGRATION.md) is the source for
+capability-first migration, isolated-clone rehearsal, coherent recovery,
+external fencing, cutover and lost-ACK retry. The source API is
+`include/qihse_auth_maintenance.h`; its authority/position/key contracts are
+summarized in [API_REFERENCE.md §7.1](API_REFERENCE.md#71-standalone-principal-maintenance--includeqihse_auth_maintenanceh).
+
+**Activation is currently blocked by LAN ownership and GC conflicts. No primary
+has been stopped or replaced. No DIRECTEYE or production SQL changes are part
+of this work. These source changes are not an operational rollout.**
+
+Discover authenticated export capability on the actual running source before
+any restart or migration. An old running binary without supported export is
+unsupported for lossless live principal migration: preserve it running. Do not
+extract process memory, use `objdump`/guessed layouts, fabricate a root context,
+pass `NULL`, or restart into a new binary and lose volatile accounts.
+
+Standalone durability is explicitly selected permanent local authority, not a
+consensus prefix or fallback. Protected bootstrap/startup and authenticated
+key-pinned encrypted archives bind the source and intended target authority,
+history, node, epoch and generation. Preserve the coherent state, bootstrap,
+keys/pins and configuration together; do not mix recovery generations. UID 0
+is not imported and hardware-token requirements are not relaxed by transfer.
+Reauthenticate all clients after recovery: sessions, caches and token-presence
+flags are not restored. Mutations must be durable before success; failed or
+uncertain durability fences readiness rather than reverting to volatile mode.
+
+For a lost import ACK, retain and retry the same request ID, original expected
+position, binding and ciphertext via the same authorized route. The durable
+receipt, not a guessed current generation, establishes the result. After any
+new principal/application writes, do not roll back to an old source/snapshot:
+fence both sides and use an approved forward-reconciliation plan. Local crash
+consistency is not entire-volume rollback protection; local locks do not fence
+a copy running on another host.
+
+#### Daemon startup configuration (source contract)
+
+Both `tools/qihse_cluster_daemon.c` and `tools/qihse_redis_server.c` parse the
+following environment before ordinary auth initialization or listener readiness.
+This is configuration reference, **not an instruction to activate production**.
+
+| Variable (`QIHSE_AUTH_` prefix) | Meaning |
+|---|---|
+| `MODE` | Explicit `standalone`; `consensus` is rejected as unsupported. Unset with no other maintenance fields retains legacy volatile mode. |
+| `ACTION` | `provision` or `recover`; never inferred from file existence. |
+| `STARTUP_USER_ID` | Optional **existing** durable startup service identity, recover-only. Strict decimal `1..65535` (no sign/whitespace); unset selects legacy UID 0. Empty, zero, overflow, provision selection, or configuration without durable standalone mode is rejected. |
+| `STATE_DIR`, `BOOTSTRAP_FILE` | Explicit private state directory and bootstrap verifier path. Directory/bootstrap parent must already exist and be owned by daemon euid, mode 0700; bootstrap helper creates only its private file. |
+| `AUTHORITY_ID`, `NODE_ID` | Nonzero 32-hex-digit identifiers, not derived from federation identity. |
+| `EPOCH` | Positive decimal integer. |
+| `RECIPIENT_PUBLIC_KEY`, `RECIPIENT_PRIVATE_KEY`, `SIGNER_PUBLIC_KEY`, `SIGNER_PRIVATE_KEY` | All four explicit PEM paths for local durable-state cryptography. |
+| `RECIPIENT_PIN`, `SIGNER_PIN` | Explicit nonzero 96-hex-digit SHA-384 DER SPKI pins. |
+| `BOOTSTRAP_USERNAME` | Required only for provision. Create-only helper uses the daemon's configured operator password; no default username or manual binary verifier file. |
+| `HISTORY_ID` | Required nonzero hex32 on recover; optional on provision to prepare a same-history relocation target, otherwise a fresh history is generated. |
+| `MIN_GENERATION` | Positive decimal required on recover, forbidden on provision. Retain the trusted floor with recovery configuration. |
+| `TRANSFER_RECIPIENT_PUBLIC_KEY`, `TRANSFER_SIGNER_PRIVATE_KEY` | Optional explicit export key pair, separate from local durable-state keys. |
+| `TRANSFER_RECIPIENT_PRIVATE_KEY`, `TRANSFER_SIGNER_PUBLIC_KEY` | Optional explicit import key pair. |
+| `TRANSFER_RECIPIENT_PIN`, `TRANSFER_SIGNER_PIN` | Both required when either transfer direction is configured; same pin format as local keys. |
+
+Any maintenance field without explicit mode is rejected. Empty paths, partial
+key pairs, malformed IDs/pins and conflicting provision/recover fields fail
+closed. Durable standalone requires authenticated startup with the configured
+startup password; the standalone RESP daemon also requires `--require-auth`.
+Cluster consensus plus standalone principal mode is rejected, not downgraded.
+Recover never calls the bootstrap provisioning/reset path. The opaque startup
+recovery capability is released before listener use; ordinary services use the
+actual authenticated startup Operator, never a raw UID-0 lookup.
+
+The helper's provisioned bootstrap is password-authenticated (no required token);
+this does not strip token policy from recovered state. Provision always selects
+UID 0 and rejects `QIHSE_AUTH_STARTUP_USER_ID`. Recovery uses the selected
+principal's **own existing password** from the protected captured
+`QIHSE_OPERATOR_PASSWORD` buffer (or the existing matching daemon password option);
+the variable name does not mean root's password when a service ID is selected.
+It authenticates that exact ID, never falls back to root, creates an elevated
+account, overwrites root credentials, or resets any hardware-token requirement.
+Missing, revoked, locked-out, wrong-password, non-system/non-Operator or
+insufficient-clearance/SCI identities fail closed. The selected actor must have
+classification and SCI masks both `65535`; role alone is insufficient. Its
+hardware-token policy remains enforced by the normal maintenance capability
+check, which must report current standalone readiness before construction of
+privileged services/listeners. Passwords must not be put in logs.
+
+**Prepare and durably enroll the existing startup service identity, with its
+independent protected password and explicitly approved full system-Operator
+policy, BEFORE requiring HWT on root.** This is not automatic elevated account
+provisioning. This password-only startup path cannot prove a hardware token;
+HWT-required root without fresh proof therefore cannot start services. On
+recovery select the already enrolled, appropriately authorized service identity
+with `QIHSE_AUTH_STARTUP_USER_ID` and supply its password, rather than disabling
+root HWT or restoring old token-presence state. A selected HWT-required service
+identity without proof fails too. The protected bootstrap file, explicit keys,
+pins, history, epoch/node bindings and trusted minimum generation are still
+required; selecting an actor does not replace recovery trust. A successful
+startup reports authenticated capabilities/history; retain this recovery
+metadata, without treating logs as a replacement for state.
+
 ## 4. Cluster smoke drills
 
 `tests/cluster_*_smoke.py` are operational drills over real RESP sockets.
