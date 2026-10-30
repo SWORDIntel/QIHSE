@@ -291,7 +291,7 @@ static void test_repl_apply_wal(void) {
     const char* keys[5] = {APPLY_KEY, APPLY_KEY, APPLY_KEY, APPLY_KEY, "repl:absent"};
     const char* values[5] = {"after", "third", NULL, "x", NULL};
     const qihse_wal_op_t ops[5] = {QIHSE_WAL_OP_UPDATE, QIHSE_WAL_OP_UPDATE,
-                                   QIHSE_WAL_OP_DELETE, (qihse_wal_op_t)99,
+                                   QIHSE_WAL_OP_DELETE, QIHSE_WAL_OP_UPDATE,
                                    QIHSE_WAL_OP_DELETE};
     size_t seg_len = 0;
     uint8_t* seg = wal_segment(keys, values, ops, 5, &seg_len);
@@ -374,7 +374,15 @@ static void test_repl_apply_wal(void) {
     memcpy(bad + 18, &klen, 4);
     assert(qihse_repl_apply_wal(ctx, bad, rec_len[1], lsn[1]) == -1);
     free(bad);
-    /* a well-formed record whose op the applier cannot map to a mutation */
+    /* Construct the unsupported op in synthetic wire bytes: public append now
+     * rejects it. Keep a valid checksum so this tests the applier's op check. */
+    uint8_t* unsupported = seg + (rec[3] - seg);
+    uint8_t old_op = unsupported[17];
+    unsupported[17] = 99;
+    uint32_t checksum;
+    memcpy(&checksum, unsupported + 26, sizeof(checksum));
+    checksum ^= qihse_wal_crc32(&old_op, 1) ^ qihse_wal_crc32(unsupported + 17, 1);
+    memcpy(unsupported + 26, &checksum, sizeof(checksum));
     assert(qihse_repl_apply_wal(ctx, rec[3], rec_len[3], lsn[3]) == -1);
     /* a well-formed record whose own LSN is not the LSN the caller declared:
      * the position must never be advanced by a record that describes another

@@ -43,6 +43,10 @@ struct qihse_wal {
     qihse_wal_durability_t durability;
     uint64_t               next_lsn;
     uint64_t               last_checkpoint_lsn;
+    uint64_t               marker_lsn;
+    uint64_t               marker_target;
+    bool                   recovering;
+    bool                   writer_failed; /* ambiguous append: reopen required */
     /* Current segment file */
     int                    seg_fd;
     int                    dir_fd;       /* lifetime cross-process writer lock */
@@ -283,15 +287,31 @@ static int seg_rotate(qihse_wal_t* wal) {
 
 /* Scan the complete valid prefix before accepting a writer after restart.
  * Reusing an LSN would make commit and checkpoint ordering ambiguous. */
+typedef struct wal_scan_state {
+    qihse_wal_t* wal;
+    uint64_t maximum;
+    bool invalid;
+} wal_scan_state_t;
+
 static bool wal_scan_lsn(const qihse_wal_record_t* record,
                          const void* key, uint32_t key_len,
                          const void* value, uint32_t value_len, void* ctx) {
-    (void)key;
-    (void)key_len;
     (void)value;
     (void)value_len;
-    uint64_t* maximum = ctx;
-    if (record->lsn > *maximum) *maximum = record->lsn;
+    wal_scan_state_t* scan = ctx;
+    scan->maximum = record->lsn;
+    if (record->op_type == QIHSE_WAL_OP_CHECKPOINT) {
+        uint64_t target;
+        if (record->txn_id != 0 || key_len != sizeof(target) ||
+            record->value_length != 0) { scan->invalid = true; return false; }
+        memcpy(&target, key, sizeof(target));
+        if (target == 0 || target > record->lsn) {
+            scan->invalid = true; return false;
+        }
+        scan->wal->marker_lsn = record->lsn;
+        scan->wal->marker_target = target;
+        scan->wal->last_checkpoint_lsn = target;
+    }
     return true;
 }
 
@@ -348,7 +368,11 @@ qihse_wal_t* qihse_wal_create(const char* directory,
         bool found = false;
         while ((ent = readdir(dir)) != NULL) {
             uint64_t idx;
-            if (sscanf(ent->d_name, "wal_%020lu.log", &idx) == 1) {
+            char canonical[64];
+            if (sscanf(ent->d_name, "wal_%20lu.log", &idx) == 1 &&
+                snprintf(canonical, sizeof(canonical), "wal_%020lu.log",
+                         (unsigned long)idx) > 0 &&
+                strcmp(ent->d_name, canonical) == 0) {
                 if (!found || idx > max_idx) {
                     max_idx = idx;
                     found = true;
@@ -367,16 +391,18 @@ qihse_wal_t* qihse_wal_create(const char* directory,
         free(wal);
         return NULL;
     }
-    uint64_t maximum = 0;
-    if (qihse_wal_replay(wal, 0, wal_scan_lsn, &maximum) < 0 ||
-        maximum == UINT64_MAX) {
+    wal_scan_state_t scan = { .wal = wal };
+    wal->recovering = true;
+    int scanned = qihse_wal_replay(wal, 0, wal_scan_lsn, &scan);
+    wal->recovering = false;
+    if (scanned < 0 || scan.invalid || scan.maximum == UINT64_MAX) {
         close(wal->seg_fd);
         close(wal->dir_fd);
         pthread_mutex_destroy(&wal->lock);
         free(wal);
         return NULL;
     }
-    wal->next_lsn = maximum + 1;
+    wal->next_lsn = scan.maximum + 1;
     return wal;
 }
 
@@ -397,6 +423,30 @@ void qihse_wal_destroy(qihse_wal_t* wal) {
 
 /* ── Append ─────────────────────────────────────────────────────────────── */
 
+/* Validate before trusting lengths for recovery or admitting an append. */
+static bool record_shape_valid(uint64_t txn_id, uint8_t engine_id,
+                               qihse_wal_op_t op, uint32_t key_len,
+                               uint32_t value_len) {
+    if (key_len > QIHSE_WAL_MAX_KEY || value_len > QIHSE_WAL_MAX_VALUE)
+        return false;
+    switch (op) {
+    case QIHSE_WAL_OP_INSERT:
+    case QIHSE_WAL_OP_UPDATE:
+        return true;
+    case QIHSE_WAL_OP_DELETE:
+        return value_len == 0;
+    case QIHSE_WAL_OP_BEGIN:
+    case QIHSE_WAL_OP_COMMIT:
+    case QIHSE_WAL_OP_ABORT:
+        return engine_id == 0 && key_len == 0 && value_len == 0;
+    case QIHSE_WAL_OP_CHECKPOINT:
+        return txn_id == 0 && engine_id == 0 &&
+               key_len == sizeof(uint64_t) && value_len == 0;
+    default:
+        return false;
+    }
+}
+
 static uint64_t wal_append_raw(qihse_wal_t* wal,
                                uint64_t txn_id,
                                uint8_t engine_id,
@@ -408,8 +458,15 @@ static uint64_t wal_append_raw(qihse_wal_t* wal,
 
     pthread_mutex_lock(&wal->lock);
 
-    /* Check if we need to rotate */
-    size_t rec_total = QIHSE_WAL_RECORD_HEADER_SIZE + key_len + value_len;
+    /* Fence failures before rotation can replace a closed, torn segment. */
+    if (wal->writer_failed || wal->seg_fd < 0 ||
+        !record_shape_valid(txn_id, engine_id, op_type, key_len, value_len) ||
+        (key_len && !key) || (value_len && !value) ||
+        wal->next_lsn == UINT64_MAX) {
+        pthread_mutex_unlock(&wal->lock);
+        return 0;
+    }
+    size_t rec_total = QIHSE_WAL_RECORD_HEADER_SIZE + (size_t)key_len + value_len;
     if (wal->seg_offset + rec_total > wal->segment_size && wal->seg_offset > 0) {
         if (seg_rotate(wal) != 0) {
             pthread_mutex_unlock(&wal->lock);
@@ -471,7 +528,16 @@ static uint64_t wal_append_raw(qihse_wal_t* wal,
     }
 
     ssize_t w = writev(wal->seg_fd, iov, iovcnt);
-    if (w != (ssize_t)rec_total) goto fail;
+    if (w != (ssize_t)rec_total) {
+        /* A short write leaves an ambiguous tail; fence every writer path
+         * until close/reopen, even if a later append would rotate segments. */
+        if (w > 0) {
+            wal->writer_failed = true;
+            close(wal->seg_fd);
+            wal->seg_fd = -1;
+        }
+        goto fail;
+    }
 
     wal->seg_offset += rec_total;
 
@@ -481,6 +547,12 @@ static uint64_t wal_append_raw(qihse_wal_t* wal,
     }
     /* GROUP_COMMIT: caller is responsible for calling qihse_wal_flush() */
 
+    if (op_type == QIHSE_WAL_OP_CHECKPOINT) {
+        uint64_t target;
+        memcpy(&target, key, sizeof(target));
+        wal->marker_lsn = lsn;
+        wal->marker_target = target;
+    }
     pthread_mutex_unlock(&wal->lock);
     return lsn;
 
@@ -496,6 +568,7 @@ uint64_t qihse_wal_append(qihse_wal_t* wal,
                           const void* key, uint32_t key_len,
                           const void* value, uint32_t value_len)
 {
+    if (op_type == QIHSE_WAL_OP_CHECKPOINT) return 0;
     return wal_append_raw(wal, txn_id, engine_id, op_type,
                           key, key_len, value, value_len);
 }
@@ -516,6 +589,7 @@ uint64_t qihse_wal_append_abort(qihse_wal_t* wal, uint64_t txn_id) {
 }
 
 uint64_t qihse_wal_append_checkpoint(qihse_wal_t* wal, uint64_t lsn) {
+    if (!wal || lsn == 0 || lsn > qihse_wal_current_lsn(wal)) return 0;
     return wal_append_raw(wal, 0, 0, QIHSE_WAL_OP_CHECKPOINT,
                           &lsn, sizeof(lsn), NULL, 0);
 }
@@ -523,12 +597,22 @@ uint64_t qihse_wal_append_checkpoint(qihse_wal_t* wal, uint64_t lsn) {
 int qihse_wal_flush(qihse_wal_t* wal) {
     if (!wal) return -1;
     pthread_mutex_lock(&wal->lock);
-    int rc = wal->seg_fd >= 0 ? sync_data_fd(wal->seg_fd) : -1;
+    int rc = !wal->writer_failed && wal->seg_fd >= 0
+             ? sync_data_fd(wal->seg_fd) : -1;
     pthread_mutex_unlock(&wal->lock);
     return rc;
 }
 
 /* ── Replay ─────────────────────────────────────────────────────────────── */
+
+static int repair_torn_tail(qihse_wal_t* wal, uint64_t idx,
+                            uint64_t final_idx, off_t position) {
+    if (!wal->recovering || idx != final_idx ||
+        ftruncate(wal->seg_fd, position) != 0 ||
+        sync_data_fd(wal->seg_fd) != 0) return -1;
+    wal->seg_offset = (size_t)position;
+    return 0;
+}
 
 static bool read_full(int fd, void* buf, size_t len) {
     size_t total = 0;
@@ -550,8 +634,8 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
 
     pthread_mutex_lock(&wal->lock);
 
-    /* Flush current segment first */
-    if (wal->seg_fd >= 0) {
+    /* Flush current segment first; a failed writer cannot validate/prune. */
+    if (!wal->writer_failed && wal->seg_fd >= 0) {
         if (sync_data_fd(wal->seg_fd) != 0) {
             pthread_mutex_unlock(&wal->lock);
             return -1;
@@ -642,8 +726,16 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
                 return -1;
             }
             if (position == segment_stat.st_size) break;
-            if (segment_stat.st_size - position < QIHSE_WAL_RECORD_HEADER_SIZE ||
-                !read_full(fd, hdr, QIHSE_WAL_RECORD_HEADER_SIZE)) {
+            if (segment_stat.st_size - position < QIHSE_WAL_RECORD_HEADER_SIZE) {
+                if (repair_torn_tail(wal, seg_indices[si],
+                                     seg_indices[seg_count - 1], position) == 0)
+                    break;
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
+            }
+            if (!read_full(fd, hdr, sizeof(hdr))) {
                 close(fd);
                 free(seg_indices);
                 pthread_mutex_unlock(&wal->lock);
@@ -663,11 +755,23 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
                 pthread_mutex_unlock(&wal->lock);
                 return -1;
             }
-            last_lsn = rec.lsn;
 
-            /* Validate key/value lengths */
-            if (rec.key_length > QIHSE_WAL_MAX_KEY ||
-                rec.value_length > QIHSE_WAL_MAX_VALUE) {
+            /* Reject malformed complete headers before considering tail repair. */
+            if (!record_shape_valid(rec.txn_id, rec.engine_id,
+                                    (qihse_wal_op_t)rec.op_type,
+                                    rec.key_length, rec.value_length)) {
+                close(fd);
+                free(seg_indices);
+                pthread_mutex_unlock(&wal->lock);
+                return -1;
+            }
+
+            if ((uint64_t)rec.key_length + rec.value_length >
+                (uint64_t)(segment_stat.st_size - position - sizeof(hdr))) {
+                /* The legacy checksum needs the entire payload: a complete
+                 * header with missing bytes is indistinguishable from a
+                 * corrupted length on an acknowledged record. Preserve it
+                 * for explicit recovery rather than guessing and reusing LSNs. */
                 close(fd);
                 free(seg_indices);
                 pthread_mutex_unlock(&wal->lock);
@@ -725,6 +829,23 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
                 return -1;
             }
 
+            if (rec.op_type == QIHSE_WAL_OP_CHECKPOINT) {
+                uint64_t target;
+                if (rec.txn_id != 0 || rec.key_length != sizeof(target) ||
+                    rec.value_length != 0) {
+                    free(key); free(value); close(fd); free(seg_indices);
+                    pthread_mutex_unlock(&wal->lock);
+                    return -1;
+                }
+                memcpy(&target, key, sizeof(target));
+                if (target == 0 || target > rec.lsn) {
+                    free(key); free(value); close(fd); free(seg_indices);
+                    pthread_mutex_unlock(&wal->lock);
+                    return -1;
+                }
+            }
+            last_lsn = rec.lsn;
+
             /* Skip records before start_lsn */
             if (rec.lsn >= start_lsn) {
                 bool cont = callback(&rec, key, rec.key_length,
@@ -753,9 +874,55 @@ done:
 
 /* ── Checkpoint ─────────────────────────────────────────────────────────── */
 
+/* Do not infer a segment's LSN from its index: rotation may split any record. */
+static int segment_last_lsn(const char* path, uint64_t* last) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    off_t pos = 0;
+    *last = 0;
+    while (pos < st.st_size) {
+        uint8_t hdr[QIHSE_WAL_RECORD_HEADER_SIZE];
+        uint64_t lsn;
+        uint32_t klen, vlen;
+        if (st.st_size - pos < (off_t)sizeof(hdr) ||
+            !read_full(fd, hdr, sizeof(hdr))) { close(fd); return -1; }
+        memcpy(&lsn, hdr, sizeof(lsn));
+        memcpy(&klen, hdr + 18, sizeof(klen));
+        memcpy(&vlen, hdr + 22, sizeof(vlen));
+        if (lsn == 0 || lsn <= *last || klen > QIHSE_WAL_MAX_KEY ||
+            vlen > QIHSE_WAL_MAX_VALUE ||
+            (uint64_t)klen + vlen > (uint64_t)(st.st_size - pos - sizeof(hdr))) {
+            close(fd); return -1;
+        }
+        *last = lsn;
+        pos += (off_t)(sizeof(hdr) + (size_t)klen + vlen);
+        if (lseek(fd, pos, SEEK_SET) != pos) { close(fd); return -1; }
+    }
+    close(fd);
+    return 0;
+}
+
+static bool validate_record(const qihse_wal_record_t* rec, const void* key,
+                            uint32_t klen, const void* value, uint32_t vlen,
+                            void* ctx) {
+    (void)rec; (void)key; (void)klen; (void)value; (void)vlen; (void)ctx;
+    return true;
+}
+
 int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn) {
-    if (!wal) return -1;
+    if (!wal || checkpoint_lsn == 0 ||
+        qihse_wal_replay(wal, 0, validate_record, NULL) < 0) return -1;
     pthread_mutex_lock(&wal->lock);
+    if (wal->writer_failed || wal->seg_fd < 0 ||
+        wal->marker_target != checkpoint_lsn ||
+        wal->marker_lsn < checkpoint_lsn ||
+        checkpoint_lsn >= wal->next_lsn ||
+        checkpoint_lsn < wal->last_checkpoint_lsn) {
+        pthread_mutex_unlock(&wal->lock);
+        return -1;
+    }
 
     /* Flush current segment */
     if (wal->seg_fd >= 0) {
@@ -770,15 +937,17 @@ int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn) {
 
     bool removed = false;
 
-    /* Truncate old segments (those with max LSN < checkpoint_lsn).
-     * For simplicity, we remove all segments except the current one.
-     * A more precise implementation would scan each segment's last LSN. */
+    /* Delete only complete segments entirely older than the durable marker. */
     DIR* dir = opendir(wal->directory);
     if (dir) {
         struct dirent* ent;
         while ((ent = readdir(dir)) != NULL) {
             uint64_t idx;
-            if (sscanf(ent->d_name, "wal_%020lu.log", &idx) == 1) {
+            char canonical[64];
+            if (sscanf(ent->d_name, "wal_%20lu.log", &idx) == 1 &&
+                snprintf(canonical, sizeof(canonical), "wal_%020lu.log",
+                         (unsigned long)idx) > 0 &&
+                strcmp(ent->d_name, canonical) == 0) {
                 if (idx < wal->seg_index) {
                     char path[PATH_MAX];
                     int n = snprintf(path, sizeof(path), "%s/%s",
@@ -787,7 +956,14 @@ int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn) {
                         /* Path too long — skip this entry */
                         continue;
                     }
-                    if (unlink(path) != 0 && errno != ENOENT) {
+                    uint64_t last;
+                    if (segment_last_lsn(path, &last) != 0) {
+                        closedir(dir);
+                        pthread_mutex_unlock(&wal->lock);
+                        return -1;
+                    }
+                    if (last >= checkpoint_lsn) continue;
+                    if (unlink(path) != 0) {
                         closedir(dir);
                         pthread_mutex_unlock(&wal->lock);
                         return -1;

@@ -42,9 +42,11 @@
 #include "qihse_auth.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -774,7 +776,7 @@ static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
 }
 
 static void test_durable_keys(qihse_user_t* user) {
-    char dir[] = "./qihse-sql-keys-XXXXXX";
+    char dir[] = "build/qihse-sql-keys-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof(dir) + 16], lock[sizeof(dir) + 24];
     assert(snprintf(path, sizeof(path), "%s/rows", dir) < (int)sizeof(path));
@@ -1434,6 +1436,7 @@ static void test_exact_numeric_predicates(qihse_uwp_context_t* ctx,
 }
 
 int main(void) {
+    assert(mkdir("build", 0700) == 0 || errno == EEXIST);
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/test_sql_dml_exec_XXXXXX";

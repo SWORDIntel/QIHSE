@@ -382,8 +382,8 @@ static void test_wal_append_replay(void) {
     assert(qihse_wal_replay(wal, lsn_upd, wal_scan_cb, &tail) == 2);
     assert(tail.count == 2 && tail.last_lsn == lsn_commit);
 
-    /* A CRC mismatch must refuse writer startup rather than conceal a
-     * committed transaction by returning a successful empty replay. */
+    /* A torn final record is discarded; complete preceding records survive.
+     * A CRC mismatch in a complete record must still refuse writer startup. */
     qihse_wal_destroy(wal);
     char path[512];
     snprintf(path, sizeof(path), "%s/wal_%020lu.log", dir, 0UL);
@@ -391,12 +391,13 @@ static void test_wal_append_replay(void) {
     assert(f);
     assert(fwrite("bad", 1, 3, f) == 3);
     assert(fclose(f) == 0);
-    assert(qihse_wal_create(dir, 64 * 1024, QIHSE_WAL_DURABILITY_NONE) == NULL);
-    f = fopen(path, "r+b");
-    assert(f);
-    assert(fseek(f, -3, SEEK_END) == 0);
-    assert(ftruncate(fileno(f), ftell(f)) == 0);
-    assert(fclose(f) == 0);
+    qihse_wal_t* repaired = qihse_wal_create(
+        dir, 64 * 1024, QIHSE_WAL_DURABILITY_NONE);
+    assert(repaired);
+    wal_scan_t repaired_scan = {0};
+    assert(qihse_wal_replay(repaired, 0, wal_scan_cb, &repaired_scan) == 4);
+    assert(repaired_scan.last_lsn == lsn_commit);
+    qihse_wal_destroy(repaired);
     f = fopen(path, "r+b");
     assert(f);
     assert(fseek(f, 26, SEEK_SET) == 0);
@@ -418,7 +419,10 @@ static void test_wal_append_replay(void) {
     assert(reopened);
     assert(qihse_wal_append_begin(reopened, 8) == lsn_commit + 1);
 
-    /* Checkpoint bookkeeping. */
+    /* Checkpoint requires a durable marker before pruning any WAL segment. */
+    assert(qihse_wal_checkpoint(reopened, lsn_commit) == -1);
+    assert(qihse_wal_append_checkpoint(reopened, lsn_commit) != 0);
+    assert(qihse_wal_flush(reopened) == 0);
     assert(qihse_wal_checkpoint(reopened, lsn_commit) == 0);
     assert(qihse_wal_last_checkpoint(reopened) == lsn_commit);
 

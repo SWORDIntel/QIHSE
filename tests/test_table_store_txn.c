@@ -336,7 +336,7 @@ static void test_concurrent_group_commits(qihse_table_t* first,
 }
 
 static void test_durable_snapshot(const qihse_col_def_t* defs) {
-    char dir[] = "/tmp/qihse-table-txn-XXXXXX";
+    char dir[] = "./build/qihse-table-txn-XXXXXX";
     assert(mkdtemp(dir));
     char path[256], tmp[260], lock[261];
     assert(snprintf(path, sizeof path, "%s/store", dir) < (int)sizeof path);
@@ -472,7 +472,7 @@ static void test_durable_snapshot(const qihse_col_def_t* defs) {
 }
 
 static void test_reject_nonfinite_snapshot(void) {
-    char dir[] = "./qihse-float-store-XXXXXX";
+    char dir[] = "./build/qihse-float-store-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof dir + 16], lock[sizeof dir + 24];
     assert(snprintf(path, sizeof path, "%s/store", dir) < (int)sizeof path);
@@ -560,7 +560,7 @@ static void downgrade_empty_snapshot(const char* path, unsigned char version) {
 }
 
 static void test_durable_retry(const qihse_col_def_t* defs) {
-    char dir[] = "/tmp/qihse-retry-XXXXXX";
+    char dir[] = "./build/qihse-retry-XXXXXX";
     assert(mkdtemp(dir));
     char path[256], lock[262];
     assert(snprintf(path, sizeof path, "%s/store", dir) < (int)sizeof path);
@@ -861,7 +861,7 @@ static void test_transform_protected_rows(qihse_user_t* operator,
 static void test_numeric_float_index(qihse_user_t* user) {
     qihse_col_def_t defs[] = {{.name="amount", .type=QIHSE_TS_NUMERIC},
                               {.name="ratio", .type=QIHSE_TS_FLOAT}};
-    char dir[] = "./qihse-numeric-zero-XXXXXX";
+    char dir[] = "./build/qihse-numeric-zero-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof(dir) + 16], lock[sizeof(dir) + 24];
     snprintf(path, sizeof(path), "%s/rows.snap", dir);
@@ -923,7 +923,7 @@ static bool indexed_row_seen(const qihse_col_value_t* row, size_t n, void* ctx) 
 }
 
 static void test_indexed_txn_shadow(qihse_user_t* operator, qihse_user_t* low) {
-    char dir[] = "./qihse-indexed-txn-XXXXXX";
+    char dir[] = "./build/qihse-indexed-txn-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof dir + 16], lock[sizeof dir + 24];
     assert(snprintf(path, sizeof path, "%s/rows.snap", dir) < (int)sizeof path);
@@ -1170,7 +1170,7 @@ static void test_seeded_publication(const char* auth_dir, qihse_user_t* operator
 }
 
 static void test_catalog_name_bijection(void) {
-    char dir[] = "./qihse-catalog-bijection-XXXXXX";
+    char dir[] = "./build/qihse-catalog-bijection-XXXXXX";
     assert(mkdtemp(dir));
     char path[256], lock[264];
     assert(snprintf(path, sizeof path, "%s/store", dir) < (int)sizeof path);
@@ -1222,9 +1222,17 @@ static void test_catalog_name_bijection(void) {
 }
 
 static void test_backup_restore(const qihse_col_def_t* defs) {
-    char dir[] = "./qihse-backup-txn-XXXXXX";
+    char dir[] = "./build/qihse-backup-txn-XXXXXX";
     assert(mkdtemp(dir));
+    const char* data_dir_env = getenv("QIHSE_DATA_DIR");
+    const char* rotate_bytes_env = getenv("QIHSE_AUDIT_ROTATE_BYTES");
+    char* saved_data_dir = data_dir_env ? strdup(data_dir_env) : NULL;
+    char* saved_rotate_bytes = rotate_bytes_env ? strdup(rotate_bytes_env) : NULL;
+    assert(!data_dir_env || saved_data_dir);
+    assert(!rotate_bytes_env || saved_rotate_bytes);
     assert(setenv("QIHSE_DATA_DIR", dir, 1) == 0);
+    /* Keep this transaction fixture independent of inherited rotation tests. */
+    assert(setenv("QIHSE_AUDIT_ROTATE_BYTES", "67108864", 1) == 0);
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("TableStoreBackupOperator1!"));
     qihse_user_t* operator = qihse_auth_get_user(0);
@@ -1368,10 +1376,22 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
         assert(rc == 0 || errno == ENOENT);
     }
     assert(rmdir(dir) == 0);
+    if (saved_data_dir) {
+        assert(setenv("QIHSE_DATA_DIR", saved_data_dir, 1) == 0);
+    } else {
+        assert(unsetenv("QIHSE_DATA_DIR") == 0);
+    }
+    if (saved_rotate_bytes) {
+        assert(setenv("QIHSE_AUDIT_ROTATE_BYTES", saved_rotate_bytes, 1) == 0);
+    } else {
+        assert(unsetenv("QIHSE_AUDIT_ROTATE_BYTES") == 0);
+    }
+    free(saved_data_dir);
+    free(saved_rotate_bytes);
 }
 
 static void test_atomic_multi_table_schema(void) {
-    char dir[] = "./qihse-multi-ddl-XXXXXX";
+    char dir[] = "./build/qihse-multi-ddl-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof dir + 16], lock[sizeof dir + 24];
     assert(snprintf(path, sizeof path, "%s/rows.snap", dir) < (int)sizeof path);
@@ -1443,7 +1463,7 @@ static bool check_typed_rows(const qihse_col_value_t* values, size_t n, void* ct
 }
 
 static void test_typed_nullable_snapshot(void) {
-    char dir[] = "/tmp/qihse-typed-store-XXXXXX";
+    char dir[] = "./build/qihse-typed-store-XXXXXX";
     assert(mkdtemp(dir));
     char path[256], lock[261];
     assert(snprintf(path, sizeof path, "%s/store", dir) < (int)sizeof path);
@@ -1532,6 +1552,7 @@ static void test_read_only_group_validation(void) {
 }
 
 int main(void) {
+    assert(mkdir("./build", 0700) == 0 || errno == EEXIST);
     test_atomic_multi_table_schema();
     test_catalog_name_bijection();
     test_typed_nullable_snapshot();

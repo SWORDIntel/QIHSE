@@ -259,21 +259,26 @@ static void test_live_udp_roundtrip(void) {
 
     /* Test slot update broadcast from bus_a to bus_b */
     assert(qihse_cluster_bus_broadcast_slot_update(bus_a, 0, 99, idx_a));
-    sleep_ms(300);
 
-    /* Verify topo_b received the slot update */
-    uint16_t owner;
+    /* Wait for the actual asynchronous UDP update, not a fixed delay that
+     * depends on host scheduling and makes this assertion race the bus thread. */
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_slot_state_t state;
-    assert(qihse_cluster_topology_get_slot(topo_b, 50, &owner, &state, NULL));
-    /* The owner_index in topo_b may differ from idx_a in topo_a, but the
-     * slot should be assigned (not NONE).  Find node_a's index in topo_b. */
     uint16_t idx_a_in_b;
     assert(qihse_cluster_topology_find_node(topo_b, node_a.id, &idx_a_in_b));
-    assert(owner == idx_a_in_b);
-
     qihse_cluster_bus_stats_t stats_b;
-    qihse_cluster_bus_stats(bus_b, &stats_b);
-    assert(stats_b.slot_updates_received > 0);
+    bool delivered = false;
+    for (unsigned attempt = 0; attempt < 50; ++attempt) {
+        qihse_cluster_bus_stats(bus_b, &stats_b);
+        if (stats_b.slot_updates_received > 0 &&
+            qihse_cluster_topology_get_slot(topo_b, 50, &owner, &state, NULL) &&
+            owner == idx_a_in_b) {
+            delivered = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    assert(delivered);
 
     qihse_cluster_bus_stop(bus_a);
     qihse_cluster_bus_stop(bus_b);

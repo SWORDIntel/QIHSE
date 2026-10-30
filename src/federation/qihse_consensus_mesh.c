@@ -54,6 +54,50 @@ typedef struct {
     int rx_fd;
 } qcm_peer_t;
 
+/* Select the oldest queued consensus item when present. Removing an interior
+ * item shifts only the logical queue suffix, preserving FIFO within each kind. */
+static qcm_tx_item_t* qcm_tx_dequeue(qcm_peer_t* peer) {
+    if (!peer || !peer->tx_count) return NULL;
+    size_t selected = 0u;
+    for (size_t i = 0; i < peer->tx_count; ++i) {
+        size_t slot = (peer->tx_head + i) % QCM_QUEUE_PER_PEER;
+        if (peer->tx[slot] && peer->tx[slot]->kind == QCM_TX_CONSENSUS) {
+            selected = i;
+            break;
+        }
+    }
+    size_t slot = (peer->tx_head + selected) % QCM_QUEUE_PER_PEER;
+    qcm_tx_item_t* item = peer->tx[slot];
+    for (size_t i = selected; i + 1u < peer->tx_count; ++i) {
+        size_t dst = (peer->tx_head + i) % QCM_QUEUE_PER_PEER;
+        size_t src = (peer->tx_head + i + 1u) % QCM_QUEUE_PER_PEER;
+        peer->tx[dst] = peer->tx[src];
+    }
+    size_t tail = (peer->tx_head + peer->tx_count - 1u) % QCM_QUEUE_PER_PEER;
+    peer->tx[tail] = NULL;
+    peer->tx_count--;
+    return item;
+}
+
+#ifdef QIHSE_CONSENSUS_MESH_TESTING
+bool qihse_consensus_mesh_test_tx_priority(void) {
+    qcm_peer_t peer = {0};
+    qcm_tx_item_t items[5] = {
+        {.kind = QCM_TX_STAGE_BLOB}, {.kind = QCM_TX_CONSENSUS},
+        {.kind = QCM_TX_STAGE_BLOB}, {.kind = QCM_TX_CONSENSUS},
+        {.kind = QCM_TX_STAGE_BLOB}
+    };
+    peer.tx_head = QCM_QUEUE_PER_PEER - 2u;
+    for (size_t i = 0; i < 5u; ++i)
+        peer.tx[(peer.tx_head + i) % QCM_QUEUE_PER_PEER] = &items[i];
+    peer.tx_count = 5u;
+    const size_t expected[] = {1u, 3u, 0u, 2u, 4u};
+    for (size_t i = 0; i < 5u; ++i)
+        if (qcm_tx_dequeue(&peer) != &items[expected[i]]) return false;
+    return peer.tx_count == 0u;
+}
+#endif
+
 typedef struct {
     qihse_consensus_mesh_t* mesh;
     size_t peer_index;
@@ -650,12 +694,8 @@ static void* qcm_tx_main(void* opaque) {
                 (void)pthread_cond_timedwait(&mesh->queue_changed, &mesh->queue_lock, &deadline);
             }
             qcm_tx_item_t* item = NULL;
-            if (mesh->peers[peer_index].tx_count) {
-                qcm_peer_t* p = &mesh->peers[peer_index];
-                item = p->tx[p->tx_head]; p->tx[p->tx_head] = NULL;
-                p->tx_head = (p->tx_head + 1u) % QCM_QUEUE_PER_PEER;
-                p->tx_count--;
-            }
+            if (mesh->peers[peer_index].tx_count)
+                item = qcm_tx_dequeue(&mesh->peers[peer_index]);
             pthread_mutex_unlock(&mesh->queue_lock);
             if (qcm_stopping(mesh)) { qcm_tx_item_destroy(item, false); break; }
             if (!item) continue;

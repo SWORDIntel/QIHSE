@@ -61,7 +61,12 @@ typedef struct qihse_wal qihse_wal_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
-/* Create / open a WAL in the given directory.
+/* Create / open a WAL in the given directory. Exclusively locks it for writing,
+ * validates existing records, and repairs only a final short header in the last
+ * segment. A complete header with incomplete payload is ambiguous in the legacy
+ * format (the checksum cannot authenticate lengths without the payload): refuse
+ * open without truncation. Malformed records, checksum mismatches and incomplete
+ * earlier segments also refuse open. No on-disk format change is required.
  * segment_size: max size per segment file (0 = default 64 MiB).
  * durability: fsync policy. */
 qihse_wal_t* qihse_wal_create(const char* directory,
@@ -71,7 +76,11 @@ void qihse_wal_destroy(qihse_wal_t* wal);
 
 /* ── Append operations ──────────────────────────────────────────────────── */
 
-/* Append a mutation record.  Returns the assigned LSN, or 0 on failure. */
+/* Append a record with a recognized operation and valid shape. DELETE has no
+ * value; BEGIN/COMMIT/ABORT have engine 0 and no payload. CHECKPOINT is admitted
+ * only through qihse_wal_append_checkpoint(). Returns the LSN, or 0 on failure.
+ * A positive short write permanently fences this handle: further appends,
+ * flushes, replay and checkpoints fail until destroy and successful reopen. */
 uint64_t qihse_wal_append(qihse_wal_t* wal,
                           uint64_t txn_id,
                           uint8_t engine_id,
@@ -88,7 +97,8 @@ uint64_t qihse_wal_append_commit(qihse_wal_t* wal, uint64_t txn_id);
 /* Append an ABORT record for a transaction. */
 uint64_t qihse_wal_append_abort(qihse_wal_t* wal, uint64_t txn_id);
 
-/* Append a CHECKPOINT record. */
+/* Append a CHECKPOINT marker for a durable, quiescent snapshot. The target
+ * must be nonzero and no greater than the next LSN at append time. */
 uint64_t qihse_wal_append_checkpoint(qihse_wal_t* wal, uint64_t lsn);
 
 /* Flush pending writes to disk according to durability policy. */
@@ -109,8 +119,11 @@ int qihse_wal_replay(qihse_wal_t* wal, uint64_t start_lsn,
 
 /* ── Checkpoint ─────────────────────────────────────────────────────────── */
 
-/* Record a checkpoint and truncate WAL segments older than the checkpoint LSN.
- * Returns 0 on success. */
+/* Fence a previously appended checkpoint marker with the same LSN, then
+ * remove only segments whose final record precedes that LSN. The caller must
+ * first durably persist engine state and quiesce transactions spanning the
+ * checkpoint boundary; a WAL marker cannot establish snapshot durability.
+ * Returns -1 for absent/invalid markers or I/O errors, 0 on success. */
 int qihse_wal_checkpoint(qihse_wal_t* wal, uint64_t checkpoint_lsn);
 
 /* Get the current LSN (next LSN to be assigned). */

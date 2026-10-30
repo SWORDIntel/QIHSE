@@ -360,15 +360,22 @@ int qihse_mvcc_row_count(qihse_mvcc_store_t* store);
 ```
 
 The header is 30 bytes (`QIHSE_WAL_RECORD_HEADER_SIZE`) with the checksum at
-offset 26; the checksum covers the header fields, the key and the value. Replay
-recomputes it and fails closed on a mismatch or incomplete record; writer
-startup scans surviving segments for the next LSN and refuses a corrupt WAL.
-An exclusive directory lock prevents competing WAL writer handles across
-processes. A torn tail currently prevents writer startup rather than repairing
-and discarding the incomplete record. This WAL is not connected to UWP SQL
-commits; SQL WAL replay and cross-process SQL state publication remain
-outstanding. The bounded native table-store snapshot described above provides
-its own catalog/row publication and fsync fence; these WAL tests do not verify it.
+offset 26; the checksum is the XOR of separate CRC32s of the header fields,
+key and value, preserving the historical format. Replay validates operation and
+control-record shape before trusting payload lengths, then rejects checksum
+mismatches for complete records. This is not an authenticated or collision-free
+corruption detector. Writer startup scans surviving segments for the next LSN;
+only a final short header in the last segment is automatically truncated. A
+complete header with an incomplete payload is ambiguous: its lengths cannot be
+checked against the checksum without the missing payload, so startup refuses
+open and preserves the bytes rather than risking deletion of an acknowledged
+record. Incomplete earlier segments also remain errors. A positive short append
+permanently fences that handle before rotation: appends, flushes, replay and
+checkpoint pruning fail until close and successful reopen. An exclusive directory
+lock prevents competing WAL writer handles across processes. This WAL is not connected
+to UWP SQL commits; SQL schema/row atomic replay, fsynced SQL commit acknowledgement,
+and cross-process SQL state publication remain outstanding. The separate opt-in
+native table-store snapshot is not a wired UWP durability guarantee.
 
 ### WAL Operations
 

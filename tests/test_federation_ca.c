@@ -444,7 +444,8 @@ static void test_negative_authorization(void) {
      * level), and the certificate then verifies for that scope. */
     assert(qihse_ca_provision_issue_node(g_op, key, &ca, &req, out,
                                          sizeof(out)));
-    assert(qihse_ca_provision_verify(&ca, NULL, out, now,
+    /* This cert starts at issuance time, not at the earlier captured `now`. */
+    assert(qihse_ca_provision_verify(&ca, NULL, out, (int64_t)time(NULL),
                                      QIHSE_SCOPE_SECURITY_ADMIN,
                                      NULL) == QIHSE_CA_VERIFY_OK);
 

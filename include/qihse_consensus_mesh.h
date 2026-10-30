@@ -192,6 +192,8 @@ bool qihse_consensus_mesh_read_committed_page(
     size_t out_cap, size_t* out_count, uint64_t* out_commit_index);
 
 #ifdef QIHSE_CONSENSUS_MESH_TESTING
+/* Exercises the production per-peer dequeue selector with interleaved jobs. */
+bool qihse_consensus_mesh_test_tx_priority(void);
 /* Test-only deterministic fault injection. After a peer imports and
  * acknowledges a blob, the sender reports the first configured ACK as lost.
  * This exercises reconnect + QBR1 HAVE retry without production hooks. */

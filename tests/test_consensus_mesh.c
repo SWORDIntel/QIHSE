@@ -388,6 +388,7 @@ static void test_snapshot_staging_is_not_commit_evidence(
 }
 
 int main(int argc, char** argv) {
+    assert(qihse_consensus_mesh_test_tx_priority());
     if (argc == 6 && strcmp(argv[1], "--mesh-leader-child") == 0) {
         uint16_t ports[NODE_COUNT];
         for (size_t i = 0; i < NODE_COUNT; i++) {
@@ -845,13 +846,26 @@ int main(int argc, char** argv) {
     }
     assert(qihse_consensus_mesh_role(meshes[leader_index]) == QIHSE_CONSENSUS_LEADER);
     bool proposed = false;
+    char last_proposal_error[160] = {0};
     for (unsigned attempt = 0; attempt < 500u && !proposed; attempt++) {
         char* wire_reply = run_resp(resp, operator_user, protected_propose, 5u);
         proposed = strstr(wire_reply, "*4\r\n") != NULL &&
                    strstr(wire_reply, ":35\r\n") != NULL;
+        if (!proposed) {
+            /* Log only the RESP error prefix, never a classified payload. */
+            const char* end = strpbrk(wire_reply, " \r\n");
+            if (wire_reply[0] == '-' && end) {
+                size_t n = (size_t)(end - wire_reply);
+                if (n >= sizeof(last_proposal_error)) n = sizeof(last_proposal_error) - 1;
+                memcpy(last_proposal_error, wire_reply, n);
+                last_proposal_error[n] = '\0';
+            }
+        }
         free(wire_reply);
         if (!proposed) usleep(10000u);
     }
+    if (!proposed) fprintf(stderr, "mesh proposal did not reach index 35: %s\n",
+                           last_proposal_error[0] ? last_proposal_error : "unexpected reply");
     assert(proposed);
     bool protected_committed = false;
     for (unsigned attempt = 0; attempt < 1500u && !protected_committed; attempt++) {

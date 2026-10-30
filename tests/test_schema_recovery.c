@@ -7,10 +7,11 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 static void test_crash_restart(void) {
-    char dir[] = "./qihse-schema-recovery-XXXXXX";
+    char dir[] = "./build/qihse-schema-recovery-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof(dir) + 16];
     char lock[sizeof(dir) + 24];
@@ -243,7 +244,7 @@ static void test_materialized_view_column_ownership(void) {
 }
 
 static void test_directeye_catalog_survives_reopen(void) {
-    char dir[] = "./qihse-directeye-catalog-XXXXXX";
+    char dir[] = "./build/qihse-directeye-catalog-XXXXXX";
     assert(mkdtemp(dir));
     char path[sizeof(dir) + 16], lock[sizeof(dir) + 24];
     assert(snprintf(path, sizeof(path), "%s/rows", dir) < (int)sizeof(path));
@@ -343,6 +344,7 @@ static void test_directeye_catalog_survives_reopen(void) {
 }
 
 int main(void) {
+    assert(mkdir("./build", 0700) == 0 || errno == EEXIST);
     test_materialized_view_column_ownership();
     test_directeye_catalog_survives_reopen();
     test_atomic_catalog_replace();
