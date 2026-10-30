@@ -19,7 +19,9 @@
  * Build: make cluster-daemon
  */
 #include "qihse_resp_wire.h"
+#include "qihse_resp_engine.h"
 #include "qihse_auth.h"
+#include <limits.h>
 #include "qihse_auth_maintenance.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
@@ -603,6 +605,7 @@ static void usage(const char* argv0) {
         "          [--brain-fed-dir DIR] [--brain-node-key PATH]\n"
         "          [--redundancy-peer HOST:PORT]\n"
         "          [--replication-principal-id N] (default 65535)\n"
+        "          [--replication-allowed-peer NODE_ID PUB_FILE] (repeatable, max 16; startup Operator required)\n"
         "          [--max-clients N]\n"
         "          (each daemon owns a BM25 index over its LOCAL KV:\n"
         "           FTS.BUILD <pattern> indexes matching keys, FTS.SEARCH <query>\n"
@@ -1476,6 +1479,8 @@ int main(int argc, char** argv) {
     bool replica_read_only = false;
     const char* replication_peer_node_id = NULL;
     const char* replication_peer_dsa_pub = NULL;
+    qihse_qkp_replication_peer_t replication_allowed_peers[QIHSE_QKP_MAX_REPLICATION_PEERS];
+    size_t replication_allowed_peer_count = 0u;
     const char* pqc_trusted[16];
     size_t pqc_trusted_count = 0;
     bool pqc_require = false;
@@ -1637,6 +1642,15 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--pqc-trusted-pub") == 0 && i + 1 < argc) {
             if (pqc_trusted_count >= sizeof(pqc_trusted) / sizeof(pqc_trusted[0])) return usage(argv[0]), 2;
             pqc_trusted[pqc_trusted_count++] = argv[++i];
+        } else if (strcmp(a, "--replication-allowed-peer") == 0 && i + 2 < argc) {
+            if (replication_allowed_peer_count == QIHSE_QKP_MAX_REPLICATION_PEERS)
+                return usage(argv[0]), 2;
+            const char* id = argv[++i];
+            const char* pub = argv[++i];
+            if (!*id || strlen(id) > QIHSE_QKP_NODE_ID_LEN || !*pub ||
+                strlen(pub) >= PATH_MAX) return usage(argv[0]), 2;
+            replication_allowed_peers[replication_allowed_peer_count++] =
+                (qihse_qkp_replication_peer_t){id, pub};
         } else if (strcmp(a, "--replication-peer-node-id") == 0 && i + 1 < argc) {
             replication_peer_node_id = argv[++i];
             if (!*replication_peer_node_id || strlen(replication_peer_node_id) > QIHSE_QKP_NODE_ID_LEN) return usage(argv[0]), 2;
@@ -1805,7 +1819,8 @@ int main(int argc, char** argv) {
     }
 
     const bool replication_configured = replication_source_host != NULL ||
-        replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL;
+        replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL ||
+        replication_allowed_peer_count != 0u;
     const bool admin_peer_configured = admin_peer_node_id != NULL ||
         admin_peer_dsa_pub != NULL;
     if (admin_peer_node_id != NULL && admin_peer_dsa_pub == NULL) {
@@ -1938,6 +1953,10 @@ int main(int argc, char** argv) {
             repl_interval == 0u || !operator_password || !replication_peer_node_id ||
             !replication_peer_dsa_pub || !pqc_node_id)) {
         fprintf(stderr, "qihse-cluster-daemon: replica pull requires --replica-read-only, exactly one dedicated --replicate namespace, nonzero interval, operator password, stable --pqc-node-id, and a pinned upstream identity\n");
+        return 2;
+    }
+    if (replication_allowed_peer_count && !operator_password) {
+        fprintf(stderr, "qihse-cluster-daemon: --replication-allowed-peer requires startup Operator authentication\n");
         return 2;
     }
     if (replication_configured && !pqc_node_id) {
@@ -2439,6 +2458,18 @@ int main(int argc, char** argv) {
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
         if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
         return 1;
+    }
+    for (size_t i = 0; i < replication_allowed_peer_count; i++) {
+        if (!qihse_resp_server_add_replication_peer(server,
+                replication_allowed_peers[i].node_id,
+                replication_allowed_peers[i].dsa_pub_path, startup_operator)) {
+            fprintf(stderr, "qihse-cluster-daemon: replication peer %s authorization failed\n",
+                    replication_allowed_peers[i].node_id);
+            qihse_resp_server_destroy(server);
+            if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
+            if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
+            return 1;
+        }
     }
     if (consensus_mesh && !qihse_consensus_mesh_start(consensus_mesh)) {
         fprintf(stderr, "qihse-cluster-daemon: consensus mesh listener/start failed\n");

@@ -56,6 +56,7 @@ struct qihse_qkp_session {
     char peer_node_id[QIHSE_QKP_NODE_ID_LEN + 1u];
     uint8_t peer_dsa_fingerprint[32];
     bool has_peer_identity;
+    bool replication_peer;
     EVP_CIPHER_CTX* tx_ctx;
     EVP_CIPHER_CTX* rx_ctx;
     uint8_t tx_scratch[6u + QIHSE_QKP_MAX_FRAME];
@@ -91,6 +92,45 @@ bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
                  CRYPTO_memcmp(s->peer_dsa_fingerprint, expected, sizeof(expected)) == 0;
     OPENSSL_cleanse(expected, sizeof(expected));
     return match;
+}
+
+static bool qkp_same_replication_pin(const char* first, const char* second) {
+    if (strcmp(first, second) == 0) return true;
+    uint8_t a[32] = {0}, b[32] = {0};
+    bool equal = qkp_dsa_pub_fingerprint(first, a) &&
+                 qkp_dsa_pub_fingerprint(second, b) &&
+                 CRYPTO_memcmp(a, b, sizeof(a)) == 0;
+    OPENSSL_cleanse(a, sizeof(a));
+    OPENSSL_cleanse(b, sizeof(b));
+    return equal;
+}
+
+static bool qkp_replication_peers_valid(const qihse_qkp_replication_peer_t* peers,
+                                        size_t count) {
+    if (count > QIHSE_QKP_MAX_REPLICATION_PEERS || (count && !peers)) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (!peers[i].node_id || !*peers[i].node_id ||
+            strnlen(peers[i].node_id, QIHSE_QKP_NODE_ID_LEN + 1u) > QIHSE_QKP_NODE_ID_LEN ||
+            !peers[i].dsa_pub_path || !*peers[i].dsa_pub_path ||
+            strnlen(peers[i].dsa_pub_path, 4096u) >= 4096u) return false;
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(peers[i].node_id, peers[j].node_id) == 0 &&
+                !qkp_same_replication_pin(peers[i].dsa_pub_path, peers[j].dsa_pub_path)) return false;
+        }
+    }
+    return true;
+}
+
+bool qihse_qkp_session_is_replication_peer_any(
+        const qihse_qkp_session_t* s,
+        const qihse_qkp_replication_peer_t* peers, size_t count) {
+    if (!s || !s->replication_peer || !peers ||
+        !qkp_replication_peers_valid(peers, count)) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (qihse_qkp_session_is_replication_peer(s, peers[i].node_id,
+                                                 peers[i].dsa_pub_path)) return true;
+    }
+    return false;
 }
 
 bool qihse_qkp_client_session_is_replication_peer(const qihse_qkp_session_t* s,
@@ -315,8 +355,21 @@ static void qkp_log_reject(const qihse_qkp_config_t* cfg, const char* reason) {
 
 qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* cfg,
                                               qihse_qkp_session_t** out) {
+    return qihse_qkp_server_negotiate_with_replication_peers(fd, cfg, NULL, 0u, out);
+}
+
+qihse_qkp_result_t qihse_qkp_server_negotiate_with_replication_peers(
+        int fd, const qihse_qkp_config_t* cfg,
+        const qihse_qkp_replication_peer_t* peers, size_t count,
+        qihse_qkp_session_t** out) {
     if (out) *out = NULL;
-    if (!cfg) return QIHSE_QKP_REJECTED;
+    if (!cfg || !qkp_replication_peers_valid(peers, count)) return QIHSE_QKP_REJECTED;
+    for (size_t i = 0; i < count; i++) {
+        if (cfg->replication_peer_node_id && cfg->replication_peer_dsa_pub_path &&
+            strcmp(peers[i].node_id, cfg->replication_peer_node_id) == 0 &&
+            !qkp_same_replication_pin(peers[i].dsa_pub_path, cfg->replication_peer_dsa_pub_path))
+            return QIHSE_QKP_REJECTED;
+    }
     uint8_t probe;
     ssize_t r = recv(fd, &probe, 1u, MSG_PEEK);
     if (r <= 0) return QIHSE_QKP_REJECTED;
@@ -328,7 +381,8 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
         return QIHSE_QKP_CLEARTEXT;
     }
     if (!cfg->dsa_key_path || !cfg->kem_key_path || !cfg->kem_pub_path ||
-        cfg->trusted_count == 0 || !cfg->trusted_pubs) {
+        (!count && (cfg->trusted_count == 0 || !cfg->trusted_pubs)) ||
+        (cfg->trusted_count && !cfg->trusted_pubs)) {
         /* f6: a QKP1 probe against a server that cannot authenticate at all
          * gets one clean error line instead of silence. */
         qkp_send_err(fd, "PQC unavailable");
@@ -443,6 +497,31 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
             client_trusted = qkp_dsa_pub_fingerprint(cfg->trusted_pubs[i], client_dsa_fingerprint);
         }
     }
+    bool replication_peer = false;
+    /* Additional anchors authorize only their exact signed label. They are
+     * never inserted into the general trusted set. */
+    for (size_t i = 0; i < count; i++) {
+        uint8_t label[QIHSE_QKP_NODE_ID_LEN] = {0};
+        memcpy(label, peers[i].node_id, strlen(peers[i].node_id));
+        if (CRYPTO_memcmp(cli_id, label, sizeof(label)) == 0 &&
+            qihse_pqc_verify_path(h2_signed, h2_signed_len, sig, peers[i].dsa_pub_path) &&
+            qkp_dsa_pub_fingerprint(peers[i].dsa_pub_path, client_dsa_fingerprint)) {
+            client_trusted = true;
+            replication_peer = true;
+            break;
+        }
+    }
+    /* Preserve the old single pin: it still requires general anchor trust. */
+    if (client_trusted && !replication_peer && cfg->replication_peer_node_id &&
+        *cfg->replication_peer_node_id &&
+        strlen(cfg->replication_peer_node_id) <= QIHSE_QKP_NODE_ID_LEN) {
+        uint8_t label[QIHSE_QKP_NODE_ID_LEN] = {0}, fingerprint[32];
+        memcpy(label, cfg->replication_peer_node_id, strlen(cfg->replication_peer_node_id));
+        replication_peer = CRYPTO_memcmp(cli_id, label, sizeof(label)) == 0 &&
+            qkp_dsa_pub_fingerprint(cfg->replication_peer_dsa_pub_path, fingerprint) &&
+            CRYPTO_memcmp(client_dsa_fingerprint, fingerprint, sizeof(fingerprint)) == 0;
+        OPENSSL_cleanse(fingerprint, sizeof(fingerprint));
+    }
     free(h2_signed);
     if (!client_trusted) {
         qkp_log_reject(cfg, "client identity not in the trusted set");
@@ -489,6 +568,7 @@ qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* 
     qihse_qkp_session_t* s = (qihse_qkp_session_t*)calloc(1u, sizeof(*s));
     if (!s) { qkp_send_err(fd, "out of memory"); return QIHSE_QKP_REJECTED; }
     s->role = QKP_ROLE_SERVER;
+    s->replication_peer = replication_peer;
     memcpy(s->key_c2s, okm, 32u);
     memcpy(s->key_s2c, okm + 32u, 32u);
     s->tx_seq = 1u;

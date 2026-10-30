@@ -1644,6 +1644,37 @@ Federation and operations state is namespaced inside the caller's KV store:
 
 ---
 
+## Explicit replication peers (QKP/RESP)
+
+`qihse_qkp_replication_peer_t` (`qihse_qkp.h`) contains `node_id` and
+`dsa_pub_path`. `qihse_qkp_server_negotiate_with_replication_peers(fd, cfg,
+peers, count, out)` accepts up to `QIHSE_QKP_MAX_REPLICATION_PEERS` (16)
+additional exact signed node-ID/ML-DSA-87 key pairs, without widening general
+trust. The original three-argument `qihse_qkp_server_negotiate` and configuration
+layouts are unchanged. `qihse_qkp_session_is_replication_peer_any(session,
+peers, count)` requires a replication-authorized server-side handshake and an
+exact matching pin; client, general-trust, administrator and migration sessions
+do not acquire replication authority merely by matching a supplied list.
+
+Before the first listener startup, call
+`qihse_resp_server_add_replication_peer(server, node_id, dsa_pub_path,
+authenticated_grantor)` (`qihse_resp_engine.h`). It returns `bool`, deep-copies
+strings, rejects conflicting keys for the same ID (including the legacy pin),
+and requires an active SYSTEM Operator whose clearance, SCI and privilege
+ceiling cover the configured active SYSTEM non-Operator replication principal.
+NULL, forged, revoked or low-privilege grantors fail closed. Added peers share
+that same service principal and its row-level authorization, not Operator or
+migration permissions. Each peer's durable checkpoints retain its actual ID.
+Ordinary Operator `AUTH` does not authorize the replication data plane.
+
+The daemon accepts repeatable `--replication-allowed-peer NODE_ID PUB_FILE`
+(maximum 16), only with authenticated startup Operator configuration. For
+example, an owner retaining its legacy `replica-t320` pin can explicitly add
+`--replication-allowed-peer replica-t420 ./keys/t420-dsa-pub.pem`; no identity
+copying or general trust-anchor changes are needed. The legacy single-peer
+options and receiver upstream pin remain unchanged. Regression coverage:
+`make test-replication-multi-peer` (real QKP crypto and negative authorization).
+
 ## 11a. 2026-09-26/28 round — new public APIs
 
 These landed with the improvement pass; each carries its own tests (named

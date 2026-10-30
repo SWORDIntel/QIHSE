@@ -54,13 +54,14 @@ class PublicAPIInstall(unittest.TestCase):
             self.assertFalse((sdk / "src").exists())
             self.assertTrue((sdk / "bin/qihse-backup").is_file())
             self.assertTrue((sdk / "bin/qihse-admin-cli").is_file())
-            # Do not let an omitted SQL/pgwire root silently skip its compile check.
+            # Do not let omitted API roots silently skip their compile checks.
             required = {"qihse.h", "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
                         "qihse_cluster_slot.h", "qihse_crc16.h",
-                        "qihse_kv_store.h"}
+                        "qihse_kv_store.h", "qihse_resp_engine.h",
+                        "qihse_resp_wire.h", "qihse_qkp.h"}
             installed = {header.name for header in (headers / "qihse").glob("*.h")}
             self.assertTrue(required <= installed, f"Missing headers: {required - installed}")
             # Compile roots separately: legacy qihse.h and SQL enums are distinct APIs.
@@ -82,6 +83,36 @@ class PublicAPIInstall(unittest.TestCase):
             dependencies = self.run_command(["ldd", str(consumer)], cwd=work, env=runtime)
             self.assertNotIn("not found", dependencies)
             self.assertIn(str(library / "libqihse.so"), dependencies)
+            # Resolve the public multi-peer APIs from the staged SDK, not checkout headers.
+            replication_source = work / "replication_consumer.c"
+            replication_source.write_text(
+                '#include <qihse/qihse_resp_engine.h>\n'
+                '#include <qihse/qihse_qkp.h>\n'
+                'int main(void) {\n'
+                '    bool (*volatile add_peer)(qihse_resp_server_t *, const char *,\n'
+                '        const char *, const qihse_user_t *) =\n'
+                '        qihse_resp_server_add_replication_peer;\n'
+                '    qihse_qkp_result_t (*volatile negotiate)(int,\n'
+                '        const qihse_qkp_config_t *, const qihse_qkp_replication_peer_t *,\n'
+                '        size_t, qihse_qkp_session_t **) =\n'
+                '        qihse_qkp_server_negotiate_with_replication_peers;\n'
+                '    bool (*volatile is_peer)(const qihse_qkp_session_t *,\n'
+                '        const qihse_qkp_replication_peer_t *, size_t) =\n'
+                '        qihse_qkp_session_is_replication_peer_any;\n'
+                '    qihse_qkp_replication_peer_t peers[QIHSE_QKP_MAX_REPLICATION_PEERS] = {0};\n'
+                '    return add_peer && negotiate && is_peer &&\n'
+                '        sizeof(peers) / sizeof(peers[0]) == 16 ? 0 : 1;\n'
+                '}\n')
+            replication_consumer = work / "replication_consumer"
+            self.run_command(self.cc + ["-std=c11", "-D_GNU_SOURCE", "-Wall", "-Wextra",
+                             "-Werror", f"-I{headers}", str(replication_source), f"-L{library}",
+                             f"-Wl,-rpath-link,{ROOT}", "-lqihse", "-o", str(replication_consumer)],
+                             cwd=work)
+            self.run_command([str(replication_consumer)], cwd=work, env=runtime)
+            replication_dependencies = self.run_command(
+                ["ldd", str(replication_consumer)], cwd=work, env=runtime)
+            self.assertNotIn("not found", replication_dependencies)
+            self.assertIn(str(library / "libqihse.so"), replication_dependencies)
             # Keep the KV C++ root separate from legacy/SQL namespace conflicts.
             cpp_source = work / "kv_consumer.cpp"
             cpp_source.write_text(

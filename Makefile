@@ -1832,7 +1832,15 @@ PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_l
     qihse_sql_parser.h qihse_sql_extensions.h qihse_sql_fts.h \
     qihse_sql_row_index.h qihse_uwp_sql_txn_schema.h \
     qihse_pg_wire.h qihse_cluster_slot.h qihse_crc16.h \
-    qihse_clickhouse_sql.h qihse_http_api.h
+    qihse_clickhouse_sql.h qihse_http_api.h \
+    qihse_resp_engine.h qihse_resp_wire.h qihse_qkp.h qihse_resp_cluster.h \
+    qihse_cluster_bus.h qihse_cluster_failover.h qihse_cluster_scatter.h \
+    qihse_system_guard.h qihse_quota.h qihse_blob.h qihse_bundle.h \
+    qihse_consensus.h qihse_consensus_blob.h qihse_consensus_blob_channel.h \
+    qihse_consensus_channel.h qihse_consensus_mesh.h qihse_consensus_wire.h \
+    qihse_consensus_prefix_attestation.h qihse_consensus_prefix_challenge.h \
+    qihse_consensus_prefix_point_challenge.h qihse_consensus_snapshot_stage.h \
+    qihse_federation.h qihse_task_queue.h qihse_task_worker.h qihse_task_scheduler.h
 PUBLIC_API_TRANSITIVE_HEADERS := memory/include/qihse_uma.h \
     memory/include/qihse_memory.h orchestration/include/qihse_hetero.h \
     core/qihse_abi.h
@@ -1919,3 +1927,12 @@ test-cluster-daemon-shutdown: cluster-daemon
 	LD_LIBRARY_PATH=. python3 tests/test_cluster_daemon_shutdown.py
 
 test-serial: test-cluster-daemon-shutdown
+
+# Real sealed-QKP multi-peer replication and low-clearance negative coverage.
+.PHONY: test-replication-multi-peer
+test-replication-multi-peer: lib keygen
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_replication_multi_peer tests/test_replication_multi_peer.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_replication_multi_peer
+
+test-serial: test-replication-multi-peer

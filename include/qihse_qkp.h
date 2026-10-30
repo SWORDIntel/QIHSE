@@ -164,6 +164,20 @@ typedef enum {
     QIHSE_QKP_REJECTED = 2      /* handshake failed / refused: fd is dead */
 } qihse_qkp_result_t;
 
+#define QIHSE_QKP_MAX_REPLICATION_PEERS 16u
+
+typedef struct {
+    const char* node_id;
+    const char* dsa_pub_path;
+} qihse_qkp_replication_peer_t;
+
+/* Additive replication-only pins; no general/admin/migration trust is implied.
+ * Entries are borrowed for the duration of negotiation. count is at most 16. */
+qihse_qkp_result_t qihse_qkp_server_negotiate_with_replication_peers(
+    int fd, const qihse_qkp_config_t* cfg,
+    const qihse_qkp_replication_peer_t* peers, size_t count,
+    qihse_qkp_session_t** out_session);
+
 /* Server side (accept path). Exactly one of SECURE/CLEARTEXT/REJECTED. */
 qihse_qkp_result_t qihse_qkp_server_negotiate(int fd, const qihse_qkp_config_t* cfg,
                                               qihse_qkp_session_t** out_session);
@@ -194,6 +208,11 @@ void qihse_qkp_session_free(qihse_qkp_session_t* s);
 bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
                                            const char* expected_node_id,
                                            const char* expected_dsa_pub_path);
+
+/* Requires an actual replication-authorized server handshake and exact pin. */
+bool qihse_qkp_session_is_replication_peer_any(
+    const qihse_qkp_session_t* s,
+    const qihse_qkp_replication_peer_t* peers, size_t count);
 
 /* True only for a client-side session whose verified server H1 carries the
  * expected canonical node label and was signed by the pinned ML-DSA key. */

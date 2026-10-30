@@ -1,5 +1,6 @@
 #include "qihse_resp_wire.h"
 #include "qihse_resp_engine.h"
+#include "../../include/qihse_resp_engine.h"
 #include "qihse_resp_cluster.h"
 #include "qihse_resp_pubsub.h"
 #include "qihse_cluster_numa.h"
@@ -42,6 +43,7 @@
 #ifndef _WIN32
 #include "qihse_af_xdp.h"
 #endif
+#include <openssl/pem.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -132,6 +134,7 @@ typedef struct {
     qihse_qkp_session_t* qkp;   /* R4c: non-null ⇒ every wire byte is sealed */
     qihse_kv_replica_snapshot_t* repl_snapshot;
     uint64_t repl_snapshot_seq;
+    uint64_t repl_snapshot_generation;
     qihse_user_t* user;
     qihse_resp_auth_kind_t auth_kind;
     uint32_t user_id;            /* numeric user id for federation attribution */
@@ -359,6 +362,9 @@ struct qihse_resp_server {
      * require flag). NULL/zeroed = opportunistic cleartext-only server. */
     qihse_qkp_config_t pqc;
     qihse_user_t* replication_service_principal;
+    qihse_qkp_replication_peer_t replication_peers[QIHSE_QKP_MAX_REPLICATION_PEERS];
+    size_t replication_peer_count;
+    bool replication_peers_frozen;
     /* R4 replicated namespaces (REPL.*): globs whose keys are sovereign-
      * local on every node, plus the anti-entropy bookkeeping REPL.STATUS
      * renders. repl_lock guards the whole list. */
@@ -10408,14 +10414,27 @@ static bool qihse_resp_handle_repl_pull(qihse_resp_session_t* session, const qih
 #define QIHSE_REPL_RECORD_MAX_KEY 4096u
 #define QIHSE_REPL_RECORD_MAX_VALUE (16u * 1024u * 1024u)
 
+static const char* qihse_resp_replication_peer_id(
+        const qihse_resp_server_t* server, const qihse_qkp_session_t* qkp) {
+    qihse_qkp_replication_peer_t legacy = {
+        server->pqc.replication_peer_node_id,
+        server->pqc.replication_peer_dsa_pub_path
+    };
+    if (qihse_qkp_session_is_replication_peer_any(qkp, &legacy, 1u))
+        return legacy.node_id;
+    for (size_t i = 0; i < server->replication_peer_count; i++) {
+        if (qihse_qkp_session_is_replication_peer_any(qkp, &server->replication_peers[i], 1u))
+            return server->replication_peers[i].node_id;
+    }
+    return NULL;
+}
+
 static bool qihse_resp_repl_data_plane_allowed(qihse_resp_session_t* s) {
     if (!s || !s->server || !s->qkp || !s->user ||
         s->auth_kind != QIHSE_RESP_AUTH_QKP_REPLICATION ||
         s->user != s->server->replication_service_principal ||
         qihse_user_get_role(s->user) == QIHSE_ROLE_OPERATOR ||
-        !qihse_qkp_session_is_replication_peer(s->qkp,
-            s->server->pqc.replication_peer_node_id,
-            s->server->pqc.replication_peer_dsa_pub_path)) return false;
+        !qihse_resp_replication_peer_id(s->server, s->qkp)) return false;
     bool active = false;
     uint32_t tenant = QIHSE_TENANT_SYSTEM;
     qihse_auth_user_active_and_tenant(s->user, &active, &tenant);
@@ -10477,7 +10496,7 @@ static bool qihse_resp_handle_repl_apply(qihse_resp_session_t* s, const qihse_re
      * persisting the per-peer checkpoint. This favors crash safety over
      * throughput; a later batch form can amortize the sync. */
     if (applied) applied = qihse_kv_replica_cursor_advance(
-        s->server->store, s->server->pqc.replication_peer_node_id, glob, seq, s->user);
+        s->server->store, qihse_resp_replication_peer_id(s->server, s->qkp), glob, seq, s->user);
     pthread_rwlock_unlock(&s->server->kv_lock);
     free(glob); free(key); free(value);
     if (!applied) return qihse_resp_error(s, "ERR replica record refused (authorization, sequence, or storage conflict)");
@@ -10498,7 +10517,7 @@ static bool qihse_resp_handle_repl_cursor(qihse_resp_session_t* s, const qihse_r
     uint64_t seq = 0u;
     pthread_rwlock_rdlock(&s->server->kv_lock);
     bool ok = qihse_kv_replica_cursor_get(s->server->store,
-        s->server->pqc.replication_peer_node_id, glob, s->user, &seq);
+        qihse_resp_replication_peer_id(s->server, s->qkp), glob, s->user, &seq);
     pthread_rwlock_unlock(&s->server->kv_lock);
     free(glob);
     if (!ok) return qihse_resp_error(s, "ERR cursor lookup failed");
@@ -10525,7 +10544,7 @@ static bool qihse_resp_handle_repl_ack(qihse_resp_session_t* s,
     pthread_rwlock_wrlock(&s->server->kv_lock);
     bool ok = seq <= qihse_kv_change_seq(s->server->store) &&
         qihse_kv_replica_cursor_advance(s->server->store,
-        s->server->pqc.replication_peer_node_id, glob, seq, s->user);
+        qihse_resp_replication_peer_id(s->server, s->qkp), glob, seq, s->user);
     pthread_rwlock_unlock(&s->server->kv_lock);
     free(glob);
     return ok ? qihse_resp_simple(s, "OK") :
@@ -10620,24 +10639,39 @@ static bool qihse_resp_handle_repl_snapshot_begin(qihse_resp_session_t* s,
         free(glob);
         return qihse_resp_error(s, "ERR snapshot namespace is not marked");
     }
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(s->user), &generation);
     qihse_kv_replica_snapshot_t* snapshot = NULL;
-    pthread_rwlock_wrlock(&s->server->kv_lock);
-    int rc = qihse_kv_replica_snapshot_create(s->server->store, s->user, glob, &snapshot);
-    uint64_t source_seq = rc == 0 ? qihse_kv_change_seq(s->server->store) : 0u;
-    bool baseline_ok = rc == 0 && qihse_kv_replica_cursor_advance(
-        s->server->store, s->server->pqc.replication_peer_node_id, glob,
-        source_seq, s->user);
-    pthread_rwlock_unlock(&s->server->kv_lock);
+    int rc = -2;
+    uint64_t source_seq = 0u;
+    bool baseline_ok = false;
+    bool generation_ok = principal && generation &&
+        qihse_auth_validate_handle_generation(s->user, generation);
+    if (generation_ok) {
+        pthread_rwlock_wrlock(&s->server->kv_lock);
+        rc = qihse_kv_replica_snapshot_create(s->server->store, principal, glob, &snapshot);
+        source_seq = rc == 0 ? qihse_kv_change_seq(s->server->store) : 0u;
+        baseline_ok = rc == 0 && qihse_auth_validate_handle_generation(principal, generation) &&
+            qihse_kv_replica_cursor_advance(s->server->store,
+                qihse_resp_replication_peer_id(s->server, s->qkp), glob, source_seq, principal);
+        pthread_rwlock_unlock(&s->server->kv_lock);
+        /* Legacy policy updates mutate the same handle in place: pointer
+         * equality alone cannot bind serialized bytes to their authorization. */
+        generation_ok = qihse_auth_validate_handle_generation(principal, generation);
+    }
+    qihse_auth_release_principal_scoped(principal);
     free(glob);
-    if (rc != 0 || !baseline_ok) {
+    if (!generation_ok || rc != 0 || !baseline_ok) {
         qihse_kv_replica_snapshot_destroy(snapshot);
-        return qihse_resp_error(s, rc == -2
+        return qihse_resp_error(s, !generation_ok || rc == -2
         ? "NOPERM snapshot principal cannot read the complete store"
         : "ERR snapshot export or durable baseline registration failed");
     }
     qihse_kv_replica_snapshot_destroy(s->repl_snapshot);
     s->repl_snapshot = snapshot;
     s->repl_snapshot_seq = source_seq;
+    s->repl_snapshot_generation = generation;
     char size_buf[32], seq_buf[32];
     int size_len = snprintf(size_buf, sizeof(size_buf), "%llu",
         (unsigned long long)qihse_kv_replica_snapshot_size(snapshot));
@@ -10657,6 +10691,8 @@ static bool qihse_resp_handle_repl_snapshot_read(qihse_resp_session_t* s,
         return qihse_resp_error(s, "ERR usage: REPL.SNAPSHOT.READ offset length (length <= 524288)");
     if (!qihse_resp_repl_data_plane_allowed(s)) return qihse_resp_error(s, "NOPERM REPL requires the pinned QKP peer mapped to the configured replication service principal");
     if (!s->repl_snapshot) return qihse_resp_error(s, "ERR begin a snapshot on this session first");
+    if (!qihse_auth_validate_handle_generation(s->user, s->repl_snapshot_generation))
+        return qihse_resp_error(s, "NOPERM snapshot principal generation changed; begin a new snapshot");
     char* data = (char*)malloc((size_t)length);
     if (!data) return qihse_resp_error(s, "ERR snapshot read allocation failed");
     size_t got = 0u;
@@ -10666,7 +10702,9 @@ static bool qihse_resp_handle_repl_snapshot_read(qihse_resp_session_t* s,
         free(data);
         return qihse_resp_error(s, "ERR snapshot read failed");
     }
-    bool ok = qihse_resp_bulk(s, data, got);
+    bool ok = qihse_auth_validate_handle_generation(s->user, s->repl_snapshot_generation)
+        ? qihse_resp_bulk(s, data, got)
+        : qihse_resp_error(s, "NOPERM snapshot principal generation changed; begin a new snapshot");
     free(data);
     return ok;
 }
@@ -10678,6 +10716,7 @@ static bool qihse_resp_handle_repl_snapshot_end(qihse_resp_session_t* s,
     qihse_kv_replica_snapshot_destroy(s->repl_snapshot);
     s->repl_snapshot = NULL;
     s->repl_snapshot_seq = 0u;
+    s->repl_snapshot_generation = 0u;
     return qihse_resp_simple(s, "OK");
 }
 
@@ -15742,7 +15781,9 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
      * an AEAD frame decrypted below. */
     if (server->pqc.dsa_key_path || server->pqc.require) {
         qihse_qkp_session_t* qkp = NULL;
-        qihse_qkp_result_t qr = qihse_qkp_server_negotiate(fd, &server->pqc, &qkp);
+        qihse_qkp_result_t qr = qihse_qkp_server_negotiate_with_replication_peers(
+            fd, &server->pqc, server->replication_peers,
+            server->replication_peer_count, &qkp);
         if (qr == QIHSE_QKP_REJECTED) {
             qihse_resp_session_pubsub_cleanup(&session);
             qihse_resp_watch_detach(&session);
@@ -15750,10 +15791,12 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
             return false;
         }
         session.qkp = qkp; /* NULL = opportunistic cleartext session */
-        if (qkp && server->replication_service_principal &&
-            qihse_qkp_session_is_replication_peer(qkp,
-                server->pqc.replication_peer_node_id,
-                server->pqc.replication_peer_dsa_pub_path)) {
+        bool replication_peer = qkp && qihse_resp_replication_peer_id(server, qkp);
+        if (replication_peer) {
+            /* A replication-only handshake cannot fall through to an insecure
+             * default, administrator, or migration identity after revocation. */
+            session.user = NULL;
+            session.auth_kind = QIHSE_RESP_AUTH_QKP_REPLICATION;
             bool active = false;
             uint32_t tenant = QIHSE_TENANT_INVALID;
             qihse_auth_user_active_and_tenant(
@@ -15770,7 +15813,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
          * configured with --admin-peer-node-id/--admin-peer-dsa-pub maps to
          * the system operator. Mirrors the replication pin; grants full
          * command scope (QIHSE_RESP_AUTH_QKP_ADMIN). */
-        if (!session.user && server->pqc.admin_peer_node_id &&
+        if (!replication_peer && !session.user && server->pqc.admin_peer_node_id &&
             server->pqc.admin_peer_dsa_pub_path &&
             qihse_qkp_session_is_replication_peer(
                 qkp, server->pqc.admin_peer_node_id,
@@ -15789,7 +15832,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
          * --migration-peer that may push data-bearing CLUSTER MOVESLOTS
          * transfers. Map a matching peer to the operator with the
          * data-movement-only allowlist (QIHSE_RESP_AUTH_QKP_MIGRATION). */
-        if (!session.user && server->pqc.migration_peer_count > 0u) {
+        if (!replication_peer && !session.user && server->pqc.migration_peer_count > 0u) {
             for (size_t mi = 0u; mi < server->pqc.migration_peer_count; mi++) {
                 if (qihse_qkp_session_is_replication_peer(
                         qkp, server->pqc.migration_peer_node_ids[mi],
@@ -15922,6 +15965,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     qihse_resp_session_pubsub_cleanup(&session);
     qihse_kv_replica_snapshot_destroy(session.repl_snapshot);
     session.repl_snapshot = NULL;
+    session.repl_snapshot_generation = 0u;
     /* R5 §13: unregister any stream watches while the session is still valid. */
     qihse_resp_watch_detach(&session);
     pthread_mutex_destroy(&session.io_lock);
@@ -15963,6 +16007,7 @@ static void* qihse_resp_client_main(void* argument) {
 }
 
 static int qihse_resp_open_listener(qihse_resp_server_t* server) {
+    server->replication_peers_frozen = true;
     char service[16];
     snprintf(service, sizeof(service), "%u", server->port);
     struct addrinfo hints;
@@ -16166,10 +16211,11 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         if (!active || tenant != QIHSE_TENANT_SYSTEM ||
             qihse_user_get_role(supplied->replication_service_principal) ==
                 QIHSE_ROLE_OPERATOR ||
-            !supplied->pqc.replication_peer_node_id ||
-            !*supplied->pqc.replication_peer_node_id ||
-            !supplied->pqc.replication_peer_dsa_pub_path ||
-            !*supplied->pqc.replication_peer_dsa_pub_path) {
+            ((supplied->pqc.replication_peer_node_id != NULL) !=
+             (supplied->pqc.replication_peer_dsa_pub_path != NULL)) ||
+            (supplied->pqc.replication_peer_node_id &&
+             (!*supplied->pqc.replication_peer_node_id ||
+              !*supplied->pqc.replication_peer_dsa_pub_path))) {
             errno = EACCES;
             return NULL;
         }
@@ -16587,6 +16633,81 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     return server;
 }
 
+static EVP_PKEY* qihse_resp_replication_pub(const char* path) {
+    FILE* file = fopen(path, "rb");
+    if (!file) return NULL;
+    EVP_PKEY* key = PEM_read_PUBKEY(file, NULL, NULL, NULL);
+    fclose(file);
+    if (key && !EVP_PKEY_is_a(key, "ML-DSA-87")) {
+        EVP_PKEY_free(key);
+        key = NULL;
+    }
+    return key;
+}
+
+bool qihse_resp_server_add_replication_peer(
+        qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
+        const qihse_user_t* authenticated_grantor) {
+    if (!server || !node_id || !*node_id ||
+        strlen(node_id) > QIHSE_QKP_NODE_ID_LEN || !dsa_pub_path ||
+        !*dsa_pub_path || strlen(dsa_pub_path) >= PATH_MAX) return false;
+    pthread_mutex_lock(&server->state_lock);
+    bool ok = false;
+    EVP_PKEY* key = NULL;
+    qihse_user_t* principal = server->replication_service_principal;
+    if (server->replication_peers_frozen || server->running ||
+        server->listen_fd >= 0 || server->stopping || server->active_clients ||
+        !authenticated_grantor || !principal ||
+        !qihse_auth_user_is_active(authenticated_grantor) ||
+        !qihse_auth_user_is_active(principal) ||
+        qihse_user_get_tenant_id(authenticated_grantor) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(authenticated_grantor) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(principal) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR ||
+        !qihse_auth_can_access(authenticated_grantor,
+            qihse_user_get_classification(principal), qihse_user_get_sci(principal)) ||
+        (qihse_user_can_create_users(principal) &&
+         !qihse_user_can_create_users(authenticated_grantor)) ||
+        (qihse_user_requires_hardware_token(authenticated_grantor) &&
+         !qihse_user_requires_hardware_token(principal)) ||
+        (qihse_user_has_hardware_token(principal) &&
+         !qihse_user_has_hardware_token(authenticated_grantor))) goto done;
+    key = qihse_resp_replication_pub(dsa_pub_path);
+    if (!key) goto done;
+    /* A node ID has exactly one key, including the legacy pin. Compare key
+     * material rather than filenames so aliases cannot evade this check. */
+    if (server->pqc.replication_peer_node_id &&
+        strcmp(node_id, server->pqc.replication_peer_node_id) == 0) {
+        EVP_PKEY* existing = server->pqc.replication_peer_dsa_pub_path
+            ? qihse_resp_replication_pub(server->pqc.replication_peer_dsa_pub_path) : NULL;
+        bool matches = existing && EVP_PKEY_eq(key, existing) == 1;
+        EVP_PKEY_free(existing);
+        if (!matches) goto done;
+    }
+    for (size_t i = 0; i < server->replication_peer_count; i++) {
+        if (strcmp(node_id, server->replication_peers[i].node_id) != 0) continue;
+        EVP_PKEY* existing = qihse_resp_replication_pub(server->replication_peers[i].dsa_pub_path);
+        ok = existing && EVP_PKEY_eq(key, existing) == 1;
+        EVP_PKEY_free(existing);
+        goto done;
+    }
+    if (server->replication_peer_count == QIHSE_QKP_MAX_REPLICATION_PEERS) goto done;
+    char* owned_id = strdup(node_id);
+    char* owned_path = strdup(dsa_pub_path);
+    if (!owned_id || !owned_path) {
+        free(owned_id);
+        free(owned_path);
+        goto done;
+    }
+    server->replication_peers[server->replication_peer_count++] =
+        (qihse_qkp_replication_peer_t){owned_id, owned_path};
+    ok = true;
+done:
+    EVP_PKEY_free(key);
+    pthread_mutex_unlock(&server->state_lock);
+    return ok;
+}
+
 bool qihse_resp_server_start(qihse_resp_server_t* server) {
     if (!server) {
         errno = EINVAL;
@@ -16772,6 +16893,10 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
             m = next;
         }
         server->repl_marks = NULL;
+    }
+    for (size_t i = 0; i < server->replication_peer_count; i++) {
+        free((char*)server->replication_peers[i].node_id);
+        free((char*)server->replication_peers[i].dsa_pub_path);
     }
     /* R5 §13: watches die with their sessions; the detach in the session
      * teardown guarantees the registry is empty by the time clients drain. */
