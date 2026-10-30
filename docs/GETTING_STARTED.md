@@ -17,6 +17,15 @@ For the project overview, start with the [root README](../README.md). For subsys
 
 QIHSE is a native C/C++ project targeting Linux. The build also integrates Python, OpenSSL, liburing, LuaJIT, eBPF/XDP, SQLite, nlohmann-json, and post-quantum cryptography components.
 
+SQL English full-text analysis additionally needs the **runtime** library
+`libstemmer.so.0d` (Debian/Ubuntu package `libstemmer0d`) in the loader path of
+every process using it, including chroot/container runtimes. It is loaded with
+`dlopen`, so a successful link or `ldd libqihse.so` is not sufficient evidence.
+The analyzer is bounded ASCII English/Snowball: input/output are limited to
+4096 bytes and tokens to 256 bytes, not complete PostgreSQL text-search parity.
+Non-ASCII/oversized input and missing library/symbols fail closed; a missing
+library fails even for empty input. It does not silently switch to another analyzer.
+
 Run the built-in environment check first:
 
 ```bash
@@ -97,10 +106,15 @@ for the entire codebase.
 or:
 
 ```bash
-make test
+make test TEST_JOBS=32
 ```
 
 Security-sensitive protocol code has additional regression, sanitizer, concurrency, TLS, ACL, and fuzz coverage. See [Security](security/README.md) and the [August 2026 UWP audit](security/UWP_AUDIT_2026-08.md).
+
+Building in a shared or dirty checkout is development work, not authorization
+to replace an installed library. For staged installation, exact artifact
+manifests, affected-consumer inventory and rollback/health gates, follow
+[Operations §1.6](OPERATIONS.md#16-staged-installation-and-upgrade-gates).
 
 ## 4. Inspect the local build
 

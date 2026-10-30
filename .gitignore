@@ -21,6 +21,16 @@ lib/
 !/tests/*.c
 !/tests/test_admin_cli.py
 !/tests/test_aimem_projection_qkp.py
+!/tests/test_pgwire_app_compat.py
+!/tests/test_pgwire_client_fixture.py
+!/tests/test_pgwire_service.py
+!/tests/test_parallel_suite.py
+!/tests/test_gold_parallel.py
+!/tests/test_pgwire_numeric.py
+!/tests/test_sql_cpp_headers.py
+!/tests/test_public_api_install.py
+!/tests/test_python_pg_tls.py
+!/tests/test_machine_token_refresh.py
 /tests/bench_*
 /tests/test_aggregate_hardened
 /tests/test_auth_privilege_boundary

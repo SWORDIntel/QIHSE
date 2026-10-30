@@ -1,12 +1,13 @@
 # QIHSE Deployment Guide
 
-> **Current deployment methods (authoritative):**
+> **Source entry points, not verified deployment evidence:**
 > - Build: `./scripts/build-native.sh --auto` per machine — auto-detects every
 >   SIMD ISA and `make all` runs the mandatory host-ISA verification.
 > - Cluster install: `scripts/install_qihse.sh` (provisions keys/config, systemd
->   units, health checks).
-> - Rolling binary updates: `scripts/cluster_rolling_restart.sh` (deploy +
->   restart one node at a time + verify).
+>   units, health checks; this mutates live deployment state).
+> - Rolling binary updates: `scripts/cluster_rolling_restart.sh` is an entry
+>   point to review, not proof of rolling compatibility or current health.
+>   Apply the staged upgrade gates below before any activation.
 > - Replication: `scripts/cluster_replica_deploy.sh` (read-only QKP-pinned
 >   replica units, one namespace each).
 > - Operator access on hardened nodes: `qihse-admin-cli` (pinned QKP admin
@@ -29,7 +30,26 @@ deployment guide that predates the
 > **Repository rule violation:** this document contains absolute paths.
 > `AGENTS.md` requires strictly relative or dynamically resolved paths.
 
-This guide provides comprehensive instructions for deploying QIHSE in production environments, including single-node, multi-node cluster, and cloud deployments.
+The legacy examples below are not a production cutover runbook. No current
+source/deployed hash parity, leader identity, rollout or recovery was verified
+in this documentation update.
+
+## Staged upgrade prerequisites
+
+Follow [Operations §1.6](../OPERATIONS.md#16-staged-installation-and-upgrade-gates)
+for staging with `DESTDIR`, exact artifact manifests, all installed-library
+consumers, pre-upgrade recovery images and authenticated health gates. A dirty
+shared checkout is not a release artifact; identical directory names are not
+hash parity. Do not run `sudo make install`, provisioning scripts or rolling
+restart scripts merely to try a development build. Leadership/quorum must be
+established from current authenticated observations; unknown leadership blocks
+a rolling change. PING/systemd status alone does not establish data health.
+
+SQL English FTS dynamically loads `libstemmer.so.0d` (Debian/Ubuntu
+`libstemmer0d`) in each actual service/chroot/container runtime. It is bounded
+ASCII English/Snowball (4096-byte input/output, 256-byte tokens), not complete
+PostgreSQL text search. Missing dependency/symbols, unsupported non-ASCII or
+oversized input fail closed; even empty input needs the dependency.
 
 ## Table of Contents
 
@@ -142,7 +162,7 @@ This guide provides comprehensive instructions for deploying QIHSE in production
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install -y build-essential cmake libssl-dev libnuma-dev
+sudo apt install -y build-essential cmake libssl-dev libnuma-dev libstemmer0d
 
 # Install Intel OneAPI
 wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
@@ -161,8 +181,9 @@ sudo apt install -y libopenvino-dev
 git clone <repository-url>
 cd qihse-breakthroughalgo
 make all
-sudo make install
-sudo ldconfig
+# Stage only; activation needs the gates above.
+STAGE="$(mktemp -d)"
+make install DESTDIR="$STAGE" PREFIX=/usr/local
 ```
 
 ### Configuration for Production
@@ -778,86 +799,56 @@ groups:
 
 ## Backup and Recovery
 
-### Data Backup Strategy
+### Preserve a recoverable generation
 
-```bash
-#!/bin/bash
-# QIHSE backup script
+Do not recursively copy a live data directory and call it a consistent backup,
+or overlay an archive onto a populated live store. Do not delete retained
+backups merely because upload or service startup succeeded.
 
-BACKUP_DIR="/backup/qihse"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_NAME="qihse_backup_${TIMESTAMP}"
+For the bounded SQL store, use the authenticated
+`qihse_table_store_backup()` / `qihse_table_store_restore()` APIs described in
+[transactions/MVCC](../architecture/transactions_mvcc.md#durable-formats-and-offline-transfer).
+They require an active bootstrap-system Operator (user/tenant ID 0), private
+owner-only parent directories and fresh nonexisting destination paths. Backup
+captures only committed catalog/rows/retry receipts from an open, unpoisoned
+durable store; restore requires exclusive access to both source and target.
+Transfer accepts validated store v3–v5 images only, despite general store
+read compatibility with v1–v5. Current writes use store v5/schema v4; old-format
+read support does **not** imply binary downgrade support or conversion.
 
-# Create backup directory
-mkdir -p "${BACKUP_DIR}/${BACKUP_NAME}"
+For other engines and service state, use their supported consistent snapshot
+mechanism or quiesce all writers and take an offline, complete generation.
+Inventory configuration, auth provisioning, trust pins/keys, audit/WAL files,
+models and external dependencies separately; the SQL transfer APIs do not
+capture them. Keep secrets under existing ownership/access controls, encrypt
+and integrity-protect archives, and record the data generation, exact runtime
+hashes and dependency manifest. Verify off-host retrieval before retention
+decisions. No service-wide backup schedule is established by these examples.
 
-# Backup configuration
-cp -r /etc/qihse "${BACKUP_DIR}/${BACKUP_NAME}/config"
+### Isolated recovery and activation gates
 
-# Backup data (if using local storage)
-cp -r /var/lib/qihse/data "${BACKUP_DIR}/${BACKUP_NAME}/data"
+1. Preserve the original data, evidence and last known-good runtime. Choose
+   operator-configured `BACKUP_ROOT` and `RECOVERY_ROOT` outside live data and
+   stage private recovery directories; never restore over an active ledger.
+2. Validate archive provenance, hashes and permissions. Restore into a fresh
+   isolated target with compatible code and runtime dependencies. Keep the
+   source and target closed elsewhere; never remove lock files to bypass
+   exclusion. A failed transfer may have published an image before an fsync
+   error: preserve and inspect it rather than assuming nothing happened.
+3. Reopen/restart the isolated target and check catalog/row consistency,
+   retry receipts and lost-reply behavior, expected reads/writes, audit
+   continuity, TLS/auth and low-clearance denial. Check all relevant engines
+   and clients; service status alone is not evidence of recovery.
+4. Test any older-runtime rollback against the preserved **pre-upgrade** image,
+   not data newly written by the candidate. Account explicitly for writes after
+   that backup; do not silently discard them or replay ambiguous commits.
+5. Only after isolated checks and current leadership/quorum/replication health
+   pass, use the reviewed activation plan. Unknown leadership blocks a cluster
+   restore/rollout; do not force promotion or restart several members blindly.
+   Recheck application behavior and durable commit/audit progress after each
+   activation. Retain originals until recovery is independently accepted.
 
-# Backup ML models and learned parameters
-cp -r /var/lib/qihse/models "${BACKUP_DIR}/${BACKUP_NAME}/models"
-
-# Create compressed archive
-cd "${BACKUP_DIR}"
-tar -czf "${BACKUP_NAME}.tar.gz" "${BACKUP_NAME}"
-
-# Upload to remote storage
-aws s3 cp "${BACKUP_NAME}.tar.gz" "s3://qihse-backups/${BACKUP_NAME}.tar.gz"
-
-# Clean up local backup
-rm -rf "${BACKUP_DIR}/${BACKUP_NAME}"
-rm "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
-
-# Keep only last 30 days of backups locally
-find "${BACKUP_DIR}" -name "qihse_backup_*.tar.gz" -mtime +30 -delete
-```
-
-### Recovery Procedure
-
-```bash
-#!/bin/bash
-# QIHSE recovery script
-
-BACKUP_NAME="$1"
-BACKUP_DIR="/backup/qihse"
-
-if [ -z "$BACKUP_NAME" ]; then
-    echo "Usage: $0 <backup_name>"
-    echo "Available backups:"
-    ls -la "${BACKUP_DIR}"/qihse_backup_*.tar.gz
-    exit 1
-fi
-
-# Stop QIHSE service
-systemctl stop qihse
-
-# Extract backup
-cd "${BACKUP_DIR}"
-tar -xzf "${BACKUP_NAME}.tar.gz"
-
-# Restore configuration
-cp -r "${BACKUP_DIR}/${BACKUP_NAME}/config"/* /etc/qihse/
-
-# Restore data
-cp -r "${BACKUP_DIR}/${BACKUP_NAME}/data"/* /var/lib/qihse/data/
-
-# Restore ML models
-cp -r "${BACKUP_DIR}/${BACKUP_NAME}/models"/* /var/lib/qihse/models/
-
-# Clean up extracted backup
-rm -rf "${BACKUP_DIR}/${BACKUP_NAME}"
-
-# Start QIHSE service
-systemctl start qihse
-
-# Verify recovery
-sleep 10
-systemctl status qihse
-qihse-info --health
-```
+This is a required validation procedure, not a claim of a successful live restore.
 
 ## Security Hardening
 

@@ -46,18 +46,85 @@
 >    active-Operator rule to mutations and requires READ on the named table
 >    before serializing its metadata.
 >
-> Also unverified here: the pgwire prepared-statement cache (see §6). No test in
-> the tree exercises it.
+> The component/parser inventory below is broader than authenticated SQL execution.
+> The context-backed contract in §1 and §6 takes precedence over legacy shapes;
+> wire coverage includes `tests/test_pg_wire_txn.c` and the disposable application
+> gate in `tests/test_pgwire_app_compat.py`.
 
 ## 1. Overview
 
-QIHSE includes a native C99 SQL engine that provides full relational query processing on top of the multi-model storage engines. The SQL engine consists of a parser, query executors, a cost-based optimizer, and a schema registry.
+QIHSE includes a native C99 SQL parser, component executors, optimizer and schema
+registry. Parser acceptance and standalone executor tests do **not** establish
+end-to-end relational or PostgreSQL compatibility.
+
+### Authenticated durable SQL boundary
+
+`qihse_pg_wire_handle_client_uwp()` delegates SQL to
+`src/spinnaker/qihse_uwp_sql_txn_schema.c` with the client's authenticated
+`qihse_user_t`, schema and transaction manager. Explicit
+`qihse_uwp_sql_open_durable()` binding enables the exclusive, fsynced versioned
+row/catalog snapshot; it is not SQL DDL WAL, distributed durability or cross-model
+ACID. The v5 image includes supported schema/constraints and a bounded
+principal/tenant-bound DML retry ledger; v1–v4 remain readable. Incomplete
+catalog/row generations fail recovery. The snapshot payload is capped at 64 MiB,
+the schema image at 1 MiB, and the retry ledger at 4096 entries with 128-byte
+key/principal/tenant text fields. These are bounded native-format limits, not
+PostgreSQL storage or exactly-once guarantees. The legacy multi-engine pgwire
+handler has no transaction manager and refuses transaction control; it is not an
+alternate route to this contract.
+
+Supported durable CREATE TABLE types are INT, BIGINT, FLOAT, DOUBLE, TEXT,
+VARCHAR, BOOL, UUID, JSONB, TIMESTAMPTZ, NUMERIC(p,s) and TSVECTOR. Native NULL is
+separate from empty/zero/false; JSONB is validated text, not PostgreSQL's physical
+format. NUMERIC is exact decimal with precision 1–38 and scale 0–precision.
+Supported defaults are UUID `gen_random_uuid()`/`uuid_generate_v4()`, timestamptz
+`NOW()`, JSONB `'{}'`, INT `0`, and quoted TEXT/VARCHAR literals (up to 4095
+decoded bytes). These are not general default expressions. Durable single-column
+PK (implied NOT NULL), NOT NULL and single-column UNIQUE on NOT NULL columns
+are enforced against the final shadow at commit. CHECK, FK/cascades, composite
+keys, nullable UNIQUE and SERIAL are refused; keys on security-labeled tables
+are refused rather than leaking hidden-key conflicts.
+
+DDL-only transactions stage supported CREATE TABLE (up to 16 new relations),
+`uuid-ossp`, indexes, the bounded function/trigger and materialized-view objects
+in one catalog/row publication. This is not general transactional ALTER/DROP or
+mixed DDL/DML. Savepoints and durable DDL retry receipts remain unsupported.
+
+- **Indexes:** non-unique BTREE-style equality postings support 1–16 column or
+  top-level JSONB `column->>'key'` expressions. GIN supports one JSONB or TSVECTOR
+  column. Admission builds a real authenticated index; generation-local postings
+  bind principal, tenant, clearance and SCI, and candidates require authorized
+  row re-fetch and full predicate recheck. This is not a persistent PostgreSQL
+  B-tree/GIN access method, a general range planner or arbitrary expression index.
+  See `src/tractable/qihse_sql_row_index.c`.
+- **Stored generated values:** only TSVECTOR from
+  `to_tsvector('english', coalesce(data->>'email','') || ' ' ||
+  coalesce(data->>'name','') || ' ' || coalesce(data->>'username',''))`, with a
+  JSONB `data` column, is admitted. INSERT and UPDATE recompute it; direct
+  assignment is refused. The analyzer is bounded ASCII/Snowball, not full
+  PostgreSQL Unicode/tokenizer parity.
+- **Functions/triggers:** only `update_updated_at_column()` returning TRIGGER
+  with the validated `NEW.updated_at = NOW(); RETURN NEW` body is executable;
+  BEFORE UPDATE FOR EACH ROW targets TIMESTAMPTZ `updated_at`. There is no
+  general PL/pgSQL runtime (catalog caps: 256 functions, 256 triggers/table).
+- **Materialized relations:** only the validated seven-column statistics shape
+  grouped by `source, record_type` is admitted: COUNT(*), distinct JSONB
+  email/phone/username counts and MAX(updated_at). CREATE seeds real rows from
+  an authenticated source snapshot and fences its generation through publication;
+  REFRESH atomically replaces the supported result in a row transaction. This
+  does not implement arbitrary materialized queries, general views or concurrent
+  PostgreSQL refresh semantics.
+
+See [the disposable application readiness gate](pgwire_app_compat.md) for the
+source-extracted corpus and remaining application/deployment gates. No actual
+DIRECTEYE migration, DSN change or production cutover follows from this support.
 
 ## 2. SQL Parser
 
 **Files**: `include/qihse_sql_parser.h`, `src/tractable/qihse_sql_parser.c`
 
-The parser tokenizes and builds an AST from SQL text. Supported statement types:
+The parser tokenizes and builds an AST from SQL text. The following are parser
+shapes, **not** a list of executable durable SQL statements:
 
 ### DML
 - `SELECT` with column list, FROM, JOIN, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET, DISTINCT
@@ -207,8 +274,10 @@ DISTINCT tracking uses a separate hash set per group to deduplicate values befor
 The mutable table store is the only in-tree store with in-place update and
 delete primitives, so parsed UPDATE and DELETE statements execute against it.
 The executor consumes the structured AST only — `ast->set_columns` /
-`set_values` / `num_set` for UPDATE and `ast->where_conditions` for both — and
-the raw SQL text is never re-parsed for execution.
+`set_values` / `num_set`, quote flags and parameter indexes for UPDATE, and
+`ast->where_conditions` for both — and
+raw SQL text is checked against the structured shape before execution. Typed
+extended bindings travel separately from SQL text; they are not interpolated.
 
 - **Row counts are actual changes.** The predicate handed to
   `qihse_table_update` / `qihse_table_delete` counts every row it accepts, and
@@ -233,11 +302,12 @@ the raw SQL text is never re-parsed for execution.
   `ILIKE`, joined by AND. Qualified names (`x.id`, an alias the parser drops)
   resolve on their last component. An UPDATE with no WHERE at all is a
   legitimate update-all; an UPDATE whose WHERE parsed to nothing is refused.
-- **Assignments must be literals.** Numeric columns require a numeric literal,
-  so `SET n = n + 1` refuses. The AST does not record whether a SET value was
-  quoted, so a value that names a column (`SET name = other_col`) refuses
-  rather than being stored as text; the refusal conservatively also catches a
-  quoted literal that happens to equal a column name.
+- **Assignments are literals, typed binds or supported DEFAULTs.** General
+  arithmetic such as `SET n = n + 1` refuses. The AST now retains `set_quoted`
+  and parameter indexes: bare column-to-column assignment refuses, but a quoted
+  literal with a column's spelling remains a literal. SQL NULL, quoted `'NULL'`
+  and DEFAULT are distinct; NOT NULL is enforced. Generated/trigger transforms
+  are explicit bounded exceptions, not general expression evaluation.
 - **Atomicity**: autocommit validation finishes before the store call, whose
   write lock covers the statement. Inside a UWP SQL transaction, the first DML
   statement captures a private optimistic table shadow. INSERT, UPDATE and
@@ -245,11 +315,11 @@ the raw SQL text is never re-parsed for execution.
   its generation is unchanged, while ROLLBACK or disconnect discards it. A
   concurrent live mutation makes COMMIT abort without overwriting that change.
   The row store can publish a bounded group of up to 16 table shadows
-  atomically, and UWP SQL enlists those shadows on demand. This is an
-  in-memory multi-table publish boundary; it does not include other models or
-  durable WAL recovery. SQL savepoint commands and transactional DDL fail
-  closed until their storage resources can snapshot and restore those
-  operations. A second identical DELETE reports `rows=0`
+  atomically, and UWP SQL enlists those shadows on demand. This is a
+  multi-table publish boundary. Explicit durable binding adds one fsynced
+  row/catalog snapshot, not cross-model atomicity or SQL WAL replay. Savepoints
+  and mixed DDL/DML refuse; supported DDL-only transactions are described in §1.
+  A second identical DELETE reports `rows=0`
   (idempotent).
 - **Failure atomicity**: live and transaction-shadow UPDATE clone the current
   rows before applying assignments. Invalid values or allocation failure return
@@ -257,10 +327,11 @@ the raw SQL text is never re-parsed for execution.
   freed and replaced by NULL under memory pressure.
 - **Store scope**: the row store is process-wide and lazily created
   (`qihse_uwp_sql_table_store()`), matching the prepared-statement cache; the
-  UWP SQL path has no per-connection engine state yet, and `ctx->sql_engine`
-  is not dereferenced. Tables must be created in the store before DML can
-  target them. INSERT populates the row store and also writes the configured
-  column-store analytic copy.
+  store is shared while transactions and pgwire prepared objects are session-local.
+  `ctx->sql_engine` is an opaque configuration marker, not dereferenced. Explicit
+  durable binding associates the store with a context and exclusive snapshot.
+  Tables must exist before DML. The column-store analytic projection is not part
+  of the authoritative row transaction's atomicity guarantee.
 - **Permission**: the same model as the KV / column / document targets — the
   ACL resource id is the FNV-1a hash of the table name, namespace 0; the
   operator role passes and every other role needs a `QIHSE_ACL_WRITE` grant.
@@ -272,27 +343,39 @@ the raw SQL text is never re-parsed for execution.
 
 ### 3.6 SQL statement authorization
 
-DDL is restricted to an active Operator. This includes CREATE, DROP, ALTER,
-view and sequence DDL, TRUNCATE, REINDEX and CLUSTER. QIHSE does not currently
+DDL authorization is restricted to an active Operator. The permission gate
+covers CREATE, DROP, ALTER, view/sequence DDL, TRUNCATE, REINDEX and CLUSTER;
+passing that gate does not make every parser shape executable. QIHSE does not currently
 expose a narrower schema-administration capability, so object WRITE grants do
 not confer DDL authority. The UWP SCHEMA adapter enforces the same rule and
 requires an active principal with table READ permission before returning table
-or index metadata. DDL inside an open SQL transaction is refused because the
-schema registry does not yet provide a rollbackable transaction resource;
-direct SCHEMA mutations on that connection are refused for the same reason.
+or index metadata. Supported durable SQL DDL-only transactions use a private
+catalog and fenced publication (§1). Direct SCHEMA mutation during a SQL
+transaction remains refused; it cannot bypass staged SQL catalog state.
 AUTH also refuses identity replacement while a transaction handle is active,
 so another principal cannot inherit and commit staged changes.
 
-The row-store SELECT slice supports one table, simple column projection (or
-`*`), the verified AND predicates supported by the DML row matcher, and
-LIMIT/OFFSET. It requires an active principal with table READ permission both
-at dispatch and immediately before scanning. The row store has no per-row
-classification or SCI metadata; these SQL rows are unclassified data under a
-table-level ACL. Joins, aggregates, ordering, CTEs, expression projections,
-and SELECT inside an open transaction fail closed rather than returning the
-optimizer's former empty placeholder as a successful result. Transactional
-read visibility and READ COMMITTED/REPEATABLE READ/SERIALIZABLE semantics for
-SQL SELECT remain open.
+The row-store SELECT slice supports one table, column projection (or `*`),
+verified AND predicates and LIMIT/OFFSET. It additionally admits a verified
+single-column ORDER BY ... LIMIT 1 (no positive OFFSET) and the source-specific
+`auth_events` COUNT(CASE), COUNT(DISTINCT) and grouped HAVING corpus. These narrow
+branches do not expose the standalone join/sort/aggregate executors generally.
+Joins, general ordering/aggregation, CTEs, windows, set operations and arbitrary
+expression projections remain outside this contract.
+
+SELECT inside a transaction reads its private table shadow, including own
+writes. Up to 16 tables can be enlisted; reads participate in generation-fenced
+commit and commit-time READ revalidation. Isolation-level syntax does not prove
+PostgreSQL-equivalent statement snapshots, predicate locking or general SQL
+SERIALIZABLE semantics; the resource uses optimistic whole-table shadows.
+
+Table READ/WRITE ACLs and active-principal revalidation are mandatory. Rows may
+carry the three INT columns `__qihse_tenant_id`, `__qihse_classification` and
+`__qihse_sci` together. Partial/mistyped/invalid labels fail closed; table ACL,
+tenant identity and classification/SCI authorization all apply. Missing labels
+mean system-tenant unclassified data, not a tenant-access bypass. SQL UPDATE
+cannot relabel rows. Catalog enumeration and index candidates retain the same
+authenticated context.
 
 ## 4. Cost-Based Optimizer
 
@@ -371,23 +454,43 @@ bool   qihse_schema_has_index(const qihse_schema_registry_t* reg, const char* ta
 ```
 
 `qihse_schema_alter_table()` handles ADD COLUMN, DROP COLUMN, RENAME COLUMN and
-RENAME TO through `ast->alter_clause->action`. It is an in-memory catalog; the
-source notes it is a stub interface that can be wired to persistent storage
-later.
+RENAME TO through `ast->alter_clause->action` as a component API. That does not
+make ALTER executable through durable pgwire. Supported schema images now
+serialize defaults, generated definitions, indexes, bounded functions/triggers
+and materialized queries; the durable SQL adapter publishes those atomically
+with row state rather than persisting arbitrary registry mutations.
 
 ## 6. Prepared Statements (pgwire)
 
-**Status: partial — status unverified.** The PostgreSQL wire protocol server
-(`src/spinnaker/qihse_pg_wire.c`) implements the extended query protocol's
-Parse / Bind / Describe / Execute / Close / Sync message handling, and
-`QIHSE_PG_MAX_PREPARED` is 64. Two corrections to the previous revision of this
-section:
+**Status: partial — bounded typed execution tested.** The context-backed handler
+in `src/spinnaker/qihse_pg_wire.c` supports Parse/Bind/Describe/Execute/Close,
+Flush and Sync. Named and unnamed prepared statements and portals are
+connection-local: 32 statements, 32 portals, 64 parameters and 64 result columns.
+Captured results and each bind value are capped at 1 MiB; frontend message
+length is capped at 16 MiB (including its four-byte length word). Statement and
+portal names are at most 128 bytes. Describe uses catalog
+metadata rather than sampled rows; Execute revalidates identity and passes
+separate typed parameter vectors to UWP, never SQL text substitution.
 
-- eviction is **FIFO**, not LRU: a full cache shifts every entry down by one and
-  appends the new statement, with no recency update on a hit;
-- there is no test in this repository for the prepared-statement path.
-  `tests/test_pg_wire_cluster.c` exercises pgwire at the cluster level, which is
-  not the same thing. `tests/test_sql_completeness.c` does not touch pgwire.
+Text and supported binary parameters/results include bool, int2/int4/int8,
+float4/float8, text/varchar/bpchar, NUMERIC, UUID, JSONB and timestamp/timestamptz
+(OIDs 16, 21, 23, 20, 700, 701, 25, 1043, 1042, 1700, 2950, 3802, 1114, 1184).
+This is not arbitrary PostgreSQL type/array/codec support; TSVECTOR is not a
+supported binary result format. Execute requires `max_rows=0`; portal suspension
+and incremental cursor fetch are refused.
+
+Without explicit BEGIN, extended DML opens an implicit transaction held through
+Sync: CommandComplete before Sync is not a durable commit acknowledgement.
+Pipeline errors/disconnect discard private changes; Sync commits only a clean
+implicit batch and reports the actual I/T/E ReadyForQuery state. Errors drain
+until Sync; explicit failed transactions require rollback. Simple-query
+implicit DML commits at the statement boundary. The experimental simple-query
+retry key cannot be used for typed extended writes.
+
+`tests/test_pg_wire_txn.c` covers wire transactions, typed bindings, pipeline
+rollback and authorization. `tests/test_pgwire_app_compat.py` exercises psycopg2,
+psycopg v3 and asyncpg against a disposable authenticated TLS fixture. A legacy
+prepared-cache shape or a cluster codec test alone is not evidence of this path.
 
 ## 7. Testing
 
@@ -447,9 +550,16 @@ COMMIT, ROLLBACK and generation-conflict abort. Transactional INSERT defers the
 column-store analytic projection; the authoritative row commit succeeds
 independently of that asynchronous projection boundary.
 
-Not covered: broader row-producing SELECT (joins, aggregates, ordering,
-expressions, CTEs), transactional SELECT visibility, pgwire transactions and
-prepared statements, savepoint data restoration (SQL savepoints currently
-refuse), cross-model atomicity, SQL WAL recovery, window functions, and
-`INSERT ... SELECT` execution.
+Additional focused coverage is in `tests/test_table_store_txn.c`,
+`tests/test_schema_recovery.c`, `tests/test_pg_wire_txn.c` and
+`tests/test_pgwire_app_compat.py`. The last is a source-extracted, disposable
+readiness probe, not an actual application migration. Historical run counts in
+roadmaps are recorded evidence, not a rerun implied by this document.
+
+Not established: general joins/aggregates/order/expression/CTE/window execution
+through authenticated durable SQL, SQL savepoint restoration, cross-model SQL
+atomicity, SQL WAL replay, `INSERT ... SELECT`, general COPY/RETURNING/ON CONFLICT,
+PostgreSQL-wide role/catalog semantics or production application replacement.
+The complete integration gate is `make test TEST_JOBS=32`; focused component
+checks do not replace it.
 

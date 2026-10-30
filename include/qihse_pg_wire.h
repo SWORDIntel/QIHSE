@@ -53,17 +53,21 @@ void qihse_pg_wire_handle_client_multi(
  * schema and transaction manager. The context and all engine pointers remain
  * caller-owned and must outlive the handler. The legacy multi-engine handler
  * has no transaction manager and therefore refuses BEGIN/COMMIT/ROLLBACK.
- * Transactional DML is routed through the authenticated UWP SQL executor;
- * transactional SELECT and other unsupported transaction statements fail
- * closed. */
+ * SQL DDL, DML and SELECT use the authenticated UWP executor. Only an
+ * executor-confirmed result is returned to the client; unsupported statements
+ * and unsupported extended-protocol bindings fail closed. Named and unnamed
+ * prepared statements and portals are connection-local and bounded; Execute
+ * revalidates authenticated identity and delegates typed binds to UWP.
+ * Transactional reads depend on
+ * the executor's isolation and authorization checks. */
 void qihse_pg_wire_handle_client_uwp(int client_fd,
                                      qihse_uwp_context_t* uwp_context,
                                      qihse_cluster_topology_t* topo);
 
 /* TCP listener for the context-backed handler. PostgreSQL password
- * authentication currently sends credentials in cleartext; there is no TLS
- * negotiation on this listener. Keep the default loopback bind, or use only
- * behind a trusted TLS proxy/tunnel. The listener borrows the UWP
+ * authentication sends credentials in cleartext on this legacy loopback-only
+ * listener. SSLRequest fails closed (no downgrade); use open_tls_uwp for
+ * network access. The listener borrows the UWP
  * context and topology; both must outlive it. It deliberately accepts and
  * serves one connection per accept_once call, leaving concurrency and stop
  * policy to the embedding application. A timeout returns 0, a served client
@@ -75,6 +79,16 @@ qihse_pg_wire_listener_t* qihse_pg_wire_listener_open_uwp(
     qihse_cluster_topology_t* topo,
     const char* bind_address,
     uint16_t port);
+/* TLS-required listener, including non-loopback binds. A valid PEM certificate
+ * chain and matching private key are mandatory. Accepts only PostgreSQL
+ * SSLRequest followed by a successful TLS 1.2+ handshake before AUTH; direct
+ * startup, failed TLS and repeated SSLRequest never downgrade to cleartext.
+ * Clients must verify the certificate identity/chain themselves. The legacy
+ * open_uwp entry point remains restricted to 127.0.0.1. */
+qihse_pg_wire_listener_t* qihse_pg_wire_listener_open_tls_uwp(
+    qihse_uwp_context_t* uwp, qihse_cluster_topology_t* topo,
+    const char* bind_address, uint16_t port,
+    const char* certificate_file, const char* private_key_file);
 uint16_t qihse_pg_wire_listener_port(const qihse_pg_wire_listener_t* listener);
 int qihse_pg_wire_listener_accept_once(qihse_pg_wire_listener_t* listener,
                                        int timeout_ms);

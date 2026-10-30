@@ -9,3 +9,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 tokio-postgres = "0.7"
+
+[dev-dependencies]
+native-tls = "0.2"
+postgres-native-tls = "0.5"

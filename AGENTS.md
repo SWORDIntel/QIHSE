@@ -34,6 +34,10 @@ The negative test MUST run in CI. A successful happy-path test is not a substitu
 
 Changes that violate any invariant above are merge blockers. Performance, compatibility, internal-only deployment, prototype status, or convenience are not exceptions. If a new capability cannot preserve an invariant yet, keep it behind an explicitly insecure/development-only boundary rather than weakening the invariant silently.
 
+## Test-suite execution
+
+Always run the complete suite with the maximum parallelism supported by the Makefile: `make test TEST_JOBS=32`. The suite runner builds shared artifacts first, runs only its audited process-isolated targets concurrently, and keeps unapproved targets serial. Do not substitute `make -j32 test`, `make test-serial`, or a parallel-only diagnostic lane for the complete suite. Focused tests may run during development but do not replace this final check; report any failures rather than omitting targets.
+
 <!-- START: RELATIVE_PATHS_RULE -->
 ## Path Resolution Policy (this QIHSE repository only)
 > **CRITICAL RULE**: This policy applies ONLY to code, configuration, scripts, and

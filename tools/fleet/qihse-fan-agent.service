@@ -4,17 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/qihse/machine-principal.env
-ExecStart=/usr/local/bin/qihse-fan-agent --daemon --interval 5
+EnvironmentFile=%E/qihse/machine-principal.env
+ExecStart=/usr/bin/python3 ${QIHSE_PREFIX}/bin/qihse-fan-agent --daemon --interval 5
 Restart=always
 RestartSec=5
-# Authentication: MACHINEAUTH token at /etc/qihse/machine_token, minted by
-# `qihse-machine-token --identity /etc/qihse/keys/qihse_dsa_key.pem
-#   --tenant "$QIHSE_MACHINE_TENANT" --user-id "$QIHSE_MACHINE_USER_ID"` and
-# installed 0600 root. The server consumes the token nonce once per
-# connection, and this agent keeps connections persistent, so re-minting is
-# needed only rarely (token TTL). QIHSE_OPERATOR_PASSWORD may be exported as
-# an emergency fallback but MUST NOT be stored in this unit.
+# Share explicit principal, tenant, prefix and token path with the refresh unit.
+# Install tools/fleet/qihse-fan-agent.py as "$QIHSE_PREFIX/bin/qihse-fan-agent".
+# Authentication uses the root-only 0600 file at QIHSE_MACHINE_TOKEN; no Operator
+# password fallback is provisioned here. See the refresh unit for deployment.
+# The nonce is consumed once per connection. Refresh does not revoke an old
+# token, but reconnects using it can be refused; the timer is not a replay fix.
 
 [Install]
 WantedBy=multi-user.target

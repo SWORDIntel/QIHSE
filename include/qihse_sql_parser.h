@@ -62,6 +62,12 @@ typedef enum {
     QIHSE_SQL_EXECUTE         = 45,
     QIHSE_SQL_REINDEX         = 46,
     QIHSE_SQL_CLUSTER         = 47,
+    /* Recognized PostgreSQL DDL whose semantics are retained as raw_sql. */
+    QIHSE_SQL_CREATE_EXTENSION = 48,
+    QIHSE_SQL_CREATE_FUNCTION = 49,
+    QIHSE_SQL_CREATE_TRIGGER = 50,
+    QIHSE_SQL_CREATE_PROCEDURE = 51,
+    QIHSE_SQL_DROP_TRIGGER = 52,
     QIHSE_SQL_UNKNOWN         = 0
 } qihse_sql_stmt_type_t;
 
@@ -85,7 +91,13 @@ typedef enum {
     QIHSE_TYPE_FLOAT_ARRAY= 13,
     QIHSE_TYPE_TEXT_ARRAY = 14,
     QIHSE_TYPE_BOOL_ARRAY = 15,
-    QIHSE_TYPE_JSONB      = 16
+    QIHSE_TYPE_JSONB      = 16,
+    QIHSE_TYPE_INET       = 17,
+    QIHSE_TYPE_NUMERIC    = 18,
+    QIHSE_TYPE_DATE       = 19,
+    QIHSE_TYPE_TIMESTAMPTZ = 20,
+    QIHSE_TYPE_UUID       = 21,
+    QIHSE_TYPE_TSVECTOR   = 22
 } qihse_sql_type_t;
 
 /* -------------------------------------------------------------------------
@@ -200,9 +212,16 @@ typedef struct {
 
 typedef struct {
     char* column_name;
+    /* C++ uses operator_name because operator is reserved; same C ABI slot. */
+#ifdef __cplusplus
+    char* operator_name; /* "=", "<>", "<", ">", "<=", ">=", "LIKE", "IN" */
+#else
     char* operator;     /* "=", "<>", "<", ">", "<=", ">=", "LIKE", "IN" */
+#endif
     char* value;
     int   value_is_string;
+    qihse_sql_type_t value_cast_type; /* explicit supported RHS cast, or UNKNOWN */
+    uint16_t value_parameter_index; /* 1-based $n identity; 0 for a literal */
     /* Subquery support for IN / EXISTS */
     qihse_sql_subq_kind_t subq_kind;
     struct qihse_sql_ast_s* subquery;  /* owned; freed with AST */
@@ -248,7 +267,17 @@ typedef struct {
     char*  alias;           /* optional output alias */
     qihse_sql_agg_kind_t agg_kind;
     char*  agg_arg;         /* argument column for aggregate, or "*" for COUNT(*) */
-    int    is_distinct;     /* DISTINCT applied to this item */
+    int    is_distinct;     /* DISTINCT on aggregate argument (e.g. COUNT(DISTINCT col)) */
+    /* Bounded searched CASE inside COUNT/SUM. NULL = no CASE. When ELSE is
+     * absent, SQL yields NULL for nonmatching rows, not zero. Executor must
+     * implement this explicitly; agg_arg retains the original CASE text. */
+    struct {
+        char* column;       /* boolean column tested by WHEN [NOT] column */
+        int negated;
+        int then_value;     /* literal 1 */
+        int has_else;
+        int else_value;     /* literal 0 or 1 when has_else */
+    } *agg_case;
     struct qihse_sql_ast_s* scalar_subquery; /* scalar subquery in select list */
     /* Window function support */
     qihse_sql_win_kind_t win_kind;
@@ -307,10 +336,13 @@ typedef struct {
 typedef struct {
     char*             name;
     qihse_sql_type_t  type;
-    int               type_len;     /* length for VARCHAR / VECTOR dim */
+    int               type_len;     /* VARCHAR length, VECTOR dimension, NUMERIC precision */
+    int               type_scale;   /* NUMERIC scale (0 when omitted) */
     int               not_null;
     int               is_primary_key;
     char*             default_expr; /* raw default expression (optional) */
+    char*             generated_expr; /* raw stored-generated expression */
+    int               generated_stored;
     int               is_unique;    /* column-level UNIQUE */
     int               is_serial;    /* SERIAL / BIGSERIAL */
     qihse_sql_fk_t*   fk;           /* column-level REFERENCES (optional) */
@@ -320,9 +352,33 @@ typedef struct {
 typedef struct {
     char* name;
     char* table_name;
-    char* column_name;   /* single-column index; NULL if multi-column */
+    char* column_name;   /* first key when a simple column is present */
+    char** expressions;  /* index key expressions, in order */
+    size_t num_expressions;
+    int* descending;     /* per-key DESC flags */
+    char* using_method;  /* optional access method, e.g. gin */
     int   unique;
+    int   if_not_exists;
 } qihse_sql_index_def_t;
+
+typedef struct {
+    char* name;
+    char* returns;
+    char* language;
+    char* body;
+    int or_replace;
+} qihse_sql_function_def_t;
+
+typedef struct {
+    char* name;
+    char* table_name;
+    char* timing;
+    char* event;
+    char* function_name;
+    int or_replace;
+    int for_each_row;
+    int drop_if_exists;
+} qihse_sql_trigger_def_t;
 
 /* -------------------------------------------------------------------------
  * ALTER TABLE actions
@@ -464,6 +520,7 @@ typedef struct qihse_sql_ast_s {
 
     /* DDL: CREATE TABLE / CREATE INDEX / DROP */
     char* table_name;                   /* target table for DDL/DML */
+    int create_if_not_exists;            /* CREATE TABLE IF NOT EXISTS */
     qihse_sql_column_def_t* columns;    /* CREATE TABLE columns (owned) */
     size_t num_columns;
     qihse_sql_index_def_t* index_def;   /* CREATE INDEX (owned) */
@@ -496,6 +553,10 @@ typedef struct qihse_sql_ast_s {
     /* CREATE VIEW / MATERIALIZED VIEW */
     char* view_name;                    /* view name */
     struct qihse_sql_ast_s* view_query; /* owned SELECT AST for the view */
+    int view_is_materialized;
+    int view_if_not_exists;             /* CREATE MATERIALIZED VIEW IF NOT EXISTS */
+    qihse_sql_function_def_t* function_def;
+    qihse_sql_trigger_def_t* trigger_def;
 
     /* EXPLAIN / EXPLAIN ANALYZE */
     int   explain_analyze;              /* 1 = EXPLAIN ANALYZE */
@@ -524,7 +585,10 @@ typedef struct qihse_sql_ast_s {
     /* INSERT specifics */
     char** insert_columns;              /* column names for INSERT */
     size_t num_insert_columns;
-    char*** insert_rows;                /* each row is array of value strings */
+    char*** insert_rows;                /* each row is a NULL-terminated array of values */
+    qihse_sql_type_t** insert_cast_types; /* [row][column]; UNKNOWN without a cast */
+    uint16_t** insert_parameter_indexes; /* [row][column]; 1-based, 0 literal */
+    int** insert_quoted;                /* [row][column]; 1 for quoted string, 0 for SQL token */
     size_t num_insert_rows;
     char*  insert_select_query;         /* raw INSERT ... SELECT text */
 
@@ -532,6 +596,8 @@ typedef struct qihse_sql_ast_s {
     char** set_columns;                 /* SET column names */
     char** set_values;                  /* RHS text; string literals stored without
                                          * their quotes, matching insert_rows */
+    uint16_t* set_parameter_indexes;   /* [assignment]; 1-based, 0 literal */
+    int* set_quoted;                    /* quoted literal, distinct from SQL NULL */
     size_t num_set;
 
     /* raw */
@@ -546,6 +612,13 @@ typedef struct qihse_sql_ast_s {
  * is malformed: an UPDATE with no SET assignments (or an assignment with no
  * value) is refused with NULL rather than returned as a silent no-op. */
 qihse_sql_ast_t* qihse_parse_sql_to_ast(const char* sql);
+
+#define QIHSE_SQL_MAX_PARAMETERS 128
+
+/* Count distinct contiguous parameter identities.  Validity rejects missing,
+ * out-of-range and unsupported expression positions (including raw SQL). */
+size_t qihse_sql_ast_parameter_count(const qihse_sql_ast_t* ast);
+int qihse_sql_ast_parameters_valid(const qihse_sql_ast_t* ast);
 
 void qihse_sql_ast_free(qihse_sql_ast_t* ast);
 

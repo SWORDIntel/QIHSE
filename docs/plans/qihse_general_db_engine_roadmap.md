@@ -5,7 +5,7 @@
 > status lines for SQL, transactions, secondary indexes and replication in
 > [architecture/](../architecture/)). Treat its phase markers as intent.
 
-> **Update:** Phases 1-8 are **COMPLETE**. Phase 9 (Database Equivalency Commands) is **COMPLETE** -- all 8 target databases now have comprehensive command interoperability:
+> **Historical phase update (not an application-replacement acceptance claim):** Phases 1-8 and the Phase 9 command inventory were previously marked **COMPLETE**. Those labels record historical implementation intent only; parser acceptance, catalog/storage changes, and isolated component tests do not establish a complete SQL execution path, PostgreSQL-equivalent behavior, successful source migration, or safe cutover for real applications. This roadmap now tracks readiness to support a possible later DIRECTEYE migration; it authorizes no migration, production listener enablement, or DSN change. The current W11/pgwire gates in the [master roadmap](../../ROADMAP.md#w11--general-database-application-platform-active-stretch-goal) and [source-backed compatibility note](../architecture/pgwire_app_compat.md) supersede those broad claims for SQL consumers:
 > - **Redis**: lists, hashes, sets, sorted sets, pub/sub, transactions (MULTI/EXEC), bitmaps, HyperLogLog, scripting, key management, server commands
 > - **MongoDB**: CRUD operations, query operators, aggregation pipeline, admin commands, BSON helpers, in-memory catalog
 > - **PostgreSQL**: TRUNCATE, BEGIN/COMMIT/ROLLBACK, COPY, GRANT/REVOKE, CASE/CAST, transaction control, DCL, utility commands, catalog views, window functions
@@ -17,7 +17,9 @@
 >
 > See the status table below for details.
 >
-> **Future direction:** with Phases 1-9 complete, **Phase 10 (Federation Data Plane)** is the accepted next major effort. It turns the database-centric cluster into a federation of sovereign nodes and adds the build/supply-chain substrate. See the Phase 10 section at the end of this document and the full design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_plan.md).
+> **Recorded verification (2026-10-29; not rerun by the documentation audit):** The disposable all-driver readiness run now passes 23/23 tests with psycopg2, psycopg v3 and asyncpg, including the 26 source-derived migration calls, SELECT corpus, typed parameters, generated/index/trigger/materialized-view behavior and genuine low-clearance denials. The post-review complete `make test TEST_JOBS=32` passed all 141 scheduled targets and additional W12/TurboQuant and UWP TLS tail checks (exit 0). The separate all-driver run passed 23/23 in 213.43s. No general PostgreSQL compatibility, production deployment or cutover is claimed. See the [master roadmap](../../ROADMAP.md#w11--general-database-application-platform-active-stretch-goal) and [source-backed compatibility gate](../architecture/pgwire_app_compat.md).
+>
+> **Historical direction:** after the command-inventory phases, **Phase 10 (Federation Data Plane)** was accepted as the next major effort. It turns the database-centric cluster into a federation of sovereign nodes and adds the build/supply-chain substrate. See the Phase 10 section at the end of this document and the full design of record: [qihse_federation_upgrade_plan.md](qihse_federation_upgrade_plan.md).
 >
 > For cross-workstream sequencing (federation, AI fabric, cluster brain, overlay, production hardening), see the master [ROADMAP.md](../../ROADMAP.md).
 
@@ -37,7 +39,7 @@ QIHSE today is a native C99 multi-model engine with eight storage subsystems, tw
 | Spatial index (Z-order Morton) | Production | Bounding box + radius queries |
 | SQLite VFS compatibility | Production | Drop-in sqlite3_vfs |
 | RESP2/RESP3 wire protocol | Production | Redis-compatible commands + cluster |
-| PostgreSQL wire protocol (pgwire) | Production | Sharded catalogs, distributed planner |
+| PostgreSQL wire protocol (pgwire) | Partial for application replacement | Legacy cluster path is distinct from opt-in authenticated durable SQL. The disposable source-derived readiness gate now passes with psycopg2, psycopg v3 and asyncpg, including typed extended queries and authenticated denials; general PostgreSQL and production lifecycle coverage remain incomplete. No consumer DSN has changed. |
 | Unified Wire Protocol (UWP) | Production | Binary, zero-alloc, engine-routed |
 | Cluster sharding (16384 slots) | Production | CRC16, MOVED/ASK, gossip, Raft failover |
 | Cluster rebalancing / migration | Production | Zero-downtime ASK handoff |
@@ -45,26 +47,51 @@ QIHSE today is a native C99 multi-model engine with eight storage subsystems, tw
 | Task queue (Celery-equivalent) | Production | Priority, retry, cron, Python SDK |
 | Auth (classification + SCI compartments) | Production | CNSA 2.0 aligned crypto (in progress), constant-time reject |
 | Temporal / time-travel queries | Partial | Vector DB only; not cross-engine |
-| SQL parser | Production | Full SQL: JOIN, GROUP BY, HAVING, ORDER BY, subqueries, UNION/INTERSECT/EXCEPT, CTEs, window functions, UPSERT, RETURNING, views, sequences, VACUUM, NOTIFY/LISTEN, EXPLAIN |
+| SQL parser | Broad parsing; execution partial | AST acceptance is not durable execution: JOIN, aggregates, UPSERT, advanced DDL and other listed forms require source-backed functional tests before claiming application compatibility. |
 | QQL parser | Minimal | Spatial + temporal + join hints + vector flag |
-| Transactions (ACID) | Production | BEGIN/COMMIT/ROLLBACK/SAVEPOINT, 3 isolation levels, MVCC, 2PC |
-| Secondary indexes (B-tree, hash) | Production | B+ tree, hash index, composite keys, index manager |
+| Transactions / MVCC | Partial by component | Transaction manager, point-key OCC and standalone MVCC/WAL tests exist; bounded UWP SQL row-store transactions are distinct. No general cross-model SQL ACID or SQL WAL recovery claim. See [transaction boundaries and recovery gates](../architecture/transactions_mvcc.md). |
+| SQL secondary indexes | Partial / not admitted by durable SQL catalog | Standalone index components do not imply SQL DDL/planner/maintenance compatibility; current schema registry admits only non-unique single-column indexes. |
 | Replication (read replicas, CDC) | Production | Streaming replication, replication slots, read replica pool, CDC pub/sub |
 | Graph engine (explicit edges/vertices) | Production | Vertex/edge store, Cypher parser/executor, graph algorithms, vector fusion |
 | MongoDB wire protocol (BSON) | Production | BSON serialization, wire protocol server, OP_REPLY handling |
 | HTTP/REST API | Production | HTTP server with route registration, JSON responses, ClickHouse + ES compatible endpoints |
 | Observability (metrics, tracing) | Production | Prometheus /metrics export, OpenTelemetry tracing with span export |
 | Backup / snapshot / restore | Production | Full/incremental backups with checksums, restore, verify |
-| Schema management / migrations | Production | Schema registry, CREATE/ALTER/DROP TABLE/INDEX, views, sequences |
+| Schema management / migrations | Partial for pgwire applications | Durable DDL-only generations stage up to 16 new relations with supported catalog objects and real materialized seed rows. Native NULL, UUID, JSONB-text, BOOLEAN, TIMESTAMPTZ, exact NUMERIC and TSVECTOR, bounded defaults/generated values, executable non-unique equality/GIN indexes, uuid-ossp and updated_at function/trigger are supported. Single-column PK/NOT NULL/NOT-NULL UNIQUE are enforced; CHECK/FK/cascades, composite keys, nullable UNIQUE, SERIAL, mixed DDL/DML and general ALTER/DROP remain refused. No actual DIRECTEYE migration or DDL retry receipt guarantee. |
 | Connection pooling / pgbouncer-like | Production | Session/transaction/statement pooling, backend management, health checks |
 | Parallel query execution | Production | Multi-worker parallel scan, join, aggregate with pthread partitioning |
 
 ---
 
+## Current SQL execution limits
+
+The authenticated `qihse_pg_wire_handle_client_uwp()` and explicitly bound durable
+UWP store are the execution boundary, not the legacy multi-engine handler or
+parser inventory. Row transactions enlist at most 16 shadows and support own-write
+SELECT with generation/commit-time authorization fences. Table ACLs and the three
+INT tenant/classification/SCI label columns apply together; partial/invalid labels
+refuse, unlabeled tables are system-tenant unclassified only, and UPDATE cannot
+relabel. This is not general SQL MVCC/isolation parity or cross-model ACID.
+
+Typed extended queries keep 32 statements and 32 portals per connection, with
+64 parameters/64 result columns, 1 MiB per bind value/captured result, 16 MiB
+frontend message length and 128-byte statement/portal names. Describe
+uses catalog metadata; Execute uses separate typed values, not substitution.
+Execute max_rows must be zero. Implicit extended DML commits at clean Sync and
+rolls back a failed pipeline; CommandComplete before Sync is not durable ACK.
+The simple-query retry identity is refused for typed writes. Savepoints,
+suspended portals, general joins/grouping/windows/CTEs/COPY/RETURNING/ON CONFLICT,
+arbitrary stored code/views/catalogs, DDL retry receipts and PostgreSQL-wide
+role semantics remain outside this contract. Source-specific aggregate/top-1
+branches and generated/trigger/materialized behavior are deliberately bounded;
+see [exact supported shapes, OIDs and defaults](../architecture/sql_engine.md)
+and [the disposable source-backed gate](../architecture/pgwire_app_compat.md).
+
 ## 1. Roadmap Phases
 
-### Phase 1 -- Relational Completeness ✅ COMPLETE
-Goal: Make the SQL surface sufficient to replace PostgreSQL for application workloads.
+### Phase 1 -- Relational Completeness ✅ COMPLETE (historical component inventory)
+Historical goal: Make the SQL surface sufficient to replace PostgreSQL for application workloads.
+This heading records the component inventory, not application-replacement acceptance.
 
 | Item | Description | Key Files |
 |---|---|---|
@@ -76,8 +103,10 @@ Goal: Make the SQL surface sufficient to replace PostgreSQL for application work
 | 1.6 Prepared statements | Parse-once, execute-many via pgwire extended query protocol | src/spinnaker/qihse_pg_wire.c |
 | 1.7 Cost-based optimizer | Statistics histogram, cardinality estimation, plan enumeration | new qihse_optimizer.c |
 
-### Phase 2 -- ACID Transactions & MVCC ✅ COMPLETE
-Goal: Provide transactional guarantees across all engines, not just per-key.
+### Phase 2 -- ACID Transactions & MVCC ✅ COMPLETE (historical component inventory)
+Historical goal: Provide transactional guarantees across all engines, not just per-key.
+The inventory below does not establish cross-model SQL atomicity or general
+PostgreSQL isolation; current row-store transactions and limits are separate.
 
 | Item | Description | Key Files |
 |---|---|---|

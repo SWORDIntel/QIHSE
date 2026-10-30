@@ -2,7 +2,9 @@
 
 Provides a psycopg2-compatible API that connects to QIHSE's PostgreSQL wire protocol.
 """
+import ipaddress
 import socket
+import ssl
 import struct
 import datetime
 from collections import namedtuple
@@ -64,13 +66,38 @@ class InternalError(Error):
 class connection:
     """psycopg2-compatible connection."""
     
-    def __init__(self, host="localhost", port=5432, dbname="test", user="admin", password="", autocommit=False):
+    def __init__(self, host="localhost", port=5432, dbname="test", user="admin", password="", autocommit=False,
+                 sslmode="verify-full", sslrootcert=None, sslhostname=None,
+                 sslcert=None, sslkey=None):
         self.host = host
         self.port = port
         self.dbname = dbname
         self.user = user
         self.password = password
         self.autocommit = autocommit
+        if sslmode not in ("verify-full", "disable"):
+            raise OperationalError("sslmode must be verify-full or explicit loopback-only disable")
+        if sslmode == "disable" and any(
+                value is not None for value in (sslrootcert, sslhostname, sslcert, sslkey)):
+            raise OperationalError("TLS options cannot be used with sslmode=disable")
+        if (sslcert is None) != (sslkey is None):
+            raise OperationalError("sslcert and sslkey must be supplied together")
+        for name, value in (("user", user), ("dbname", dbname), ("password", password)):
+            if not isinstance(value, str) or "\x00" in value:
+                raise OperationalError("%s must be a string without NUL bytes" % name)
+        self.sslmode = sslmode
+        self.sslhostname = host if sslhostname is None else sslhostname
+        self._ssl_context = None
+        if sslmode == "verify-full":
+            if not isinstance(self.sslhostname, str) or not self.sslhostname or "\x00" in self.sslhostname:
+                raise OperationalError("TLS hostname must be a nonempty string without NUL bytes")
+            try:
+                self._ssl_context = ssl.create_default_context(cafile=sslrootcert)
+                self._ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+                if sslcert is not None:
+                    self._ssl_context.load_cert_chain(sslcert, sslkey)
+            except (OSError, ValueError) as exc:
+                raise OperationalError("invalid PostgreSQL TLS configuration: %s" % exc) from exc
         self._closed = False
         self._sock = None
         self._in_transaction = False
@@ -79,11 +106,22 @@ class connection:
     
     def _connect(self):
         try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(10)
-            self._sock.connect((self.host, self.port))
+            self._sock = socket.create_connection((self.host, self.port), timeout=10)
+            if self.sslmode == "disable":
+                # Check the connected peer, not a hostname that could resolve differently.
+                if not ipaddress.ip_address(self._sock.getpeername()[0]).is_loopback:
+                    raise OperationalError("sslmode=disable is restricted to loopback development")
+            else:
+                self._sock.sendall(struct.pack("!II", 8, 80877103))
+                if self._read_exact(self._sock, 1) != b'S':
+                    raise OperationalError("PostgreSQL server refused TLS; cleartext fallback is disabled")
+                self._sock = self._ssl_context.wrap_socket(
+                    self._sock, server_hostname=self.sslhostname)
             self._send_startup()
-        except (socket.error, OSError, Error):
+        except OSError as exc:
+            self._discard_socket()
+            raise OperationalError("PostgreSQL TLS/transport failed: %s" % exc) from exc
+        except (ValueError, Error):
             self._discard_socket()
             raise
 

@@ -7,14 +7,12 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_postgres::config::SslMode;
+use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::types::ToSql;
 
-/// Marker retained for callers that do not configure TLS.
-///
-/// The current QIHSE PostgreSQL listener does not offer TLS negotiation. The
-/// credentials and SQL traffic therefore use the listener's configured
-/// transport; use a protected network when connecting with this marker.
-pub struct NoTls;
+/// Explicit plaintext connector; requires [`Config::disable_tls`].
+pub use tokio_postgres::NoTls;
 
 /// Connection configuration builder.
 pub struct Config {
@@ -23,6 +21,7 @@ pub struct Config {
     dbname: String,
     user: String,
     password: String,
+    ssl_mode: SslMode,
 }
 
 impl Config {
@@ -33,6 +32,7 @@ impl Config {
             dbname: "test".into(),
             user: "admin".into(),
             password: String::new(),
+            ssl_mode: SslMode::Require,
         }
     }
     pub fn host(mut self, host: &str) -> Self {
@@ -56,21 +56,33 @@ impl Config {
         self
     }
 
+    /// Explicitly opt into plaintext transport, for use with [`NoTls`].
+    /// Credentials and SQL traffic will not be encrypted.
+    pub fn disable_tls(mut self) -> Self {
+        self.ssl_mode = SslMode::Disable;
+        self
+    }
+
     /// Connect and authenticate using the configured database principal.
     ///
     /// Authentication completes during the PostgreSQL startup handshake. A
     /// returned client is considered authenticated only after that succeeds.
-    pub async fn connect<T>(&self, _tls: T) -> io::Result<(Client, Connection)>
+    /// TLS is required unless explicitly disabled. The supplied connector is
+    /// responsible for verifying the configured host and its certificate chain;
+    /// TLS errors never trigger a plaintext retry.
+    pub async fn connect<T>(&self, tls: T) -> io::Result<(Client, Connection)>
     where
-        T: Send + 'static,
+        T: MakeTlsConnect<tokio_postgres::Socket> + Send,
+        T::Stream: Send + 'static,
     {
         let mut pg = tokio_postgres::Config::new();
         pg.host(&self.host)
             .port(self.port)
             .dbname(&self.dbname)
             .user(&self.user)
-            .password(&self.password);
-        let (client, connection) = pg.connect(tokio_postgres::NoTls).await.map_err(pg_error)?;
+            .password(&self.password)
+            .ssl_mode(self.ssl_mode);
+        let (client, connection) = pg.connect(tls).await.map_err(pg_error)?;
         let task: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> =
             Box::pin(async move { connection.await.map_err(pg_error) });
         let inner = Arc::new(Mutex::new(ClientInner {
@@ -340,5 +352,7 @@ mod tests {
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 5432);
         assert_eq!(config.dbname, "test");
+        assert_eq!(config.ssl_mode, SslMode::Require);
+        assert_eq!(config.disable_tls().ssl_mode, SslMode::Disable);
     }
 }

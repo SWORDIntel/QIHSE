@@ -110,6 +110,7 @@ DO_CLEAN=1
 DO_SERVICE=1
 DO_LAUNCH=1
 DRY_RUN=0
+CHECK_DEPENDENCIES_ONLY=0
 VERBOSE=1
 
 # ── Usage / Help ──────────────────────────────────────────────────────────────
@@ -148,6 +149,7 @@ Build & Execution Options:
   --no-service             Install binaries and keys, but do not create/modify systemd unit
   --launch                 Start/restart systemd cluster service immediately (default: enabled)
   --no-launch              Create systemd unit, but leave daemon offline until started manually
+  --check-dependencies     Check required runtime libraries and exit without modifying system
   --dry-run                Print detected ISA, planned compiler flags, and install plan without modifying system
   --verbose, -v            Show detailed command output (default: verbose)
   --quiet, -q              Suppress detailed command output
@@ -184,6 +186,7 @@ while [ "$#" -gt 0 ]; do
         --no-service)        DO_SERVICE=0; shift ;;
         --launch)            DO_LAUNCH=1; shift ;;
         --no-launch)         DO_LAUNCH=0; shift ;;
+        --check-dependencies) CHECK_DEPENDENCIES_ONLY=1; shift ;;
         --dry-run)           DRY_RUN=1; shift ;;
         --verbose|-v)        VERBOSE=1; shift ;;
         --quiet|-q)          VERBOSE=0; shift ;;
@@ -195,6 +198,17 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+# Fail before credentials, builds, installation or service changes. SQL FTS uses
+# dlopen, so ldd on libqihse alone cannot establish this runtime dependency.
+make --no-print-directory -s -C "${ROOT_DIR}" check-runtime-deps
+if [ "$CHECK_DEPENDENCIES_ONLY" -eq 1 ]; then
+    exit 0
+fi
+if [ "$(realpath -m -- "$PREFIX")" = "$(realpath -- "$ROOT_DIR")" ]; then
+    echo "[ERROR] Installation prefix is the source checkout; use a separate staged/versioned prefix." >&2
+    exit 1
+fi
 
 # Operator password resolution:
 # 1. Use user-supplied QIHSE_OPERATOR_PASSWORD or --operator-password if provided
@@ -740,6 +754,8 @@ $SUDO install -m 755 "${ROOT_DIR}/libqihse.so" "${PREFIX}/bin/libqihse.so"
 $SUDO install -m 755 "${ROOT_DIR}/qihse-cluster-daemon" "${PREFIX}/bin/qihse-cluster-daemon"
 $SUDO install -m 755 "${ROOT_DIR}/qihse_keygen" "${PREFIX}/bin/qihse_keygen"
 $SUDO install -m 755 "${ROOT_DIR}/qihse-machine-token" "${PREFIX}/bin/qihse-machine-token"
+$SUDO install -d -m 755 "${PREFIX}/libexec"
+$SUDO install -m 755 "${ROOT_DIR}/tools/fleet/refresh-machine-token.sh" "${PREFIX}/libexec/refresh-machine-token.sh"
 
 if [ -f "${ROOT_DIR}/qihse-federation-ca" ]; then
     $SUDO install -m 755 "${ROOT_DIR}/qihse-federation-ca" "${PREFIX}/bin/qihse-federation-ca"
@@ -748,15 +764,8 @@ if [ -f "${ROOT_DIR}/tests/qihse_server" ]; then
     $SUDO install -m 755 "${ROOT_DIR}/tests/qihse_server" "${PREFIX}/bin/qihse_server"
 fi
 
-# Install headers
-if [ -f "${ROOT_DIR}/qihse.h" ]; then
-    $SUDO install -m 644 "${ROOT_DIR}/qihse.h" "${PREFIX}/include/qihse/qihse.h"
-fi
-for h in "${ROOT_DIR}"/include/*.h; do
-    if [ -f "$h" ]; then
-        $SUDO install -m 644 "$h" "${PREFIX}/include/qihse/$(basename "$h")"
-    fi
-done
+# Share the staged installer manifest, including transitive public headers.
+$SUDO make --no-print-directory -C "${ROOT_DIR}" install-headers PREFIX="${PREFIX}" DESTDIR=
 
 echo "  [✓] Installed binaries and shared libraries into ${PREFIX}."
 

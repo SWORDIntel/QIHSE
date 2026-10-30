@@ -1,15 +1,31 @@
 # QIHSE PostgreSQL Wire Protocol (PGWire) Sharded Partitioning & Multi-Engine Virtual Catalogs
 
-> **Status: implemented** — the pgwire server, CRC16 slot routing, and the
-> virtual `pg_catalog.pg_tables` view are exercised by
-> `tests/test_pg_wire_cluster.c` (`make test-pg-wire-cluster`; the target exists
-> but is not part of the default `make test` list).
+> **Status: partial** — this document describes the legacy cluster handler's
+> virtual catalog/routing surface. `tests/test_pg_wire_cluster.c`
+> (`make test-pg-wire-cluster`) exercises that component, not universal client,
+> ORM, transaction or durable SQL compatibility. Current authenticated SQL is
+> documented separately in [SQL engine](sql_engine.md) and
+> [application readiness](pgwire_app_compat.md).
 
 ## 1. Executive Summary
 
 QIHSE incorporates a native **PostgreSQL Wire Protocol v3 Server** (`include/qihse_pg_wire.h`) extended with **16,384 CRC16 Hash Slot Partitioning** and **Multi-Engine Virtual System Catalogs**.
 
-This enables standard SQL clients, BI platforms, and ORMs (`psql`, SQLAlchemy, Prisma, DBeaver, Grafana, Superset, Metabase) to connect directly over standard TCP port 5432 and execute multi-model queries across vector, time-series, columnar, and KV stores without middleware or proxies.
+This is a protocol and routing surface, not evidence that arbitrary SQL clients,
+BI platforms or ORMs work without adaptation. Port 5432 in examples is a chosen
+listener port, not proof of a deployed service. The legacy
+`qihse_pg_wire_handle_client_multi()` has no transaction manager and refuses
+BEGIN/COMMIT/ROLLBACK. Its virtual multi-engine catalogs and planner branches
+must not be confused with authenticated durable row-store SQL.
+
+The context-backed `qihse_pg_wire_handle_client_uwp()` instead propagates the
+client principal to UWP SQL and supports bounded durable DDL-only generations,
+transactional row reads, row labels and typed extended queries. Its supported
+`information_schema.tables` and `pg_indexes` shapes enumerate committed catalog
+objects visible to that principal, not invented multi-engine tables. Prepared
+objects are connection-local (32 statements/32 portals, 64 binds/result columns); implicit
+extended DML commits only at clean Sync. Unsupported SQL/catalog shapes fail
+closed; the component diagram below is not an execution guarantee.
 
 ---
 
@@ -40,7 +56,9 @@ This enables standard SQL clients, BI platforms, and ORMs (`psql`, SQLAlchemy, P
 
 ## 3. Supported Virtual Tables & Views
 
-When clients introspect the database schema (via `pg_catalog.pg_tables` or `information_schema.tables`), QIHSE returns virtual system tables representing its multi-engine architecture:
+The **legacy cluster handler** exposes virtual engine names for its recognized
+catalog shapes, rather than a complete PostgreSQL catalog. These are not the
+context-backed SQL registry's actual table definitions:
 
 | Virtual Table | Object Type | Description |
 |---|---|---|
@@ -65,7 +83,12 @@ SELECT * FROM cluster_nodes;
 -- node_beta      | 10.0.0.2  | 5432 | master | connected
 ```
 
-### 4.2 Partition-Scoped & Hybrid Multi-Model Queries
+### 4.2 Partition-Scoped & Hybrid Multi-Model Query Shapes
+
+The following illustrate legacy planner/routing syntax. They are **not**
+assertions that these queries execute against authenticated durable SQL, nor
+that aggregates/vector/TSDB share a SQL transaction or recovery boundary.
+
 ```sql
 -- Scoped single-shard vector similarity query (O(1) slot dispatch)
 SELECT * FROM {device_4096} WHERE vector_search(embedding, top_k=5);
@@ -79,7 +102,7 @@ SELECT * FROM telemetry WHERE ts_range(ts, 0, 1000000) AND AVG(cpu_temp) > 80.0;
 ## 5. C99 API Reference
 
 ```c
-// Start sharded PostgreSQL wire server
+// Legacy cluster entry point; not the authenticated durable SQL listener.
 bool ok = qihse_start_pg_wire_cluster_server(
     kv_store, vector_db, tsdb, column_store, topology, 5432, "0.0.0.0"
 );

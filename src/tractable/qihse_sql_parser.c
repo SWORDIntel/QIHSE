@@ -15,6 +15,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <limits.h>
 
 /* -------------------------------------------------------------------------
  * Small string utilities
@@ -71,13 +72,39 @@ static const char* read_identifier(const char* p, size_t* out_len) {
         p++;
         start = p;
         while (*p && *p != '"') p++;
-        *out_len = (size_t)(p - start);
-        if (*p == '"') p++;
+        if (*p == '"') *out_len = (size_t)(p - start);
     } else {
-        while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '.')) p++;
-        *out_len = (size_t)(p - start);
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            p++;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '.')) p++;
+            *out_len = (size_t)(p - start);
+        }
     }
     return start;
+}
+
+/* Returns -1 for a malformed/unsupported parameter leaf, 0 for a literal.
+ * Only an entire unquoted value (optionally cast to a supported temporal type)
+ * can be a parameter; no SQL string substitution is performed. */
+static int parameter_leaf(const char* start, size_t len, qihse_sql_type_t* cast) {
+    if (!len || *start != '$') return 0;
+    size_t pos = 1, index = 0;
+    if (!isdigit((unsigned char)start[pos])) return -1;
+    while (pos < len && isdigit((unsigned char)start[pos])) {
+        index = index * 10 + (unsigned)(start[pos++] - '0');
+        if (index > QIHSE_SQL_MAX_PARAMETERS) return -1;
+    }
+    if (!index) return -1;
+    if (pos < len) {
+        if (len - pos < 3 || start[pos] != ':' || start[pos + 1] != ':') return -1;
+        pos += 2;
+        if (len - pos == 9 && strncasecmp(start + pos, "timestamp", 9) == 0)
+            *cast = QIHSE_TYPE_TIMESTAMP;
+        else if (len - pos == 11 && strncasecmp(start + pos, "timestamptz", 11) == 0)
+            *cast = QIHSE_TYPE_TIMESTAMPTZ;
+        else return -1;
+    }
+    return (int)index;
 }
 
 static const char* read_value(const char* p, size_t* out_len, int* is_string, const char** after) {
@@ -92,6 +119,7 @@ static const char* read_value(const char* p, size_t* out_len, int* is_string, co
         while (*p && *p != '\'') p++;
         *out_len = (size_t)(p - start);
         if (*p == '\'') p++;
+        else *out_len = 0;
     } else {
         while (*p && !isspace((unsigned char)*p) && *p != ';' && *p != ')') p++;
         *out_len = (size_t)(p - start);
@@ -146,6 +174,15 @@ static qihse_sql_type_t parse_type_name(const char* p, size_t len, int* type_len
     if (strcmp(tmp, "TEXT") == 0) return QIHSE_TYPE_TEXT;
     if (strcmp(tmp, "BOOL") == 0 || strcmp(tmp, "BOOLEAN") == 0) return QIHSE_TYPE_BOOL;
     if (strcmp(tmp, "TIMESTAMP") == 0) return QIHSE_TYPE_TIMESTAMP;
+    if (strcmp(tmp, "TIMESTAMPTZ") == 0) return QIHSE_TYPE_TIMESTAMPTZ;
+    if (strcmp(tmp, "JSONB") == 0) return QIHSE_TYPE_JSONB;
+    if (strcmp(tmp, "UUID") == 0) return QIHSE_TYPE_UUID;
+    if (strcmp(tmp, "TSVECTOR") == 0) return QIHSE_TYPE_TSVECTOR;
+    if (strcmp(tmp, "INET") == 0) return QIHSE_TYPE_INET;
+    if (strcmp(tmp, "NUMERIC") == 0 || strcmp(tmp, "DECIMAL") == 0) return QIHSE_TYPE_NUMERIC;
+    if (strcmp(tmp, "DATE") == 0) return QIHSE_TYPE_DATE;
+    if (strcmp(tmp, "SERIAL") == 0) return QIHSE_TYPE_SERIAL;
+    if (strcmp(tmp, "BIGSERIAL") == 0) return QIHSE_TYPE_BIGSERIAL;
     if (strcmp(tmp, "VECTOR") == 0) return QIHSE_TYPE_VECTOR;
     return QIHSE_TYPE_UNKNOWN;
 }
@@ -221,18 +258,72 @@ static const char* find_matching_paren(const char* p) {
 /* -------------------------------------------------------------------------
  * Parse a SELECT-list item expression, detecting aggregates and aliases
  * ------------------------------------------------------------------------- */
-static void parse_select_item(const char* start, size_t len, qihse_sql_select_item_t* item) {
+static bool has_case_keyword(const char* text) {
+    int quoted = 0;
+    for (const char* p = text; *p; ++p) {
+        if (*p == '\'') { quoted = !quoted; continue; }
+        if (!quoted && (p == text || !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) &&
+            match_kw(p, "CASE") == p + 4) return true;
+    }
+    return false;
+}
+
+/* Only this bounded CASE shape has an AST representation. */
+static bool parse_agg_case(const char* p, const char* end,
+                           qihse_sql_select_item_t* item) {
+    const char* next = match_kw(p, "CASE");
+    if (!next || !(p = match_kw(next, "WHEN"))) return false;
+    p = skip_ws(p);
+    const char* neg = match_kw(p, "NOT");
+    if (neg) p = skip_ws(neg);
+    size_t n = 0;
+    const char* col = read_identifier(p, &n);
+    if (!n || !(isalpha((unsigned char)*col) || *col == '_') ||
+        col[n-1] == '.' || !(p = match_kw(col + n, "THEN"))) return false;
+    p = skip_ws(p);
+    if (*p != '1' || isalnum((unsigned char)p[1]) || p[1] == '_') return false;
+    p = skip_ws(p + 1);
+    int has_else = 0, else_value = 0;
+    next = match_kw(p, "ELSE");
+    if (next) {
+        has_else = 1;
+        p = skip_ws(next);
+        if ((*p != '0' && *p != '1') || isalnum((unsigned char)p[1]) || p[1] == '_')
+            return false;
+        else_value = *p - '0';
+        p = skip_ws(p + 1);
+    }
+    next = match_kw(p, "END");
+    if (!next || skip_ws(next) != end) return false;
+    item->agg_case = calloc(1, sizeof(*item->agg_case));
+    if (!item->agg_case) return false;
+    item->agg_case->column = dup_token(col, n);
+    if (!item->agg_case->column) return false;
+    item->agg_case->negated = neg != NULL;
+    item->agg_case->then_value = 1;
+    item->agg_case->has_else = has_else;
+    item->agg_case->else_value = else_value;
+    return true;
+}
+
+static bool parse_select_item(const char* start, size_t len, qihse_sql_select_item_t* item) {
     memset(item, 0, sizeof(*item));
     /* find " AS " or trailing alias */
     char* buf = dup_token(start, len);
-    if (!buf) return;
-    
+    if (!buf) return false;
+
     char* endp = buf + len;
 
     /* look for " AS " */
     char* as_pos = NULL;
+    int depth = 0, quoted = 0;
     for (char* c = buf; c < endp - 3; c++) {
-        if (strncasecmp(c, " AS ", 4) == 0 || strncasecmp(c, "\tAS\t", 4) == 0) {
+        if (*c == '\'') quoted = !quoted;
+        if (quoted) continue;
+        if (*c == '(') depth++;
+        else if (*c == ')') depth--;
+        if (depth == 0 && (strncasecmp(c, " AS ", 4) == 0 ||
+                           strncasecmp(c, "\tAS\t", 4) == 0)) {
             as_pos = c;
             break;
         }
@@ -241,13 +332,11 @@ static void parse_select_item(const char* start, size_t len, qihse_sql_select_it
         *as_pos = '\0';
         char* alias_part = as_pos + 4;
         while (*alias_part && isspace((unsigned char)*alias_part)) alias_part++;
+        if (!*alias_part || strpbrk(alias_part, " \t\r\n")) { free(buf); return false; }
         item->alias = strdup(alias_part);
         /* trim trailing ws of expr */
         char* e = as_pos - 1;
         while (e > buf && isspace((unsigned char)*e)) { *e = '\0'; e--; }
-        item->expr = strdup(trim_str(buf));
-        free(buf);
-        return;
     }
 
     /* detect aggregate: NAME(arg) possibly at start */
@@ -267,13 +356,52 @@ static void parse_select_item(const char* start, size_t len, qihse_sql_select_it
             qihse_sql_agg_kind_t agg = detect_aggregate(fname, fname_len, NULL, NULL);
             if (agg != QIHSE_AGG_NONE) {
                 item->agg_kind = agg;
-                if ((size_t)(arg_e - arg_s) == 1 && arg_s[0] == '*') {
+                if (arg_s == arg_e) { free(buf); return false; }
+                const char* distinct = match_kw(arg_s, "DISTINCT");
+                if (distinct) {
+                    if (agg != QIHSE_AGG_COUNT) { free(buf); return false; }
+                    arg_s = skip_ws(distinct);
+                    if (arg_s >= arg_e) { free(buf); return false; }
+                    size_t n = 0;
+                    const char* col = read_identifier(arg_s, &n);
+                    const char* operand_end = col + n;
+                    if (!n || !(isalpha((unsigned char)*col) || *col == '_') ||
+                        col[n-1] == '.') { free(buf); return false; }
+                    /* JSON text extraction is an expression, not a bare column. */
+                    if (operand_end[0] == '-' && operand_end[1] == '>' &&
+                        operand_end[2] == '>') {
+                        const char* key = skip_ws(operand_end + 3);
+                        if (*key++ != '\'') { free(buf); return false; }
+                        while (key < arg_e && *key != '\'') key++;
+                        if (key == arg_e || key == skip_ws(operand_end + 3) + 1) {
+                            free(buf); return false;
+                        }
+                        operand_end = key + 1;
+                    }
+                    if (skip_ws(operand_end) != arg_e) { free(buf); return false; }
+                    item->is_distinct = 1;
+                    item->agg_arg = dup_range(col, operand_end);
+                } else if ((size_t)(arg_e - arg_s) == 1 && arg_s[0] == '*') {
+                    if (agg != QIHSE_AGG_COUNT) { free(buf); return false; }
                     item->agg_kind = QIHSE_AGG_COUNT_STAR;
                     item->agg_arg = strdup("*");
                 } else {
                     item->agg_arg = dup_range(arg_s, arg_e);
+                    if (!item->agg_arg) { free(buf); return false; }
+                    if (match_kw(arg_s, "CASE")) {
+                        if ((agg != QIHSE_AGG_COUNT && agg != QIHSE_AGG_SUM) ||
+                            !parse_agg_case(arg_s, arg_e, item)) {
+                            free(buf); return false;
+                        }
+                    } else if (has_case_keyword(item->agg_arg)) {
+                        free(buf); return false;
+                    }
                 }
                 item->expr = dup_range(fname, close + 1);
+                /* Conditional/DISTINCT windows need separate executor semantics. */
+                if ((item->agg_case || item->is_distinct) && match_kw(close + 1, "OVER")) {
+                    free(buf); return false;
+                }
                 /* check for OVER clause (aggregate used as window) */
                 const char* over_p = close + 1;
                 over_p = skip_ws(over_p);
@@ -288,8 +416,10 @@ static void parse_select_item(const char* start, size_t len, qihse_sql_select_it
                         }
                     }
                 }
+                if (*over_p && !item->window) { free(buf); return false; }
+                if (item->agg_case && item->window) { free(buf); return false; }
                 free(buf);
-                return;
+                return item->expr && item->agg_arg;
             }
             /* window function (non-aggregate) followed by OVER */
             qihse_sql_win_kind_t wk = detect_window(fname, fname_len);
@@ -315,13 +445,15 @@ static void parse_select_item(const char* start, size_t len, qihse_sql_select_it
                     }
                 }
                 free(buf);
-                return;
+                return true;
             }
         }
     }
 
+    if (has_case_keyword(buf)) { free(buf); return false; }
     item->expr = strdup(trim_str(buf));
     free(buf);
+    return item->expr != NULL;
 }
 
 /* -------------------------------------------------------------------------
@@ -344,11 +476,42 @@ static void parse_column_def(const char* seg, qihse_sql_column_def_t* col) {
     int type_len = 0;
     col->type = parse_type_name(tstart, tlen, &type_len);
     p = skip_ws(p);
+    if (col->type == QIHSE_TYPE_TIMESTAMP && match_kw(p, "WITH TIME ZONE")) {
+        col->type = QIHSE_TYPE_TIMESTAMPTZ;
+        p = skip_ws(match_kw(p, "WITH TIME ZONE"));
+    } else if (col->type == QIHSE_TYPE_TIMESTAMP && match_kw(p, "WITHOUT TIME ZONE")) {
+        p = skip_ws(match_kw(p, "WITHOUT TIME ZONE"));
+    }
     if (*p == '(') {
-        p++;
-        type_len = (int)strtol(p, (char**)&p, 10);
-        p = skip_ws(p);
-        if (*p == ')') p++;
+        if (col->type != QIHSE_TYPE_VARCHAR && col->type != QIHSE_TYPE_VECTOR &&
+            col->type != QIHSE_TYPE_NUMERIC) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+        p = skip_ws(p + 1);
+        if (!isdigit((unsigned char)*p)) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+        char* end;
+        long n = strtol(p, &end, 10);
+        if (n <= 0 || n > INT_MAX) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+        type_len = (int)n;
+        p = skip_ws(end);
+        if (*p == ',' && col->type == QIHSE_TYPE_NUMERIC) {
+            p = skip_ws(p + 1);
+            if (!isdigit((unsigned char)*p)) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+            n = strtol(p, &end, 10);
+            if (n < 0 || n > type_len) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+            col->type_scale = (int)n;
+            p = skip_ws(end);
+        }
+        if (*p != ')') { col->type = QIHSE_TYPE_UNKNOWN; return; }
+        p = skip_ws(p + 1);
+    }
+    if (p[0] == '[' && p[1] == ']') {
+        switch (col->type) {
+            case QIHSE_TYPE_INT: col->type = QIHSE_TYPE_INT_ARRAY; break;
+            case QIHSE_TYPE_FLOAT: col->type = QIHSE_TYPE_FLOAT_ARRAY; break;
+            case QIHSE_TYPE_TEXT: col->type = QIHSE_TYPE_TEXT_ARRAY; break;
+            case QIHSE_TYPE_BOOL: col->type = QIHSE_TYPE_BOOL_ARRAY; break;
+            default: col->type = QIHSE_TYPE_UNKNOWN; return;
+        }
+        p = skip_ws(p + 2);
     }
     col->type_len = type_len;
 
@@ -375,6 +538,25 @@ static void parse_column_def(const char* seg, qihse_sql_column_def_t* col) {
                 const char* close = find_matching_paren(p);
                 if (close) { col->check_expr = dup_range(p, close + 1); p = close + 1; continue; }
             }
+            col->type = QIHSE_TYPE_UNKNOWN;
+            return;
+        }
+        const char* generated = match_kw(p, "GENERATED ALWAYS AS");
+        if (generated) {
+            p = skip_ws(generated);
+            if (*p != '(') { col->type = QIHSE_TYPE_UNKNOWN; return; }
+            const char* close = find_matching_paren(p);
+            if (!close || close == p + 1 || col->type != QIHSE_TYPE_TSVECTOR) {
+                col->type = QIHSE_TYPE_UNKNOWN;
+                return;
+            }
+            col->generated_expr = dup_range(p + 1, close);
+            if (!col->generated_expr) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+            p = skip_ws(close + 1);
+            const char* stored = match_kw(p, "STORED");
+            if (!stored) { col->type = QIHSE_TYPE_UNKNOWN; return; }
+            col->generated_stored = 1;
+            p = stored;
             continue;
         }
         if (strncasecmp(p, "REFERENCES", 10) == 0 && !isalnum((unsigned char)p[10])) {
@@ -449,6 +631,7 @@ static void parse_column_def(const char* seg, qihse_sql_column_def_t* col) {
                 continue;
             }
         }
+        if (*p) col->type = QIHSE_TYPE_UNKNOWN;
         break;
     }
 }
@@ -488,7 +671,11 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
                 size_t idx = ast->num_uniques;
                 ast->uniques = (qihse_sql_unique_t*)realloc(ast->uniques, (idx+1)*sizeof(qihse_sql_unique_t));
                 memset(&ast->uniques[idx], 0, sizeof(qihse_sql_unique_t));
-                ast->uniques[idx].name = name ? name : strdup("PRIMARY");
+                /* Catalog v1 identifies a PK by its column flags; named PK
+                 * metadata cannot be preserved by this parser. Reject it. */
+                bool named_pk = name != NULL;
+                free(name);
+                ast->uniques[idx].name = strdup("PRIMARY");
                 size_t cap = 0;
                 const char* ip = icopy;
                 for (;;) {
@@ -514,6 +701,13 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
                     }
                 }
                 p = close + 1;
+                if (named_pk || skip_ws(p) != end) {
+                    for (size_t j = 0; j < ast->uniques[idx].num_columns; ++j)
+                        free(ast->uniques[idx].columns[j]);
+                    free(ast->uniques[idx].columns);
+                    ast->uniques[idx].columns = NULL;
+                    ast->uniques[idx].num_columns = 0;
+                }
             }
         }
         return 1;
@@ -552,6 +746,13 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
                 free(icopy);
                 ast->num_uniques++;
                 p = close + 1;
+                if (skip_ws(p) != end) {
+                    for (size_t j = 0; j < ast->uniques[idx].num_columns; ++j)
+                        free(ast->uniques[idx].columns[j]);
+                    free(ast->uniques[idx].columns);
+                    ast->uniques[idx].columns = NULL;
+                    ast->uniques[idx].num_columns = 0;
+                }
             }
         }
         return 1;
@@ -564,7 +765,7 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
         p = skip_ws(p);
         if (*p == '(') {
             const char* close = find_matching_paren(p);
-            if (close) {
+            if (close && skip_ws(close + 1) == end) {
                 size_t idx = ast->num_checks;
                 ast->checks = (qihse_sql_check_t*)realloc(ast->checks, (idx+1)*sizeof(qihse_sql_check_t));
                 memset(&ast->checks[idx], 0, sizeof(qihse_sql_check_t));
@@ -587,6 +788,7 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
         qihse_sql_fk_t* fk = (qihse_sql_fk_t*)calloc(1, sizeof(qihse_sql_fk_t));
         fk->on_delete = QIHSE_FK_NO_ACTION;
         fk->on_update = QIHSE_FK_NO_ACTION;
+        int columns_valid = 0, ref_columns_valid = 0;
         if (*p == '(') {
             const char* close = find_matching_paren(p);
             if (close) {
@@ -608,6 +810,9 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
                     if (*ip == ',') { ip++; continue; }
                     break;
                 }
+                const char* last = ip;
+                while (last > icopy && isspace((unsigned char)last[-1])) last--;
+                columns_valid = fk->num_columns > 0 && *skip_ws(ip) == '\0' && last > icopy && last[-1] != ',';
                 free(icopy);
                 p = close + 1;
             }
@@ -641,6 +846,9 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
                         if (*ip == ',') { ip++; continue; }
                         break;
                     }
+                    const char* last = ip;
+                    while (last > icopy && isspace((unsigned char)last[-1])) last--;
+                    ref_columns_valid = fk->num_ref_columns > 0 && *skip_ws(ip) == '\0' && last > icopy && last[-1] != ',';
                     free(icopy);
                     p = close + 1;
                 }
@@ -676,6 +884,17 @@ static int parse_table_constraint(const char* seg, size_t seg_len, qihse_sql_ast
                 break;
             }
             break;
+        }
+        if (!columns_valid || !ref_columns_valid || !fk->ref_table ||
+            fk->num_columns != fk->num_ref_columns || skip_ws(p) != end) {
+            for (size_t i = 0; i < fk->num_columns; ++i) free(fk->columns[i]);
+            for (size_t i = 0; i < fk->num_ref_columns; ++i) free(fk->ref_columns[i]);
+            free(fk->columns);
+            free(fk->ref_columns);
+            free(fk->ref_table);
+            free(fk);
+            free(name);
+            return 1;
         }
         size_t idx = ast->num_fks;
         ast->fks = (qihse_sql_fk_t*)realloc(ast->fks, (idx+1)*sizeof(qihse_sql_fk_t));
@@ -735,6 +954,9 @@ static void parse_where(const char** pp, qihse_sql_ast_t* ast) {
 
     for (;;) {
         p = skip_ws(p);
+        const char* wrapped_start = p;
+        int wrapped = *p == '(';
+        if (wrapped) p = skip_ws(p + 1);
         /* EXISTS / NOT EXISTS */
         if (strncasecmp(p, "EXISTS", 6) == 0 && !isalnum((unsigned char)p[6])) {
             p += 6;
@@ -761,11 +983,44 @@ static void parse_where(const char** pp, qihse_sql_ast_t* ast) {
             c->subquery = sub;
             c->operator = strdup("NOT EXISTS");
         } else {
+            const char* boolean_not = match_kw(p, "NOT");
+            if (boolean_not) p = boolean_not;
             size_t col_len;
             const char* col_start = read_identifier(p, &col_len);
             if (col_len == 0) break;
             p = col_start + col_len;
             p = skip_ws(p);
+            if (!strncmp(p, "->>", 3)) {
+                if (boolean_not) break;
+                const char* key = skip_ws(p + 3);
+                if (*key != '\'') break;
+                const char* end = key + 1;
+                while (*end) {
+                    if (*end == '\'' && end[1] == '\'') { end += 2; continue; }
+                    if (*end == '\'') break;
+                    ++end;
+                }
+                if (*end != '\'') break;
+                p = end + 1;
+                col_len = (size_t)(p - col_start);
+                p = skip_ws(p);
+            }
+            if (boolean_not) {
+                if (*p && *p != ';' && !match_kw(p, "AND") && !match_kw(p, "OR") &&
+                    !match_kw(p, "GROUP BY") && !match_kw(p, "ORDER BY") &&
+                    !match_kw(p, "LIMIT") && !match_kw(p, "HAVING")) break;
+                if (ast->num_where_conditions >= cond_cap) {
+                    cond_cap *= 2;
+                    ast->where_conditions = realloc(ast->where_conditions,
+                        cond_cap * sizeof(*ast->where_conditions));
+                }
+                qihse_sql_condition_t* c = &ast->where_conditions[ast->num_where_conditions++];
+                memset(c, 0, sizeof(*c));
+                c->column_name = dup_token(col_start, col_len);
+                c->operator = strdup("=");
+                c->value = strdup("FALSE");
+                goto condition_done;
+            }
 
             /* detect leading NOT (NOT IN / NOT BETWEEN / NOT LIKE) */
             int negated = 0;
@@ -887,6 +1142,15 @@ static void parse_where(const char** pp, qihse_sql_ast_t* ast) {
                 const char* val_start = read_value(p, &val_len, &is_str, &after_val);
                 if (val_len == 0) break;
                 p = after_val ? after_val : (val_start + val_len);
+                qihse_sql_type_t cast_type = QIHSE_TYPE_UNKNOWN;
+                int param = is_str ? 0 : parameter_leaf(val_start, val_len, &cast_type);
+                if (param < 0) break;
+                if (is_str && p[0] == ':' && p[1] == ':') {
+                    const char* cast_end = match_kw(p + 2, "TIMESTAMP");
+                    if (!cast_end) break;
+                    cast_type = QIHSE_TYPE_TIMESTAMP;
+                    p = cast_end;
+                }
 
                 if (ast->num_where_conditions >= cond_cap) {
                     cond_cap *= 2;
@@ -898,12 +1162,23 @@ static void parse_where(const char** pp, qihse_sql_ast_t* ast) {
                 c->operator = dup_token(op_start, op_len);
                 c->value = dup_token(val_start, val_len);
                 c->value_is_string = is_str;
+                c->value_cast_type = cast_type;
+                c->value_parameter_index = (uint16_t)param;
             }
         }
 
+condition_done:
         p = skip_ws(p);
-        if (strncasecmp(p, "AND", 3) == 0 && !isalnum((unsigned char)p[3])) { p += 3; continue; }
-        if (strncasecmp(p, "OR", 2) == 0 && !isalnum((unsigned char)p[2])) { p += 2; continue; }
+        if (wrapped) {
+            if (*p != ')') { *pp = wrapped_start; return; }
+            p = skip_ws(p + 1);
+        }
+        if (strncasecmp(p, "AND", 3) == 0 && !isalnum((unsigned char)p[3])) {
+            if (!*skip_ws(p + 3)) break;
+            p += 3; continue;
+        }
+        /* The AST has no boolean connective; accepting OR as AND changes the query. */
+        if (match_kw(p, "OR")) { *pp = p; return; }
         break;
     }
     *pp = p;
@@ -920,12 +1195,18 @@ static void parse_where(const char** pp, qihse_sql_ast_t* ast) {
  * "p = point(1, 2)" survive).  Returns the number of assignments written to
  * the AST; 0 means the list was absent or malformed.
  * ------------------------------------------------------------------------- */
+static char* parse_string_literal(const char** pp);
+
 static size_t parse_set_list(const char** pp, qihse_sql_ast_t* ast) {
     const char* p = *pp;
     size_t cap = 4;
     ast->set_columns = (char**)calloc(cap, sizeof(char*));
     ast->set_values = (char**)calloc(cap, sizeof(char*));
+    ast->set_quoted = calloc(cap, sizeof(*ast->set_quoted));
+    ast->set_parameter_indexes = (uint16_t*)calloc(cap, sizeof(uint16_t));
     ast->num_set = 0;
+    if (!ast->set_columns || !ast->set_values || !ast->set_quoted ||
+        !ast->set_parameter_indexes) return 0;
 
     for (;;) {
         p = skip_ws(p);
@@ -940,12 +1221,13 @@ static size_t parse_set_list(const char** pp, qihse_sql_ast_t* ast) {
 
         const char* vstart;
         const char* vend;
-        if (*q == '\'') {
-            q++;
+        int quoted_value = *q == '\'';
+        char* decoded = NULL;
+        if (quoted_value) {
             vstart = q;
-            while (*q && *q != '\'') q++;
+            decoded = parse_string_literal(&q);
+            if (!decoded) break;
             vend = q;
-            if (*q == '\'') q++;
         } else {
             vstart = q;
             int depth = 0;
@@ -965,15 +1247,35 @@ static size_t parse_set_list(const char** pp, qihse_sql_ast_t* ast) {
             vend = q;
             while (vend > vstart && isspace((unsigned char)vend[-1])) vend--;
         }
-        if (vend <= vstart) break;             /* "col =" with an empty value */
+        if (vend <= vstart) { free(decoded); break; }
 
+        qihse_sql_type_t cast = QIHSE_TYPE_UNKNOWN;
+        int param = quoted_value ? 0 : parameter_leaf(vstart, (size_t)(vend - vstart), &cast);
+        if (param < 0 || (param && cast != QIHSE_TYPE_UNKNOWN)) { free(decoded); break; }
         if (ast->num_set >= cap) {
-            cap *= 2;
-            ast->set_columns = (char**)realloc(ast->set_columns, cap * sizeof(char*));
-            ast->set_values = (char**)realloc(ast->set_values, cap * sizeof(char*));
+            size_t grown_cap = cap * 2;
+            char** columns = realloc(ast->set_columns, grown_cap * sizeof(*columns));
+            if (!columns) { free(decoded); break; }
+            ast->set_columns = columns;
+            char** values = realloc(ast->set_values, grown_cap * sizeof(*values));
+            if (!values) { free(decoded); break; }
+            ast->set_values = values;
+            uint16_t* parameters = realloc(ast->set_parameter_indexes,
+                                           grown_cap * sizeof(*parameters));
+            if (!parameters) { free(decoded); break; }
+            ast->set_parameter_indexes = parameters;
+            int* quoted = realloc(ast->set_quoted, grown_cap * sizeof(*quoted));
+            if (!quoted) { free(decoded); break; }
+            ast->set_quoted = quoted;
+            cap = grown_cap;
         }
-        ast->set_columns[ast->num_set] = dup_token(cstart, clen);
-        ast->set_values[ast->num_set] = dup_range(vstart, vend);
+        char* column = dup_token(cstart, clen);
+        char* value = quoted_value ? decoded : dup_range(vstart, vend);
+        if (!column || !value) { free(column); free(value); break; }
+        ast->set_parameter_indexes[ast->num_set] = (uint16_t)param;
+        ast->set_quoted[ast->num_set] = quoted_value;
+        ast->set_columns[ast->num_set] = column;
+        ast->set_values[ast->num_set] = value;
         ast->num_set++;
 
         p = skip_ws(q);
@@ -1159,7 +1461,9 @@ static void parse_group_by(const char** pp, qihse_sql_ast_t* ast) {
                 strncasecmp(hend, "OFFSET", 6) == 0) break;
             hend++;
         }
-        ast->group_by->having_expr = dup_range(hstart, hend);
+        const char* he = hend;
+        while (he > hstart && isspace((unsigned char)he[-1])) he--;
+        ast->group_by->having_expr = dup_range(hstart, he);
         p = hend;
     }
     *pp = p;
@@ -1237,6 +1541,9 @@ static qihse_sql_ast_t* parse_select(const char** pp) {
     if (!after) { free(ast); return NULL; }
     p = after;
     p = skip_ws(p);
+    if (!*p || match_kw(p, "FROM") || *p == ';') {
+        qihse_sql_ast_free(ast); return NULL;
+    }
     if (strncasecmp(p, "DISTINCT", 8) == 0 && !isalnum((unsigned char)p[8])) {
         ast->select_distinct = 1;
         p += 8;
@@ -1252,15 +1559,23 @@ static qihse_sql_ast_t* parse_select(const char** pp) {
         p = skip_ws(p);
         const char* start = p;
         int paren_depth = 0;
+        char quote = 0;
         while (*p) {
+            if (quote) {
+                if (*p == quote && p[1] == quote) { p += 2; continue; }
+                if (*p == quote) quote = 0;
+                p++; continue;
+            }
+            if (*p == '\'' || *p == '"') { quote = *p++; continue; }
             if (*p == '(') paren_depth++;
             else if (*p == ')') { if (paren_depth == 0) break; paren_depth--; }
-            else if (paren_depth == 0 && *p == ',') break;
+            else if (paren_depth == 0 && (*p == ',' || *p == ';')) break;
             else if (paren_depth == 0 && strncasecmp(p, " FROM", 5) == 0) break;
             else if (paren_depth == 0 && strncasecmp(p, "\tFROM", 5) == 0) break;
             else if (paren_depth == 0 && strncasecmp(p, "\nFROM", 5) == 0) break;
             p++;
         }
+        if (quote || paren_depth) { qihse_sql_ast_free(ast); return NULL; }
         size_t len = (size_t)(p - start);
         if (len > 0) {
             /* trim trailing ws */
@@ -1270,13 +1585,24 @@ static qihse_sql_ast_t* parse_select(const char** pp) {
                     item_cap *= 2;
                     ast->select_items = (qihse_sql_select_item_t*)realloc(ast->select_items, item_cap * sizeof(qihse_sql_select_item_t));
                 }
-                parse_select_item(start, len, &ast->select_items[ast->num_select_items++]);
+                if (!parse_select_item(start, len, &ast->select_items[ast->num_select_items++])) {
+                    qihse_sql_ast_free(ast);
+                    return NULL;
+                }
             }
         }
         p = skip_ws(p);
-        if (*p == ',') { p++; continue; }
+        if (*p == ',') {
+            p++;
+            if (!*skip_ws(p) || match_kw(p, "FROM")) {
+                qihse_sql_ast_free(ast);
+                return NULL;
+            }
+            continue;
+        }
         break;
     }
+    if (!ast->num_select_items) { qihse_sql_ast_free(ast); return NULL; }
 
     /* FROM */
     p = skip_ws(p);
@@ -1330,6 +1656,7 @@ static qihse_sql_ast_t* parse_select(const char** pp) {
             break;
         }
 
+        if (!ast->num_from_tables) { qihse_sql_ast_free(ast); return NULL; }
         /* JOINs */
         parse_joins(&p, ast);
     }
@@ -1340,13 +1667,20 @@ static qihse_sql_ast_t* parse_select(const char** pp) {
     if (where_after) {
         p = where_after;
         parse_where(&p, ast);
+        if (!ast->num_where_conditions) { qihse_sql_ast_free(ast); return NULL; }
     }
 
     /* GROUP BY / HAVING */
+    const char* group_at = match_kw(p, "GROUP BY");
     parse_group_by(&p, ast);
+    if (group_at && (!ast->group_by || !ast->group_by->num_group_columns)) {
+        qihse_sql_ast_free(ast); return NULL;
+    }
 
     /* ORDER BY */
+    const char* order_at = match_kw(p, "ORDER BY");
     parse_order_by(&p, ast);
+    if (order_at && !ast->num_order_items) { qihse_sql_ast_free(ast); return NULL; }
 
     /* LIMIT / OFFSET */
     parse_limit_offset(&p, ast);
@@ -1369,19 +1703,22 @@ static qihse_sql_ast_t* parse_select(const char** pp) {
     }
     if (sop != QIHSE_SET_NONE) {
         qihse_sql_ast_t* right = parse_select(&p);
-        if (right) {
-            /* wrap: current ast becomes left operand */
-            qihse_sql_ast_t* wrapper = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
-            wrapper->stmt_type = QIHSE_SQL_SELECT;
-            wrapper->set_op = sop;
-            wrapper->set_left = ast;
-            wrapper->set_right = right;
-            wrapper->limit = -1;
-            wrapper->offset = -1;
-            ast = wrapper;
-        }
+        if (!right) { qihse_sql_ast_free(ast); return NULL; }
+        /* wrap: current ast becomes left operand */
+        qihse_sql_ast_t* wrapper = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
+        if (!wrapper) { qihse_sql_ast_free(ast); qihse_sql_ast_free(right); return NULL; }
+        wrapper->stmt_type = QIHSE_SQL_SELECT;
+        wrapper->set_op = sop;
+        wrapper->set_left = ast;
+        wrapper->set_right = right;
+        wrapper->limit = -1;
+        wrapper->offset = -1;
+        ast = wrapper;
     }
 
+    p = skip_ws(p);
+    if (*p == ';') p = skip_ws(p + 1);
+    if (*p) { qihse_sql_ast_free(ast); return NULL; }
     *pp = p;
     return ast;
 }
@@ -1395,44 +1732,88 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
     ast->limit = -1; ast->offset = -1;
     ast->stmt_type = QIHSE_SQL_CREATE;
 
-    /* CREATE [UNIQUE] INDEX name ON table (col) */
+    /* CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table
+     * [USING method] (expression [ASC|DESC], ...). */
     p = skip_ws(p);
     int unique = 0;
     const char* u_after = match_kw(p, "UNIQUE");
     if (u_after) { unique = 1; p = u_after; }
     const char* idx_after = match_kw(p, "INDEX");
     if (idx_after) {
-        p = idx_after;
-        size_t id_len;
+        p = skip_ws(idx_after);
+        int if_not_exists = 0;
+        const char* if_after = match_kw(p, "IF");
+        if (if_after) {
+            const char* not_after = match_kw(if_after, "NOT");
+            const char* exists_after = not_after ? match_kw(not_after, "EXISTS") : NULL;
+            if (!exists_after) { qihse_sql_ast_free(ast); return NULL; }
+            if_not_exists = 1; p = exists_after;
+        }
+        size_t id_len, tlen;
         const char* id_start = read_identifier(p, &id_len);
+        if (!id_len) { qihse_sql_ast_free(ast); return NULL; }
         char* idx_name = dup_token(id_start, id_len);
         p = id_start + id_len;
         const char* on_after = match_kw(p, "ON");
-        if (on_after) {
-            p = on_after;
-            size_t tlen;
-            const char* tstart = read_identifier(p, &tlen);
-            char* tbl = dup_token(tstart, tlen);
-            p = tstart + tlen;
-            p = skip_ws(p);
-            char* col = NULL;
-            if (*p == '(') {
-                p++;
-                size_t clen;
-                const char* cstart = read_identifier(p, &clen);
-                col = dup_token(cstart, clen);
-                p = cstart + clen;
-                p = skip_ws(p);
-                if (*p == ')') p++;
-            }
-            ast->index_def = (qihse_sql_index_def_t*)calloc(1, sizeof(qihse_sql_index_def_t));
-            ast->index_def->name = idx_name;
-            ast->index_def->table_name = tbl;
-            ast->index_def->column_name = col;
-            ast->index_def->unique = unique;
-        } else {
-            free(idx_name);
+        if (!on_after) { free(idx_name); qihse_sql_ast_free(ast); return NULL; }
+        p = skip_ws(on_after);
+        const char* tstart = read_identifier(p, &tlen);
+        if (!tlen) { free(idx_name); qihse_sql_ast_free(ast); return NULL; }
+        char* tbl = dup_token(tstart, tlen);
+        p = skip_ws(tstart + tlen);
+        char* method = NULL;
+        const char* using_after = match_kw(p, "USING");
+        if (using_after) {
+            p = skip_ws(using_after);
+            size_t mlen; const char* mstart = read_identifier(p, &mlen);
+            if (!mlen) { free(idx_name); free(tbl); qihse_sql_ast_free(ast); return NULL; }
+            method = dup_token(mstart, mlen); p = skip_ws(mstart + mlen);
         }
+        if (*p != '(') { free(idx_name); free(tbl); free(method); qihse_sql_ast_free(ast); return NULL; }
+        p++;
+        qihse_sql_index_def_t* def = calloc(1, sizeof(*def));
+        def->name = idx_name; def->table_name = tbl; def->unique = unique;
+        def->if_not_exists = if_not_exists; def->using_method = method;
+        for (;;) {
+            p = skip_ws(p);
+            const char* start = p; int depth = 0; char quote = 0;
+            while (*p) {
+                if (quote) { if (*p == quote && p[1] == quote) { p += 2; continue; }
+                    if (*p == quote) quote = 0;
+                    p++; continue; }
+                if (*p == '\'' || *p == '"') { quote = *p++; continue; }
+                if (*p == '(') { depth++; p++; continue; }
+                if (*p == ')') { if (!depth) break; depth--; p++; continue; }
+                if (*p == ',' && !depth) break;
+                p++;
+            }
+            if (quote || depth || !*p) {
+                ast->index_def = def;
+                qihse_sql_ast_free(ast);
+                return NULL;
+            }
+            const char* end = p;
+            while (end > start && isspace((unsigned char)end[-1])) end--;
+            const char* dir = end;
+            while (dir > start && (isalnum((unsigned char)dir[-1]) || dir[-1] == '_')) dir--;
+            int desc = 0;
+            if (dir > start && isspace((unsigned char)dir[-1])) {
+                if ((size_t)(end-dir) == 4 && strncasecmp(dir, "DESC", 4) == 0) { desc = 1; end = dir; }
+                else if ((size_t)(end-dir) == 3 && strncasecmp(dir, "ASC", 3) == 0) end = dir;
+            }
+            while (end > start && isspace((unsigned char)end[-1])) end--;
+            if (end == start) { qihse_sql_ast_free(ast); free(def->name); free(def->table_name); free(def->using_method); for(size_t i=0;i<def->num_expressions;i++)free(def->expressions[i]);free(def->expressions);free(def->descending);free(def);return NULL; }
+            def->expressions = realloc(def->expressions, (def->num_expressions+1)*sizeof(char*));
+            def->descending = realloc(def->descending, (def->num_expressions+1)*sizeof(int));
+            def->expressions[def->num_expressions] = dup_range(start, end);
+            def->descending[def->num_expressions++] = desc;
+            if (*p == ',') { p++; continue; }
+            if (*p == ')') { p++; break; }
+            qihse_sql_ast_free(ast); free(def->name); free(def->table_name); free(def->using_method); for(size_t i=0;i<def->num_expressions;i++)free(def->expressions[i]);free(def->expressions);free(def->descending);free(def);return NULL;
+        }
+        if (!def->num_expressions) { free(def->name); free(def->table_name); free(def->using_method); free(def); qihse_sql_ast_free(ast); return NULL; }
+        def->column_name = strdup(def->expressions[0]);
+        ast->index_def = def;
         *pp = p;
         return ast;
     }
@@ -1466,8 +1847,17 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
         const char* mv_after = match_kw(p, "VIEW");
         if (mv_after) {
             p = mv_after;
+            const char* if_after = match_kw(p, "IF");
+            if (if_after) {
+                const char* not_after = match_kw(if_after, "NOT");
+                const char* exists_after = not_after ? match_kw(not_after, "EXISTS") : NULL;
+                if (!exists_after) { qihse_sql_ast_free(ast); return NULL; }
+                ast->view_if_not_exists = 1;
+                p = exists_after;
+            }
             size_t vlen;
             const char* vstart = read_identifier(p, &vlen);
+            if (!vlen) { qihse_sql_ast_free(ast); return NULL; }
             ast->view_name = dup_token(vstart, vlen);
             p = vstart + vlen;
             p = skip_ws(p);
@@ -1478,6 +1868,7 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
                 ast->view_query = parse_select(&p);
             }
             ast->stmt_type = QIHSE_SQL_CREATE_MATVIEW;
+            ast->view_is_materialized = 1;
             *pp = p;
             return ast;
         }
@@ -1559,10 +1950,18 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
         return ast;
     }
 
-    /* CREATE TABLE name ( col defs ) */
+    /* CREATE TABLE [IF NOT EXISTS] name ( col defs ) */
     const char* tbl_after = match_kw(p, "TABLE");
     if (!tbl_after) { ast->stmt_type = QIHSE_SQL_UNKNOWN; *pp = p; return ast; }
     p = tbl_after;
+    const char* if_after = match_kw(p, "IF");
+    if (if_after) {
+        const char* not_after = match_kw(if_after, "NOT");
+        const char* exists_after = not_after ? match_kw(not_after, "EXISTS") : NULL;
+        if (!exists_after) { qihse_sql_ast_free(ast); return NULL; }
+        ast->create_if_not_exists = 1;
+        p = exists_after;
+    }
     size_t id_len;
     const char* id_start = read_identifier(p, &id_len);
     ast->table_name = dup_token(id_start, id_len);
@@ -1570,12 +1969,17 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
     p = skip_ws(p);
     if (*p == '(') {
         p++;
+        int closed = 0;
+        int after_comma = 0;
         size_t col_cap = 8;
         ast->columns = (qihse_sql_column_def_t*)calloc(col_cap, sizeof(qihse_sql_column_def_t));
         ast->num_columns = 0;
         for (;;) {
             p = skip_ws(p);
-            if (*p == ')') { p++; break; }
+            if (*p == ')') {
+                if (after_comma) { qihse_sql_ast_free(ast); return NULL; }
+                p++; closed = 1; break;
+            }
             /* find next comma at depth 0 */
             const char* seg_start = p;
             int depth = 0;
@@ -1586,11 +1990,21 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
                 p++;
             }
             size_t seg_len = (size_t)(p - seg_start);
+            after_comma = 0;
             /* trim */
             while (seg_len > 0 && isspace((unsigned char)seg_start[seg_len-1])) seg_len--;
-            /* table-level constraints vs column definitions */
+            if (!seg_len) { qihse_sql_ast_free(ast); return NULL; }
+            /* A malformed constraint must not disappear from the AST: the
+             * executor cannot reject a constraint it never sees. */
+            size_t constraints_before = ast->num_fks + ast->num_checks + ast->num_uniques;
             if (parse_table_constraint(seg_start, seg_len, ast)) {
-                /* handled as a table-level constraint */
+                if (ast->num_fks + ast->num_checks + ast->num_uniques ==
+                    constraints_before ||
+                    (ast->num_uniques > 0 &&
+                     ast->uniques[ast->num_uniques - 1].num_columns == 0)) {
+                    qihse_sql_ast_free(ast);
+                    return NULL;
+                }
             } else if (seg_len > 0) {
                 if (ast->num_columns >= col_cap) {
                     col_cap *= 2;
@@ -1599,13 +2013,28 @@ static qihse_sql_ast_t* parse_create(const char** pp) {
                 char* seg_copy = dup_token(seg_start, seg_len);
                 parse_column_def(seg_copy, &ast->columns[ast->num_columns++]);
                 free(seg_copy);
+                if (ast->columns[ast->num_columns - 1].type == QIHSE_TYPE_UNKNOWN) {
+                    qihse_sql_ast_free(ast);
+                    return NULL;
+                }
             }
             p = skip_ws(p);
-            if (*p == ',') { p++; continue; }
-            if (*p == ')') { p++; break; }
+            if (*p == ',') { p++; after_comma = 1; continue; }
+            if (*p == ')') { p++; closed = 1; break; }
             break;
         }
-    }
+        if (!closed) { qihse_sql_ast_free(ast); return NULL; }
+        /* Table-level PK may precede its column definitions. */
+        for (size_t k = 0; k < ast->num_uniques; ++k) {
+            qihse_sql_unique_t* key = &ast->uniques[k];
+            if (!key->name || strcmp(key->name, "PRIMARY")) continue;
+            for (size_t j = 0; j < key->num_columns; ++j)
+                for (size_t c = 0; c < ast->num_columns; ++c)
+                    if (ast->columns[c].name && key->columns[j] &&
+                        !strcasecmp(ast->columns[c].name, key->columns[j]))
+                        ast->columns[c].is_primary_key = 1;
+        }
+    } else { qihse_sql_ast_free(ast); return NULL; }
     *pp = p;
     return ast;
 }
@@ -1638,12 +2067,22 @@ static qihse_sql_ast_t* parse_alter(const char** pp) {
         if (col_after) p = col_after;
         /* parse rest as a column def */
         const char* seg_start = p;
-        while (*p && *p != ';' && *p != ',') p++;
+        int depth = 0;
+        while (*p && *p != ';') {
+            if (*p == '(') depth++;
+            else if (*p == ')') depth--;
+            if (*p == ',' && depth == 0) break;
+            p++;
+        }
         char* seg = dup_range(seg_start, p);
         ast->alter_clause->action = QIHSE_ALTER_ADD_COLUMN;
         ast->alter_clause->add_column = (qihse_sql_column_def_t*)calloc(1, sizeof(qihse_sql_column_def_t));
         parse_column_def(seg, ast->alter_clause->add_column);
         free(seg);
+        if (ast->alter_clause->add_column->type == QIHSE_TYPE_UNKNOWN) {
+            qihse_sql_ast_free(ast);
+            return NULL;
+        }
     } else if (drop_after) {
         p = drop_after;
         const char* col_after = match_kw(p, "COLUMN");
@@ -1710,9 +2149,32 @@ static qihse_sql_ast_t* parse_drop(const char** pp) {
     ast->limit = -1; ast->offset = -1;
     ast->stmt_type = QIHSE_SQL_DROP;
 
+    const char* trigger_after = match_kw(p, "TRIGGER");
     const char* idx_after = match_kw(p, "INDEX");
     const char* tbl_after = match_kw(p, "TABLE");
-    if (idx_after) {
+    if (trigger_after) {
+        p = skip_ws(trigger_after);
+        const char* if_after = match_kw(p, "IF");
+        if (if_after) {
+            const char* exists_after = match_kw(if_after, "EXISTS");
+            if (!exists_after) { qihse_sql_ast_free(ast); return NULL; }
+            ast->trigger_def = calloc(1, sizeof(*ast->trigger_def));
+            ast->trigger_def->drop_if_exists = 1;
+            p = exists_after;
+        } else ast->trigger_def = calloc(1, sizeof(*ast->trigger_def));
+        p = skip_ws(p); size_t nlen; const char* nstart = read_identifier(p, &nlen);
+        if (!nlen) { qihse_sql_ast_free(ast); return NULL; }
+        ast->trigger_def->name = dup_token(nstart, nlen);
+        p = skip_ws(nstart + nlen);
+        const char* on_after = match_kw(p, "ON");
+        if (!on_after) { qihse_sql_ast_free(ast); return NULL; }
+        p = skip_ws(on_after); const char* tstart = read_identifier(p, &nlen);
+        if (!nlen) { qihse_sql_ast_free(ast); return NULL; }
+        ast->trigger_def->table_name = dup_token(tstart, nlen); p = tstart + nlen;
+        ast->stmt_type = QIHSE_SQL_DROP_TRIGGER;
+        *pp = p;
+        return ast;
+    } else if (idx_after) {
         p = idx_after;
         ast->drop_is_index = 1;
     } else if (tbl_after) {
@@ -1782,10 +2244,21 @@ static char* parse_string_literal(const char** pp) {
     if (*p != '\'') { *pp = p; return NULL; }
     p++;
     const char* start = p;
-    while (*p && *p != '\'') p++;
-    char* out = dup_range(start, p);
-    if (*p == '\'') p++;
-    *pp = p;
+    while (*p) {
+        if (*p == '\'' && p[1] == '\'') { p += 2; continue; }
+        if (*p == '\'') break;
+        ++p;
+    }
+    if (*p != '\'') return NULL;
+    char* out = malloc((size_t)(p - start) + 1);
+    if (!out) return NULL;
+    size_t n = 0;
+    for (const char* s = start; s < p; ++s) {
+        out[n++] = *s;
+        if (*s == '\'') ++s;
+    }
+    out[n] = '\0';
+    *pp = p + 1;
     return out;
 }
 
@@ -1820,16 +2293,19 @@ static qihse_sql_ast_t* parse_utility(const char** pp, qihse_sql_stmt_type_t typ
         else { after = match_kw(p, "TRANSACTION"); if (after) p = after; }
         for (;;) {
             p = skip_ws(p);
-            const char* iso = match_kw(p, "ISOLATION");
+            const char* iso = match_kw(p, "ISOLATION LEVEL");
             if (iso) {
-                p = iso;
-                const char* lvl = match_kw(p, "LEVEL");
-                if (lvl) p = lvl;
-                p = skip_ws(p);
-                /* consume level name token(s) */
-                while (*p && (isalpha((unsigned char)*p) || *p == '_')) p++;
+                const char* level = match_kw(iso, "SERIALIZABLE");
+                if (!level) level = match_kw(iso, "REPEATABLE READ");
+                if (!level) level = match_kw(iso, "READ COMMITTED");
+                if (!level) level = match_kw(iso, "READ UNCOMMITTED");
+                if (!level) break;
+                p = level;
                 continue;
             }
+            /* Retain the native SQL dispatcher's existing shorthand. */
+            const char* serializable = match_kw(p, "SERIALIZABLE");
+            if (serializable) { p = serializable; continue; }
             const char* rw = match_kw(p, "READ WRITE");
             if (rw) { p = rw; continue; }
             const char* ro = match_kw(p, "READ ONLY");
@@ -2167,6 +2643,86 @@ static qihse_sql_ast_t* parse_utility(const char** pp, qihse_sql_stmt_type_t typ
     return ast;
 }
 
+/* Parse only the ON CONFLICT forms represented by qihse_sql_on_conflict_t.
+ * An expression is retained as text; evaluating it is the consumer's job. */
+static int parse_on_conflict(const char** pp, qihse_sql_ast_t* ast) {
+    const char* p = skip_ws(*pp);
+    qihse_sql_on_conflict_t* conflict = calloc(1, sizeof(*conflict));
+    if (!conflict) return 0;
+    ast->on_conflict = conflict;
+    if (*p == '(') {
+        p++;
+        for (;;) {
+            size_t len;
+            const char* start = read_identifier(p, &len);
+            if (!len || conflict->num_conflict_columns >= 64 ||
+                memchr(start, '.', len)) return 0;
+            char* name = dup_token(start, len);
+            char** columns = realloc(conflict->conflict_columns,
+                                     (conflict->num_conflict_columns + 1) * sizeof(char*));
+            if (!name || !columns) { free(name); return 0; }
+            conflict->conflict_columns = columns;
+            columns[conflict->num_conflict_columns++] = name;
+            p = skip_ws(start + len);
+            if (*p == ')') { p++; break; }
+            if (*p != ',') return 0;
+            p++;
+        }
+    }
+    p = match_kw(p, "DO");
+    if (!p) return 0;
+    const char* after = match_kw(p, "NOTHING");
+    if (after) {
+        conflict->action = QIHSE_CONFLICT_NOTHING;
+        *pp = after;
+        return 1;
+    }
+    p = match_kw(p, "UPDATE");
+    if (!p || !conflict->num_conflict_columns) return 0;
+    p = match_kw(p, "SET");
+    if (!p) return 0;
+    qihse_sql_ast_t assignments = {0};
+    const char* set_start = p;
+    if (strlen(set_start) > 8192) return 0;
+    size_t count = parse_set_list(&p, &assignments);
+    conflict->set_columns = assignments.set_columns;
+    conflict->set_values = assignments.set_values;
+    conflict->num_set = assignments.num_set;
+    free(assignments.set_parameter_indexes);
+    free(assignments.set_quoted);
+    const char* last = p;
+    while (last > set_start && isspace((unsigned char)last[-1])) last--;
+    if (!count || count > 64 || (size_t)(p - set_start) > 8192 ||
+        (last > set_start && last[-1] == ',')) return 0;
+    conflict->action = QIHSE_CONFLICT_UPDATE;
+    after = match_kw(p, "WHERE");
+    if (after) {
+        const char* start = skip_ws(after);
+        const char* end = start;
+        int depth = 0, quoted = 0;
+        while (*end && *end != ';') {
+            if (*end == '\'') {
+                if (quoted && end[1] == '\'') { end += 2; continue; }
+                quoted = !quoted;
+            } else if (!quoted) {
+                if (*end == '(') depth++;
+                else if (*end == ')') { if (!depth) return 0; depth--; }
+                if (!depth && end > start && isspace((unsigned char)end[-1]) &&
+                    match_kw(end, "RETURNING")) break;
+            }
+            end++;
+            if ((size_t)(end - start) > 8192) return 0;
+        }
+        if (quoted || depth || end == start) return 0;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+        conflict->where_expr = dup_range(start, end);
+        if (!conflict->where_expr) return 0;
+        p = end;
+    }
+    *pp = p;
+    return 1;
+}
+
 /* -------------------------------------------------------------------------
  * Parse a single statement (top-level dispatch)
  * ------------------------------------------------------------------------- */
@@ -2192,29 +2748,37 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
         cur = skip_ws(cur);
         size_t tlen;
         const char* tstart = read_identifier(cur, &tlen);
-        if (tlen > 0) { ast->table_name = dup_token(tstart, tlen); cur = tstart + tlen; }
-        cur = skip_ws(cur);
+        if (!tlen) goto bad_insert;
+        ast->table_name = dup_token(tstart, tlen);
+        if (!ast->table_name) goto bad_insert;
+        cur = skip_ws(tstart + tlen);
         /* Optional column list */
         if (*cur == '(') {
             cur++;
             size_t col_cap = 8;
             ast->insert_columns = (char**)calloc(col_cap, sizeof(char*));
+            if (!ast->insert_columns) goto bad_insert;
             ast->num_insert_columns = 0;
             for (;;) {
                 cur = skip_ws(cur);
                 size_t clen;
                 const char* cstart = read_identifier(cur, &clen);
-                if (clen == 0) break;
+                if (clen == 0) goto bad_insert;
                 if (ast->num_insert_columns >= col_cap) {
+                    if (col_cap > SIZE_MAX / 2 / sizeof(char*)) goto bad_insert;
                     col_cap *= 2;
-                    ast->insert_columns = (char**)realloc(ast->insert_columns, col_cap * sizeof(char*));
+                    char** grown = realloc(ast->insert_columns, col_cap * sizeof(char*));
+                    if (!grown) goto bad_insert;
+                    ast->insert_columns = grown;
                 }
-                ast->insert_columns[ast->num_insert_columns++] = dup_token(cstart, clen);
+                ast->insert_columns[ast->num_insert_columns] = dup_token(cstart, clen);
+                if (!ast->insert_columns[ast->num_insert_columns]) goto bad_insert;
+                ast->num_insert_columns++;
                 cur = cstart + clen;
                 cur = skip_ws(cur);
                 if (*cur == ',') { cur++; continue; }
                 if (*cur == ')') { cur++; break; }
-                break;
+                goto bad_insert;
             }
         }
         cur = skip_ws(cur);
@@ -2223,81 +2787,139 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
         if (values_after) {
             cur = values_after;
             cur = skip_ws(cur);
-            size_t row_cap = 4;
-            ast->insert_rows = (char***)calloc(row_cap, sizeof(char**));
-            ast->num_insert_rows = 0;
-                        for (;;) {
+            /* Every row owns parallel value, cast and quotedness arrays.  Keep
+             * the value array NULL-terminated even on parse failure. */
+            size_t width = ast->num_insert_columns;
+            do {
                 cur = skip_ws(cur);
-                if (*cur != '(') break;
-                cur++;
-                size_t val_cap = 8;
-                char** values = (char**)calloc(val_cap, sizeof(char*));
+                if (*cur++ != '(') goto bad_insert;
+                size_t cap = width ? width : 8;
+                char** values = calloc(cap + 1, sizeof(*values));
+                qihse_sql_type_t* casts = calloc(cap, sizeof(*casts));
+                int* quoted = calloc(cap, sizeof(*quoted));
+                uint16_t* parameters = calloc(cap, sizeof(*parameters));
+                if (!values || !casts || !quoted || !parameters) {
+                    free(values); free(casts); free(quoted); free(parameters);
+                    goto bad_insert;
+                }
                 size_t nvalues = 0;
                 for (;;) {
                     cur = skip_ws(cur);
-                    if (*cur == ')') { cur++; break; }
-                    /* Parse a value token */
-                    const char* vstart = cur;
-                    if (*cur == '\'') {
-                        cur++;
-                        vstart = cur;
-                        while (*cur && *cur != '\'') cur++;
-                        if (*cur == '\'') { size_t vlen = (size_t)(cur - vstart); if (nvalues >= val_cap) { val_cap *= 2; values = (char**)realloc(values, val_cap * sizeof(char*)); } values[nvalues++] = dup_token(vstart, vlen); cur++; }
-                    } else {
-                        while (*cur && *cur != ',' && *cur != ')') cur++;
-                        size_t vlen = (size_t)(cur - vstart);
-                        while (vlen > 0 && isspace((unsigned char)vstart[vlen-1])) vlen--;
-                        if (nvalues >= val_cap) { val_cap *= 2; values = (char**)realloc(values, val_cap * sizeof(char*)); }
-                        values[nvalues++] = dup_token(vstart, vlen);
+                    if (!*cur || *cur == ')' || *cur == ',') goto bad_insert_row;
+                    if (nvalues == cap) {
+                        if (width || cap > SIZE_MAX / 2 / sizeof(char*)) goto bad_insert_row;
+                        size_t next = cap * 2;
+                        char** grown_values = realloc(values, (next + 1) * sizeof(*values));
+                        if (!grown_values) goto bad_insert_row;
+                        values = grown_values;
+                        memset(values + cap, 0, (next + 1 - cap) * sizeof(*values));
+                        qihse_sql_type_t* grown_casts = realloc(casts, next * sizeof(*casts));
+                        if (!grown_casts) goto bad_insert_row;
+                        casts = grown_casts;
+                        int* grown_quoted = realloc(quoted, next * sizeof(*quoted));
+                        if (!grown_quoted) goto bad_insert_row;
+                        quoted = grown_quoted;
+                        uint16_t* grown_parameters = realloc(parameters, next * sizeof(*parameters));
+                        if (!grown_parameters) goto bad_insert_row;
+                        parameters = grown_parameters;
+                        memset(parameters + cap, 0, (next - cap) * sizeof(*parameters));
+                        cap = next;
                     }
+                    if (*cur == '\'') {
+                        quoted[nvalues] = 1;
+                        cur++;
+                        const char* start = cur;
+                        size_t len = 0;
+                        while (*cur) {
+                            if (*cur == '\'') {
+                                if (cur[1] == '\'') { cur += 2; len++; continue; }
+                                break;
+                            }
+                            cur++; len++;
+                        }
+                        if (*cur != '\'') goto bad_insert_row;
+                        values[nvalues] = malloc(len + 1);
+                        if (!values[nvalues]) goto bad_insert_row;
+                        char* dst = values[nvalues];
+                        for (const char* s = start; s < cur; s++) {
+                            *dst++ = *s;
+                            if (*s == '\'' && s[1] == '\'') s++;
+                        }
+                        *dst = '\0';
+                        cur = skip_ws(cur + 1);
+                        if (cur[0] == ':' && cur[1] == ':') {
+                            cur = skip_ws(cur + 2);
+                            const char* cast_start = cur;
+                            while (isalnum((unsigned char)*cur) || *cur == '_') cur++;
+                            size_t cast_len = (size_t)(cur - cast_start);
+                            if (cast_len == 9 && strncasecmp(cast_start, "timestamp", 9) == 0)
+                                casts[nvalues] = QIHSE_TYPE_TIMESTAMP;
+                            else if (cast_len == 11 && strncasecmp(cast_start, "timestamptz", 11) == 0)
+                                casts[nvalues] = QIHSE_TYPE_TIMESTAMPTZ;
+                            else goto bad_insert_row;
+                        }
+                    } else {
+                        const char* start = cur;
+                        while (*cur && *cur != ',' && *cur != ')' && *cur != ';') cur++;
+                        const char* end = cur;
+                        while (end > start && isspace((unsigned char)end[-1])) end--;
+                        if (end == start || memchr(start, '\'', (size_t)(end - start))) goto bad_insert_row;
+                        int param = parameter_leaf(start, (size_t)(end - start), &casts[nvalues]);
+                        if (param < 0 || (param == 0 && memchr(start, ':', (size_t)(end - start))))
+                            goto bad_insert_row;
+                        parameters[nvalues] = (uint16_t)param;
+                        for (const char* s = start; s < end; s++)
+                            if (isspace((unsigned char)*s)) goto bad_insert_row;
+                        values[nvalues] = dup_range(start, end);
+                        if (!values[nvalues]) goto bad_insert_row;
+                    }
+                    nvalues++;
                     cur = skip_ws(cur);
-                    if (*cur == ',') { cur++; continue; }
                     if (*cur == ')') { cur++; break; }
-                    break;
+                    if (*cur != ',') goto bad_insert_row;
+                    cur++;
                 }
-                if (ast->num_insert_rows >= row_cap) {
-                    row_cap *= 2;
-                    ast->insert_rows = (char***)realloc(ast->insert_rows, row_cap * sizeof(char**));
-                                    }
-                /* ensure NULL-termination for safe freeing */
-                if (nvalues >= val_cap) { val_cap = nvalues + 1; values = (char**)realloc(values, val_cap * sizeof(char*)); }
-                values[nvalues] = NULL;
-                ast->insert_rows[ast->num_insert_rows] = values;
-                                ast->num_insert_rows++;
+                if (!width) width = nvalues;
+                if (nvalues != width) goto bad_insert_row;
+                size_t row = ast->num_insert_rows;
+                char*** rows = realloc(ast->insert_rows, (row + 1) * sizeof(*rows));
+                if (!rows) goto bad_insert_row;
+                ast->insert_rows = rows;
+                qihse_sql_type_t** row_casts = realloc(ast->insert_cast_types, (row + 1) * sizeof(*row_casts));
+                if (!row_casts) goto bad_insert_row;
+                ast->insert_cast_types = row_casts;
+                int** row_quoted = realloc(ast->insert_quoted, (row + 1) * sizeof(*row_quoted));
+                if (!row_quoted) goto bad_insert_row;
+                ast->insert_quoted = row_quoted;
+                uint16_t** row_parameters = realloc(ast->insert_parameter_indexes,
+                                                     (row + 1) * sizeof(*row_parameters));
+                if (!row_parameters) goto bad_insert_row;
+                ast->insert_parameter_indexes = row_parameters;
+                ast->insert_rows[row] = values;
+                ast->insert_cast_types[row] = casts;
+                ast->insert_quoted[row] = quoted;
+                ast->insert_parameter_indexes[row] = parameters;
+                ast->num_insert_rows++;
                 cur = skip_ws(cur);
                 if (*cur != ',') break;
                 cur++;
-            }
+                if (*skip_ws(cur) != '(') goto bad_insert;
+                continue;
+            bad_insert_row:
+                for (size_t i = 0; i < cap; i++) free(values[i]);
+                free(values); free(casts); free(quoted); free(parameters);
+                goto bad_insert;
+            } while (1);
         }
         cur = skip_ws(cur);
         /* ON CONFLICT (UPSERT) */
         const char* on_after = match_kw(cur, "ON");
         if (on_after) {
             const char* conflict_after = match_kw(on_after, "CONFLICT");
-            if (conflict_after) {
-                cur = conflict_after;
-                ast->on_conflict = (qihse_sql_on_conflict_t*)calloc(1, sizeof(qihse_sql_on_conflict_t));
-                ast->on_conflict->action = 1; /* DO UPDATE by default */
-                cur = skip_ws(cur);
-                if (*cur == '(') {
-                    cur++;
-                    size_t clen;
-                    const char* cstart = read_identifier(cur, &clen);
-                    if (clen > 0) { ast->on_conflict->conflict_columns = (char**)calloc(1, sizeof(char*)); ast->on_conflict->conflict_columns[0] = dup_token(cstart, clen); ast->on_conflict->num_conflict_columns = 1; cur = cstart + clen; }
-                    cur = skip_ws(cur);
-                    if (*cur == ')') cur++;
-                }
-                cur = skip_ws(cur);
-                const char* do_after = match_kw(cur, "DO");
-                if (do_after) {
-                    cur = do_after;
-                    cur = skip_ws(cur);
-                    const char* update_after = match_kw(cur, "UPDATE");
-                    const char* nothing_after = match_kw(cur, "NOTHING");
-                    if (nothing_after) { cur = nothing_after; ast->on_conflict->action = 2; }
-                    else if (update_after) { cur = update_after; ast->on_conflict->action = 1; }
-                }
+            if (!conflict_after || !parse_on_conflict(&conflict_after, ast)) {
+                qihse_sql_ast_free(ast); free(work); return NULL;
             }
+            cur = conflict_after;
         }
         cur = skip_ws(cur);
         /* RETURNING */
@@ -2332,6 +2954,15 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
                 }
             }
         }
+        cur = skip_ws(cur);
+        if (*cur == ';') cur = skip_ws(cur + 1);
+        if (*cur || !values_after || !ast->num_insert_rows ||
+            (ast->returning && !ast->returning->is_star && !ast->returning->num_columns))
+            goto bad_insert;
+        goto insert_done;
+    bad_insert:
+        qihse_sql_ast_free(ast); free(work); return NULL;
+    insert_done:;
     } else if (strncasecmp(cur, "UPDATE", 6) == 0 && !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
         ast = (qihse_sql_ast_t*)calloc(1, sizeof(qihse_sql_ast_t));
         ast->stmt_type = QIHSE_SQL_UPDATE;
@@ -2398,9 +3029,182 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
         }
     } else if (strncasecmp(cur, "CREATE ROLE", 11) == 0) {
         cur += 11; ast = parse_utility(&cur, QIHSE_SQL_CREATE_ROLE);
-    } else if (strncasecmp(cur, "CREATE", 6) == 0) {
-        cur += 6;
-        ast = parse_create(&cur);
+    } else if (strncasecmp(cur, "CREATE", 6) == 0 &&
+               !isalnum((unsigned char)cur[6]) && cur[6] != '_') {
+        /* Recognize extension and procedural DDL without claiming execution;
+         * parsing must consume every suffix, including dollar-quoted bodies. */
+        const char* kind = skip_ws(cur + 6);
+        if (strncasecmp(kind, "OR REPLACE", 10) == 0 &&
+            !isalnum((unsigned char)kind[10]) && kind[10] != '_')
+            kind = skip_ws(kind + 10);
+        qihse_sql_stmt_type_t opaque_type = QIHSE_SQL_UNKNOWN;
+        if (strncasecmp(kind, "EXTENSION", 9) == 0 &&
+            !isalnum((unsigned char)kind[9]) && kind[9] != '_')
+            opaque_type = QIHSE_SQL_CREATE_EXTENSION;
+        else if (strncasecmp(kind, "FUNCTION", 8) == 0 &&
+                 !isalnum((unsigned char)kind[8]) && kind[8] != '_')
+            opaque_type = QIHSE_SQL_CREATE_FUNCTION;
+        else if (strncasecmp(kind, "PROCEDURE", 9) == 0 &&
+                 !isalnum((unsigned char)kind[9]) && kind[9] != '_')
+            opaque_type = QIHSE_SQL_CREATE_PROCEDURE;
+        else if (strncasecmp(kind, "TRIGGER", 7) == 0 &&
+                 !isalnum((unsigned char)kind[7]) && kind[7] != '_')
+            opaque_type = QIHSE_SQL_CREATE_TRIGGER;
+        if (opaque_type == QIHSE_SQL_CREATE_FUNCTION) {
+            const char* fp = skip_ws(kind + 8);
+            ast = calloc(1, sizeof(*ast));
+            ast->limit = -1; ast->offset = -1;
+            ast->stmt_type = opaque_type;
+            ast->function_def = calloc(1, sizeof(*ast->function_def));
+            ast->function_def->or_replace = kind != skip_ws(cur + 6);
+            size_t nlen; const char* nstart = read_identifier(fp, &nlen);
+            if (!nlen) { qihse_sql_ast_free(ast); ast = NULL; }
+            else {
+                ast->function_def->name = dup_token(nstart, nlen);
+                fp = skip_ws(nstart + nlen);
+                const char* args_end = find_matching_paren(fp);
+                const char* ret = args_end ? match_kw(args_end + 1, "RETURNS") : NULL;
+                if (!args_end || args_end != fp + 1 || !ret) { qihse_sql_ast_free(ast); ast = NULL; }
+                else {
+                    const char* rstart = read_identifier(ret, &nlen);
+                    if (!nlen) { qihse_sql_ast_free(ast); ast = NULL; }
+                    else {
+                        ast->function_def->returns = dup_token(rstart, nlen);
+                        fp = match_kw(rstart + nlen, "AS");
+                        fp = fp ? skip_ws(fp) : NULL;
+                        const char* delim_end = fp && *fp == '$' ? strchr(fp + 1, '$') : NULL;
+                        if (!delim_end) { qihse_sql_ast_free(ast); ast = NULL; }
+                        else {
+                            size_t delim_len = (size_t)(delim_end - fp + 1);
+                            char* delimiter = dup_token(fp, delim_len);
+                            const char* body_end = delimiter ? strstr(delim_end + 1, delimiter) : NULL;
+                            free(delimiter);
+                            if (!body_end) { qihse_sql_ast_free(ast); ast = NULL; }
+                            else {
+                                ast->function_def->body = dup_range(delim_end + 1, body_end);
+                                fp = match_kw(body_end + delim_len, "LANGUAGE");
+                                if (!fp) { qihse_sql_ast_free(ast); ast = NULL; }
+                                else {
+                                    const char* lstart = read_identifier(fp, &nlen);
+                                    if (!nlen) { qihse_sql_ast_free(ast); ast = NULL; }
+                                    else {
+                                        ast->function_def->language = dup_token(lstart, nlen);
+                                        cur = lstart + nlen;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (opaque_type == QIHSE_SQL_CREATE_TRIGGER) {
+            ast = calloc(1, sizeof(*ast)); ast->limit = -1; ast->offset = -1;
+            ast->stmt_type = opaque_type; ast->trigger_def = calloc(1, sizeof(*ast->trigger_def));
+            ast->trigger_def->or_replace = strcasestr(sql, "OR REPLACE") != NULL;
+            const char* tp = skip_ws(kind + 7); size_t nlen; const char* nstart = read_identifier(tp, &nlen);
+            if (!nlen) { qihse_sql_ast_free(ast); ast = NULL; }
+            else {
+                ast->trigger_def->name = dup_token(nstart, nlen);
+                tp = match_kw(nstart + nlen, "BEFORE");
+                if (tp) ast->trigger_def->timing = strdup("BEFORE");
+                else if ((tp = match_kw(nstart + nlen, "AFTER")))
+                    ast->trigger_def->timing = strdup("AFTER");
+                else if ((tp = match_kw(nstart + nlen, "INSTEAD OF")))
+                    ast->trigger_def->timing = strdup("INSTEAD OF");
+                const char* event = tp ? skip_ws(tp) : NULL;
+                const char* on = event ? match_kw(event, "UPDATE") : NULL;
+                if (on) ast->trigger_def->event = strdup("UPDATE");
+                else if (event && (on = match_kw(event, "INSERT")))
+                    ast->trigger_def->event = strdup("INSERT");
+                else if (event && (on = match_kw(event, "DELETE")))
+                    ast->trigger_def->event = strdup("DELETE");
+                on = on ? match_kw(on, "ON") : NULL;
+                size_t tlen = 0;
+                const char* tstart = on ? read_identifier(on, &tlen) : NULL;
+                if (tlen) ast->trigger_def->table_name = dup_token(tstart, tlen);
+                tp = tlen ? match_kw(tstart + tlen, "FOR EACH ROW") : NULL;
+                if (tp) ast->trigger_def->for_each_row = 1;
+                const char* exec = tp ? match_kw(tp, "EXECUTE FUNCTION") : NULL;
+                size_t flen = 0;
+                const char* fn = exec ? read_identifier(exec, &flen) : NULL;
+                if (flen) ast->trigger_def->function_name = dup_token(fn, flen);
+                const char* args = flen ? skip_ws(fn + flen) : NULL;
+                if (!args || *args != '(' || !find_matching_paren(args) ||
+                    find_matching_paren(args) != args + 1) {
+                    qihse_sql_ast_free(ast); ast = NULL;
+                } else cur = args + 2;
+            }
+        } else if (opaque_type == QIHSE_SQL_CREATE_EXTENSION) {
+            const char* ep = skip_ws(kind + 9);
+            ast = calloc(1, sizeof(*ast));
+            if (ast) {
+                ast->stmt_type = opaque_type;
+                ast->util = util_new();
+                const char* if_after = match_kw(ep, "IF");
+                if (if_after) {
+                    const char* not_after = match_kw(if_after, "NOT");
+                    const char* exists_after = not_after ? match_kw(not_after, "EXISTS") : NULL;
+                    if (!exists_after) { qihse_sql_ast_free(ast); ast = NULL; }
+                    else { ast->create_if_not_exists = 1; ep = exists_after; }
+                }
+                if (ast) {
+                    size_t nlen = 0;
+                    const char* name = read_identifier(ep, &nlen);
+                    if (!nlen || !ast->util) { qihse_sql_ast_free(ast); ast = NULL; }
+                    else { ast->util->name = dup_token(name, nlen); cur = name + nlen;
+                        if (*skip_ws(ep) == '"' && *cur == '"') cur++;
+                    }
+                }
+            }
+        } else if (opaque_type == QIHSE_SQL_CREATE_PROCEDURE) {
+            /* Procedures remain opaque and are never executable through this
+             * parser, but their delimiter and complete suffix are validated. */
+            const char* proc = skip_ws(kind + 9);
+            size_t nlen = 0;
+            const char* name = read_identifier(proc, &nlen);
+            const char* args = nlen ? skip_ws(name + nlen) : NULL;
+            const char* close_args = args ? find_matching_paren(args) : NULL;
+            const char* language = close_args ? match_kw(close_args + 1, "LANGUAGE") : NULL;
+            const char* lang_name = language ? read_identifier(language, &nlen) : NULL;
+            const char* as = lang_name && nlen ? match_kw(lang_name + nlen, "AS") : NULL;
+            const char* dollar = as ? skip_ws(as) : NULL;
+            const char* delimiter_end = dollar && *dollar == '$' ? strchr(dollar + 1, '$') : NULL;
+            if (args && close_args == args + 1 && delimiter_end) {
+                size_t len = (size_t)(delimiter_end - dollar + 1);
+                char* delimiter = dup_token(dollar, len);
+                const char* body_end = delimiter ? strstr(delimiter_end + 1, delimiter) : NULL;
+                free(delimiter);
+                if (body_end) {
+                    ast = calloc(1, sizeof(*ast));
+                    if (ast) { ast->stmt_type = opaque_type; cur = body_end + len; }
+                }
+            }
+        } else {
+            cur += 6;
+            ast = parse_create(&cur);
+        }
+        if (ast && ast->stmt_type == QIHSE_SQL_CREATE &&
+            !ast->index_def && ast->table_name) {
+            const char* tail = skip_ws(cur);
+            if (*tail == ';') tail = skip_ws(tail + 1);
+            if (*tail) { qihse_sql_ast_free(ast); ast = NULL; }
+        }
+    } else if (match_kw(cur, "REFRESH")) {
+        cur = match_kw(cur, "REFRESH");
+        const char* mat = match_kw(cur, "MATERIALIZED VIEW");
+        if (mat) {
+            size_t nlen = 0;
+            const char* name = read_identifier(mat, &nlen);
+            if (nlen) {
+                ast = calloc(1, sizeof(*ast));
+                if (ast) {
+                    ast->stmt_type = QIHSE_SQL_REFRESH;
+                    ast->view_is_materialized = 1;
+                    ast->view_name = dup_token(name, nlen);
+                    cur = name + nlen;
+                }
+            }
+        }
     } else if (strncasecmp(cur, "ALTER ROLE", 10) == 0) {
         cur += 10; ast = parse_utility(&cur, QIHSE_SQL_ALTER_ROLE);
     } else if (strncasecmp(cur, "ALTER", 5) == 0) {
@@ -2676,13 +3480,149 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
         ast->limit = -1; ast->offset = -1;
     }
 
+    /* Every supported grammar must consume its complete statement.  Never
+     * return a valid-looking prefix for a second command or malformed suffix. */
+    if (ast) {
+        const char* tail = skip_ws(cur);
+        if (*tail == ';') tail = skip_ws(tail + 1);
+        if (*tail || ast->stmt_type == QIHSE_SQL_UNKNOWN ||
+            (ast->stmt_type == QIHSE_SQL_CREATE_MATVIEW && !ast->view_query) ||
+            (ast->stmt_type == QIHSE_SQL_CREATE_VIEW && !ast->view_query)) {
+            qihse_sql_ast_free(ast);
+            ast = NULL;
+        }
+    }
     free(work);
     if (ast && !ast->raw_sql) ast->raw_sql = strdup(sql);
     return ast;
 }
 
+/* Match raw placeholders against the typed leaves: a repeated $n is fine,
+ * but a parameter hidden inside an unsupported expression is never bound. */
+static int count_ast_parameters(const qihse_sql_ast_t* ast, unsigned* counts) {
+    if (!ast) return 1;
+    for (size_t i = 0; i < ast->num_where_conditions; ++i) {
+        const qihse_sql_condition_t* c = &ast->where_conditions[i];
+        if (c->value_parameter_index) {
+            if (c->value_parameter_index > QIHSE_SQL_MAX_PARAMETERS) return 0;
+            counts[c->value_parameter_index]++;
+        }
+        if (!count_ast_parameters(c->subquery, counts)) return 0;
+    }
+    for (size_t i = 0; i < ast->num_set; ++i) {
+        unsigned n = ast->set_parameter_indexes ? ast->set_parameter_indexes[i] : 0;
+        if (n > QIHSE_SQL_MAX_PARAMETERS) return 0;
+        if (n) counts[n]++;
+    }
+    for (size_t r = 0; r < ast->num_insert_rows; ++r) {
+        if (!ast->insert_rows[r] || !ast->insert_parameter_indexes) return 0;
+        for (size_t i = 0; ast->insert_rows[r][i]; ++i) {
+            unsigned n = ast->insert_parameter_indexes[r][i];
+            if (n > QIHSE_SQL_MAX_PARAMETERS) return 0;
+            if (n) counts[n]++;
+        }
+    }
+    for (size_t i = 0; i < ast->num_select_items; ++i)
+        if (!count_ast_parameters(ast->select_items[i].scalar_subquery, counts)) return 0;
+    if (!count_ast_parameters(ast->set_left, counts) ||
+        !count_ast_parameters(ast->set_right, counts) ||
+        !count_ast_parameters(ast->view_query, counts) ||
+        !count_ast_parameters(ast->explain_query, counts)) return 0;
+    if (ast->with_clause) {
+        for (size_t i = 0; i < ast->with_clause->num_ctes; ++i)
+            if (!count_ast_parameters(ast->with_clause->ctes[i].query, counts)) return 0;
+        if (!count_ast_parameters(ast->with_clause->body, counts)) return 0;
+    }
+    if (ast->cursor_def && !count_ast_parameters(ast->cursor_def->query, counts)) return 0;
+    if (ast->util && !count_ast_parameters(ast->util->subquery, counts)) return 0;
+    return 1;
+}
+
+static int count_sql_parameters(const char* sql, unsigned* counts) {
+    if (!sql) return 0;
+    const char* p = sql;
+    while (*p) {
+        if (*p == '\'' || *p == '"') {
+            char quote = *p++;
+            while (*p) {
+                if (*p == quote) {
+                    if (p[1] == quote) { p += 2; continue; }
+                    break;
+                }
+                if (*p == '\\' && p[1]) p += 2;
+                else p++;
+            }
+            if (!*p) return 0;
+            p++;
+            continue;
+        }
+        if (p[0] == '-' && p[1] == '-') {
+            p += 2;
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            const char* end = strstr(p + 2, "*/");
+            if (!end) return 0;
+            p = end + 2;
+            continue;
+        }
+        if (*p != '$') { p++; continue; }
+        const char* tag = p + 1;
+        while (isalnum((unsigned char)*tag) || *tag == '_') tag++;
+        if (*tag == '$' && (tag == p + 1 || isalpha((unsigned char)p[1]) || p[1] == '_')) {
+            size_t delimiter_len = (size_t)(tag + 1 - p);
+            const char* body = tag + 1;
+            const char* end = NULL;
+            for (const char* q = body; *q; ++q)
+                if (*q == '$' && strncmp(q, p, delimiter_len) == 0) { end = q; break; }
+            if (!end) return 0;
+            p = end + delimiter_len;
+            continue;
+        }
+        p++;
+        if (!isdigit((unsigned char)*p)) return 0;
+        unsigned n = 0;
+        do {
+            n = n * 10 + (unsigned)(*p++ - '0');
+            if (n > QIHSE_SQL_MAX_PARAMETERS) return 0;
+        } while (isdigit((unsigned char)*p));
+        if (!n || isalnum((unsigned char)*p) || *p == '_') return 0;
+        counts[n]++;
+    }
+    return 1;
+}
+
+int qihse_sql_ast_parameters_valid(const qihse_sql_ast_t* ast) {
+    if (!ast || !ast->raw_sql) return 0;
+    unsigned parsed[QIHSE_SQL_MAX_PARAMETERS + 1] = {0};
+    unsigned source[QIHSE_SQL_MAX_PARAMETERS + 1] = {0};
+    if (!count_ast_parameters(ast, parsed) || !count_sql_parameters(ast->raw_sql, source)) return 0;
+    unsigned max = 0;
+    for (unsigned i = 1; i <= QIHSE_SQL_MAX_PARAMETERS; ++i) {
+        if (parsed[i] != source[i]) return 0;
+        if (parsed[i]) max = i;
+    }
+    for (unsigned i = 1; i <= max; ++i) if (!parsed[i]) return 0;
+    return 1;
+}
+
+size_t qihse_sql_ast_parameter_count(const qihse_sql_ast_t* ast) {
+    if (!qihse_sql_ast_parameters_valid(ast)) return 0;
+    unsigned counts[QIHSE_SQL_MAX_PARAMETERS + 1] = {0};
+    count_ast_parameters(ast, counts);
+    for (size_t i = QIHSE_SQL_MAX_PARAMETERS; i > 0; --i)
+        if (counts[i]) return i;
+    return 0;
+}
+
 qihse_sql_ast_t* qihse_parse_sql_to_ast(const char* sql) {
-    return parse_statement(sql);
+    qihse_sql_ast_t* ast = parse_statement(sql);
+    if (ast && !qihse_sql_ast_parameters_valid(ast)) {
+        qihse_sql_ast_free(ast);
+        return NULL;
+    }
+    return ast;
 }
 
 /* -------------------------------------------------------------------------
@@ -2692,6 +3632,7 @@ static void free_column_def(qihse_sql_column_def_t* c) {
     if (!c) return;
     free(c->name);
     free(c->default_expr);
+    free(c->generated_expr);
     free(c->check_expr);
     if (c->fk) {
         for (size_t i = 0; i < c->fk->num_columns; i++) free(c->fk->columns[i]);
@@ -2731,6 +3672,10 @@ void qihse_sql_ast_free(qihse_sql_ast_t* ast) {
         free(ast->select_items[i].expr);
         free(ast->select_items[i].alias);
         free(ast->select_items[i].agg_arg);
+        if (ast->select_items[i].agg_case) {
+            free(ast->select_items[i].agg_case->column);
+            free(ast->select_items[i].agg_case);
+        }
         free(ast->select_items[i].win_arg);
         free(ast->select_items[i].win_default);
         qihse_sql_ast_free(ast->select_items[i].scalar_subquery);
@@ -2780,10 +3725,25 @@ void qihse_sql_ast_free(qihse_sql_ast_t* ast) {
     free(ast->table_name);
     for (size_t i = 0; i < ast->num_columns; i++) free_column_def(&ast->columns[i]);
     free(ast->columns);
+    if (ast->trigger_def) {
+        free(ast->trigger_def->name); free(ast->trigger_def->table_name);
+        free(ast->trigger_def->timing); free(ast->trigger_def->event);
+        free(ast->trigger_def->function_name); free(ast->trigger_def);
+    }
+    if (ast->function_def) {
+        free(ast->function_def->name); free(ast->function_def->returns);
+        free(ast->function_def->language); free(ast->function_def->body);
+        free(ast->function_def);
+    }
     if (ast->index_def) {
         free(ast->index_def->name);
         free(ast->index_def->table_name);
         free(ast->index_def->column_name);
+        for (size_t i = 0; i < ast->index_def->num_expressions; ++i)
+            free(ast->index_def->expressions[i]);
+        free(ast->index_def->expressions);
+        free(ast->index_def->descending);
+        free(ast->index_def->using_method);
         free(ast->index_def);
     }
     free(ast->drop_name);
@@ -2876,6 +3836,14 @@ void qihse_sql_ast_free(qihse_sql_ast_t* ast) {
         }
     }
     free(ast->insert_rows);
+    for (size_t i = 0; i < ast->num_insert_rows; i++) {
+        free(ast->insert_cast_types[i]);
+        free(ast->insert_quoted[i]);
+        free(ast->insert_parameter_indexes[i]);
+    }
+    free(ast->insert_cast_types);
+    free(ast->insert_quoted);
+    free(ast->insert_parameter_indexes);
     free(ast->insert_select_query);
     /* update set */
     for (size_t i = 0; i < ast->num_set; i++) {
@@ -2884,6 +3852,8 @@ void qihse_sql_ast_free(qihse_sql_ast_t* ast) {
     }
     free(ast->set_columns);
     free(ast->set_values);
+    free(ast->set_quoted);
+    free(ast->set_parameter_indexes);
     free(ast->raw_sql);
     free(ast);
 }
@@ -2902,6 +3872,19 @@ const char* qihse_sql_type_name(qihse_sql_type_t t) {
         case QIHSE_TYPE_BOOL:      return "BOOL";
         case QIHSE_TYPE_TIMESTAMP: return "TIMESTAMP";
         case QIHSE_TYPE_VECTOR:    return "VECTOR";
+        case QIHSE_TYPE_SERIAL:    return "SERIAL";
+        case QIHSE_TYPE_BIGSERIAL: return "BIGSERIAL";
+        case QIHSE_TYPE_INT_ARRAY: return "INT[]";
+        case QIHSE_TYPE_FLOAT_ARRAY: return "FLOAT[]";
+        case QIHSE_TYPE_TEXT_ARRAY: return "TEXT[]";
+        case QIHSE_TYPE_BOOL_ARRAY: return "BOOL[]";
+        case QIHSE_TYPE_JSONB:     return "JSONB";
+        case QIHSE_TYPE_INET:      return "INET";
+        case QIHSE_TYPE_NUMERIC:   return "NUMERIC";
+        case QIHSE_TYPE_DATE:      return "DATE";
+        case QIHSE_TYPE_TIMESTAMPTZ: return "TIMESTAMPTZ";
+        case QIHSE_TYPE_UUID:      return "UUID";
+        case QIHSE_TYPE_TSVECTOR:  return "TSVECTOR";
         default: return "UNKNOWN";
     }
 }
@@ -3010,6 +3993,11 @@ const char* qihse_sql_stmt_name(qihse_sql_stmt_type_t s) {
         case QIHSE_SQL_EXECUTE:       return "EXECUTE";
         case QIHSE_SQL_REINDEX:       return "REINDEX";
         case QIHSE_SQL_CLUSTER:       return "CLUSTER";
+        case QIHSE_SQL_CREATE_EXTENSION: return "CREATE EXTENSION";
+        case QIHSE_SQL_CREATE_FUNCTION:  return "CREATE FUNCTION";
+        case QIHSE_SQL_CREATE_TRIGGER:   return "CREATE TRIGGER";
+        case QIHSE_SQL_CREATE_PROCEDURE: return "CREATE PROCEDURE (opaque)";
+        case QIHSE_SQL_DROP_TRIGGER: return "DROP TRIGGER";
         default: return "UNKNOWN";
     }
 }

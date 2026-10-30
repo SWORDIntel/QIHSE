@@ -1,16 +1,23 @@
 # QIHSE Database Schema
 
-Complete reference for all data stored in QIHSE, keyed by the KV store prefix system.
+Reference for application KV namespaces and the native SQL row/catalog format.
+The JSON examples below describe application records, not a universal storage encoding.
 
 ## Storage Layers
 
 | Layer | Purpose | Persistence | In-Memory |
 |-------|---------|-------------|-----------|
-| **KVStore** | Primary key-value store for all records | `/bridge/audit/qihse.db` | Yes (loaded on startup) |
+| **KVStore** | Namespaced key-value records (not SQL table rows) | Configured KV path (example: `./audit/qihse.db`) | Yes (loaded on startup) |
 | **FTSIndex** | BM25 full-text search over all records | In-memory (rebuilt from KV + map on startup) | Yes |
-| **VectorDB** | Hash-based semantic embeddings (256-dim) | `/bridge/audit/tool_vectors.db` | No (file-backed) |
+| **VectorDB** | Hash-based semantic embeddings (256-dim) | Configured vector path (example: `./audit/tool_vectors.db`) | No (file-backed) |
 | **TimeSeriesDB** | Gorilla-compressed metrics | In-process | Yes |
-| **EventStream** | Append-only durable event log | `/bridge/audit/events_<name>` | No (file-backed) |
+| **EventStream** | Append-only durable event log | Configured stream path (example: `./audit/events_<name>`) | No (file-backed) |
+| **SQL Table Store** | Typed mutable rows, SQL catalog and retry receipts | Opt-in native snapshot at the path passed to `qihse_uwp_sql_open_durable` | Yes (recovered on open) |
+
+Paths here are relative examples, not fixed deployment defaults. Configure each
+store's path for the deployment; a SQL durable snapshot requires an existing
+private directory owned by the effective uid (for example `./data/sql/`, mode
+`0700`). SQL durability is separate from KV, vector and event-stream storage.
 
 ## Tenant Namespace Conventions (session-delivery, enforced engine-side)
 
@@ -30,19 +37,69 @@ operator principals are unrestricted). See
 
 ## Auxiliary Files
 
+Application-specific relative path examples; resolve them against the configured
+data directory rather than assuming a machine-specific mount point.
+
 | File | Purpose |
 |------|---------|
-| `/bridge/audit/qihse_fts_map.json` | Maps FTS doc_id → KV key (for resolving search results) |
-| `/bridge/audit/tool_graph.json` | Tool dependency graph (consumers + chains_together) |
-| `/bridge/audit/tool_cards.json` | Compact LLM tool cards for prompt injection |
-| `/bridge/audit/tool_idf.json` | Inverse Document Frequency weights for vector embeddings |
-| `/bridge/audit/tool_vectors.db` | VectorDB file (256-dim hash embeddings) |
+| `./audit/qihse_fts_map.json` | Maps FTS doc_id → KV key (for resolving search results) |
+| `./audit/tool_graph.json` | Tool dependency graph (consumers + chains_together) |
+| `./audit/tool_cards.json` | Compact LLM tool cards for prompt injection |
+| `./audit/tool_idf.json` | Inverse Document Frequency weights for vector embeddings |
+| `./audit/tool_vectors.db` | VectorDB file (256-dim hash embeddings) |
 
 ---
 
+## Native SQL Row and Catalog Schema
+
+Public contracts: [`include/qihse_table_store.h`](include/qihse_table_store.h)
+and [`include/qihse_uwp_sql_txn_schema.h`](include/qihse_uwp_sql_txn_schema.h);
+see [API reference §8.2](docs/API_REFERENCE.md#82-table-store-dml-primitives--includeqihse_table_storeh).
+
+- The native snapshot writer emits **v5**; recovery accepts **v1–v5**. It stores
+  typed column definitions, row slots/tombstones and table generations. v2 adds
+  a catalog image; v3 adds retry receipts; v4 adds explicit NULL and extended
+  scalar types; v5 adds NUMERIC and TSVECTOR. NULL is independent of empty text,
+  zero and false. Owned text types include STRING, UUID, JSONB, NUMERIC and
+  TSVECTOR; TIMESTAMPTZ is signed Unix-epoch microseconds.
+- The embedded `QSC1` schema writer emits **v4**; readers accept **v1–v4**.
+  The versioned/checksummed catalog records supported tables/columns, constraints,
+  extensions, indexes, generated expressions, functions/triggers and views.
+  Serialization refuses unsupported definitions; it is not a promise of full
+  PostgreSQL catalog compatibility. SQL open validates the complete catalog/row
+  pairing and supported keys before exposing the recovered store.
+- A durable commit publishes rows, catalog and retry receipts in one fsynced
+  snapshot generation, not a JSON export or a cross-model WAL. Direct
+  INSERT/UPDATE/DELETE are rejected on durable handles; SQL uses fenced
+  transaction/catalog publication (raw CREATE does not update the SQL catalog).
+  A failed post-rename directory sync is
+  ambiguous: close/reopen and resolve the receipt before retrying.
+- Reserved row security columns `__qihse_tenant_id`,
+  `__qihse_classification` and `__qihse_sci` must appear together as INT32.
+  Authenticated scans check table READ ACL and filter rows by tenant/clearance/SCI;
+  full authenticated source snapshots instead refuse any inaccessible live row.
+  Unlabeled rows are system-tenant, unclassified data, not a tenant bypass.
+  Context-free row scans, counts and raw catalog enumeration are engine helpers,
+  **not classified-capable adapter entry points**.
+- Backup/restore transfer committed **v3–v5** images without upgrading them,
+  preserving catalog, rows and principal/tenant-bound retry receipts. Only the
+  active bootstrap **Operator id 0, tenant 0** qualifies; other Operators do not.
+  Destinations must not exist. Restore requires source and target locks to be
+  available, so close their handles first. A failed transfer may already have
+  published its destination; inspect/reopen rather than overwriting it.
+
+Source verification: `src/tractable/qihse_table_store.c` (`ts_persist`,
+`qihse_table_store_open_durable`, `ts_copy_snapshot`, `ts_backup_authorized`,
+`ts_table_read_context`); `src/tractable/qihse_schema.c`
+(`qihse_schema_serialize`, `qihse_schema_deserialize`);
+`src/spinnaker/qihse_uwp_sql_txn_schema.c` (`uwp_sql_open_durable_locked`).
+
 ## KV Key Schema
 
-All data is stored as JSON strings under namespaced keys.
+The application namespaces documented below conventionally store JSON text
+under namespaced KV keys. KV values are not universally JSON: other namespaces
+can contain strings, binary payloads, pointers or versioned encodings. Native
+SQL rows/catalogs, vector files and event logs are not JSON KV records.
 
 ### Tools — `tool:<name>`
 
@@ -233,7 +290,7 @@ Execution dedup + success rate tracking. `params_hash` is MD5 of the rendered co
   "fail_count": 0,
   "last_exit_code": 0,
   "last_run_at": "2026-08-22T12:30:00Z",
-  "summary_file": "/bridge/engagements/acme-pentest/summaries/nmap_10.26.0.1.json"
+  "summary_file": "./engagements/acme-pentest/summaries/nmap_10.26.0.1.json"
 }
 ```
 
@@ -262,7 +319,7 @@ Set to `"ok"` on health check command.
 
 The FTS index is in-memory only. On startup, it is rebuilt from the KV store using the FTS map file.
 
-### FTS Map — `/bridge/audit/qihse_fts_map.json`
+### FTS Map — `./audit/qihse_fts_map.json`
 
 ```json
 {
@@ -289,7 +346,7 @@ For each record type, the following fields are concatenated for indexing:
 
 ## VectorDB
 
-256-dimensional hash-based embeddings stored in `/bridge/audit/tool_vectors.db`.
+256-dimensional hash-based embeddings stored in `./audit/tool_vectors.db`.
 
 ### Embedding Method
 
@@ -299,7 +356,7 @@ For each record type, the following fields are concatenated for indexing:
 4. Accumulate signed weights into 256-dim vector
 5. L2 normalize
 
-### IDF Weights — `/bridge/audit/tool_idf.json`
+### IDF Weights — `./audit/tool_idf.json`
 
 ```json
 {
@@ -340,7 +397,7 @@ Gorilla-compressed time-series for operational metrics.
 
 ## EventStream
 
-Append-only durable event log at `/bridge/audit/events_<name>`.
+Append-only durable event log at `./audit/events_<name>`.
 
 ### API
 

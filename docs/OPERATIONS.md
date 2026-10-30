@@ -1,9 +1,9 @@
 # QIHSE Operations Manual
 
-> **Status: implemented** — every command in the "Build", "Test", "Daemons
-> and CLIs", and "Cluster smoke drills" sections below was executed on this
-> branch (2026-09-26) unless explicitly marked *not verified here*. Commands
-> marked unverified were read from the source but not executed in this pass.
+> **Status: mixed implementation and historical evidence.** Command execution
+> notes dated 2026-09-26 describe that earlier pass, not current verification.
+> Installation/recovery gates added here are source-reviewed requirements, not
+> claims that a deployment, live health check or restore was performed.
 
 This is the operator manual: how to build, test, and run every tool QIHSE
 ships. It complements, and does not repeat, the [API reference](API_REFERENCE.md)
@@ -25,6 +25,25 @@ cluster-wide read or followed to another member. This recovery inspection
 command has not been exercised on a live daemon in this update.
 
 ---
+
+## Delivery and local service gates
+
+The installer refuses a prefix resolving to its own source checkout. Build and
+validate into a separate staged/versioned prefix; do not overwrite or recursively
+change ownership of a dirty shared checkout to refresh a running installation.
+The installer places the fleet refresh helper under `libexec/`, but does not
+provision an account or activate the refresh service on its own.
+
+The fleet refresh unit requires a private systemd configuration environment file
+(named in `tools/fleet/qihse-machine-token-refresh.service`) with explicit
+`QIHSE_PREFIX`, `QIHSE_MACHINE_IDENTITY`, `QIHSE_MACHINE_TOKEN`,
+`QIHSE_MACHINE_USER_ID` and `QIHSE_MACHINE_TENANT`. Use a provisioned, positive
+machine-principal ID and tenant ID; do not infer them from a SQL role name or
+substitute the bootstrap Operator. Configure paths for the actual installation,
+install the matching helper/template, then reload systemd and test the oneshot
+before enabling its timer. Missing/invalid configuration fails before minting.
+A mint failure preserves the old credential; successful replacement is atomic
+and mode 0600. Never print the token to establish service health.
 
 ## 0. Quick index — credentials and tools at a glance
 
@@ -63,7 +82,7 @@ in-memory password verifier cache to reduce subsequent latency).
 | Task | Command (from repo root) | Credential needed |
 |---|---|---|
 | Build library | `make lib` | none |
-| Full test aggregate | `make test` (~40–50 min) | none |
+| Full test aggregate | `make test TEST_JOBS=32` (duration varies) | none |
 | Gold validation suite | `make test-gold` | none |
 | Repo workflow check | `make check` | none |
 | Native SDK demo | `./qihse demo` | demo default or env |
@@ -96,6 +115,16 @@ in-memory password verifier cache to reduce subsequent latency).
 `clang` is needed only for `make xdp-kern`. Post-quantum dependencies
 (`liboqs`, `oqs-provider`) are vendored submodules that `make lib` builds and
 installs into `/usr/local` on first use (skipped when already present).
+SQL English FTS also requires `libstemmer.so.0d` at runtime: install the
+Debian/Ubuntu `libstemmer0d` package in each actual runtime, including chroots
+and containers. `src/tractable/qihse_sql_fts.c` uses `dlopen`, so checking only
+ELF `NEEDED` entries or linking successfully does not verify this dependency.
+`make check-runtime-deps` checks the build host's loader and required symbols;
+repeat the check in the deployment runtime and exercise the analyzer there.
+This bounded ASCII English/Snowball analyzer limits input/output to 4096 bytes
+and tokens to 256 bytes. Non-ASCII/oversized input, missing library/symbols and
+analyzer failures fail closed (including empty input when the library is absent),
+not with a fallback tokenizer. It is not full PostgreSQL text-search parity.
 
 ### 1.2 Targets
 
@@ -112,12 +141,16 @@ installs into `/usr/local` on first use (skipped when already present).
 | `make keygen` | Build `qihse_keygen` (PQC key generator) | Verified |
 | `make federation-ca` | Build `qihse-federation-ca` | Verified |
 | `make xdp-kern` | Compile the eBPF XDP object with `clang` | *Not verified here* |
-| `make install` | Install `libqihse.so` + header into `$(DESTDIR)/usr/local` | *Not verified here* |
+| `make install` | Install library, `qihse-backup` and public/transitive headers under `$(DESTDIR)$(PREFIX)` | Defaults to a live prefix when `DESTDIR` is empty; stage first (§1.6). Not executed in this documentation update. |
 | `make install-host` | Automated hardware ISA detection, build, `/opt/QIHSE` install, PQC keygen & systemd launch (`scripts/install_qihse.sh`) | Verified |
 
 ### 1.3 CPU ISA selection & Automated Host Installer
 
-QIHSE includes an automated hardware-optimizing installer: [scripts/install_qihse.sh](file:///home/john/Documents/QIHSE/scripts/install_qihse.sh).
+QIHSE includes an automated hardware-optimizing installer:
+[scripts/install_qihse.sh](../scripts/install_qihse.sh). These are provisioning
+commands, not staging commands: they can replace live binaries, provision keys,
+change units and start services. Do not run them from a dirty/shared development
+checkout as an upgrade shortcut. No installer was executed in this update.
 
 ```bash
 # Dry run to inspect detected CPU ISAs and planned compiler flags
@@ -182,23 +215,82 @@ make` is only needed after changing flags or ISA paths.
 
 ---
 
+### 1.6 Staged installation and upgrade gates
+
+**No live install is implied by a successful development build.** The shared
+checkout can contain concurrent edits and mixed build artifacts. Freeze and
+review the intended source inputs before producing a release candidate; do not
+install the checkout's current `libqihse.so` directly into a running prefix.
+The commands below illustrate staging only, not a deployment performed here:
+
+```bash
+STAGE="$(mktemp -d)"
+make install DESTDIR="$STAGE" PREFIX=/usr/local
+# Inspect "$STAGE/usr/local"; do not copy it over live files yet.
+```
+
+`DESTDIR` redirects installation, not compilation or dependency provisioning:
+build prerequisites can still modify the build host (see §1.1). It does not
+supply runtime dependencies inside a target chroot. Use a prepared build
+environment and validate `libstemmer.so.0d` in every final runtime.
+
+Before activation:
+
+1. Record source revision **and** dirty diff/untracked inputs, compiler/ISA
+   flags, runtime dependencies and SHA-256 of the exact library, daemon, tools
+   and headers. Directory names, Git HEAD alone, timestamps and identical
+   install paths do not prove identical artifacts. A dirty candidate is not a
+   reproducible release merely because its build succeeds.
+2. Inventory **all** consumers of each installed library: cluster/RESP/SQL
+   daemons, Python ctypes/native extensions, backup tools, KEYSTONE integrations
+   and other processes. Check loader paths, chroots, containers and mapped
+   libraries. Replacing a file does not update already mapped code; restarting
+   only one daemon leaves mixed generations. Never overwrite a mapped library
+   in place. Retain versioned old artifacts and coordinate each consumer's
+   tested restart/activation plan.
+3. Preserve validated pre-upgrade data images plus configuration, credentials,
+   trust pins and runtime manifests under existing access controls. SQL store
+   v5/schema v4 read older formats; this is **not binary downgrade support**.
+   Prove rollback with the old runtime against a restored pre-upgrade image in
+   isolation before allowing new writes. See [recovery](deployment/README.md#backup-and-recovery).
+4. Stage inactive artifacts and compare actual per-file hashes with the
+   manifest on each host. Verify CPU baseline, ABI/relocations, loader paths,
+   dependency symbols and analyzer behavior in each service runtime. Run the
+   complete suite with `make test TEST_JOBS=32`, then isolated persistent-store,
+   restart/crash recovery, backup/restore, TLS/auth and low-clearance denial
+   checks for the intended clients. Passing unit tests is not deployment proof.
+5. Establish current leadership, quorum, replication/commit progress and audit
+   continuity through authenticated observations. If leadership is unknown,
+   stop: do not choose a follower from a hostname or stale role label. Only
+   after those gates pass, roll one confirmed follower at a time, rechecking
+   quorum, commit progress, audit continuity and authenticated application
+   reads/writes after each restart; handle the current leader last through the
+   tested leadership procedure. Keep intentionally fenced nodes fenced.
+6. Stop progression on ambiguous leadership, lag, startup/audit failures,
+   authorization failures or mismatched hashes. A PING, open port, service
+   status or matching directory name is not a health gate. Do not point older
+   code at newly written data as a rollback shortcut.
+
+These are required gates, not evidence that any current host passed them.
+No live hashes, leadership, rollout, backup recovery or credential changes were
+verified/performed in this documentation update.
+
 ## 2. Test
 
 ### 2.1 The aggregate
 
-**Parallel invocation (default since 2026-09-26):** `make -j8 test` — every
-test binary isolates its audit chain/log under `QIHSE_DATA_DIR` (a per-test
-`build/<target>_XXXXXX` scratch dir), so targets run concurrently safely.
-Measured on the reference box: the full aggregate drops from ~40–50 min
-serial to **~5 min** (the gold suite is the critical path). One aggregate
-at a time still applies — two concurrent `make test` runs would race the
-shared `build/` compile artifacts.
+Run the complete suite with the Makefile-managed concurrency limit:
 
 ```bash
-make test        # or ./qihse test
+make test TEST_JOBS=32
 ```
 
-Runs the full sequential list defined in `Makefile` (≈90 `test-*` targets:
+The suite builds shared artifacts first, runs only audited process-isolated
+targets concurrently, and retains unapproved targets serially. Do not substitute
+`make -j32 test`, `make test-serial` or a parallel-only lane. Run one aggregate
+at a time: concurrent aggregates can race shared build artifacts.
+
+Runs the full suite defined in `Makefile` (including `test-*` targets for:
 auth/privilege boundary, object ACL, UWP regressions, graph, cluster
 slot/numa/bus/failover/scatter, brain, overlay/DHT, federation F0–F8 + mTLS +
 repl + transport + rejoin + CA + CRL + backup + consensus + incremental export,
@@ -533,7 +625,7 @@ deliberate:
 #### Provisioning Helper Script (`scripts/setup_i2p_replication.sh`)
 
 To simplify secure certificate generation and daemon configuration, use
-[scripts/setup_i2p_replication.sh](file:///home/john/Documents/QIHSE/scripts/setup_i2p_replication.sh):
+[scripts/setup_i2p_replication.sh](../scripts/setup_i2p_replication.sh):
 - **Constants at Top of File**: Node IDs, ports, tunnel lengths, and hardening parameters
   are clearly defined constants at the top of the script.
 - **`gen-keys`**: Derives ML-KEM-1024 and ML-DSA-87 keypairs with `0600` permissions and

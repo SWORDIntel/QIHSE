@@ -30,18 +30,45 @@ Compatibility is implemented inside QIHSE; it is not a statement that every edge
 
 ## PostgreSQL / pgwire
 
-QIHSE implements PostgreSQL wire-protocol paths and a relational SQL engine.
+**Status: partial — bounded authenticated SQL, not universal PostgreSQL compatibility.**
+`qihse_pg_wire_handle_client_uwp()` uses the client's authenticated identity,
+shared schema and transaction manager. Explicit durable binding adds fsynced
+row/catalog generations. The legacy multi-engine handler and parser command
+inventory are distinct; they do not establish this execution or recovery contract.
 
-Supported areas include:
+- Simple queries and typed Parse/Bind/Describe/Execute/Close/Flush/Sync are
+  exercised by `tests/test_pg_wire_txn.c` and the disposable all-driver gate.
+  Connection-local limits: 32 statements, 32 portals, 64 parameters, 64 result
+  columns, 1 MiB captured results and 1 MiB per bind value (16 MiB frontend
+  message-length cap; statement/portal names at most 128 bytes). Execute accepts
+  `max_rows=0` only (no suspended portals). Values are typed vectors, not SQL
+  interpolation; supported text/binary codecs are enumerated in the SQL doc.
+- BEGIN/COMMIT/ROLLBACK enlist up to 16 row-table shadows with own-write reads,
+  generation fences and commit-time authorization checks. Extended implicit DML
+  stays private until Sync; a failed pipeline rolls back. This is not general
+  PostgreSQL isolation parity or cross-model SQL ACID. Savepoints refuse.
+- Durable DDL-only generations support bounded CREATE TABLE, uuid-ossp, executable
+  indexes, the validated stored-generated TSVECTOR expression, updated_at
+  function/trigger, and a validated statistics materialized relation with real
+  CREATE population and REFRESH. Mixed DDL/DML, general ALTER/DROP, arbitrary
+  stored code and views, and DDL retry receipts remain outside this contract.
+- Native NULL, UUID, JSONB-text, BOOLEAN, TIMESTAMPTZ, exact NUMERIC(1–38 precision)
+  and TSVECTOR have bounded semantics, not PostgreSQL-wide type parity. Supported
+  single-column PK/NOT NULL/NOT-NULL UNIQUE are enforced; CHECK, FK/cascades,
+  composite keys, nullable UNIQUE and SERIAL refuse.
+- SELECT supports one-table projection, verified AND predicates, LIMIT/OFFSET,
+  verified top-1 ordering and the source-specific auth_events aggregate corpus;
+  general joins, expressions, grouping, windows, CTEs, COPY, RETURNING, ON CONFLICT
+  and PostgreSQL GRANT/REVOKE/role semantics are not promised by parser support.
+- Table ACLs, tenant/classification/SCI row labels and authenticated catalog/index
+  reads apply. Exact supported information_schema.tables/pg_indexes queries do
+  not imply arbitrary ORM/catalog compatibility.
 
-- simple and extended query flows
-- Parse / Bind / Execute / Describe / Close / Sync
-- transactions and savepoints
-- DDL and DML
-- GRANT / REVOKE and role-management paths
-- prepared statements
-- common aggregate and window functions
-- COPY and utility commands
+The loopback plaintext listener is restricted to 127.0.0.1 and refuses SSLRequest
+rather than downgrading; network access uses the TLS-required listener (TLS 1.2+)
+and clients verifying the server certificate. See the
+[disposable application readiness gate](architecture/pgwire_app_compat.md):
+source-derived tests are not an actual DIRECTEYE migration or deployment claim.
 
 Related code and docs:
 

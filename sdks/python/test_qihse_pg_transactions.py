@@ -112,7 +112,7 @@ def command(tag, status):
 class PgTransactionTests(unittest.TestCase):
     def test_startup_sends_password_before_authenticated_ready(self):
         server = FakePgServer([]).start()
-        conn = connect(host="127.0.0.1", port=server.port, user="alice",
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", user="alice",
                        dbname="inventory", password="secret")
         self.assertIn(b"user\x00alice\x00database\x00inventory\x00", server.startup)
         self.assertEqual(server.password, b"secret")
@@ -123,7 +123,7 @@ class PgTransactionTests(unittest.TestCase):
     def test_startup_rejection_prevents_connection_creation(self):
         server = FakePgServer([], reject_auth=True).start()
         with self.assertRaises(OperationalError):
-            connect(host="127.0.0.1", port=server.port, user="alice",
+            connect(host="127.0.0.1", port=server.port, sslmode="disable", user="alice",
                     password="wrong")
         server.join()
         self.assertEqual(server.password, b"wrong")
@@ -131,7 +131,7 @@ class PgTransactionTests(unittest.TestCase):
 
     def test_begin_rejection_keeps_transaction_state_false(self):
         server = FakePgServer([error_response() + ready(b"I")]).start()
-        conn = connect(host="127.0.0.1", port=server.port, password="secret")
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", password="secret")
         with self.assertRaises(ProgrammingError):
             conn.begin()
         self.assertFalse(conn._in_transaction)
@@ -144,7 +144,7 @@ class PgTransactionTests(unittest.TestCase):
             command("BEGIN", b"T"),
             error_response("commit refused") + ready(b"I"),
         ]).start()
-        conn = connect(host="127.0.0.1", port=server.port, password="secret")
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", password="secret")
         conn.begin()
         self.assertTrue(conn._in_transaction)
         with self.assertRaises(ProgrammingError):
@@ -159,7 +159,7 @@ class PgTransactionTests(unittest.TestCase):
             command("BEGIN", b"T"),
             command("ROLLBACK", b"I"),
         ]).start()
-        conn = connect(host="127.0.0.1", port=server.port, password="secret")
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", password="secret")
         conn.begin()
         conn.rollback()
         self.assertFalse(conn._in_transaction)
@@ -177,7 +177,7 @@ class PgTransactionTests(unittest.TestCase):
             row_description + data_row + command("SELECT 1", b"T"),
             command("COMMIT", b"I"),
         ]).start()
-        conn = connect(host="127.0.0.1", port=server.port, password="secret")
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", password="secret")
         cur = conn.cursor()
         cur.execute("SELECT 1")
         self.assertEqual(cur.fetchone(), ("1",))
@@ -191,7 +191,7 @@ class PgTransactionTests(unittest.TestCase):
 
     def test_default_cursor_does_not_run_query_if_begin_is_rejected(self):
         server = FakePgServer([error_response() + ready(b"I")]).start()
-        conn = connect(host="127.0.0.1", port=server.port, password="secret")
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", password="secret")
         with self.assertRaises(ProgrammingError):
             conn.cursor().execute("SELECT 1")
         self.assertFalse(conn._in_transaction)
@@ -201,7 +201,7 @@ class PgTransactionTests(unittest.TestCase):
 
     def test_transport_close_is_reported_and_socket_discarded(self):
         server = FakePgServer([None]).start()
-        conn = connect(host="127.0.0.1", port=server.port, password="secret",
+        conn = connect(host="127.0.0.1", port=server.port, sslmode="disable", password="secret",
                        autocommit=True)
         with self.assertRaises(OperationalError):
             conn.cursor().execute("SELECT 1")

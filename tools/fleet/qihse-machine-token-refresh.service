@@ -4,5 +4,18 @@ Description=Refresh QIHSE machine token (MACHINEAUTH bearer credential)
 [Service]
 Type=oneshot
 UMask=077
-Environment=LD_LIBRARY_PATH=/opt/qihse/lib
-ExecStart=/bin/sh -c 'LD_LIBRARY_PATH=/opt/qihse/lib /opt/qihse/bin/qihse-machine-token --identity /etc/qihse/keys/qihse_dsa_key.pem --ttl-seconds 86400 > /etc/qihse/machine_token.tmp && mv /etc/qihse/machine_token.tmp /etc/qihse/machine_token'
+EnvironmentFile=%E/qihse/machine-principal.env
+ExecStart=/bin/sh ${QIHSE_PREFIX}/libexec/refresh-machine-token.sh
+# Provision the root-owned 0600 EnvironmentFile before enabling the timer.
+# Required: QIHSE_PREFIX, QIHSE_MACHINE_IDENTITY, QIHSE_MACHINE_TOKEN,
+# QIHSE_MACHINE_USER_ID and QIHSE_MACHINE_TENANT (positive decimal uint32).
+# Discover the existing non-Operator machine principal and its nonzero tenant
+# through authenticated administration; never substitute Operator/id 0.
+# Install bin/qihse-machine-token, lib dependencies and the libexec helper under
+# the configured prefix. Install the fan agent as bin/qihse-fan-agent there too.
+# Paths in the EnvironmentFile must be absolute deployment values; systemd does
+# not expand shell variables in that file. Token parent must be root-owned and
+# not group/world writable. Keep signing keys and configuration root-only.
+# After reviewed deployment, daemon-reload, run refresh and verify mode 0600
+# without printing the token, then enable the supplied 12-hour timer and agent.
+# This mints 24-hour credentials with clearance/SCI 0; it grants no privileges.

@@ -28,6 +28,7 @@
  * It is reported, not asserted, so that fixing it cannot break this test.
  */
 #include "qihse_sql_parser.h"
+#include "qihse_sql_fts.h"
 #include "qihse_join_executor.h"
 #include "qihse_aggregate_executor.h"
 #include "qihse_sort_executor.h"
@@ -75,13 +76,94 @@ static void test_select_shape(void) {
     assert(strcmp(ast->where_conditions[0].value, "bob") == 0);
     qihse_sql_ast_free(ast);
 
-    /* A statement the parser cannot classify is reported as UNKNOWN. */
+    /* Unsupported statements must not be accepted as executable ASTs. */
     ast = qihse_parse_sql_to_ast("FROBNICATE THE DATABASE");
-    assert(ast);
-    assert(ast->stmt_type == QIHSE_SQL_UNKNOWN);
-    qihse_sql_ast_free(ast);
+    assert(!ast);
 
     printf("PASS sql parser: SELECT shape, WHERE, ORDER BY, LIMIT/OFFSET, DISTINCT\n");
+}
+
+static void test_literal_null_and_parameter_shape(void) {
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(
+        "INSERT INTO literals (id, note) VALUES (1, 'NULL'), (2, NULL), (3, $1)");
+    assert(ast && ast->stmt_type == QIHSE_SQL_INSERT && ast->num_insert_rows == 3);
+    assert(ast->insert_quoted[0][1] == 1 &&
+           strcmp(ast->insert_rows[0][1], "NULL") == 0);
+    assert(ast->insert_quoted[1][1] == 0 &&
+           strcmp(ast->insert_rows[1][1], "NULL") == 0);
+    assert(ast->insert_parameter_indexes[2][1] == 1 &&
+           qihse_sql_ast_parameter_count(ast) == 1);
+    qihse_sql_ast_free(ast);
+}
+
+static void test_stored_generated_tsvector_parse(void) {
+    const char* sql =
+        "CREATE TABLE generated_case (id UUID DEFAULT gen_random_uuid(), "
+        "data JSONB NOT NULL, search_vector TSVECTOR GENERATED ALWAYS AS ("
+        "to_tsvector('english', COALESCE(data->>'email', '') || ' ' || "
+        "COALESCE(data->>'name', '') || ' ' || "
+        "COALESCE(data->>'username', ''))) STORED)";
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(sql);
+    assert(ast && ast->stmt_type == QIHSE_SQL_CREATE && ast->num_columns == 3);
+    assert(ast->columns[0].type == QIHSE_TYPE_UUID &&
+           strcmp(ast->columns[0].default_expr, "gen_random_uuid()") == 0);
+    assert(ast->columns[2].type == QIHSE_TYPE_TSVECTOR &&
+           ast->columns[2].generated_stored && ast->columns[2].generated_expr &&
+           strstr(ast->columns[2].generated_expr, "to_tsvector('english'") != NULL);
+    qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE bad_generated (x TSVECTOR GENERATED ALWAYS AS ('x'))");
+    assert(!ast);
+    printf("PASS SQL parser: stored generated TSVECTOR and raw expression retention\n");
+}
+
+static void test_directeye_english_vector(void) {
+    char* vector = NULL;
+    assert(qihse_sql_to_tsvector_english("The Original Changed", &vector));
+    assert(vector && strcmp(vector, "'chang':3 'origin':2") == 0);
+    free(vector);
+    vector = NULL;
+    assert(qihse_sql_to_tsvector_english("hello hello", &vector));
+    assert(vector && strcmp(vector, "'hello':1,2") == 0);
+    free(vector);
+}
+
+static void test_directeye_ddl_shape(void) {
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE leakosint_queries (id UUID DEFAULT gen_random_uuid() "
+        "PRIMARY KEY, cost DECIMAL(10, 4) NOT NULL, "
+        "executed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())");
+    assert(ast && ast->stmt_type == QIHSE_SQL_CREATE && ast->num_columns == 3);
+    assert(ast->columns[1].type == QIHSE_TYPE_NUMERIC &&
+           ast->columns[1].type_len == 10 && ast->columns[1].type_scale == 4);
+    assert(ast->columns[0].is_primary_key && ast->columns[0].default_expr);
+    qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE INDEX IF NOT EXISTS idx_osint_data_gin ON osint_records USING GIN (data)");
+    assert(ast && ast->index_def && ast->index_def->if_not_exists &&
+           ast->index_def->using_method &&
+           strcmp(ast->index_def->using_method, "GIN") == 0);
+    qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE INDEX IF NOT EXISTS idx_osint_email "
+        "ON osint_records ((data->>'email'))");
+    assert(ast && ast->index_def && ast->index_def->num_expressions == 1 &&
+           strstr(ast->index_def->expressions[0], "data->>'email'") != NULL);
+    qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS osint_stats AS "
+        "SELECT source, COUNT(*) AS record_count FROM osint_records GROUP BY source");
+    assert(ast && ast->stmt_type == QIHSE_SQL_CREATE_MATVIEW &&
+           ast->view_if_not_exists && ast->view_query);
+    qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast(
+        "DROP TRIGGER IF EXISTS update_osint_records_updated_at ON osint_records");
+    assert(ast && ast->stmt_type == QIHSE_SQL_DROP_TRIGGER &&
+           ast->trigger_def && ast->trigger_def->drop_if_exists);
+    qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast("REFRESH MATERIALIZED VIEW osint_stats");
+    assert(ast && ast->stmt_type == QIHSE_SQL_REFRESH && ast->view_name);
+    qihse_sql_ast_free(ast);
 }
 
 static void test_aggregates_and_grouping(void) {
@@ -111,6 +193,107 @@ static void test_aggregates_and_grouping(void) {
     assert(strcmp(ast->group_by->group_columns[1], "b") == 0);
     qihse_sql_ast_free(ast);
     printf("PASS sql parser: SUM/COUNT/COUNT(*)/AVG/MIN/MAX, GROUP BY, HAVING\n");
+}
+
+static void test_directeye_auth_stats_parse(void) {
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(
+        "SELECT COUNT(*) as total_attempts, "
+        "COUNT(CASE WHEN success THEN 1 END) as successful, "
+        "COUNT(CASE WHEN NOT success THEN 1 END) as failed, "
+        "COUNT(DISTINCT ip_address) as unique_ips "
+        "FROM auth_events WHERE created_at > %s");
+    assert(ast && ast->num_select_items == 4);
+    assert(ast->select_items[0].agg_kind == QIHSE_AGG_COUNT_STAR);
+    assert(strcmp(ast->select_items[0].alias, "total_attempts") == 0);
+    for (size_t i = 1; i <= 2; ++i) {
+        const qihse_sql_select_item_t* item = &ast->select_items[i];
+        assert(item->agg_kind == QIHSE_AGG_COUNT && item->agg_case);
+        assert(strcmp(item->agg_case->column, "success") == 0);
+        assert(item->agg_case->negated == (int)(i == 2));
+        assert(item->agg_case->then_value == 1 && !item->agg_case->has_else);
+        assert(strstr(item->agg_arg, "CASE WHEN") == item->agg_arg);
+    }
+    assert(strcmp(ast->select_items[2].alias, "failed") == 0);
+    assert(ast->select_items[3].agg_kind == QIHSE_AGG_COUNT);
+    assert(ast->select_items[3].is_distinct);
+    assert(strcmp(ast->select_items[3].agg_arg, "ip_address") == 0);
+    assert(strcmp(ast->select_items[3].alias, "unique_ips") == 0);
+    assert(ast->num_where_conditions == 1);
+    assert(strcmp(ast->where_conditions[0].column_name, "created_at") == 0);
+    assert(strcmp(ast->where_conditions[0].operator, ">") == 0);
+    assert(strcmp(ast->where_conditions[0].value, "%s") == 0);
+    qihse_sql_ast_free(ast);
+
+    /* psycopg2 adapts a naive datetime bind as a quoted PostgreSQL cast. */
+    ast = qihse_parse_sql_to_ast(
+        "SELECT COUNT(*) as total_attempts, "
+        "COUNT(CASE WHEN success THEN 1 END) as successful, "
+        "COUNT(CASE WHEN NOT success THEN 1 END) as failed, "
+        "COUNT(DISTINCT ip_address) as unique_ips FROM auth_events "
+        "WHERE created_at > '2026-10-25T12:13:14'::timestamp");
+    assert(ast && ast->num_where_conditions == 1);
+    assert(ast->where_conditions[0].value_is_string &&
+           ast->where_conditions[0].value_cast_type == QIHSE_TYPE_TIMESTAMP &&
+           strcmp(ast->where_conditions[0].value, "2026-10-25T12:13:14") == 0);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast(
+        "SELECT SUM(CASE WHEN success THEN 1 ELSE 0 END) AS successes FROM auth_events");
+    assert(ast && ast->select_items[0].agg_kind == QIHSE_AGG_SUM);
+    assert(ast->select_items[0].agg_case && ast->select_items[0].agg_case->has_else);
+    assert(ast->select_items[0].agg_case->else_value == 0);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast(
+        "SELECT ip_address, COUNT(*) as attempts FROM auth_events "
+        "WHERE created_at > %s AND NOT success "
+        "GROUP BY ip_address HAVING COUNT(*) > 2 ORDER BY attempts DESC LIMIT 10");
+    assert(ast && ast->num_where_conditions == 2);
+    assert(strcmp(ast->where_conditions[1].column_name, "success") == 0 &&
+           strcmp(ast->where_conditions[1].operator, "=") == 0 &&
+           strcmp(ast->where_conditions[1].value, "FALSE") == 0);
+    assert(ast->group_by && ast->group_by->num_group_columns == 1);
+    assert(strcmp(ast->group_by->group_columns[0], "ip_address") == 0);
+    assert(strstr(ast->group_by->having_expr, "COUNT(*) > 2"));
+    assert(ast->num_order_items == 1 && !ast->order_items[0].ascending);
+    assert(ast->limit == 10);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast(
+        "SELECT ip_address, COUNT(*) as attempts FROM auth_events "
+        "WHERE created_at > '2026-10-25T12:13:14'::timestamp AND NOT success "
+        "GROUP BY ip_address HAVING COUNT(*) > 2 ORDER BY attempts DESC LIMIT 10");
+    assert(ast && ast->num_where_conditions == 2 &&
+           ast->where_conditions[0].value_cast_type == QIHSE_TYPE_TIMESTAMP &&
+           strcmp(ast->where_conditions[1].value, "FALSE") == 0);
+    qihse_sql_ast_free(ast);
+
+    /* Malformed or unsupported aggregate forms must remain fail-closed. */
+    const char* bad[] = {
+        "SELECT COUNT(CASE WHEN success THEN 1) FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN END) FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN 1 ELSE END) FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN 1 ELSE 0 END END) FROM auth_events",
+        "SELECT COUNT(CASE WHEN success = 1 THEN 1 END) FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN 1 WHEN failure THEN 1 END) FROM auth_events",
+        "SELECT COUNT(DISTINCT) FROM auth_events",
+        "SELECT COUNT(DISTINCT ip_address, success) FROM auth_events",
+        "SELECT SUM(DISTINCT ip_address) FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN 1 END) OVER () FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN 1 END) garbage FROM auth_events",
+        "SELECT COUNT(CASE WHEN success THEN 1 END) FROM auth_events EXTRA trailing",
+        "SELECT COUNT(*) FROM auth_events WHERE created_at > '2026-10-25T12:13:14'::timestamptz",
+        "SELECT COUNT(*) FROM auth_events WHERE created_at > '2026-10-25T12:13:14'::timestamp EXTRA",
+        "SELECT COUNT(*) FROM auth_events WHERE created_at > '2026-10-25T12:13:14'::timestamp::text",
+        "SELECT COUNT(*) FROM auth_events WHERE created_at > '2026-10-25T12:13:14'::timestamp OR success",
+        "SELECT COUNT(*) FROM auth_events WHERE created_at > '2026-10-25T12:13:14'::timestamp AND NOT success = TRUE"
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); ++i) {
+        qihse_sql_ast_t* invalid = qihse_parse_sql_to_ast(bad[i]);
+        if (invalid) fprintf(stderr, "accepted bad[%zu]: %s\n", i, bad[i]);
+        assert(invalid == NULL);
+    }
+    printf("PASS DIRECTEYE auth-stats parser: bounded conditional aggregates, DISTINCT, rejection\n");
 }
 
 static void test_join_parsing(void) {
@@ -198,7 +381,90 @@ static void test_dml_and_ddl_parsing(void) {
     assert(strcmp(ast->insert_rows[0][1], "x") == 0);
     assert(strcmp(ast->insert_rows[1][0], "2") == 0);
     assert(strcmp(ast->insert_rows[1][1], "y") == 0);
+    assert(ast->insert_cast_types[0][0] == QIHSE_TYPE_UNKNOWN);
+    assert(ast->insert_quoted[0][0] == 0 && ast->insert_quoted[0][1] == 1);
     qihse_sql_ast_free(ast);
+
+    /* psycopg2 mogrify emits timestamp values with a PostgreSQL suffix cast. */
+    ast = qihse_parse_sql_to_ast(
+        "INSERT INTO osint_records(source,record_type,identifier,data,updated_at) "
+        "VALUES ('fixture','person','id','{\"name\":\"Original\",\"email\":\"first@example.com\"}',"
+        "'2020-01-01T00:00:00+00:00'::timestamptz)");
+    assert(ast && ast->num_insert_rows == 1 && ast->num_insert_columns == 5);
+    assert(strcmp(ast->insert_rows[0][3], "{\"name\":\"Original\",\"email\":\"first@example.com\"}") == 0);
+    assert(strcmp(ast->insert_rows[0][4], "2020-01-01T00:00:00+00:00") == 0);
+    assert(ast->insert_cast_types[0][4] == QIHSE_TYPE_TIMESTAMPTZ);
+    assert(ast->insert_quoted[0][4] == 1);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast(
+        "INSERT INTO t (a,b,c,d) VALUES ('O''Brien', 'NULL', NULL, '2020-01-01'::TIMESTAMP), "
+        "('text', '', 'NULL', '2020-01-02' :: timestamptz)");
+    assert(ast && ast->num_insert_rows == 2);
+    assert(strcmp(ast->insert_rows[0][0], "O'Brien") == 0);
+    assert(strcmp(ast->insert_rows[0][1], "NULL") == 0 && ast->insert_quoted[0][1]);
+    assert(strcmp(ast->insert_rows[0][2], "NULL") == 0 && !ast->insert_quoted[0][2]);
+    assert(ast->insert_cast_types[0][3] == QIHSE_TYPE_TIMESTAMP);
+    assert(ast->insert_cast_types[1][3] == QIHSE_TYPE_TIMESTAMPTZ);
+    assert(ast->insert_cast_types[1][1] == QIHSE_TYPE_UNKNOWN);
+    qihse_sql_ast_free(ast);
+    const char* bad_insert[] = {
+        "INSERT INTO t (a) VALUES ('unterminated)",
+        "INSERT INTO t (a) VALUES ('x'::date)",
+        "INSERT INTO t (a) VALUES ('x'::timestampjunk)",
+        "INSERT INTO t (a) VALUES ('x'::timestamp(6))",
+        "INSERT INTO t (a) VALUES ('x'::timestamptz::text)",
+        "INSERT INTO t (a) VALUES ('x' trailing)",
+        "INSERT INTO t (a) VALUES (NULL garbage)",
+        "INSERT INTO t (a) VALUES (1::timestamp)",
+        "INSERT INTO t VALUES ()",
+        "INSERT INTO t (a) VALUES ('x',)",
+        "INSERT INTO t (a) VALUES ('x', 2)",
+        "INSERT INTO t (a,b) VALUES ('x')",
+        "INSERT INTO t VALUES (1,2), (3)",
+        "INSERT INTO t (a) VALUES (1),",
+        "INSERT INTO t (a) VALUES (1) GARBAGE",
+        "INSERT INTO t (a) VALUES (1); SELECT 2"
+    };
+    for (size_t i = 0; i < sizeof(bad_insert) / sizeof(bad_insert[0]); i++)
+        assert(qihse_parse_sql_to_ast(bad_insert[i]) == NULL);
+
+    /* UPSERT is represented, not executed: target, action, assignments and
+     * optional UPDATE predicate must not be silently dropped. */
+    ast = qihse_parse_sql_to_ast(
+        "INSERT INTO t (id, tenant, payload) VALUES (1, 2, 'x') "
+        "ON CONFLICT (id, tenant) DO UPDATE SET payload = excluded.payload, tenant = 3 "
+        "WHERE t.tenant = 2 RETURNING id");
+    assert(ast && ast->on_conflict);
+    assert(ast->on_conflict->action == QIHSE_CONFLICT_UPDATE);
+    assert(ast->on_conflict->num_conflict_columns == 2);
+    assert(strcmp(ast->on_conflict->conflict_columns[0], "id") == 0);
+    assert(strcmp(ast->on_conflict->conflict_columns[1], "tenant") == 0);
+    assert(ast->on_conflict->num_set == 2);
+    assert(strcmp(ast->on_conflict->set_columns[0], "payload") == 0);
+    assert(strcmp(ast->on_conflict->set_values[0], "excluded.payload") == 0);
+    assert(strcmp(ast->on_conflict->set_values[1], "3") == 0);
+    assert(strcmp(ast->on_conflict->where_expr, "t.tenant = 2") == 0);
+    assert(ast->returning && ast->returning->num_columns == 1);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast("INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING");
+    assert(ast && ast->on_conflict && ast->on_conflict->action == QIHSE_CONFLICT_NOTHING);
+    assert(ast->on_conflict->num_conflict_columns == 0);
+    qihse_sql_ast_free(ast);
+    const char* bad_conflict[] = {
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT DO UPDATE SET id = 2",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT (id,) DO NOTHING",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id =",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 2,",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT ON CONSTRAINT t_key DO NOTHING",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) WHERE id > 0 DO NOTHING",
+        "INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING ELSE",
+    };
+    for (size_t i = 0; i < sizeof(bad_conflict) / sizeof(bad_conflict[0]); i++)
+        assert(qihse_parse_sql_to_ast(bad_conflict[i]) == NULL);
 
     /* UPDATE SET is parsed into structured assignments, and the WHERE clause
      * into the same condition representation SELECT uses. */
@@ -290,6 +556,47 @@ static void test_dml_and_ddl_parsing(void) {
     assert(ast->columns[8].type_len == 128);
     qihse_sql_ast_free(ast);
 
+    ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE app (doc JSONB, labels TEXT[], addr INET, "
+        "amount NUMERIC(12, 4), day DATE, created TIMESTAMP, "
+        "updated TIMESTAMP WITH TIME ZONE, at TIMESTAMPTZ, id UUID)");
+    assert(ast && ast->num_columns == 9);
+    qihse_sql_type_t app_types[] = {
+        QIHSE_TYPE_JSONB, QIHSE_TYPE_TEXT_ARRAY, QIHSE_TYPE_INET,
+        QIHSE_TYPE_NUMERIC, QIHSE_TYPE_DATE, QIHSE_TYPE_TIMESTAMP,
+        QIHSE_TYPE_TIMESTAMPTZ, QIHSE_TYPE_TIMESTAMPTZ, QIHSE_TYPE_UUID
+    };
+    for (size_t i = 0; i < 9; i++) {
+        assert(ast->columns[i].type == app_types[i]);
+        assert(strcmp(qihse_sql_type_name(app_types[i]), "UNKNOWN") != 0);
+    }
+    assert(ast->columns[3].type_len == 12 && ast->columns[3].type_scale == 4);
+    qihse_sql_ast_free(ast);
+    assert(qihse_parse_sql_to_ast("CREATE TABLE t (a NUMERIC(2, 3))") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE TABLE t (a NUMERIC(4,))") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE TABLE t (a TEXT[4])") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE TABLE t (a MADEUP)") == NULL);
+
+    /* Never turn incomplete or trailing CHECK/FK syntax into catalog metadata. */
+    const char* malformed_constraints[] = {
+        "CREATE TABLE t (id INT CHECK bad)",
+        "CREATE TABLE t (id INT, CHECK (id > 0) NOT VALID)",
+        "CREATE TABLE t (id INT, CHECK (id > 0) garbage)",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p(id) NOT VALID)",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p(id) ON DELETE UNKNOWN)",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id junk) REFERENCES p(id))",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id,) REFERENCES p(id))",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p(id, x))",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p(id,))",
+        "CREATE TABLE t (id INT, FOREIGN KEY (id) REFERENCES p)",
+    };
+    for (size_t i = 0; i < sizeof(malformed_constraints) / sizeof(*malformed_constraints); ++i)
+        assert(qihse_parse_sql_to_ast(malformed_constraints[i]) == NULL);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE t (id INT, CHECK (id > 0), FOREIGN KEY (id) REFERENCES p(id))");
+    assert(ast && ast->num_checks == 1 && ast->num_fks == 1);
+    qihse_sql_ast_free(ast);
+
     /* ALTER TABLE: add / drop / rename column, rename table. */
     struct { const char* sql; qihse_sql_alter_action_t want; } alters[] = {
         {"ALTER TABLE t ADD COLUMN x INT",      QIHSE_ALTER_ADD_COLUMN},
@@ -307,15 +614,61 @@ static void test_dml_and_ddl_parsing(void) {
         qihse_sql_ast_free(ast);
     }
 
+    /* Procedural DDL is retained as typed structural metadata. */
+    const char* opaque_ddl[] = {
+        "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";",
+        "CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;",
+        "CREATE TRIGGER tr BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION f();",
+        "CREATE OR REPLACE FUNCTION app.touch() RETURNS trigger AS $body$ BEGIN "
+        "NEW.updated_at := now(); RETURN NEW; END $body$ LANGUAGE plpgsql;",
+        "CREATE OR REPLACE PROCEDURE app.rebuild() LANGUAGE plpgsql AS $proc$ "
+        "BEGIN UPDATE t SET value = coalesce(value, 0); END $proc$;",
+        "CREATE OR REPLACE TRIGGER tr BEFORE UPDATE ON t FOR EACH ROW "
+        "EXECUTE FUNCTION app.touch();"
+    };
+    const qihse_sql_stmt_type_t opaque_types[] = {
+        QIHSE_SQL_CREATE_EXTENSION, QIHSE_SQL_CREATE_FUNCTION,
+        QIHSE_SQL_CREATE_TRIGGER, QIHSE_SQL_CREATE_FUNCTION,
+        QIHSE_SQL_CREATE_PROCEDURE, QIHSE_SQL_CREATE_TRIGGER
+    };
+    for (size_t i = 0; i < sizeof(opaque_ddl) / sizeof(*opaque_ddl); ++i) {
+        ast = qihse_parse_sql_to_ast(opaque_ddl[i]);
+        assert(ast && ast->stmt_type == opaque_types[i]);
+        if (i == 3) assert(ast->function_def && ast->function_def->or_replace &&
+                            ast->function_def->returns && ast->function_def->language &&
+                            ast->function_def->body);
+        if (i == 5) assert(ast->trigger_def && ast->trigger_def->or_replace &&
+                            ast->trigger_def->for_each_row && ast->trigger_def->function_name);
+        qihse_sql_ast_free(ast);
+    }
+
     /* CREATE INDEX / DROP INDEX / DROP TABLE. */
-    ast = qihse_parse_sql_to_ast("CREATE INDEX idx ON t (a)");
+    ast = qihse_parse_sql_to_ast("CREATE INDEX IF NOT EXISTS idx ON t USING GIN (lower(a), b DESC)");
     assert(ast);
     assert(ast->stmt_type == QIHSE_SQL_CREATE);
     assert(ast->index_def);
     assert(strcmp(ast->index_def->name, "idx") == 0);
     assert(strcmp(ast->index_def->table_name, "t") == 0);
-    assert(strcmp(ast->index_def->column_name, "a") == 0);
+    assert(strcmp(ast->index_def->column_name, "lower(a)") == 0);
+    assert(ast->index_def->if_not_exists && ast->index_def->num_expressions == 2);
+    assert(strcmp(ast->index_def->using_method, "GIN") == 0);
+    assert(!ast->index_def->descending[0] && ast->index_def->descending[1]);
     qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast("CREATE MATERIALIZED VIEW mv AS SELECT a FROM t");
+    assert(ast && ast->stmt_type == QIHSE_SQL_CREATE_MATVIEW && ast->view_is_materialized);
+    assert(ast->view_query && ast->view_query->num_select_items == 1);
+    qihse_sql_ast_free(ast);
+
+    ast = qihse_parse_sql_to_ast("DROP TRIGGER IF EXISTS tr ON t");
+    assert(ast && ast->trigger_def && ast->trigger_def->drop_if_exists);
+    assert(strcmp(ast->trigger_def->name, "tr") == 0 && strcmp(ast->trigger_def->table_name, "t") == 0);
+    qihse_sql_ast_free(ast);
+    assert(qihse_parse_sql_to_ast("CREATE INDEX bad ON t (a,)") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE INDEX bad ON t USING (a)") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE FUNCTION broken() RETURNS trigger") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE TRIGGER broken BEFORE UPDATE ON t") == NULL);
+    assert(qihse_parse_sql_to_ast("DROP TRIGGER IF NOT EXISTS tr ON t") == NULL);
 
     ast = qihse_parse_sql_to_ast("DROP INDEX idx");
     assert(ast);
@@ -597,6 +950,13 @@ static void test_schema_registry(void) {
     assert(ast);
     assert(qihse_schema_create_table(reg, ast) == 0);
     qihse_sql_ast_free(ast);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY)");
+    assert(ast && ast->stmt_type == QIHSE_SQL_CREATE &&
+           ast->create_if_not_exists && strcmp(ast->table_name, "users") == 0);
+    qihse_sql_ast_free(ast);
+    assert(qihse_parse_sql_to_ast("CREATE TABLE IF users (id INT)") == NULL);
+    assert(qihse_parse_sql_to_ast("CREATE TABLE IF NOT EXIST users (id INT)") == NULL);
 
     assert(qihse_schema_table_count(reg) == 1);
     const qihse_schema_table_t* t = qihse_schema_get_table(reg, "users");
@@ -793,14 +1153,77 @@ static void report_known_gaps(void) {
     qihse_sql_ast_free(ast);
 }
 
+static void test_required_column_catalog_image(void) {
+    qihse_schema_registry_t* reg = qihse_schema_registry_create();
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE required_image (id INT NOT NULL, note TEXT)");
+    assert(reg && ast && qihse_schema_create_table(reg, ast) == 0);
+    uint8_t* image = NULL;
+    size_t len = 0;
+    assert(qihse_schema_serialize(reg, &image, &len) == 0);
+    qihse_schema_registry_t* recovered = NULL;
+    assert(qihse_schema_deserialize(image, len, &recovered) == 0);
+    const qihse_schema_table_t* table =
+        qihse_schema_get_table(recovered, "required_image");
+    assert(table && table->num_columns == 2);
+    assert(table->columns[0].not_null && !table->columns[1].not_null);
+    qihse_schema_registry_destroy(recovered);
+    qihse_sql_ast_free(ast);
+    free(image);
+    ast = qihse_parse_sql_to_ast(
+        "CREATE TABLE keyed_image (code TEXT NOT NULL UNIQUE, id INT, PRIMARY KEY (id))");
+    assert(ast && ast->columns[1].is_primary_key);
+    assert(qihse_schema_create_table(reg, ast) == 0);
+    assert(qihse_schema_serialize(reg, &image, &len) == 0);
+    assert(qihse_schema_deserialize(image, len, &recovered) == 0);
+    table = qihse_schema_get_table(recovered, "keyed_image");
+    assert(table && table->columns[0].is_unique && table->columns[1].is_primary_key);
+    assert(table->num_uniques == 1 && table->uniques[0].num_columns == 1);
+    qihse_schema_registry_destroy(recovered);
+    qihse_schema_registry_destroy(reg);
+    qihse_sql_ast_free(ast);
+    free(image);
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
     char qdd[] = "build/test_sql_completeness_XXXXXX";
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
+    qihse_sql_ast_t* transaction = qihse_parse_sql_to_ast("BEGIN SERIALIZABLE");
+    assert(transaction && transaction->stmt_type == QIHSE_SQL_BEGIN);
+    qihse_sql_ast_free(transaction);
+    transaction = qihse_parse_sql_to_ast("BEGIN ISOLATION LEVEL READ COMMITTED");
+    assert(transaction && transaction->stmt_type == QIHSE_SQL_BEGIN);
+    qihse_sql_ast_free(transaction);
+    assert(!qihse_parse_sql_to_ast("BEGIN ISOLATION LEVEL invented"));
+    qihse_sql_ast_t* json_filter = qihse_parse_sql_to_ast(
+        "SELECT id FROM osint_records WHERE data->>'email' = 'first@example.com'");
+    assert(json_filter && json_filter->num_where_conditions == 1 &&
+        !strcmp(json_filter->where_conditions[0].column_name, "data->>'email'") &&
+        !strcmp(json_filter->where_conditions[0].value, "first@example.com"));
+    qihse_sql_ast_free(json_filter);
+    assert(!qihse_parse_sql_to_ast(
+        "SELECT id FROM osint_records WHERE data->>'email = 'x'"));
+    qihse_sql_ast_t* quoted_set = qihse_parse_sql_to_ast(
+        "UPDATE t SET note = 'NULL', empty = '', escaped = 'O''Brien', "
+        "keyword = 'DEFAULT', bound = $1 WHERE id = $2");
+    assert(quoted_set && quoted_set->num_set == 5 && quoted_set->set_quoted);
+    assert(quoted_set->set_quoted[0] && !strcmp(quoted_set->set_values[0], "NULL"));
+    assert(quoted_set->set_quoted[1] && !strcmp(quoted_set->set_values[1], ""));
+    assert(quoted_set->set_quoted[2] && !strcmp(quoted_set->set_values[2], "O'Brien"));
+    assert(quoted_set->set_quoted[3] && !strcmp(quoted_set->set_values[3], "DEFAULT"));
+    assert(!quoted_set->set_quoted[4] && quoted_set->set_parameter_indexes[4] == 1);
+    qihse_sql_ast_free(quoted_set);
+    assert(!qihse_parse_sql_to_ast("UPDATE t SET note = 'unterminated WHERE id = 1"));
     test_select_shape();
+    test_literal_null_and_parameter_shape();
+    test_stored_generated_tsvector_parse();
+    test_directeye_english_vector();
+    test_directeye_ddl_shape();
     test_aggregates_and_grouping();
+    test_directeye_auth_stats_parse();
     test_join_parsing();
     test_subqueries_and_set_ops();
     test_dml_and_ddl_parsing();
@@ -808,6 +1231,7 @@ int main(void) {
     test_aggregate_execution();
     test_sort_execution();
     test_schema_registry();
+    test_required_column_catalog_image();
     test_optimizer_plans();
     test_optimizer_histograms();
     report_known_gaps();

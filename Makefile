@@ -219,6 +219,7 @@ SRCS_VFS = persistence/qihse_sqlite_vfs.c \
 
 SRCS_BASE += $(SRCS_VFS)
 SRCS_BASE += src/black_hole/qihse_analysis_artifact.c
+SRCS_BASE += src/tractable/qihse_sql_fts.c src/tractable/qihse_sql_row_index.c
 SRCS_BASE += src/federation/qihse_consensus_blob.c
 SRCS_BASE += src/federation/qihse_consensus_wire.c
 SRCS_BASE += src/federation/qihse_consensus_channel.c
@@ -441,11 +442,11 @@ test-admin-protocol-sanitize: lib
 	$(CC) $(filter-out -O3,$(CFLAGS)) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -o tests/test_admin_protocol_sanitize tests/test_admin_protocol.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_admin_protocol_sanitize
 
-test-admin-cli: admin-cli test-admin-protocol
+test-admin-cli: admin-cli redis-server test-admin-protocol
 	$(CC) $(CFLAGS) -o tests/test_qkp_admin tests/test_qkp_admin.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_qkp_admin
 
-test: test-admin-cli
+test-serial: test-admin-cli
 
 test-qkp-access-negative: lib
 	$(CC) $(CFLAGS) -o tests/test_qkp_access_negative tests/test_qkp_access_negative.c -L. -lqihse $(LDFLAGS)
@@ -629,7 +630,7 @@ test-cluster-bus-bind:
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c -Wl,--gc-sections -pthread -lcrypto
 	./build/test_cluster_bus_bind
 
-test: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
+test-serial: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
 test-container-flush-locking: lib
 	@mkdir -p build && chmod 0700 build
@@ -823,7 +824,7 @@ test-kp14-artifact-contract: lib
 	$(CC) $(CFLAGS) -o tests/test_analysis_artifact_keystone_integration tests/test_analysis_artifact_keystone_integration.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_analysis_artifact_keystone_integration
 
-test: test-kp14-artifact-contract
+test-serial: test-kp14-artifact-contract
 
 # W7 item 5: classification-preserving KEYSTONE feed over the wire.
 test-keystone-feed-wire: lib
@@ -1066,14 +1067,54 @@ test-edge-persistence: lib
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/qihse_edge_persistence_test
 
-test: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-qkp-access-negative test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-consensus-wire test-consensus-snapshot-stage test-consensus-channel test-consensus-mesh test-consensus-blob-channel test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-aimem-resp test-aimem-durable-crash test-aimem-replay-recovery test-aimem-qh05-08 test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-table-store-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
+test-serial: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-qkp-access-negative test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-consensus-wire test-consensus-snapshot-stage test-consensus-channel test-consensus-mesh test-consensus-blob-channel test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-aimem-resp test-aimem-durable-crash test-aimem-replay-recovery test-aimem-qh05-08 test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-table-store-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
 
-test: test-aimem-scope-index
-test: test-aimem-qh08 test-aimem-qh08-resp
-test: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
-test: test-wal-durability
-test: test-python-pg-sdk
-test: test-pg-wire-txn
+test-serial: test-aimem-scope-index
+test-serial: test-aimem-qh08 test-aimem-qh08-resp
+test-serial: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
+test-serial: test-wal-durability
+test-serial: test-python-pg-sdk
+test-serial: test-pg-wire-txn test-schema-recovery test-pgwire-service test-pgwire-app-compat
+
+GOLD_PACK ?= tests/gold/pack.v1.gold
+GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^[:space:]]*\/[^[:space:]]*\).*/\1/p' $(GOLD_PACK) 2>/dev/null)
+
+# Build shared artifacts once, then run only audited independent tests in
+# parallel OS processes. All other `test-serial:` prerequisites run serially;
+# the nested-make gold pack runs last. Override with TEST_JOBS=1..32.
+.PHONY: test-serial test-parallel test-parallel-runner
+test: test-parallel
+test-parallel-runner:
+	PYTHONPATH=tests python3 -m unittest -v test_parallel_suite test_gold_parallel
+
+test-serial: test-parallel-runner
+test-serial: test-public-api-install test-sql-cpp-headers test-python-pg-tls test-rust-pg-tls test-machine-token-refresh
+test-parallel: lib admin-cli redis-server cluster-daemon tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
+	GOLD_PACK='$(GOLD_PACK)' python3 tests/run_parallel_suite.py $(if $(TEST_JOBS),--jobs $(TEST_JOBS))
+
+test-schema-recovery: lib
+	$(CC) $(CFLAGS) -o tests/test_schema_recovery tests/test_schema_recovery.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_schema_recovery
+
+test-pgwire-service:
+	python3 tests/test_pgwire_service.py
+
+test-pgwire-app-compat:
+	python3 -c 'import pytest, psycopg2, psycopg, asyncpg'
+	python3 -m pytest -q tests/test_pgwire_app_compat.py tests/test_pgwire_numeric.py
+
+.PHONY: test-sql-cpp-headers test-python-pg-tls test-rust-pg-tls test-machine-token-refresh
+test-sql-cpp-headers: lib
+	python3 tests/test_sql_cpp_headers.py
+
+test-python-pg-tls:
+	python3 -m pytest -q tests/test_python_pg_tls.py
+
+test-rust-pg-tls:
+	python3 -m pytest -q sdks/rust/tests/test_tls.py
+
+test-machine-token-refresh: lib
+	python3 tests/test_machine_token_refresh.py
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
@@ -1082,9 +1123,6 @@ test: test-pg-wire-txn
 # through the targets that already exist.  GOLD_PACK pins the pack version;
 # GOLD_STRICT=1 makes known defects and recorded coverage gaps fatal (the
 # runner then exits 2).
-GOLD_PACK ?= tests/gold/pack.v1.gold
-GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^[:space:]]*\/[^[:space:]]*\).*/\1/p' $(GOLD_PACK) 2>/dev/null)
-
 test-gold: lib cluster-daemon tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
 	LD_LIBRARY_PATH=. ./tests/gold/gold_runner $(GOLD_PACK)
 
@@ -1370,7 +1408,7 @@ test-pqc: lib
 	LD_LIBRARY_PATH=. QIHSE_ENABLE_PQC=1 ./tests/test_pqc_e2e
 
 .PHONY: test-distance-dispatch test-exact-search-parity
-test: test-distance-dispatch test-exact-search-parity
+test-serial: test-distance-dispatch test-exact-search-parity
 
 test-distance-dispatch:
 	$(CC) $(CFLAGS) -o tests/test_distance_dispatch \
@@ -1750,12 +1788,43 @@ workspace-clean:
 pristine: clean workspace-clean
 	@echo "Build artifacts and workspace artifacts removed."
 
-install: all
-	@install -d $(DESTDIR)/usr/local/lib $(DESTDIR)/usr/local/include/qihse $(DESTDIR)/usr/local/bin
-	@install -m 644 libqihse.so $(DESTDIR)/usr/local/lib/libqihse.so
-	@install -m 644 qihse.h $(DESTDIR)/usr/local/include/qihse/qihse.h
-	@install -m 755 qihse-backup $(DESTDIR)/usr/local/bin/qihse-backup
-	@echo "Installed libqihse.so and qihse.h into $(DESTDIR)/usr/local"
+# Public C API roots and their local-header closure, not source/data internals.
+PREFIX ?= /usr/local
+PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_rate_limit.h \
+    qihse_hetero.h qihse_math.h qihse_instr.h qihse_search.h \
+    qihse_vector_db.h qihse_uwp.h qihse_uwp_tls.h qihse_uwp_metrics.h \
+    qihse_kv_store.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
+    qihse_timeseries.h qihse_event_stream.h qihse_repl.h qihse_pooler.h \
+    qihse_txn.h qihse_platform.h qihse_schema.h qihse_table_store.h \
+    qihse_sql_parser.h qihse_sql_extensions.h qihse_sql_fts.h \
+    qihse_sql_row_index.h qihse_uwp_sql_txn_schema.h \
+    qihse_pg_wire.h qihse_cluster_slot.h qihse_crc16.h \
+    qihse_clickhouse_sql.h qihse_http_api.h
+PUBLIC_API_TRANSITIVE_HEADERS := memory/include/qihse_uma.h \
+    memory/include/qihse_memory.h orchestration/include/qihse_hetero.h \
+    core/qihse_abi.h
+
+.PHONY: install install-headers install-runtime check-runtime-deps test-public-api-install
+check-runtime-deps:
+	@python3 -c 'import ctypes, sys; exec("try:\n lib = ctypes.CDLL(\"libstemmer.so.0d\")\n for symbol in (\"sb_stemmer_new\", \"sb_stemmer_stem\", \"sb_stemmer_length\", \"sb_stemmer_delete\"): getattr(lib, symbol)\nexcept (OSError, AttributeError) as exc:\n sys.exit(\"Required SQL FTS dependency libstemmer.so.0d unavailable: %s. Install libstemmer0d (Debian/Ubuntu) and check the runtime loader path.\" % exc)")'
+
+install-headers: $(addprefix include/,$(PUBLIC_API_HEADERS)) $(PUBLIC_API_TRANSITIVE_HEADERS) algorithms/qihse_anchor_search.h
+	@install -d "$(DESTDIR)$(PREFIX)/include/qihse"
+	@install -m 644 $(addprefix include/,$(PUBLIC_API_HEADERS)) algorithms/qihse_anchor_search.h "$(DESTDIR)$(PREFIX)/include/qihse/"
+	@for h in $(PUBLIC_API_TRANSITIVE_HEADERS); do \
+	    install -D -m 644 "$$h" "$(DESTDIR)$(PREFIX)/include/$$h" || exit $$?; \
+	done
+
+install-runtime: check-runtime-deps libqihse.so backup-cli
+	@install -d "$(DESTDIR)$(PREFIX)/lib" "$(DESTDIR)$(PREFIX)/bin"
+	@install -m 755 libqihse.so "$(DESTDIR)$(PREFIX)/lib/libqihse.so"
+	@install -m 755 qihse-backup "$(DESTDIR)$(PREFIX)/bin/qihse-backup"
+
+install: install-runtime install-headers
+	@echo "Installed public C API and library into $(DESTDIR)$(PREFIX)"
+
+test-public-api-install: libqihse.so backup-cli
+	python3 tests/test_public_api_install.py
 
 install-host:
 	@./scripts/install_qihse.sh $(INSTALL_ARGS)
@@ -1808,4 +1877,4 @@ test-fts-persist-adapter: lib
 	$(CC) $(CFLAGS) -o tests/test_fts_persist_adapter tests/test_fts_persist_adapter.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_fts_persist_adapter
 
-test: test-fts-persist-adapter
+test-serial: test-fts-persist-adapter

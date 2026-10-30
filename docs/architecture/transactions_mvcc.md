@@ -11,13 +11,42 @@
 >    shadow per table; COMMIT publishes up to 16 table shadows atomically behind
 >    generation fences and ROLLBACK discards them. Autocommit UWP SQL SELECT
 >    now supports a bounded one-table projection/filter path behind READ ACLs;
->    SELECT within a transaction, cross-model transactions, savepoint data
->    restoration and WAL durability remain outside this bounded slice. Pgwire
->    delegates some SQL DML and SELECT to UWP, but this does not make the table
->    store durable. Its public listener refuses non-loopback binds because it
->    still rejects SSL negotiation and requests cleartext passwords. No SQL
->    consumer should be redirected until TLS, durable SQL recovery, authorization,
->    and application compatibility have been verified.
+>    Cross-model transactions, savepoint data restoration and cross-model
+>    durability remain outside this bounded slice.
+>    Transactional SELECT supports one-table projections and simple predicates
+>    from a transaction-private shadow, with commit-time READ revalidation. The
+>    source-required auth aggregates and ordered top-1 query now execute; general
+>    joins, aggregates and ordering remain outside this bounded path. A read-only transaction validates
+>    captured generations without publishing a shadow or advancing the table
+>    generation; this remains a bounded optimistic snapshot, not general MVCC.
+>    An explicitly bound native table-store snapshot recovers a versioned catalog
+>    and rows together, and supports autocommit or DDL-only transactions for
+>    bounded CREATE TABLE and seeded materialized aggregates using native typed
+>    cells, including explicit NULL, UUID, JSONB text, BOOLEAN, TIMESTAMPTZ,
+>    exact NUMERIC and canonical TSVECTOR. Enforced PK and single-column NOT NULL
+>    UNIQUE remain supported. The source-required default/generated expressions,
+>    updated_at function/trigger and ordinary/expression/GIN index definitions
+>    have executable behavior; this is not arbitrary stored code or PostgreSQL
+>    catalog equivalence. Recovery validates schema/row bijection and types.
+>    Transactional CREATE stages up to 16 tables in a private catalog, and
+>    COMMIT persists all of them together in one fsynced generation; rollback
+>    publishes none. A changed committed catalog rejects a stale DDL stage.
+>    Materialized-view CREATE fences the source generation and live publishing
+>    principal while atomically publishing computed rows and the catalog.
+>    CHECK/FK/cascades, general stored code/views, mixed DDL/DML, DDL savepoints,
+>    universal retry safety and full PostgreSQL type compatibility remain open.
+>    Typed pgwire binds use AST parameter leaves, not SQL interpolation. Implicit
+>    extended writes share a private transaction until Sync; pipeline failure
+>    rolls it back. Completed portals do not repeat writes. Experimental retry
+>    identity still covers simple DML only and refuses typed writes.
+>    Pgwire has an isolated TLS-required listener; its legacy cleartext listener
+>    remains loopback-only. Neither listener is a production SQL replacement.
+>    No production cutover has occurred. This work prepares for a possible later
+>    DIRECTEYE migration; it does not run that migration or change a DSN. No
+>    consumer should be redirected until source migrations and queries pass with
+>    each intended driver, authorization negatives pass, and persistent-auth/TLS,
+>    restart, backup/restore, rollback, crash recovery and lost-reply recovery
+>    gates are independently verified.
 > 2. **`qihse_mvcc_min_active_snapshot()` returns 0 as a placeholder** and must
 >    not be used as a vacuum cutoff; callers pass the cutoff explicitly.
 >
@@ -31,6 +60,64 @@
 > aborted. `tests/test_txn.c` asserts the corrected behaviour and
 > `tests/test_mvcc_delete.c` asserts it in both directions, including the
 > over-correction guards.
+
+## Opt-in pgwire retry identity (experimental)
+
+On an isolated durable SQL listener, an authenticated client can issue
+`SET qihse.retry_key = 'request_01'` while idle, then `BEGIN`, one or more
+simple-query INSERT/UPDATE/DELETE statements, and `COMMIT`. The key is scoped
+to the authenticated user ID and tenant ID. The commit snapshot persists the
+row changes, key, a 32-byte SHA-256 operation digest, affected-row and command
+counts in one generation. A matching retry returns COMMIT without reapplying
+rows; a reused key with different operations or principal is refused. No key
+is evicted: a full ledger refuses new keyed writes. This does **not** enable
+retry protection for transactions without keys, DDL, prepared/extended-query
+protocol, cross-model writes, or an unavailable service.
+
+The digest is SHA-256 of ASCII `QIHSE-SQL-RETRY-v1`, a one-byte QIHSE BEGIN
+isolation code (`READ COMMITTED` by default), then for each successful DML
+simple Query: its four-byte big-endian SQL length and that many SQL bytes after
+pgwire's trailing semicolon/whitespace removal. Clients must preserve the
+identical SQL and statement order on retry (including literal values); do not
+substitute differently encoded bound parameters. An idle authenticated client
+can query `SELECT qihse_retry_status('request_01','<64 hex digest>')`, which
+returns `committed` plus counts or `absent`. Another principal or a mismatched
+digest receives an error, not the original outcome. A post-rename I/O error
+is ambiguous (`40003`); close/reopen the durable store and query status before
+retrying. The service scaffold stays disabled without persistent-auth
+provisioning and a verified TLS deployment policy; it is not a production
+recovery controller.
+
+### Durable formats and offline transfer
+
+The current writer emits **store v5** and **schema image v4**. The current store
+reader accepts v1–v5; the schema decoder accepts v1–v4. These are new-code
+read-compatibility guarantees, **not** permission to run an older binary on a
+newly written store/schema, nor a downgrade/export conversion. New typed cells
+(NUMERIC/TSVECTOR) and executable schema metadata require compatible readers.
+Preserve the pre-upgrade data image and matching runtime before any new writes;
+rollback to older code requires a separately tested restore of that image, not
+opening the upgraded store with the old binary.
+
+`qihse_table_store_backup()` and `qihse_table_store_restore()` require a live,
+active bootstrap-system Operator (user ID 0, tenant ID 0), not merely any account
+with the Operator role. Transfer accepts only validated **v3–v5** committed
+images with a nonempty valid catalog, rows and retry receipts. General v1/v2
+open compatibility does not make those formats eligible for transfer. Backup
+copies the committed image's bytes, rather than converting its version, from
+an open, unpoisoned durable store owned by this process. Restore requires the
+source and target not to be open elsewhere. Both refuse an existing destination;
+use fresh paths in private owner-only directories, not a live ledger path.
+Files are checked for ownership, private permissions, symlinks/hardlinks,
+checksum and schema/row validity; exclusion locks remain part of the contract.
+
+A transfer failure after publication/directory sync can leave a destination
+image. Preserve and inspect it rather than deleting it or assuming no write
+occurred. Retry with a new destination only after resolving the outcome. These
+APIs cover the bounded SQL store, not a service-wide snapshot of auth, keys,
+models, other engines or cluster state. They do not constitute a verified backup
+schedule or production recovery controller. See the
+[isolated recovery procedure](../deployment/README.md#backup-and-recovery).
 
 ## 1. Overview
 
@@ -279,9 +366,9 @@ startup scans surviving segments for the next LSN and refuses a corrupt WAL.
 An exclusive directory lock prevents competing WAL writer handles across
 processes. A torn tail currently prevents writer startup rather than repairing
 and discarding the incomplete record. This WAL is not connected to UWP SQL
-commits; SQL schema/row atomic replay, fsynced commit acknowledgement, and
-cross-process SQL state publication remain outstanding. Do not interpret these
-WAL tests as evidence of durable SQL.
+commits; SQL WAL replay and cross-process SQL state publication remain
+outstanding. The bounded native table-store snapshot described above provides
+its own catalog/row publication and fsync fence; these WAL tests do not verify it.
 
 ### WAL Operations
 

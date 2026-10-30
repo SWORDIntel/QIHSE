@@ -759,7 +759,7 @@ delete primitives, which is why the SQL `UPDATE`/`DELETE` executor targets it
 | `qihse_table_t* qihse_table_store_find_table(qihse_table_store_t* store, const char* name)` | Look up a table by name. | `NULL` |
 | `int qihse_table_insert(qihse_table_t* table, const qihse_col_value_t* values, size_t num_values)` | Insert a row; string values are deep-copied. | `-1` |
 | `int qihse_table_update(qihse_table_t* table, int (*pred)(const qihse_col_value_t* values, size_t num_cols, void* ctx), void* pred_ctx, const int* update_cols, const qihse_col_value_t* new_values, size_t num_updates)` | Atomically update the rows the predicate accepts: the columns in `update_cols` are set to the corresponding `new_values` (strings deep-copied). | `1` when rows changed, `0` when no row matched, `-1` on invalid input or allocation failure; the table is unchanged on error |
-| `bool qihse_table_delete(qihse_table_t* table, int (*pred)(const qihse_col_value_t* values, size_t num_cols, void* ctx), void* pred_ctx)` | Delete (tombstone) the rows the predicate accepts; the table is compacted periodically. | `false` when no row matched |
+| `bool qihse_table_delete(qihse_table_t* table, int (*pred)(const qihse_col_value_t* values, size_t num_cols, void* ctx), void* pred_ctx)` | Delete (tombstone) the rows the predicate accepts; the table is compacted periodically. | `false` when no row matched or direct durable mutation was refused |
 | `size_t qihse_table_row_count(const qihse_table_t* table)` | Live (non-deleted) row count. | `0` |
 | `void qihse_table_scan(const qihse_table_t* table, qihse_table_row_cb cb, void* ctx)` | Scan live rows; the callback's value pointer is valid only during the call and returning `false` stops the scan. | n/a |
 | `size_t qihse_table_num_cols(const qihse_table_t* table)` / `const qihse_col_def_t* qihse_table_col_def(const qihse_table_t* table, size_t idx)` / `int qihse_table_find_col(const qihse_table_t* table, const char* name)` / `const char* qihse_table_name(const qihse_table_t* table)` | Introspection. | `0` / `NULL` / `-1` |
@@ -768,6 +768,156 @@ The SQL executor above these primitives reports the rows actually changed, not
 a match count, and refuses a zero-condition DELETE instead of turning it into a
 match-all; see [sql_engine.md §3.5](architecture/sql_engine.md) for the
 executor-level contract.
+
+#### 8.2.1 Durable lifecycle and ownership
+
+Also declared in `include/qihse_uwp_sql_txn_schema.h`; implemented by
+`src/spinnaker/qihse_uwp_sql_txn_schema.c` (`uwp_sql_open_durable_locked`,
+`qihse_uwp_sql_close_durable`).
+
+| API | Contract |
+|---|---|
+| `qihse_table_store_open_durable(path)` | Returns an owned raw store or `NULL`; reads native snapshot v1–v5, writes v5. Raw open does not bind SQL or create a missing catalog. `qihse_table_store_destroy` releases its lifetime-exclusive `path.lock` lock and all tables. |
+| `qihse_uwp_sql_open_durable(ctx, path)` | Returns `0` or `-1`. Binds the single process-wide SQL row store to this context, before requests start; refuses an already-created/bound row store. A new store requires `ctx->schema`; recovery adopts the embedded registry when it is `NULL`, otherwise requires byte-identical serialized schema. Validates catalog/table correspondence and supported keys. |
+| `qihse_uwp_sql_durable_ready(ctx)` | True only for the bound owner context and an unpoisoned, current-process durable store with a catalog. Not merely a test for a non-NULL path. |
+| `qihse_uwp_sql_close_durable(ctx)` | After all sessions and transactions finish, the owning context closes the store and releases its lock; another context cannot close it. Does not destroy `ctx->schema`: the caller owns that registry even when recovered by open. |
+| `qihse_uwp_sql_table_store()` | Borrowed process-wide store, not a new caller-owned handle. Do not destroy it directly when SQL owns it. |
+
+The path's parent must already exist, be owned by the effective uid and have no
+group/other permission bits (for example `./data/sql/` mode `0700`). Existing
+snapshot and lock files must be owned, private, singly linked regular files;
+final-component symlinks are refused. Use a local filesystem with working
+atomic rename and fsync. A durable handle is not usable after fork; open a
+fresh handle in the process that will own it. Path arguments are deployment
+configuration, not hardcoded installation locations.
+
+Persistence writes a private temporary file, fsyncs it, renames it over the
+snapshot, then fsyncs the parent directory (`ts_persist` in
+`src/tractable/qihse_table_store.c`). Success acknowledges this sequence. A
+failure **after rename is ambiguous**, not proof of rollback: the on-disk
+snapshot may contain the operation while live state has not been published.
+The handle is poisoned. Close/destroy, reopen, then inspect the recovered
+state/retry receipt before another write. Do not blindly replay a failed write.
+
+#### 8.2.2 Explicit authentication and typed rows
+
+The context-free functions in the preceding table, raw transaction snapshots,
+row counts, `table_count`/`table_at`/`find_table`, and raw schema images are
+**engine primitives, not classified-capable protocol/SDK adapter entry points**.
+They do not acquire an authenticated identity by being called from an adapter.
+Propagate the actual principal to the authenticated APIs; enforce write/DDL
+permissions and constraints before raw publication. Never use `NULL` as a
+security-disabled mode or derive retry principal/tenant bindings from untrusted
+request strings.
+
+| API | Authorization, result and lifetime |
+|---|---|
+| `qihse_table_scan_user(table, user, cb, ctx)` / `qihse_table_scan_ids_user(...)` | Require an active non-NULL principal, a valid label layout and table READ ACL. Rows outside tenant/clearance/SCI never reach the callback. Return `false` on invalid/denied context; `true` includes callback-requested early termination. Callback values are borrowed only during the call; copy anything retained. |
+| `qihse_table_generation_user(table, user, &generation)` | Authenticated table READ check; copies the generation on success. Not an authorization grant for later row access. |
+| `qihse_table_row_get_user(table, user, generation, row_id, cb, ctx)` | Rechecks table and row authorization and generation before invoking the callback. Returns `false` for stale, missing or denied rows; `true` means a row was delivered (the callback return does not determine success). IDs are snapshot-local, not stable external identifiers. |
+| `qihse_table_txn_scan_user` / `qihse_table_txn_scan_ids_user` / `qihse_table_txn_generation_user` / `qihse_table_txn_row_get_user` | Authenticated equivalents for a transaction-local snapshot. They do not make a raw, unauthorized snapshot acquisition safe; choose the correct acquisition API first. |
+
+The reserved columns `__qihse_tenant_id`, `__qihse_classification`, and
+`__qihse_sci` must appear together as INT32. Partial/invalid labels fail closed.
+Unlabeled rows are system-tenant unclassified data, not a fallback for tenant
+principals. See `ts_table_access_context`, `ts_transform_row_allowed` and the
+`*_user` implementations in `src/tractable/qihse_table_store.c`.
+
+`qihse_col_value_t.is_null` is independent of empty text/zero/false. STRING,
+UUID, JSONB, NUMERIC and TSVECTOR carry owned text; inserted text is copied.
+TIMESTAMPTZ uses signed microseconds since the Unix epoch. NUMERIC is exact
+base-10 text, not binary float; `qihse_ts_numeric_valid` and
+`qihse_ts_tsvector_valid` validate their respective representations.
+
+#### 8.2.3 Transactions and atomic catalog publication
+
+| API | Contract |
+|---|---|
+| `qihse_table_txn_begin(table)` / `qihse_table_txn_begin_user(table, user)` | Owned, thread-local deep snapshot with a captured generation, or `NULL`. The raw form has no authorization; the user form requires READ and refuses if **any** live row is inaccessible, rather than returning a partial source. Keep the borrowed table/store alive until completion. |
+| `qihse_table_txn_insert` / `qihse_table_txn_update` / `qihse_table_txn_delete` | Mutate only the private shadow; no uncommitted live rows. Insert returns row ID or `-1`; update returns `1`/`0`/`-1` (changed/no match/error), leaving the shadow unchanged on error; delete returns a boolean, not a diagnostic status. |
+| `qihse_table_txn_transform(txn, user, pred, pred_ctx, transform, transform_ctx)` | Requires an authenticated principal; only authorized rows reach callbacks. The transform supplies a complete typed candidate row, with caller-owned text valid through callback return. Callback failure/invalid output leaves the shadow unchanged; returns `1`/`0`/`-1`. |
+| `qihse_table_txn_commit(txn)` / `qihse_table_txn_commit_group(txns, count)` | Check captured generations while holding participating write locks, then publish all or none in live memory. Durable groups persist the complete store first and cannot mix stores. Consume transactions on success **and failure** for a valid nonempty group; never pass duplicate transaction pointers. Caller retains ownership of the pointer array, not the consumed shadows. |
+| `qihse_table_txn_validate_group(txns, count)` | Read-only generation validation, consumes valid shadows without publishing/persisting; refuses poisoned stores. |
+| `qihse_table_txn_rollback(txn)` | Consumes/discards the private snapshot; no live publication. |
+| `qihse_table_store_set_schema_image` / `qihse_table_store_replace_schema_image` / `qihse_table_store_schema_image` | Initial installation requires an empty durable store without an image; replacement compares expected catalog bytes before persistence. Inputs are copied. Readback is raw borrowed bytes, invalid after replacement/destruction: serialize access and copy if retaining. |
+| `qihse_table_store_create_table_with_schema` / `qihse_table_store_create_tables_with_schema` | Publish table(s) and final catalog in one snapshot; the group fences the expected catalog bytes. Do not publish an adapter's staged registry unless successful. These raw helpers do not authorize DDL. |
+| `qihse_table_store_create_tables_seeded_with_schema` | Copies typed initial rows privately, authorizes destination rows for WRITE and complete source rows for READ, and fences source generations plus expected catalog before persistence. Source handles remain store-owned. Empty/unseeded cases still require caller-level DDL authorization. |
+
+Direct `qihse_table_insert`, `qihse_table_update` and `qihse_table_delete`
+are rejected for durable stores (`-1`, `-1`, `false` respectively). Raw
+`qihse_table_store_create_table` does not update the SQL catalog, so use atomic
+catalog/table publication for bound SQL stores; standalone raw/legacy stores
+can have no SQL catalog. In-memory direct mutations remain available.
+Neither a failed publication nor a false commit proves that a
+post-rename durable write is absent; use the reopen contract above.
+
+The SQL transaction layer supports bounded DDL-only catalog publication and
+separate DML shadow groups, not arbitrary mixed DDL/DML, savepoints or
+cross-model atomicity. The `QSC1` schema serializer writes **v4**, reads
+**v1–v4**, and refuses unsupported definitions rather than silently persisting
+an incomplete catalog (`src/tractable/qihse_schema.c`,
+`qihse_schema_serialize` / `qihse_schema_deserialize`).
+
+#### 8.2.4 Typed Describe/Execute and authenticated catalogs
+
+Declared in `include/qihse_uwp_sql_txn_schema.h`, implemented in
+`src/spinnaker/qihse_uwp_sql_txn_schema.c`. These return `uwp_sts_result_t`,
+not PostgreSQL SQLSTATE values; protocol adapters map errors separately.
+
+| API | Contract |
+|---|---|
+| `qihse_uwp_sql_describe(ctx, sql, user, declared_oids, nparams, metadata)` | Parses and checks supported SQL/schema/permissions without executing or reading rows. Zero parameter OIDs request inference; unsupported/ambiguous forms fail closed. Metadata is copied into caller-owned `qihse_uwp_sql_metadata_t`, not borrowed catalog storage. |
+| `qihse_uwp_sql_execute_params(ctx, sql, params, nparams, current_txn, user, write_fn, write_ctx)` | Parses original SQL and binds typed AST leaves, never SQL string interpolation. Uses the supplied transaction pointer and normal reply envelope. Caller retains parameter bytes through synchronous return; `oid=0` requests inference, `format=0/1` is text/binary, and only `is_null` represents SQL NULL (text `"NULL"` is ordinary text). Unsupported types/formats/lengths fail, not fall back to textual SQL substitution. |
+| `qihse_uwp_sql_select_type_oids(ctx, ast, user, result_names, count, oids)` | Copies result OIDs from the catalog under the dispatch lock after authenticated supported single-table SELECT. Never guesses types from serialized row values or exposes borrowed catalog pointers. |
+| `qihse_uwp_sql_catalog_tables(ctx, user, &names, &count)` | Copies sorted committed names visible under table READ ACL from the bound durable context; refuses incomplete catalog/row state. |
+| `qihse_uwp_sql_catalog_indexes(ctx, user, table, &names, &count)` | Copies committed names only for relations with readable ACL/labels. Protected or absent relations yield an empty result; `table=NULL` enumerates accessible committed relations atomically. |
+
+Both catalog APIs require active authenticated principals. The caller frees
+every returned name and then the array. Describe is metadata-only: it is not a
+substitute for Execute's row authorization. The declared bounds include 64
+result columns and 1 MiB per bind value; see header constants for parameter
+count limits.
+
+#### 8.2.5 Retry identity and snapshot transfer
+
+`qihse_ts_retry_identity_t` binds a nonempty key to authenticated principal and
+tenant strings (each at most 128 bytes) and a 32-byte digest over the canonical
+operation, typed parameters, targets and ordering. These are copied into the
+ledger, not authenticated by the raw store itself. There is no ledger eviction:
+capacity exhaustion fails closed rather than permitting duplicate execution.
+
+- `qihse_table_store_retry_lookup` returns `COMMITTED` with the original
+  `affected_rows`/`command_count`, `ABSENT`, `MISMATCH`, or `ERROR`.
+  Mismatched identity never discloses another principal's outcome.
+- `qihse_table_txn_commit_group_retry` consumes a valid nonempty group on every
+  result. A fresh `COMMITTED` persists rows and the supplied outcome together;
+  matching replay returns the original outcome without publishing new shadows.
+  `ABSENT` means a generation conflict, `MISMATCH` means key reuse, and `ERROR`
+  includes capacity/I/O failures, possibly ambiguous. Reopen before lookup after
+  ambiguous persistence failure.
+- `qihse_uwp_sql_txn_bind_retry` copies identity fields into a transaction with
+  staged SQL writes. Caller-owned status/outcome output storage must remain
+  valid until synchronous COMMIT returns. This is not permission to accept
+  arbitrary client-provided principal/tenant bindings.
+
+`qihse_table_store_backup(store, user, backup_path)` and
+`qihse_table_store_restore(user, backup_path, target_path)` require the **active
+bootstrap Operator, id 0 and tenant 0**, not arbitrary Operators. They borrow
+principals/handles and return `bool`; neither stops, starts nor rebinds a service.
+Backup borrows an open unpoisoned durable store and holds its mutex across
+capture. Restore opens/locks both paths itself: close source and target handles
+first. All paths must satisfy the private-directory/file checks above.
+
+Transfer accepts committed **v3–v5** snapshots containing a catalog, preserving
+the exact image and retry ledger rather than upgrading/reconstructing it; v1/v2
+are recoverable by raw open but not transferable through these APIs. The
+**destination must not exist**: no replacement of a live store or erasure of
+its retry history. A private temp file is fsynced, published with a no-replace
+link, unlinked and followed by directory fsync. If unlink/directory fsync fails
+after publication, `false` may leave a destination image present. Inspect/reopen
+it instead of deleting or overwriting it. Source contracts are implemented in
+`ts_copy_snapshot`, `ts_backup_authorized`, `qihse_table_store_backup` and
+`qihse_table_store_restore` in `src/tractable/qihse_table_store.c`.
 
 ### 8.3 Parallel query — `include/qihse_parallel_query.h`
 

@@ -40,15 +40,48 @@ db.start_resp_proxy("0.0.0.0", 6379)
 db.start_pg_proxy("0.0.0.0", 5432)
 ```
 
-The `qihse_pg` client completes PostgreSQL startup authentication before it
-returns a connection, then reads each command through `ReadyForQuery` so server
-errors and transport failures reach the caller. Managed connections issue
-`BEGIN` before their first statement and only update transaction state after a
-successful command-complete/ready response. The current QIHSE PG wire server
-does not yet implement transaction commands, so these calls fail explicitly;
-use `autocommit=True` only when statement-at-a-time behavior is intended. The
-current server also rejects PostgreSQL SSL negotiation and asks for a cleartext
-password, so do not send credentials over an untrusted network.
+### PostgreSQL wire client (`qihse_pg`)
+
+```python
+import qihse_pg
+
+with qihse_pg.connect(host="localhost", port=5432, dbname="qihse",
+                      user="User_2", password=password,
+                      sslrootcert="./certs/ca.pem") as conn:
+    cur = conn.cursor()
+    cur.execute("SELECT 1")
+    print(cur.fetchone())
+```
+
+The client defaults to `sslmode="verify-full"`: PostgreSQL SSLRequest negotiation
+followed by TLS 1.2 or newer with mandatory CA and hostname verification, before
+sending the startup identity or password. `sslrootcert` selects a CA PEM file;
+when omitted, Python's system trust roots apply. `sslhostname` explicitly selects
+the expected certificate identity (default: `host`), independently of the network
+endpoint. Optional `sslcert` and `sslkey` must be supplied together for a client
+certificate/key pair. Client certificates do not replace QIHSE username/password
+authentication or grant a claimed role. Server SQL authorization uses the actual
+authenticated principal's tenant, clearance and SCI compartments.
+
+TLS refusal, handshake failure, an untrusted CA or a hostname mismatch closes the
+connection; there is no cleartext fallback. Modes such as `prefer`, `require` and
+`verify-ca` are rejected because they weaken verification. For an explicitly
+insecure local development listener only, `sslmode="disable"` permits plaintext
+credentials after verifying that the connected peer address is loopback. This is
+never automatic, cannot be combined with TLS options, and does not bypass server
+authentication or authorization. TLS listeners still require TLS on loopback.
+
+The client completes PostgreSQL startup authentication before returning a
+connection, then reads each command through `ReadyForQuery` so server errors and
+transport failures reach the caller. Managed connections issue `BEGIN` before
+their first statement and update transaction state only after a successful
+command-complete/ready response. Use `autocommit=True` only when
+statement-at-a-time behavior is intended.
+
+Run the disposable TLS/auth regression with `python3 -m pytest -q
+tests/test_python_pg_tls.py` from the repository root after building
+`libqihse.so`. It creates its own listener, certificate and protected rows; it
+does not use a configured DSN or service.
 
 ## Security & Supernatural Auth Gates
 
