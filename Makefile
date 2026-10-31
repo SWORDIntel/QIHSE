@@ -1901,9 +1901,9 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 # This is NOT linked into HAX and adds no mandatory dependency to libqihse.so.
 .PHONY: test-codegraph
 qihse-codegraph: tools/qihse_codegraph.c $(LIB_TARGET)
-	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include \
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core \
 	  $< -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl) \
-	  $(LDFLAGS) -Wl,-rpath,'$ORIGIN'
+	  $(LDFLAGS) -Wl,-rpath,'$$ORIGIN'
 
 test-codegraph: qihse-codegraph
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph

@@ -15,28 +15,33 @@
 #include <ftw.h>
 #include <inttypes.h>
 #include <json-c/json.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "qihse_kv_store.h"
-#include "../core/qihse_audit.h"
-#include "qihse_auth.h"
 #include "qihse_graph_store.h"
+#include "qihse_audit.h"
 
 #define CG_MAX_LINE 262144u
 #define CG_MAX_NODES 2000000u
 #define CG_MAX_EDGES 8000000u
 #define CG_MAX_OUT 100000u
 #define CG_MAX_FILES 64u
+#define CG_REQUEST_MAX 65536u
 
 typedef struct {
     char id[65];
@@ -47,11 +52,13 @@ typedef struct {
 
 typedef struct {
     qihse_kv_store_t *kv;
+    qihse_user_t *principal;
     qihse_graph_t *graph;
     cg_node *nodes;
     cg_node **by_vertex;
     size_t nn, capacity, edges, unresolved;
     struct json_object *meta, *manifest;
+    bool audit_ready;
     char directory[PATH_MAX], repository[PATH_MAX];
     char scratch[PATH_MAX];
 } cg_state;
@@ -83,11 +90,15 @@ static void json_text(struct json_object *obj, const char *key, const char *valu
 static void json_int(struct json_object *obj, const char *key, int64_t value) {
     json_object_object_add(obj, key, json_object_new_int64(value));
 }
-static void json_bool_field(struct json_object *obj, const char *key, bool value) {
+static void json_boolean(struct json_object *obj, const char *key, bool value) {
     json_object_object_add(obj, key, json_object_new_boolean(value));
 }
+static FILE *response_stream;
+static bool response_inline;
 static void print_json(struct json_object *obj) {
-    puts(json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN));
+    FILE *out = response_stream ? response_stream : stdout;
+    fputs(json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN), out);
+    if (!response_inline) fputc('\n', out);
 }
 static int error_json(const char *reason) {
     struct json_object *o = json_object_new_object();
@@ -95,25 +106,16 @@ static int error_json(const char *reason) {
     print_json(o); json_object_put(o);
     return 1;
 }
+static bool hex_n(const char *v, size_t length) {
+    if (!v || strlen(v) != length) return false;
+    for (size_t i = 0; i < length; ++i)
+        if (!((v[i] >= '0' && v[i] <= '9') ||
+              (v[i] >= 'a' && v[i] <= 'f'))) return false;
+    return true;
+}
 static bool hex64(const char *v) {
-    if (!v || strlen(v) != 64) return false;
-    for (size_t i = 0; i < 64; ++i)
-        if (!((v[i] >= '0' && v[i] <= '9') ||
-              (v[i] >= 'a' && v[i] <= 'f'))) return false;
-    return true;
+    return hex_n(v, 64);
 }
-/* Git commit ids: SHA-1 (40 hex) on classic repos, SHA-256 (64 hex) on new
- * ones. The freshness gate compares against `git rev-parse HEAD` byte-for-byte,
- * so both lengths are legitimate in the header. */
-static bool hex_head(const char *v) {
-    size_t len;
-    if (!v || ((len = strlen(v)) != 40 && len != 64)) return false;
-    for (size_t i = 0; i < len; ++i)
-        if (!((v[i] >= '0' && v[i] <= '9') ||
-              (v[i] >= 'a' && v[i] <= 'f'))) return false;
-    return true;
-}
-
 static bool safe_relative(const char *path) {
     if (!path || *path == '/' || *path == '~' || strchr(path, '\\')) return false;
     for (const char *p = path; *p;) {
@@ -187,14 +189,13 @@ static void graph_close(cg_state *st) {
     free(st->nodes); free(st->by_vertex);
     if (st->meta) json_object_put(st->meta);
     if (st->manifest) json_object_put(st->manifest);
-    /* The audit signer is a background thread writing into this scratch dir.
-     * Deleting the dir while a record (e.g. the failed-import event) is still
-     * in flight made the signer's append fail ENOENT, which the audit layer
-     * treats as a chain-integrity abort. Drain it before cleanup. */
-    qihse_audit_flush();
+    if (st->audit_ready) {
+        qihse_audit_flush();
+        qihse_audit_shutdown();
+    }
     if (st->scratch[0]) nftw(st->scratch, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS);
 }
-static bool graph_open(cg_state *st, const char *repo) {
+static bool graph_open(cg_state *st, const char *repo, bool importing) {
     memset(st, 0, sizeof(*st));
     if (!realpath(repo, st->repository)) return false;
     char work_marker[PATH_MAX];
@@ -209,7 +210,13 @@ static bool graph_open(cg_state *st, const char *repo) {
     if (!sha256_buffer(st->repository, strlen(st->repository), repo_hash)) return false;
     if (snprintf(st->directory, sizeof(st->directory), "%s/qihse/codegraph/%s",
                  base, repo_hash) >= (int)sizeof(st->directory)) return false;
-    if (!make_directory(st->directory)) return false;
+    if (importing) {
+        if (!make_directory(st->directory)) return false;
+    } else {
+        struct stat state_stat;
+        if (stat(st->directory, &state_stat) != 0 ||
+            !S_ISDIR(state_stat.st_mode)) return false;
+    }
     if (snprintf(st->scratch, sizeof(st->scratch), "%s/.runtime-XXXXXX",
                  st->directory) >= (int)sizeof(st->scratch) ||
         !mkdtemp(st->scratch)) {
@@ -220,13 +227,29 @@ static bool graph_open(cg_state *st, const char *repo) {
      * never the host's production /opt/qihse-data. This process is single
      * purpose; QIHSE caches its data dir for the process lifetime. */
     if (setenv("QIHSE_DATA_DIR", st->scratch, 1) != 0) return false;
-    /* Audited KV paths fail closed (abort) without an initialized audit
-     * writer. Must run AFTER the scratch dir is in place: the audit subsystem
-     * resolves its directory once from QIHSE_DATA_DIR. */
-    if (!qihse_auth_init()) {
-        fprintf(stderr, "codegraph: auth init failed\n");
-        return false;
-    }
+    /* This offline process has its own authenticated realm. Never inherit
+     * credentials or storage from a running QIHSE service. */
+    if (unsetenv("QIHSE_OPERATOR_PASSWORD") != 0) return false;
+    unsigned char secret[32];
+    char password[65];
+    if (RAND_bytes(secret, sizeof(secret)) != 1) return false;
+    digest_hex(secret, sizeof(secret), password);
+    OPENSSL_cleanse(secret, sizeof(secret));
+    st->audit_ready = true;
+    bool initialized = qihse_auth_init();
+    bool authenticated = initialized && qihse_auth_bootstrap_operator(password);
+    qihse_user_t *operator_user = authenticated ?
+        qihse_auth_authenticate_id(0, password) : NULL;
+    if (operator_user && !importing) {
+        /* A reader needs only public CodeGraph records. The isolated realm's
+         * Operator creates a low-clearance identity; graph snapshot load,
+         * iteration and KV reads all carry that identity. */
+        qihse_user_t *created = qihse_auth_create_user(operator_user, 77u,
+            QIHSE_ROLE_GUEST, 0, 0, password, false);
+        if (created) st->principal = qihse_auth_authenticate_id(77u, password);
+    } else st->principal = operator_user;
+    OPENSSL_cleanse(password, sizeof(password));
+    if (!st->principal) return false;
     st->kv = qihse_kv_store_create();
     if (!st->kv) return false;
     return true;
@@ -260,6 +283,13 @@ static bool atomic_write(const char *path, const char *text) {
 static bool validate_node(struct json_object *item) {
     char *id = json_string(item, "id"), *file = json_string(item, "file");
     char *name = json_string(item, "name"), *kind = json_string(item, "kind");
+    struct json_object *classification = NULL, *sci = NULL;
+    if ((json_object_object_get_ex(item, "classification", &classification) &&
+         (!json_object_is_type(classification, json_type_int) ||
+          json_object_get_int64(classification) != 0)) ||
+        (json_object_object_get_ex(item, "sci", &sci) &&
+         (!json_object_is_type(sci, json_type_int) ||
+          json_object_get_int64(sci) != 0))) return false;
     return hex64(id) && file && safe_relative(file) && strlen(file) <= 4096 &&
            name && strlen(name) <= 512 && kind && strlen(kind) <= 64 &&
            json_num(item, "line_start") >= 0 &&
@@ -272,6 +302,13 @@ static bool validate_edge(struct json_object *item) {
     char *resolution = json_string(item, "resolution");
     bool traversable = json_flag(item, "traversable");
     char *tier = json_string(item, "tier");
+    struct json_object *classification = NULL, *sci = NULL;
+    if ((json_object_object_get_ex(item, "classification", &classification) &&
+         (!json_object_is_type(classification, json_type_int) ||
+          json_object_get_int64(classification) != 0)) ||
+        (json_object_object_get_ex(item, "sci", &sci) &&
+         (!json_object_is_type(sci, json_type_int) ||
+          json_object_get_int64(sci) != 0))) return false;
     return hex64(id) && file && safe_relative(file) &&
            src && (!*src || hex64(src)) && dst && (!*dst || hex64(dst)) &&
            type && strlen(type) < 32 && resolution &&
@@ -333,7 +370,8 @@ static int import_snapshot(cg_state *st, const char *input) {
             char *worktree = json_string(row, "worktree");
             if (strcmp(type, "h") || !format ||
                 strcmp(format, "qihse-codegraph-v1") ||
-                json_num(row, "version") != 1 || !hex_head(head) || !hex64(worktree)) {
+                json_num(row, "version") != 1 ||
+                !(hex_n(head, 40) || hex_n(head, 64)) || !hex64(worktree)) {
                 problem = "invalid header/version"; ok = false;
             } else {
                 meta = json_object_get(row); header = true;
@@ -346,8 +384,9 @@ static int import_snapshot(cg_state *st, const char *input) {
                 char key[72];
                 snprintf(key, sizeof(key), "%c:%s", is_node ? 'n' : 'e',
                          json_string(row, "id"));
-                if (qihse_kv_exists(st->kv, key) ||
-                    !qihse_kv_set(st->kv, key, line, 0, 0)) {
+                if (qihse_kv_exists_user(st->kv, key, st->principal) ||
+                    !qihse_kv_set_user(st->kv, key, line, 0, 0,
+                                       st->principal)) {
                     problem = "duplicate record or QIHSE KV write failed"; ok = false;
                 } else {
                     if (is_node) nodes++; else {
@@ -381,7 +420,10 @@ static int import_snapshot(cg_state *st, const char *input) {
     fclose(stream);
     free(line);
     EVP_MD_CTX_free(digest);
-    if (!header || !trailer) { ok = false; problem = "snapshot header/trailer missing"; }
+    if (ok && (!header || !trailer)) {
+        ok = false;
+        problem = "snapshot header/trailer missing";
+    }
     if (!ok) {
         if (meta) json_object_put(meta);
         close(lfd);
@@ -389,14 +431,16 @@ static int import_snapshot(cg_state *st, const char *input) {
     }
     /* Save verified header and trailer within the QIHSE KV generation. */
     const char *meta_json = json_object_to_json_string_ext(meta, JSON_C_TO_STRING_PLAIN);
-    ok = qihse_kv_set(st->kv, "_meta", meta_json, 0, 0);
+    ok = qihse_kv_set_user(st->kv, "_meta", meta_json, 0, 0,
+                           st->principal);
     struct json_object *end = json_object_new_object();
     json_int(end, "nodes", (int64_t)nodes);
     json_int(end, "edges", (int64_t)edges);
     json_int(end, "unresolved_edges", (int64_t)unresolved);
     json_text(end, "sha256", input_hash);
-    ok = ok && qihse_kv_set(st->kv, "_end",
-        json_object_to_json_string_ext(end, JSON_C_TO_STRING_PLAIN), 0, 0);
+    ok = ok && qihse_kv_set_user(st->kv, "_end",
+        json_object_to_json_string_ext(end, JSON_C_TO_STRING_PLAIN), 0, 0,
+        st->principal);
     json_object_put(end);
     if (!ok) { json_object_put(meta); close(lfd);
         return error_json("failed to publish verified metadata in QIHSE KV"); }
@@ -426,7 +470,7 @@ static int import_snapshot(cg_state *st, const char *input) {
     snprintf(published, sizeof(published), "%s/%s", st->directory, name);
     snprintf(temporary, sizeof(temporary), "%s/.snapshot-%ld.tmp",
              st->directory, (long)getpid());
-    if (qihse_kv_save(st->kv, temporary) != 0) {
+    if (qihse_kv_save_user(st->kv, temporary, st->principal) != 0) {
         json_object_put(meta); close(lfd);
         return error_json("QIHSE KV snapshot serialization failed");
     }
@@ -555,7 +599,8 @@ static bool build_native_graph(cg_state *st, size_t expected_nodes,
     if (st->graph) return false;
     st->graph = qihse_graph_create();
     if (!st->graph ||
-        !qihse_kv_foreach_user(st->kv, NULL, nodes_from_kv, st) ||
+        !qihse_kv_foreach_prefix_user(st->kv, "n:", st->principal,
+                                      nodes_from_kv, st) ||
         st->capacity == SIZE_MAX || st->nn != expected_nodes)
         return false;
     qsort(st->nodes, st->nn, sizeof(*st->nodes), compare_node_id);
@@ -567,7 +612,8 @@ static bool build_native_graph(cg_state *st, size_t expected_nodes,
             return false;
         st->by_vertex[st->nodes[i].vertex] = &st->nodes[i];
     }
-    return qihse_kv_foreach_user(st->kv, NULL, edges_from_kv, st) &&
+    return qihse_kv_foreach_prefix_user(st->kv, "e:", st->principal,
+                                         edges_from_kv, st) &&
            st->edges != SIZE_MAX && st->edges == expected_edges &&
            st->unresolved == expected_unresolved;
 }
@@ -597,9 +643,10 @@ static struct json_object *read_json_file(const char *path) {
     }
     return row;
 }
-static bool load_snapshot(cg_state *st) {
+static bool load_snapshot(cg_state *st, bool build_graph) {
     char manifest_path[PATH_MAX];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory);
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/current.json",
+                 st->directory) >= (int)sizeof(manifest_path)) return false;
     st->manifest = read_json_file(manifest_path);
     if (!st->manifest) return false;
     char *snapshot = json_string(st->manifest, "snapshot");
@@ -611,9 +658,10 @@ static bool load_snapshot(cg_state *st) {
     if (snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s",
                  st->directory, snapshot) >= (int)sizeof(snapshot_path) ||
         !sha256_file(snapshot_path, actual) || strcmp(actual, sha)) return false;
-    if (qihse_kv_load(st->kv, snapshot_path) != 0) return false;
-    char *header = qihse_kv_get(st->kv, "_meta");
-    char *end = qihse_kv_get(st->kv, "_end");
+    if (qihse_kv_load_user(st->kv, snapshot_path, st->principal) != 0)
+        return false;
+    char *header = qihse_kv_get_user(st->kv, "_meta", st->principal);
+    char *end = qihse_kv_get_user(st->kv, "_end", st->principal);
     if (!header || !end) { free(header); free(end); return false; }
     st->meta = json_tokener_parse(header);
     struct json_object *trailer = json_tokener_parse(end);
@@ -627,6 +675,7 @@ static bool load_snapshot(cg_state *st) {
               json_num(trailer, "unresolved_edges");
     if (trailer) json_object_put(trailer);
     if (!ok) return false;
+    if (!build_graph) return true;
     return build_native_graph(st,
         (size_t)json_num(st->manifest, "nodes"),
         (size_t)json_num(st->manifest, "edges"),
@@ -718,23 +767,32 @@ static bool freshness(cg_state *st, const char **reason) {
     free(head); free(worktree); free(diff);
     return ok;
 }
-static struct json_object *summary(cg_state *st) {
+static struct json_object *summary(cg_state *st, bool freshness_verified) {
     struct json_object *obj = json_object_new_object();
     json_text(obj, "backend", "QIHSE native CodeGraph");
     json_text(obj, "format", "qihse-codegraph-v1");
-    json_int(obj, "nodes", (int64_t)st->nn);
-    json_int(obj, "edges", (int64_t)st->edges);
-    json_int(obj, "unresolved_edges", (int64_t)st->unresolved);
+    json_int(obj, "nodes", json_num(st->manifest, "nodes"));
+    json_int(obj, "edges", json_num(st->manifest, "edges"));
+    json_int(obj, "unresolved_edges",
+             json_num(st->manifest, "unresolved_edges"));
     json_text(obj, "head", json_string(st->manifest, "head"));
+    json_text(obj, "generation", json_string(st->manifest, "snapshot"));
     const char *reason = NULL;
-    bool fresh = freshness(st, &reason);
-    json_bool_field(obj, "fresh", fresh);
+    bool fresh = freshness_verified || freshness(st, &reason);
+    json_boolean(obj, "fresh", fresh);
     if (!fresh) json_text(obj, "stale_reason", reason);
     return obj;
 }
 static bool impact_edge(const char *type, bool incoming) {
     if (!strcmp(type, "TESTED_BY")) return !incoming;
     if (!incoming) return false;
+    return !strcmp(type, "CALLS") || !strcmp(type, "IMPORTS_FROM") ||
+           !strcmp(type, "DEPENDS_ON") || !strcmp(type, "REFERENCES") ||
+           !strcmp(type, "INHERITS") || !strcmp(type, "IMPLEMENTS") ||
+           !strcmp(type, "HANDLES") || !strcmp(type, "TRIGGERS");
+}
+static bool context_edge(const char *type, bool incoming) {
+    if (!strcmp(type, "TESTED_BY")) return !incoming;
     return !strcmp(type, "CALLS") || !strcmp(type, "IMPORTS_FROM") ||
            !strcmp(type, "DEPENDS_ON") || !strcmp(type, "REFERENCES") ||
            !strcmp(type, "INHERITS") || !strcmp(type, "IMPLEMENTS") ||
@@ -748,16 +806,18 @@ static struct json_object *record_node(cg_node *n, int hop, double risk,
     json_text(record, "symbol", n->name);
     json_text(record, "kind", n->kind);
     json_int(record, "line_start", n->line);
-    if (!compact) json_int(record, "line_end", n->end_line);
+    json_int(record, "line_end", n->end_line);
     json_int(record, "hop", hop);
-    json_bool_field(record, "is_test", n->is_test);
+    json_boolean(record, "is_test", n->is_test);
     if (!compact)
         json_object_object_add(record, "risk_hint",
                                json_object_new_double(risk));
     return record;
 }
-static bool matches_symbol(const cg_node *node, const char *query) {
-    return query && *query && (strcasestr(node->name, query) != NULL);
+static bool matches_symbol(const cg_node *node, const char *query, bool exact) {
+    if (!query || !*query) return false;
+    return exact ? strcasecmp(node->name, query) == 0 :
+                   strcasestr(node->name, query) != NULL;
 }
 static bool matches_file(const cg_node *node, const char *files[], size_t nfiles) {
     for (size_t i = 0; i < nfiles; ++i)
@@ -808,8 +868,9 @@ static size_t git_changed_files(cg_state *st, const char *base, char ***names) {
  * against native QIHSE indexed adjacency, never a global edge-table scan. */
 static int query_graph(cg_state *st, const char *action, const char *symbol,
                        const char *files[], size_t nfiles, const char *base,
-                       int depth, size_t max_nodes, int token_budget) {
-    struct json_object *report = summary(st);
+                       int depth, size_t max_nodes, int token_budget,
+                       bool freshness_verified) {
+    struct json_object *report = summary(st, freshness_verified);
     if (!json_flag(report, "fresh")) {
         json_text(report, "error", "stale CodeGraph: run graph_index update");
         print_json(report); json_object_put(report);
@@ -835,9 +896,14 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
     }
     depth = depth < 1 ? 1 : depth > 5 ? 5 : depth;
     max_nodes = max_nodes < 1 ? 1 : max_nodes > 256 ? 256 : max_nodes;
-    if (token_budget > 0 && max_nodes > (size_t)(token_budget / 45))
-        max_nodes = (size_t)(token_budget / 45);
+    bool compact = strcmp(action, "context") == 0;
+    if (token_budget > 0 && max_nodes >
+        (size_t)(token_budget / (compact ? 80 : 45)))
+        max_nodes = (size_t)(token_budget / (compact ? 80 : 45));
     if (!max_nodes) max_nodes = 1;
+    size_t evidence_limit = compact ? (size_t)(token_budget / 180) : 40;
+    if (!evidence_limit) evidence_limit = 1;
+    if (compact && evidence_limit > 16) evidence_limit = 16;
     uint8_t *visited = calloc(st->nn + 2, sizeof(*visited));
     uint8_t *distance = calloc(st->nn + 2, sizeof(*distance));
     uint64_t *queue = calloc(max_nodes + 1, sizeof(*queue));
@@ -857,9 +923,20 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
         json_object_put(evidence); json_object_put(gaps);
         return error_json("CodeGraph query allocation failed");
     }
+    bool exact_symbol = false;
+    if (symbol && *symbol) {
+        for (size_t i = 0; i < st->nn; ++i) {
+            if (matches_symbol(&st->nodes[i], symbol, true)) {
+                exact_symbol = true;
+                break;
+            }
+        }
+        json_text(report, "seed_match", exact_symbol ? "exact" : "substring");
+    }
     for (size_t i = 0; i < st->nn; ++i) {
         cg_node *n = &st->nodes[i];
-        if (!matches_symbol(n, symbol) && !matches_file(n, files, nfiles)) continue;
+        if (!matches_symbol(n, symbol, exact_symbol) &&
+            !matches_file(n, files, nfiles)) continue;
         seeds++;
         if (used < max_nodes) { visited[n->vertex] = 1; queue[used++] = n->vertex; }
         else truncated = true;
@@ -895,8 +972,10 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
             if (count == 2048) truncated = true;
             for (size_t e = 0; e < count; ++e) {
                 graph_adj_t *adj = &edges[e];
+                bool incoming = dir == GRAPH_DIR_INCOMING;
                 if (strcmp(action, "query") != 0 &&
-                    !impact_edge(adj->edge_type, dir == GRAPH_DIR_INCOMING))
+                    !(compact ? context_edge(adj->edge_type, incoming) :
+                                impact_edge(adj->edge_type, incoming)))
                     continue;
                 uint64_t neighbor = adj->neighbor_id;
                 if (neighbor > st->nn || visited[neighbor]) continue;
@@ -906,8 +985,7 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
                 queue[used++] = neighbor;
                 /* Explain each included relationship with its original
                  * source line and confidence. No guessed targets are here. */
-                if (json_object_array_length(evidence) < 40 &&
-                    strcmp(action, "context") != 0) {
+                if (json_object_array_length(evidence) < evidence_limit) {
                     graph_edge_t *edge = qihse_graph_edge_get(st->graph, adj->edge_id);
                     if (edge) {
                         cg_node *related = st->by_vertex[neighbor];
@@ -931,7 +1009,7 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
                         json_object_array_add(evidence, ev);
                         graph_edge_free(edge);
                     }
-                }
+                } else truncated = true;
             }
         }
     }
@@ -965,13 +1043,13 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
     json_int(report, "seed_nodes", (int64_t)seeds);
     json_int(report, "shown_nodes", (int64_t)shown);
     json_int(report, "depth", depth);
-    json_bool_field(report, "truncated", truncated);
+    json_boolean(report, "truncated", truncated);
     json_text(report, "risk_kind", "heuristic review priority; not vulnerability probability");
     json_object_object_add(report, "nodes", found);
     json_object_object_add(report, "affected_files", affected);
     json_object_object_add(report, "candidate_tests", tests);
-    if (strcmp(action, "context") == 0) {
-        json_object_put(evidence);
+    if (compact) {
+        json_object_object_add(report, "evidence", evidence);
         json_object_put(gaps);
     } else {
         json_object_object_add(report, "evidence", evidence);
@@ -990,20 +1068,370 @@ static int query_graph(cg_state *st, const char *action, const char *symbol,
     return seeds || (!symbol && nfiles == 0) ? 0 : 2;
 }
 
-static int usage(void) {
-    fputs("usage: qihse-codegraph <import|status|query|impact|review|context> "
+/* The reader is deliberately single-threaded. QIHSE graph/KV iterators do
+ * not promise concurrent reads, so accepted clients are serialized while the
+ * immutable generation remains resident. The socket backlog bounds waiting
+ * clients; each request has a receive timeout and a bounded JSON frame. */
+static void clear_generation(cg_state *st) {
+    if (st->graph) qihse_graph_destroy(st->graph);
+    st->graph = NULL;
+    if (st->kv) qihse_kv_store_destroy(st->kv);
+    st->kv = NULL;
+    for (size_t i = 0; i < st->nn; ++i) {
+        free(st->nodes[i].file); free(st->nodes[i].name); free(st->nodes[i].kind);
+    }
+    free(st->nodes); st->nodes = NULL;
+    free(st->by_vertex); st->by_vertex = NULL;
+    st->nn = st->capacity = st->edges = st->unresolved = 0;
+    if (st->meta) json_object_put(st->meta);
+    if (st->manifest) json_object_put(st->manifest);
+    st->meta = st->manifest = NULL;
+}
+
+static bool same_manifest(struct json_object *a, struct json_object *b) {
+    if (!a || !b) return false;
+    return strcmp(json_object_to_json_string_ext(a, JSON_C_TO_STRING_PLAIN),
+                  json_object_to_json_string_ext(b, JSON_C_TO_STRING_PLAIN)) == 0;
+}
+
+static bool current_manifest(cg_state *st, struct json_object **out) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/current.json", st->directory) >=
+        (int)sizeof(path)) return false;
+    *out = read_json_file(path);
+    return *out != NULL;
+}
+
+static bool refresh_generation(cg_state *st) {
+    struct json_object *published = NULL;
+    bool available = current_manifest(st, &published);
+    bool same = available && same_manifest(st->manifest, published);
+    if (published) json_object_put(published);
+    if (!available) {
+        clear_generation(st);
+        return false;
+    }
+    if (same && st->graph) return true;
+    /* Drop the old graph before trying the new publication. An invalid
+     * replacement must never leave an older generation serviceable. */
+    clear_generation(st);
+    st->kv = qihse_kv_store_create();
+    if (!st->kv || !load_snapshot(st, true)) {
+        clear_generation(st);
+        return false;
+    }
+    return true;
+}
+
+static bool paired_socket_paths(const char *socket_path, const char *token_path) {
+    if (!socket_path || !token_path || socket_path[0] != '/' ||
+        token_path[0] != '/' || strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path))
+        return false;
+    char first[PATH_MAX], second[PATH_MAX];
+    snprintf(first, sizeof(first), "%s", socket_path);
+    snprintf(second, sizeof(second), "%s", token_path);
+    char *a = strrchr(first, '/'), *b = strrchr(second, '/');
+    if (!a || !b || !a[1] || !b[1] || strcmp(a + 1, b + 1) == 0) return false;
+    *a = *b = '\0';
+    if (strcmp(first, second) != 0) return false;
+    struct stat info;
+    /* The socket and token must share one real directory (lstat rejects
+     * symlinks); no group/other restrictions apply to the directory itself,
+     * since the socket and token files carry their own owner-only checks. */
+    return lstat(first, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+static bool new_capability(const char *path, char token[65]) {
+    unsigned char random[32];
+    if (RAND_bytes(random, sizeof(random)) != 1) return false;
+    digest_hex(random, sizeof(random), token);
+    OPENSSL_cleanse(random, sizeof(random));
+    char line[66];
+    snprintf(line, sizeof(line), "%s\n", token);
+    if (!atomic_write(path, line)) {
+        OPENSSL_cleanse(token, 65);
+        return false;
+    }
+    return true;
+}
+
+static bool authorized_request(cg_state *st, struct json_object *request,
+                               const char token[65]) {
+    const char *presented = json_string(request, "token");
+    return presented && hex64(presented) &&
+           CRYPTO_memcmp(presented, token, 64) == 0 &&
+           qihse_auth_user_is_active(st->principal) &&
+           qihse_auth_can_access(st->principal, 0, 0);
+}
+
+static int socket_reply(FILE *out, const char *reason) {
+    struct json_object *obj = json_object_new_object();
+    json_text(obj, "error", reason);
+    fputs(json_object_to_json_string_ext(obj, JSON_C_TO_STRING_PLAIN), out);
+    fputc('\n', out);
+    json_object_put(obj);
+    return 1;
+}
+
+static void serve_request(cg_state *st, FILE *stream, const char *token_path,
+                          char token[65]) {
+    char *line = malloc(CG_REQUEST_MAX + 2);
+    if (!line) { socket_reply(stream, "request allocation failed"); return; }
+    size_t used = 0;
+    bool complete = false;
+    while (used <= CG_REQUEST_MAX) {
+        ssize_t n = recv(fileno(stream), line + used,
+                         CG_REQUEST_MAX + 1 - used, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
+        if (memchr(line, '\n', used)) { complete = true; break; }
+    }
+    bool framed = complete && used <= CG_REQUEST_MAX &&
+                  !memchr(line, '\0', used) && line[used - 1] == '\n' &&
+                  !memchr(line, '\n', used - 1);
+    line[used] = '\0';
+    if (!framed) {
+        socket_reply(stream, "invalid or oversized CodeGraph request");
+        free(line);
+        return;
+    }
+    struct json_object *request = json_tokener_parse(line);
+    free(line);
+    if (!request || !json_object_is_type(request, json_type_object)) {
+        socket_reply(stream, "invalid CodeGraph request JSON");
+        if (request) json_object_put(request);
+        return;
+    }
+    if (!authorized_request(st, request, token)) {
+        socket_reply(stream, "CodeGraph authentication or authorization denied");
+        json_object_put(request);
+        return;
+    }
+    const char *command = json_string(request, "command");
+    if (command && strcmp(command, "ping") == 0) {
+        fputs("{\"status\":\"ready\"}\n", stream);
+    } else if (command && strcmp(command, "revoke") == 0) {
+        if (new_capability(token_path, token))
+            fputs("{\"status\":\"revoked\"}\n", stream);
+        else socket_reply(stream, "CodeGraph capability rotation failed");
+    } else if (command && (strcmp(command, "status") == 0 ||
+                           strcmp(command, "context") == 0)) {
+        if (!refresh_generation(st)) {
+            socket_reply(stream, "no valid QIHSE CodeGraph generation");
+        } else if (strcmp(command, "status") == 0) {
+            struct json_object *report = summary(st, false);
+            print_json(report);
+            json_object_put(report);
+        } else {
+            const char *symbol = json_string(request, "symbol");
+            struct json_object *field = NULL;
+            int depth = json_object_object_get_ex(request, "depth", &field) ?
+                        (int)json_num(request, "depth") : 2;
+            int limit = json_object_object_get_ex(request, "limit", &field) ?
+                        (int)json_num(request, "limit") : 80;
+            int tokens = json_object_object_get_ex(request, "max_tokens", &field) ?
+                         (int)json_num(request, "max_tokens") : 4000;
+
+            /* Multi-symbol batch: client sends "symbols" array, iterate in one request.
+             * The batch must honour the same freshness gate as the single-symbol path:
+             * a stale generation is refused, never shipped with "fresh":true. */
+            struct json_object *symbols_field = NULL;
+            if (json_object_object_get_ex(request, "symbols", &symbols_field) &&
+                json_object_is_type(symbols_field, json_type_array) &&
+                json_object_array_length(symbols_field) > 0) {
+                const char *stale_reason = NULL;
+                if (!freshness(st, &stale_reason)) {
+                    struct json_object *report = summary(st, false);
+                    json_text(report, "error", "stale CodeGraph: run graph_index update");
+                    print_json(report);
+                    json_object_put(report);
+                    json_object_put(request);
+                    return;
+                }
+                FILE *capture = NULL;
+                char *result = NULL; size_t result_len = 0;
+                size_t n_syms = json_object_array_length(symbols_field);
+                bool query_failed = false;
+                for (size_t si = 0; si < n_syms; si++) {
+                    const char *sym = json_object_get_string(
+                        json_object_array_get_idx(symbols_field, si));
+                    if (!sym || !*sym || strlen(sym) > 512) continue;
+                    if (!capture) {
+                        capture = open_memstream(&result, &result_len);
+                        if (!capture) break;
+                        response_stream = capture;
+                        response_inline = true;
+                        fputs("{\"backend\":\"QIHSE native CodeGraph\",\"format\":"
+                              "\"qihse-codegraph-v1\",\"fresh\":true,"
+                              "\"truncated\":false,\"nodes\":[", capture);
+                    } else {
+                        fputc(',', capture);
+                    }
+                    if (query_graph(st, "context", sym, NULL, 0, NULL,
+                                    depth, (size_t)limit, tokens, true) != 0)
+                        query_failed = true;
+                }
+                if (capture) {
+                    fputs("]}\n", capture);
+                    response_inline = false;
+                    response_stream = stream;
+                    fclose(capture);
+                    struct json_object *published = NULL;
+                    const char *reason = NULL;
+                    bool still_current = current_manifest(st, &published) &&
+                        same_manifest(st->manifest, published) &&
+                        freshness(st, &reason) &&
+                        qihse_auth_user_is_active(st->principal);
+                    if (published) json_object_put(published);
+                    if (!query_failed && still_current && result && result_len)
+                        fwrite(result, 1, result_len, stream);
+                    else socket_reply(stream, "CodeGraph batch context failed or changed");
+                    free(result);
+                } else
+                    socket_reply(stream, "no valid symbols in batch request");
+            } else if (!symbol || !*symbol || strlen(symbol) > 512 || depth < 1 ||
+                depth > 5 || limit < 1 || limit > 256 ||
+                tokens < 128 || tokens > 16000) {
+                socket_reply(stream, "invalid bounded CodeGraph context request");
+            } else {
+                const char *stale_reason = NULL;
+                if (!freshness(st, &stale_reason)) {
+                    query_graph(st, "context", symbol, NULL, 0, NULL,
+                                depth, (size_t)limit, tokens, false);
+                    json_object_put(request);
+                    return;
+                }
+                char *result = NULL;
+                size_t result_len = 0;
+                FILE *capture = open_memstream(&result, &result_len);
+                if (!capture) {
+                    socket_reply(stream, "CodeGraph response allocation failed");
+                } else {
+                    response_stream = capture;
+                    query_graph(st, "context", symbol, NULL, 0, NULL,
+                                depth, (size_t)limit, tokens, true);
+                    response_stream = stream;
+                    fclose(capture);
+                    struct json_object *published = NULL;
+                    const char *reason = NULL;
+                    bool still_current = current_manifest(st, &published) &&
+                        same_manifest(st->manifest, published) &&
+                        freshness(st, &reason) &&
+                        qihse_auth_user_is_active(st->principal);
+                    if (published) json_object_put(published);
+                    if (still_current && result && result_len)
+                        fwrite(result, 1, result_len, stream);
+                    else socket_reply(stream, "CodeGraph changed during query");
+                    free(result);
+                }
+            }
+        }
+    } else socket_reply(stream, "unsupported CodeGraph reader command");
+    json_object_put(request);
+}
+
+static int serve_graph(cg_state *st, const char *socket_path,
+                       const char *token_path, int idle_seconds) {
+    if (!paired_socket_paths(socket_path, token_path))
+        return error_json("CodeGraph socket/token paths must share one directory");
+    char token[65] = {0};
+    char lock_path[PATH_MAX];
+    if (snprintf(lock_path, sizeof(lock_path), "%s.lock", socket_path) >=
+        (int)sizeof(lock_path))
+        return error_json("CodeGraph socket lock path too long");
+    int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (lock_fd >= 0) close(lock_fd);
+        return error_json("CodeGraph reader already active");
+    }
+    bool token_owned = false, socket_owned = false;
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) goto failed;
+    struct stat existing;
+    if (lstat(socket_path, &existing) == 0) {
+        if (!S_ISSOCK(existing.st_mode) || existing.st_uid != geteuid())
+            goto failed;
+        int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un address = { .sun_family = AF_UNIX };
+        snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
+        int active = probe >= 0 && connect(probe, (struct sockaddr *)&address,
+                                           sizeof(address)) == 0;
+        if (probe >= 0) close(probe);
+        if (active || unlink(socket_path) != 0) goto failed;
+    } else if (errno != ENOENT) goto failed;
+    if (!new_capability(token_path, token)) goto failed;
+    token_owned = true;
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
+    mode_t old_umask = umask(0077);
+    int bound = bind(listener, (struct sockaddr *)&address, sizeof(address));
+    umask(old_umask);
+    socket_owned = bound == 0;
+    if (bound != 0 || chmod(socket_path, 0600) != 0 || listen(listener, 16) != 0)
+        goto failed_socket;
+    for (;;) {
+        struct pollfd ready = { .fd = listener, .events = POLLIN };
+        int polled = poll(&ready, 1, idle_seconds * 1000);
+        if (polled == 0) break;
+        if (polled < 0) { if (errno == EINTR) continue; break; }
+        int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+        if (client < 0) { if (errno == EINTR) continue; break; }
+        struct ucred peer; socklen_t peer_size = sizeof(peer);
+        bool same_uid = getsockopt(client, SOL_SOCKET, SO_PEERCRED,
+                                   &peer, &peer_size) == 0 &&
+                        peer_size == sizeof(peer) && peer.uid == geteuid();
+        struct timeval timeout = { .tv_sec = 5 };
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        FILE *stream = fdopen(client, "w");
+        if (!stream) { close(client); continue; }
+        response_stream = stream;
+        if (same_uid) serve_request(st, stream, token_path, token);
+        else socket_reply(stream, "CodeGraph peer denied");
+        response_stream = NULL;
+        fflush(stream);
+        fclose(stream);
+    }
+    close(listener);
+    unlink(socket_path);
+    unlink(token_path);
+    close(lock_fd);
+    OPENSSL_cleanse(token, sizeof(token));
+    return 0;
+failed_socket:
+    if (socket_owned) unlink(socket_path);
+failed:
+    if (listener >= 0) close(listener);
+    if (token_owned) unlink(token_path);
+    close(lock_fd);
+    OPENSSL_cleanse(token, sizeof(token));
+    return error_json("CodeGraph reader socket unavailable");
+}
+
+static const char *usage_text =
+    "usage: qihse-codegraph <import|status|query|impact|review|context|serve> "
           "[--repo DIR] [--input JSONL] [--symbol NAME] [--file PATH] "
           "[--base GITREF] [--depth 1..5] [--limit 1..256] "
-          "[--max-tokens 128..16000]\n", stderr);
+          "[--max-tokens 128..16000] [--socket PATH] [--token-file PATH] "
+          "[--idle-seconds 1..3600]\n";
+static int usage(void) {
+    fputs(usage_text, stderr);
     return 2;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
+    if (!strcmp(argv[1], "--help")) {
+        fputs(usage_text, stdout);
+        return 0;
+    }
     const char *action = argv[1], *repo = ".", *input = NULL;
+    const char *socket_path = NULL, *token_path = NULL;
     const char *symbol = NULL, *base = NULL, *files[CG_MAX_FILES] = {0};
     size_t nfiles = 0, limit = 80;
     int depth = 2, tokens = 4000;
+    int idle_seconds = 60;
     for (int i = 2; i < argc; i++) {
         const char *flag = argv[i];
         if (i + 1 >= argc) return usage();
@@ -1018,36 +1446,43 @@ int main(int argc, char **argv) {
         } else if (!strcmp(flag, "--depth")) depth = atoi(value);
         else if (!strcmp(flag, "--limit")) limit = (size_t)atoi(value);
         else if (!strcmp(flag, "--max-tokens")) tokens = atoi(value);
+        else if (!strcmp(flag, "--socket")) socket_path = value;
+        else if (!strcmp(flag, "--token-file")) token_path = value;
+        else if (!strcmp(flag, "--idle-seconds")) idle_seconds = atoi(value);
         else return usage();
     }
     if (strcmp(action, "import") && strcmp(action, "status") &&
         strcmp(action, "query") && strcmp(action, "impact") &&
-        strcmp(action, "review") && strcmp(action, "context")) return usage();
+        strcmp(action, "review") && strcmp(action, "context") &&
+        strcmp(action, "serve")) return usage();
     /* Bare impact/review means "changed since HEAD", never whole-repo
      * pseudo-review with no seeds. Graph context requires an explicit seed. */
     if (!symbol && !base && !nfiles &&
         (!strcmp(action, "impact") || !strcmp(action, "review")))
         base = "HEAD";
     if (tokens < 128 || tokens > 16000 || limit == 0 || limit > 256 ||
-        depth < 1 || depth > 5) return usage();
+        depth < 1 || depth > 5 || idle_seconds < 1 || idle_seconds > 3600 ||
+        (!strcmp(action, "serve") && (!socket_path || !token_path))) return usage();
     cg_state st;
-    if (!graph_open(&st, repo)) {
+    if (!graph_open(&st, repo, !strcmp(action, "import"))) {
         graph_close(&st);
         return error_json("CodeGraph repo/runtime not available");
     }
     int rc;
     if (!strcmp(action, "import")) {
         rc = input ? import_snapshot(&st, input) : usage();
-    } else if (!load_snapshot(&st)) {
+    } else if (!load_snapshot(&st, strcmp(action, "status") != 0)) {
         rc = error_json("no valid QIHSE CodeGraph generation; import a fresh CRG snapshot");
+    } else if (!strcmp(action, "serve")) {
+        rc = serve_graph(&st, socket_path, token_path, idle_seconds);
     } else if (!strcmp(action, "status")) {
-        struct json_object *report = summary(&st);
+        struct json_object *report = summary(&st, false);
         print_json(report);
         json_object_put(report);
         rc = 0;
     } else {
         rc = query_graph(&st, action, symbol, files, nfiles, base,
-                         depth, limit, tokens);
+                         depth, limit, tokens, false);
     }
     graph_close(&st);
     return rc;
