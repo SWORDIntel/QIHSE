@@ -479,6 +479,15 @@ flags; PQC: `--pqc-identity-dir`, `--pqc-trusted-pub` (repeatable),
 `--pqc-require` (refuse cleartext peers — verified by `make
 test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
 
+Maintenance hold at startup: `--failover-start-paused` installs the failover
+hold **before the first listen** so a staged restart retains canonical slot
+ownership while configured peers are still absent. Only an authenticated
+SYSTEM-domain Operator `CLUSTER FAILOVER.RESUME` releases it (`+RESUMED`,
+or `+ALREADY-RUNNING` on a repeated release). Unauthenticated sessions,
+tenant Operators, lower roles and pinned replication principals cannot
+release it. It is a startup ownership hold, not a live drain and not a data
+fence — pair it with an ingress fence for a real cutover.
+
 ### 3.2.1 Replication Transports & Mutual Pinning
 
 QIHSE provides one-way authenticated KV replication between nodes with end-to-end
@@ -655,6 +664,49 @@ To simplify secure certificate generation and daemon configuration, use
 - Real-world deployment smoke testing was verified across Proxmox LXC containers
   (`stageb-node1`, `stageb-node2`, `stageb-node3`) with strict Layer-2 bridge isolation
   (`ebtables` dropping all IPv4 and ARP between containers).
+
+### 3.2.2 Cluster maintenance gate — `CLUSTER MAINTENANCE`
+
+`qihse-cluster-daemon` constructs a process-local maintenance gate that admits
+individually registered writer classes when OPEN and requires **complete
+coverage** before a hold may begin. The 11 writer classes, in STATUS order:
+
+```text
+resp bgsave bus_slot failover reclaim bus_group bus_federation
+replica expiry task_worker brain
+```
+
+States: `OPEN` → `DRAINING` → `HELD` → (fail-closed on lease expiry)
+`EXPIRED_HELD`. A hold requires a token: `BEGIN` returns
+`[generation, 64-hex-token, "HELD"]` and `RELEASE <generation> <token>` is
+refused unless the token matches (constant-time compare) and an active
+SYSTEM-domain Operator issues it. The token is never readable back from
+STATUS.
+
+RESP surface (authenticated, SYSTEM-domain Operator only):
+
+```text
+CLUSTER MAINTENANCE STATUS
+CLUSTER MAINTENANCE BEGIN <timeout_ms 0..5000> <lease_ms 1000..1800000>
+CLUSTER MAINTENANCE RELEASE <generation> <64-hex-token>
+```
+
+STATUS returns a 21-entry array ending in a nested list of 11 `[name,
+registered]` pairs, plus per-class active counters, pending failbacks,
+rejected SLOT_UPDATE/GROUP/federation counters and the failover-paused flag.
+
+While HELD, RESP admits only `PING`, `INFO`, `CLUSTER HEALTH/TOPOLOGY/INFO/
+NODES/SLOTS` and `REPL.SNAPSHOT.*`; everything else gets
+`BUSY cluster maintenance is held`. `BEGIN` also refuses while a pending
+failback ledger exists, and `DBSIZE` is excluded from the held whitelist
+(it can take a compaction fallback if metadata is degraded).
+
+Operational rule: read the retained graves **before** any iteration,
+materialization or compaction, and take logical snapshots while both owners
+are HELD. Regression coverage: `make test-cluster-maintenance`,
+`make test-cluster-maintenance-resp` (authenticated begin/lease/release,
+release-denial and hold-time BUSY), plus the bus, failover and daemon
+shutdown targets.
 
 ### 3.3 `qihse-redis-server`
 

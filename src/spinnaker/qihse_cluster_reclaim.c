@@ -76,7 +76,7 @@ static bool reclaim_iter(const char* key, void* user_data) {
     return true;
 }
 
-size_t qihse_cluster_reclaim_foreign_slots_bounded(qihse_kv_store_t* store,
+static size_t reclaim_foreign_slots_bounded_inner(qihse_kv_store_t* store,
                                                    const qihse_cluster_topology_t* topology,
                                                    uint16_t local_index,
                                                    qihse_user_t* user,
@@ -115,6 +115,35 @@ size_t qihse_cluster_reclaim_foreign_slots_bounded(qihse_kv_store_t* store,
     }
     free(c.keys);
     return c.deleted;
+}
+
+size_t qihse_cluster_reclaim_foreign_slots_bounded_gated(qihse_kv_store_t* store,
+                                                   const qihse_cluster_topology_t* topology,
+                                                   uint16_t local_index,
+                                                   qihse_user_t* user,
+                                                   size_t max_keys,
+                                                   bool* out_has_more,
+                                                   qihse_cluster_maintenance_t* gate) {
+    if (!gate) return reclaim_foreign_slots_bounded_inner(store, topology, local_index, user,
+                                                           max_keys, out_has_more);
+    if (!qihse_cluster_maintenance_enter(gate, QIHSE_MAINT_WRITER_RECLAIM)) {
+        if (out_has_more) *out_has_more = true;
+        return 0u;
+    }
+    size_t deleted = reclaim_foreign_slots_bounded_inner(store, topology, local_index, user,
+                                                          max_keys, out_has_more);
+    qihse_cluster_maintenance_leave(gate, QIHSE_MAINT_WRITER_RECLAIM);
+    return deleted;
+}
+
+size_t qihse_cluster_reclaim_foreign_slots_bounded(qihse_kv_store_t* store,
+                                                   const qihse_cluster_topology_t* topology,
+                                                   uint16_t local_index,
+                                                   qihse_user_t* user,
+                                                   size_t max_keys,
+                                                   bool* out_has_more) {
+    return reclaim_foreign_slots_bounded_inner(store, topology, local_index, user,
+                                                max_keys, out_has_more);
 }
 
 size_t qihse_cluster_reclaim_foreign_slots(qihse_kv_store_t* store,

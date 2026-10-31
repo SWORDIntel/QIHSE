@@ -59,7 +59,7 @@ class PublicAPIInstall(unittest.TestCase):
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
-                        "qihse_cluster_slot.h", "qihse_crc16.h",
+                        "qihse_cluster_slot.h", "qihse_cluster_maintenance.h", "qihse_crc16.h",
                         "qihse_kv_store.h", "qihse_resp_engine.h",
                         "qihse_resp_wire.h", "qihse_qkp.h"}
             installed = {header.name for header in (headers / "qihse").glob("*.h")}

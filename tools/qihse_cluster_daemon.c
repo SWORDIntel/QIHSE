@@ -19,6 +19,7 @@
  * Build: make cluster-daemon
  */
 #include "qihse_resp_wire.h"
+#include "qihse_cluster_maintenance.h"
 #include "qihse_resp_engine.h"
 #include "qihse_auth.h"
 #include <limits.h>
@@ -1137,6 +1138,7 @@ typedef struct {
     const char* data_dir;
     uint32_t interval_seconds;
     volatile sig_atomic_t* stop;
+    qihse_cluster_maintenance_t* maintenance_gate;
 } ae_ctx_t;
 
 static bool parse_u64_decimal(const char* text, uint64_t* value) {
@@ -1310,9 +1312,16 @@ static void* ae_main(void* argument) {
             nanosleep(&ts, NULL);
         }
         if (__atomic_load_n(ae->stop, __ATOMIC_ACQUIRE)) break;
+        if (ae->maintenance_gate &&
+            !qihse_cluster_maintenance_enter(ae->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA))
+            continue;
         char globs[REPL_AE_GLOBS_MAX][128];
         size_t glob_count = qihse_resp_server_repl_list(ae->server, globs, NULL, REPL_AE_GLOBS_MAX);
-        if (glob_count == 0u) continue;
+        if (glob_count == 0u) {
+            if (ae->maintenance_gate)
+                qihse_cluster_maintenance_leave(ae->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA);
+            continue;
+        }
         if (ae->source_host) {
             mini_resp_t source;
             int connected = ae->source_via_i2p
@@ -1348,6 +1357,8 @@ static void* ae_main(void* argument) {
                 }
             }
         }
+        if (ae->maintenance_gate)
+            qihse_cluster_maintenance_leave(ae->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA);
 
     }
     return NULL;
@@ -2452,11 +2463,28 @@ int main(int argc, char** argv) {
         }
     }
 
+    qihse_cluster_maintenance_t* maintenance_gate = qihse_cluster_maintenance_create();
+    if (!maintenance_gate ||
+        !qihse_cluster_maintenance_register(maintenance_gate, QIHSE_MAINT_WRITER_RECLAIM, true)) {
+        fprintf(stderr, "qihse-cluster-daemon: all-writer maintenance gate registration failed\n");
+        if (maintenance_gate) qihse_cluster_maintenance_destroy(maintenance_gate);
+        if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
+        if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
+        return 1;
+    }
+    /* Preserve optional brain service operation, but do not claim coverage
+     * until its asynchronous writes use the maintenance admission gate. */
+    (void)qihse_cluster_maintenance_register(maintenance_gate,
+        QIHSE_MAINT_WRITER_REPLICA, true);
+    (void)qihse_cluster_maintenance_register(maintenance_gate,
+        QIHSE_MAINT_WRITER_BRAIN, !brain_enabled);
+    config.maintenance_gate = maintenance_gate;
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     OPENSSL_cleanse(g_transport_keys.bus_veil,
                     sizeof(g_transport_keys.bus_veil));
     config.veil_key = NULL;
     if (!server) {
+        qihse_cluster_maintenance_destroy(maintenance_gate);
         fprintf(stderr, "qihse-cluster-daemon: server create failed (bind %s port %u): %s\n",
                 bind, port, strerror(errno));
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
@@ -2467,6 +2495,7 @@ int main(int argc, char** argv) {
         !qihse_resp_server_start_failover_paused(server, startup_operator)) {
         fprintf(stderr, "qihse-cluster-daemon: startup failover hold requires authenticated system Operator and an unstarted coordinator\n");
         qihse_resp_server_destroy(server);
+        qihse_cluster_maintenance_destroy(maintenance_gate);
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
         if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
         return 1;
@@ -2478,6 +2507,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "qihse-cluster-daemon: replication peer %s authorization failed\n",
                     replication_allowed_peers[i].node_id);
             qihse_resp_server_destroy(server);
+            qihse_cluster_maintenance_destroy(maintenance_gate);
             if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
             if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
             return 1;
@@ -2488,6 +2518,7 @@ int main(int argc, char** argv) {
         qihse_consensus_mesh_destroy(consensus_mesh);
         qihse_blob_store_destroy(consensus_blobs);
         qihse_resp_server_destroy(server);
+        qihse_cluster_maintenance_destroy(maintenance_gate);
         return 1;
     }
     if (irc_server && irc_channel) {
@@ -2507,6 +2538,7 @@ int main(int argc, char** argv) {
                     OPENSSL_cleanse(g_transport_keys.overlay_hmac,
                                     sizeof(g_transport_keys.overlay_hmac));
                     qihse_resp_server_destroy(server);
+                    qihse_cluster_maintenance_destroy(maintenance_gate);
                     return 1;
                 }
                 ocfg.hmac_password = g_transport_keys.overlay_hmac;
@@ -2584,6 +2616,7 @@ int main(int argc, char** argv) {
         ae_ctx.data_dir = data_dir;
         ae_ctx.interval_seconds = repl_interval;
         ae_ctx.stop = &ae_stop;
+        ae_ctx.maintenance_gate = maintenance_gate;
         if (!ae_ctx.replica_principal || pthread_create(&ae_thread, NULL, ae_main, &ae_ctx) != 0) {
             fprintf(stderr, "qihse-cluster-daemon: replica pull thread failed to start (operator principal unavailable)\n");
             goto shutdown;
@@ -2603,6 +2636,16 @@ int main(int argc, char** argv) {
     ok = qihse_resp_server_start(server);
     if (ok) {
         bool gc_pending = replayed_journal_entries > 0;
+        bool gc_gate_held = false;
+        if (gc_pending) {
+            gc_gate_held = qihse_cluster_maintenance_enter(
+                maintenance_gate, QIHSE_MAINT_WRITER_RECLAIM);
+            if (!gc_gate_held) {
+                fprintf(stderr, "qihse-cluster-daemon: cannot admit pending reclaim work\n");
+                ok = false;
+                g_stop = 1;
+            }
+        }
         size_t gc_ticks = 0u;
         struct timespec wait = {0, 100000000L};
         while (!g_stop) {
@@ -2613,19 +2656,33 @@ int main(int argc, char** argv) {
                     qihse_user_t* op = startup_operator;
                     bool has_more = false;
                     if (op && qihse_cluster_topology_is_covered(topology)) {
-                        size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded(
-                            store, topology, indexes[self_index], op, 256u, &has_more);
+                        size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded_gated(
+                            store, topology, indexes[self_index], op, 256u, &has_more,
+                            maintenance_gate);
                         if (deleted > 0u) {
                             fprintf(stderr, "qihse-cluster-daemon: reclaimed %zu stale foreign-slot key(s)\n", deleted);
                         }
                         gc_pending = has_more && deleted > 0u;
+                        if (!gc_pending && gc_gate_held) {
+                            qihse_cluster_maintenance_leave(maintenance_gate,
+                                QIHSE_MAINT_WRITER_RECLAIM);
+                            gc_gate_held = false;
+                        }
                     } else {
                         gc_pending = false;
+                        if (gc_gate_held) {
+                            qihse_cluster_maintenance_leave(maintenance_gate,
+                                QIHSE_MAINT_WRITER_RECLAIM);
+                            gc_gate_held = false;
+                        }
                     }
                     gc_ticks = 40u; /* 1 s between bounded batches if more remain */
                 }
             }
         }
+        if (gc_gate_held)
+            qihse_cluster_maintenance_leave(maintenance_gate,
+                QIHSE_MAINT_WRITER_RECLAIM);
     }
 shutdown:
     g_stop = 1; /* Also arm the watchdog when listener/worker startup fails. */
@@ -2655,6 +2712,7 @@ shutdown:
     }
     qihse_resp_server_stop(server);
     qihse_resp_server_destroy(server);
+    qihse_cluster_maintenance_destroy(maintenance_gate);
     /* config.store is borrowed. Destroy drains server-owned writers (including
      * BGSAVE); only then may the data owner fence and release the caller's KV.
      * The void destructor cannot report flush errors, so check sync first. */

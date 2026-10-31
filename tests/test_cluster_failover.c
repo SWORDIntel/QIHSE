@@ -655,6 +655,52 @@ static void test_non_coordinator_does_not_trip_cooldown(void) {
     printf("PASS deferred/non-coordinator on_fail does not trip 30s cooldown\n");
 }
 
+static void test_maintenance_fences_failover_callbacks(void) {
+    qihse_cluster_maintenance_t* gate = qihse_cluster_maintenance_create();
+    assert(gate);
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_RESP, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BGSAVE, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BUS_SLOT, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_RECLAIM, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BUS_GROUP, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BUS_FEDERATION, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_REPLICA, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_EXPIRY, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_TASK_WORKER, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BRAIN, true));
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo);
+    qihse_cluster_node_t primary, replica;
+    make_node(&primary, "maint-primary", "127.0.0.1", 7000, 17000,
+              QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    uint16_t pi, ri;
+    assert(qihse_cluster_topology_upsert_node(topo, &primary, &pi));
+    make_node(&replica, "maint-replica", "127.0.0.1", 7001, 17001,
+              QIHSE_CLUSTER_NODE_REPLICA, pi);
+    assert(qihse_cluster_topology_upsert_node(topo, &replica, &ri));
+    assert(qihse_cluster_topology_assign_range(topo, 0, 99, pi));
+    qihse_cluster_failover_config_t cfg = {0};
+    cfg.topology = topo;
+    cfg.local_node_index = ri;
+    cfg.maintenance_gate = gate;
+    qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&cfg);
+    assert(fo);
+    assert(qihse_cluster_failover_register_maintenance(fo));
+    uint64_t generation;
+    uint8_t token[32];
+    assert(qihse_cluster_maintenance_begin(gate, 0, 5000, &generation, token));
+    assert(qihse_cluster_failover_promote(fo, pi, ri) == false);
+    uint16_t owner;
+    assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
+    assert(owner == pi);
+    assert(qihse_cluster_maintenance_release_trusted(gate, generation, token));
+    assert(qihse_cluster_failover_promote(fo, pi, ri));
+    qihse_cluster_failover_destroy(fo);
+    qihse_cluster_topology_destroy(topo);
+    qihse_cluster_maintenance_destroy(gate);
+    printf("PASS maintenance fences manual promotion\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -675,6 +721,7 @@ int main(void) {
     test_failback_on_remote_takeover();
     test_takeover_promotion_lock_order();
     test_non_coordinator_does_not_trip_cooldown();
+    test_maintenance_fences_failover_callbacks();
     printf("cluster failover tests passed\n");
     return 0;
 }

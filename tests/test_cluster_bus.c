@@ -543,6 +543,53 @@ static void test_silent_peer_health(void) {
     printf("PASS silent peer health and first-contact revival\n");
 }
 
+static void test_maintenance_defers_slot_update(void) {
+    qihse_cluster_maintenance_t* gate = qihse_cluster_maintenance_create();
+    assert(gate);
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_RESP, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BGSAVE, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_FAILOVER, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_RECLAIM, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BUS_GROUP, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BUS_FEDERATION, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_REPLICA, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_EXPIRY, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_TASK_WORKER, true));
+    assert(qihse_cluster_maintenance_register(gate, QIHSE_MAINT_WRITER_BRAIN, true));
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo);
+    qihse_cluster_node_t node;
+    make_node(&node, "maint-owner", "127.0.0.1", 7000, 17000);
+    uint16_t idx;
+    assert(qihse_cluster_topology_upsert_node(topo, &node, &idx));
+    qihse_cluster_bus_config_t cfg = {0};
+    cfg.topology = topo;
+    cfg.local_node_index = idx;
+    cfg.maintenance_gate = gate;
+    qihse_cluster_bus_t* bus = qihse_cluster_bus_create(&cfg);
+    assert(bus);
+    uint64_t generation;
+    uint8_t token[32];
+    assert(qihse_cluster_maintenance_begin(gate, 0, 5000, &generation, token));
+    uint8_t frame[QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(qihse_cluster_bus_slot_update_t)];
+    size_t len = make_slot_update_frame(idx, node.id, 50, 50, frame, sizeof(frame));
+    assert(qihse_cluster_bus_inject(bus, frame, len, "127.0.0.1", 17000));
+    uint16_t owner;
+    assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
+    assert(owner == QIHSE_CLUSTER_NODE_NONE);
+    qihse_cluster_bus_stats_t stats;
+    qihse_cluster_bus_stats(bus, &stats);
+    assert(stats.maintenance_slot_updates_rejected == 1u);
+    assert(qihse_cluster_maintenance_release_trusted(gate, generation, token));
+    assert(qihse_cluster_bus_inject(bus, frame, len, "127.0.0.1", 17000));
+    assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
+    assert(owner == idx);
+    qihse_cluster_bus_destroy(bus);
+    qihse_cluster_topology_destroy(topo);
+    qihse_cluster_maintenance_destroy(gate);
+    printf("PASS maintenance rejects SLOT_UPDATE and reports it\n");
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -557,6 +604,7 @@ int main(void) {
     test_veiled_framing();
     test_live_udp_roundtrip();
     test_silent_peer_health();
+    test_maintenance_defers_slot_update();
     printf("cluster bus tests passed\n");
     return 0;
 }

@@ -188,7 +188,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/bombe/qihse_math.c src/bombe/qihse_instr.c src/bombe/qihse_hetero.c \
             src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_system_guard.c src/qihse_exports.c src/broad_oak/qihse_recursive_search.c \
             src/marmalade/qihse_temporal.c src/bombe/qihse_fusion.c src/spinnaker/qihse_subscription.c src/spinnaker/qihse_cluster.c src/spinnaker/qihse_lua_injector.c src/spinnaker/qihse_http_telemetry.c \
-            src/spinnaker/qihse_crc16.c src/spinnaker/qihse_qkp.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_numa.c src/spinnaker/qihse_cluster_migrate.c src/spinnaker/qihse_resp_cluster.c src/spinnaker/qihse_resp_engine.c src/spinnaker/qihse_resp_pubsub.c src/spinnaker/qihse_cluster_bus.c src/spinnaker/qihse_cluster_failover.c src/spinnaker/qihse_cluster_scatter.c src/spinnaker/qihse_cluster_rebalance.c src/spinnaker/qihse_cluster_ownership_journal.c src/spinnaker/qihse_cluster_reclaim.c \
+            src/spinnaker/qihse_crc16.c src/spinnaker/qihse_qkp.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_numa.c src/spinnaker/qihse_cluster_migrate.c src/spinnaker/qihse_resp_cluster.c src/spinnaker/qihse_resp_engine.c src/spinnaker/qihse_resp_pubsub.c src/spinnaker/qihse_cluster_bus.c src/spinnaker/qihse_cluster_failover.c src/spinnaker/qihse_cluster_scatter.c src/spinnaker/qihse_cluster_rebalance.c src/spinnaker/qihse_cluster_ownership_journal.c src/spinnaker/qihse_cluster_maintenance.c src/spinnaker/qihse_cluster_reclaim.c \
             src/spinnaker/qihse_aimem_projection_store.c src/spinnaker/qihse_task_queue.c src/spinnaker/qihse_task_worker.c src/spinnaker/qihse_task_scheduler.c src/spinnaker/qihse_ingest_guard.c src/spinnaker/qihse_bundle.c src/spinnaker/qihse_fabric_index.c src/federation/qihse_fabric_dispatch.c src/spinnaker/qihse_machine_auth.c \
             src/black_hole/qihse_kv_store.c src/black_hole/qihse_blob.c src/black_hole/qihse_export.c src/black_hole/qihse_keystone.c src/spinnaker/qihse_resp_wire.c src/spinnaker/qihse_uwp.c src/spinnaker/qihse_uwp_graph_index.c src/spinnaker/qihse_uwp_repl_pool.c src/spinnaker/qihse_uwp_sql_txn_schema.c src/spinnaker/qihse_uwp_tls.c src/spinnaker/qihse_uwp_metrics.c \
             algorithms/qihse_trinary_trie.c src/black_hole/qihse_arena.c src/frieze/qihse_fts_index.c src/frieze/qihse_document_store.c src/frieze/qihse_spatial_index.c \
@@ -386,7 +386,7 @@ backup-cli: lib
 
 admin-cli: lib
 	$(CC) $(CFLAGS) -o qihse-admin-cli tools/qihse_admin_cli.c -L. -lqihse $(LDFLAGS) \
-	    -Wl,-rpath,'$$ORIGIN/..' -Wl,-rpath,'$$ORIGIN'
+	    -Wl,-rpath,'$$ORIGIN/../lib' -Wl,-rpath,'$$ORIGIN/..' -Wl,-rpath,'$$ORIGIN'
 	@echo "qihse-admin-cli build successful"
 
 test-backup-cli: backup-cli
@@ -443,7 +443,8 @@ stress-session-delivery: lib
 	LD_LIBRARY_PATH=. ./tests/stress_session_delivery
 
 cluster-daemon: lib
-	$(CC) $(CFLAGS) -o qihse-cluster-daemon tools/qihse_cluster_daemon.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -o qihse-cluster-daemon tools/qihse_cluster_daemon.c -L. -lqihse \
+	    -Wl,-rpath,'$$ORIGIN/../lib' $(LDFLAGS)
 	@echo "qihse-cluster-daemon build successful"
 
 machine-token: lib
@@ -1289,6 +1290,14 @@ test-cluster-failover: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_failover tests/test_cluster_failover.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_failover
 
+test-cluster-maintenance:
+	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance tests/test_cluster_maintenance.c src/spinnaker/qihse_cluster_maintenance.c -pthread $(LDFLAGS)
+	./tests/test_cluster_maintenance
+
+test-cluster-maintenance-resp: lib
+	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance_resp tests/test_cluster_maintenance_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_maintenance_resp
+
 test-af-xdp-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_af_xdp_resp tests/test_af_xdp_resp.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_af_xdp_resp
@@ -1834,7 +1843,7 @@ PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_l
     qihse_pg_wire.h qihse_cluster_slot.h qihse_crc16.h \
     qihse_clickhouse_sql.h qihse_http_api.h \
     qihse_resp_engine.h qihse_resp_wire.h qihse_qkp.h qihse_resp_cluster.h \
-    qihse_cluster_bus.h qihse_cluster_failover.h qihse_cluster_scatter.h \
+    qihse_cluster_bus.h qihse_cluster_maintenance.h qihse_cluster_failover.h qihse_cluster_scatter.h \
     qihse_system_guard.h qihse_quota.h qihse_blob.h qihse_bundle.h \
     qihse_consensus.h qihse_consensus_blob.h qihse_consensus_blob_channel.h \
     qihse_consensus_channel.h qihse_consensus_mesh.h qihse_consensus_wire.h \

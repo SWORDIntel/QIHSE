@@ -1,5 +1,6 @@
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_maintenance.h"
 #include "qihse_platform.h"
 #include <errno.h>
 #include <stdio.h>
@@ -35,6 +36,7 @@ typedef struct {
 struct qihse_cluster_failover {
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
+    qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
     uint16_t local_node_index;
     bool single_coordinator;
     bool startup_paused;
@@ -50,8 +52,9 @@ struct qihse_cluster_failover {
     uint32_t stable_ms;
     uint32_t poll_ms;
     pthread_mutex_t ledger_lock;
-    fo_ledger_entry_t ledger[FO_LEDGER_MAX];
+    fo_ledger_entry_t* ledger;
     size_t ledger_count;
+    size_t ledger_capacity;
     uint64_t failbacks;
     pthread_t worker;
     bool worker_started;
@@ -68,6 +71,7 @@ static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t
     fo->startup_paused = paused;
     fo->topology = config->topology;
     fo->bus = config->bus;
+    fo->maintenance_gate = config->maintenance_gate;
     fo->local_node_index = config->local_node_index;
     fo->single_coordinator = config->single_coordinator;
     fo->failback_fn = config->failback_fn;
@@ -86,11 +90,22 @@ static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t
         return NULL;
     }
     if (fo->failback_fn) {
+        fo->ledger = (fo_ledger_entry_t*)calloc(FO_LEDGER_MAX, sizeof(*fo->ledger));
+        if (!fo->ledger) {
+            pthread_mutex_destroy(&fo->ledger_lock);
+            pthread_mutex_destroy(&fo->lock);
+            free(fo);
+            return NULL;
+        }
+        fo->ledger_capacity = FO_LEDGER_MAX;
         if (pthread_create(&fo->worker, NULL, fo_failback_main, fo) == 0) {
             fo->worker_started = true;
         } else {
-            /* No worker means no failback; failover itself still works. */
-            fo->failback_fn = NULL;
+            free(fo->ledger);
+            pthread_mutex_destroy(&fo->ledger_lock);
+            pthread_mutex_destroy(&fo->lock);
+            free(fo);
+            return NULL;
         }
     }
     return fo;
@@ -128,6 +143,12 @@ bool qihse_cluster_failover_resume(qihse_cluster_failover_t* fo) {
     return changed;
 }
 
+bool qihse_cluster_failover_register_maintenance(qihse_cluster_failover_t* fo) {
+    return fo && fo->maintenance_gate &&
+        qihse_cluster_maintenance_register(fo->maintenance_gate,
+                                            QIHSE_MAINT_WRITER_FAILOVER, true);
+}
+
 bool qihse_cluster_failover_is_paused(qihse_cluster_failover_t* fo) {
     if (!fo) return false;
     pthread_mutex_lock(&fo->lock);
@@ -142,6 +163,7 @@ void qihse_cluster_failover_destroy(qihse_cluster_failover_t* fo) {
         __atomic_store_n(&fo->stop, 1, __ATOMIC_RELEASE);
         pthread_join(fo->worker, NULL);
     }
+    free(fo->ledger);
     pthread_mutex_destroy(&fo->ledger_lock);
     pthread_mutex_destroy(&fo->lock);
     free(fo);
@@ -233,7 +255,16 @@ static void fo_ledger_record(qihse_cluster_failover_t* fo, uint16_t failed,
             return;
         }
     }
-    if (fo->ledger_count < FO_LEDGER_MAX) {
+    if (fo->ledger_count == fo->ledger_capacity) {
+        size_t next_capacity = fo->ledger_capacity ? fo->ledger_capacity * 2u : FO_LEDGER_MAX;
+        fo_ledger_entry_t* next = (fo_ledger_entry_t*)realloc(
+            fo->ledger, next_capacity * sizeof(*next));
+        if (next) {
+            fo->ledger = next;
+            fo->ledger_capacity = next_capacity;
+        }
+    }
+    if (fo->ledger_count < fo->ledger_capacity) {
         fo_ledger_entry_t* e = &fo->ledger[fo->ledger_count++];
         memset(e, 0, sizeof(*e));
         e->failed_index = failed;
@@ -242,7 +273,7 @@ static void fo_ledger_record(qihse_cluster_failover_t* fo, uint16_t failed,
         fprintf(stderr, "qihse-cluster-failback: ledgered slots %u-%u taken over from node %u\n",
                 (unsigned)start, (unsigned)end, (unsigned)failed);
     } else {
-        fprintf(stderr, "qihse-cluster-failback: ledger full, slots %u-%u from node %u will not be failed back\n",
+        fprintf(stderr, "qihse-cluster-failback: CRITICAL: cannot retain failback debt for slots %u-%u from node %u; allocation failed\n",
                 (unsigned)start, (unsigned)end, (unsigned)failed);
     }
     pthread_mutex_unlock(&fo->ledger_lock);
@@ -298,7 +329,7 @@ static bool fo_promote_locked(qihse_cluster_failover_t* fo,
     return true;
 }
 
-bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
+static bool qihse_cluster_failover_promote_inner(qihse_cluster_failover_t* fo,
                                     uint16_t failed_primary_index,
                                     uint16_t replica_index) {
     if (!fo) return false;
@@ -310,7 +341,18 @@ bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
     return ok;
 }
 
-uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
+bool qihse_cluster_failover_promote(qihse_cluster_failover_t* fo,
+                                    uint16_t failed_primary_index,
+                                    uint16_t replica_index) {
+    if (!fo) return false;
+    if (!fo->maintenance_gate) return qihse_cluster_failover_promote_inner(fo, failed_primary_index, replica_index);
+    if (!qihse_cluster_maintenance_enter(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER)) return false;
+    bool result = qihse_cluster_failover_promote_inner(fo, failed_primary_index, replica_index);
+    qihse_cluster_maintenance_leave(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER);
+    return result;
+}
+
+static uint16_t qihse_cluster_failover_handle_inner(qihse_cluster_failover_t* fo,
                                        uint16_t failed_node_index) {
     if (!fo || !fo->topology) return QIHSE_CLUSTER_NODE_NONE;
     pthread_mutex_lock(&fo->lock);
@@ -389,6 +431,17 @@ uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
     return promoted ? replica : QIHSE_CLUSTER_NODE_NONE;
 }
 
+uint16_t qihse_cluster_failover_handle(qihse_cluster_failover_t* fo,
+                                       uint16_t failed_node_index) {
+    if (!fo) return QIHSE_CLUSTER_NODE_NONE;
+    if (!fo->maintenance_gate) return qihse_cluster_failover_handle_inner(fo, failed_node_index);
+    if (!qihse_cluster_maintenance_enter(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER))
+        return QIHSE_CLUSTER_NODE_NONE;
+    uint16_t result = qihse_cluster_failover_handle_inner(fo, failed_node_index);
+    qihse_cluster_maintenance_leave(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER);
+    return result;
+}
+
 void qihse_cluster_failover_on_fail_cb(qihse_cluster_topology_t* topology,
                                        uint16_t failed_node_index,
                                        void* user_data) {
@@ -413,7 +466,7 @@ static bool fo_slot_is_ours(const qihse_cluster_failover_t* fo, uint32_t slot) {
 
 /* One pass over the ledger: for every entry whose owner has been continuously
  * healthy long enough, hand the slots we STILL own back to it. */
-static void fo_failback_pass(qihse_cluster_failover_t* fo) {
+static void fo_failback_pass_inner(qihse_cluster_failover_t* fo) {
     if (qihse_cluster_failover_is_paused(fo)) return;
     uint64_t now = fo_now_ms();
     pthread_mutex_lock(&fo->ledger_lock);
@@ -495,6 +548,13 @@ static void fo_failback_pass(qihse_cluster_failover_t* fo) {
     }
     fo->ledger_count = w;
     pthread_mutex_unlock(&fo->ledger_lock);
+}
+
+static void fo_failback_pass(qihse_cluster_failover_t* fo) {
+    if (!fo->maintenance_gate) { fo_failback_pass_inner(fo); return; }
+    if (!qihse_cluster_maintenance_enter(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER)) return;
+    fo_failback_pass_inner(fo);
+    qihse_cluster_maintenance_leave(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER);
 }
 
 static void* fo_failback_main(void* arg) {

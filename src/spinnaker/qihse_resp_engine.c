@@ -44,6 +44,7 @@
 #include "qihse_af_xdp.h"
 #endif
 #include <openssl/pem.h>
+#include <openssl/crypto.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -306,6 +307,7 @@ struct qihse_resp_server {
     size_t max_clients;
     size_t max_request_bytes;
     bool auth_required;
+    qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
     uint32_t aimem_service_user_id;
     qihse_user_t* unauthenticated_user;
     bool require_full_coverage;
@@ -10760,6 +10762,9 @@ static void* qihse_resp_bgsave_worker(void* arg) {
     pthread_mutex_lock(&session.server->save_lock);
     session.server->bgsave_in_progress = false;
     pthread_mutex_unlock(&session.server->save_lock);
+    if (session.server->maintenance_gate)
+        qihse_cluster_maintenance_leave(session.server->maintenance_gate,
+                                        QIHSE_MAINT_WRITER_BGSAVE);
     return NULL;
 }
 
@@ -10790,8 +10795,17 @@ static bool qihse_resp_handle_bgsave(qihse_resp_session_t* session, const qihse_
         pthread_mutex_lock(&session->server->save_lock);
         session->server->bgsave_thread_alive = false;
     }
+    if (session->server->maintenance_gate &&
+        !qihse_cluster_maintenance_enter(session->server->maintenance_gate,
+                                          QIHSE_MAINT_WRITER_BGSAVE)) {
+        pthread_mutex_unlock(&session->server->save_lock);
+        return qihse_resp_error(session, "BUSY cluster maintenance admission is closed");
+    }
     if (pthread_create(&session->server->bgsave_thread, NULL,
                        qihse_resp_bgsave_worker, session->server) != 0) {
+        if (session->server->maintenance_gate)
+            qihse_cluster_maintenance_leave(session->server->maintenance_gate,
+                                              QIHSE_MAINT_WRITER_BGSAVE);
         pthread_mutex_unlock(&session->server->save_lock);
         return qihse_resp_error(session, "ERR could not start background save thread");
     }
@@ -15242,9 +15256,39 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
  */
 static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     qihse_resp_server_t* server = session->server;
-    if (!server || !server->metrics || request->argc == 0) {
-        return qihse_resp_dispatch_inner(session, request, keep_open);
+    qihse_cluster_maintenance_t* gate = server ? server->maintenance_gate : NULL;
+    bool control = request->argc >= 2u && qihse_resp_command_is(request, "CLUSTER") &&
+                   qihse_resp_arg_equal(&request->argv[1], "MAINTENANCE");
+    bool admitted = false;
+    if (gate && request->argc && !control) {
+        qihse_cluster_maintenance_status_t status;
+        if (!qihse_cluster_maintenance_status(gate, &status))
+            return qihse_resp_error(session, "ERR maintenance status unavailable");
+        bool safe = qihse_resp_command_is(request, "PING") ||
+                    qihse_resp_command_is(request, "INFO") ||
+                    qihse_resp_command_is(request, "CLUSTER.HEALTH") ||
+                    qihse_resp_command_is(request, "CLUSTER.TOPOLOGY") ||
+                    (qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2u &&
+                     (qihse_resp_arg_equal(&request->argv[1], "HEALTH") ||
+                      qihse_resp_arg_equal(&request->argv[1], "TOPOLOGY") ||
+                      qihse_resp_arg_equal(&request->argv[1], "INFO") ||
+                      qihse_resp_arg_equal(&request->argv[1], "NODES") ||
+                      qihse_resp_arg_equal(&request->argv[1], "SLOTS"))) ||
+                    (request->argv[0].len >= 14u &&
+                     memcmp(request->argv[0].data, "REPL.SNAPSHOT.", 14u) == 0);
+        if (status.state != QIHSE_MAINT_OPEN && !safe)
+            return qihse_resp_error(session, "BUSY cluster maintenance is held");
+        if (status.state == QIHSE_MAINT_OPEN) {
+            admitted = qihse_cluster_maintenance_enter(gate, QIHSE_MAINT_WRITER_RESP);
+            if (!admitted) return qihse_resp_error(session, "BUSY cluster maintenance admission is closed");
+        }
     }
+    if (!server || !server->metrics || request->argc == 0) {
+        bool result = qihse_resp_dispatch_inner(session, request, keep_open);
+        if (admitted) qihse_cluster_maintenance_leave(gate, QIHSE_MAINT_WRITER_RESP);
+        return result;
+    }
+
     qihse_query_type_t type = qihse_resp_classify(request);
     session->query_type = type;
     struct timespec started;
@@ -15266,6 +15310,7 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
             (uint64_t)(seconds * 1000000.0));
     }
     if (server->tlm.latency[type]) qihse_metrics_series_observe(server->tlm.latency[type], seconds);
+    if (admitted) qihse_cluster_maintenance_leave(gate, QIHSE_MAINT_WRITER_RESP);
     return ok;
 }
 
@@ -15360,6 +15405,100 @@ static bool qihse_resp_session_is_aimem_service(
            qihse_auth_get_user(configured) == session->user;
 }
 
+static bool qihse_resp_handle_maintenance(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    qihse_cluster_maintenance_t* gate = session->server->maintenance_gate;
+    if (!gate) return qihse_resp_error(session, "ERR maintenance gate is not configured");
+    if (!session->user || !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOPERM active authenticated principal required");
+    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+        return qihse_resp_error(session, "NOPERM system Operator required");
+    if (request->argc < 3u) return qihse_resp_wrong_arity(session, "cluster maintenance");
+    if (qihse_resp_arg_equal(&request->argv[2], "STATUS")) {
+        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "cluster maintenance status");
+        qihse_cluster_maintenance_status_t st;
+        if (!qihse_cluster_maintenance_status(gate, &st)) return qihse_resp_error(session, "ERR maintenance status unavailable");
+        static const char* names[] = {"OPEN", "DRAINING", "HELD", "EXPIRED_HELD"};
+        if (st.state < QIHSE_MAINT_OPEN || st.state > QIHSE_MAINT_EXPIRED_HELD) return qihse_resp_error(session, "ERR invalid maintenance state");
+        qihse_cluster_bus_stats_t bus_stats = {0};
+        if (session->server->bus)
+            qihse_cluster_bus_stats(session->server->bus, &bus_stats);
+        uint64_t pending_failbacks = session->server->failover
+            ? qihse_cluster_failover_pending_failbacks(session->server->failover) : 0u;
+        static const char* writer_names[QIHSE_MAINT_WRITER_CLASS_COUNT] = {
+            "resp", "bgsave", "bus_slot", "failover", "reclaim",
+            "bus_group", "bus_federation", "replica", "expiry",
+            "task_worker", "brain"
+        };
+        bool ok = qihse_resp_array(session, 21u) && qihse_resp_bulk_text(session, names[st.state]) &&
+            qihse_resp_integer(session, (int64_t)st.generation) && qihse_resp_integer(session, (int64_t)st.lease_expires_ms) &&
+            qihse_resp_integer(session, st.writer_coverage_complete ? 1 : 0) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_RESP]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_BGSAVE]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_BUS_SLOT]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_FAILOVER]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_RECLAIM]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_BUS_GROUP]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_BUS_FEDERATION]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_REPLICA]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_EXPIRY]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_TASK_WORKER]) &&
+            qihse_resp_integer(session, (int64_t)st.active[QIHSE_MAINT_WRITER_BRAIN]) &&
+            qihse_resp_integer(session, (int64_t)pending_failbacks) &&
+            qihse_resp_integer(session, (int64_t)bus_stats.maintenance_slot_updates_rejected) &&
+            qihse_resp_integer(session, (int64_t)bus_stats.maintenance_group_updates_rejected) &&
+            qihse_resp_integer(session, (int64_t)bus_stats.maintenance_federation_rejected) &&
+            qihse_resp_integer(session, session->server->failover &&
+                               qihse_cluster_failover_is_paused(session->server->failover) ? 1 : 0) &&
+            qihse_resp_array(session, QIHSE_MAINT_WRITER_CLASS_COUNT);
+        for (size_t i = 0; ok && i < QIHSE_MAINT_WRITER_CLASS_COUNT; ++i)
+            ok = qihse_resp_array(session, 2u) && qihse_resp_bulk_text(session, writer_names[i]) &&
+                 qihse_resp_integer(session, st.writer_registered[i] ? 1 : 0);
+        return ok;
+    }
+    if (qihse_resp_arg_equal(&request->argv[2], "BEGIN")) {
+        uint64_t timeout_ms, lease_ms, generation = 0; uint8_t token[32];
+        if (request->argc != 5u || !qihse_resp_parse_u64_arg(&request->argv[3], &timeout_ms) ||
+            !qihse_resp_parse_u64_arg(&request->argv[4], &lease_ms) || timeout_ms > 5000u ||
+            lease_ms < 1000u || lease_ms > 1800000u)
+            return qihse_resp_error(session, "ERR usage: CLUSTER MAINTENANCE BEGIN <timeout_ms 0..5000> <lease_ms 1000..1800000>");
+        if (!qihse_cluster_maintenance_begin(gate, timeout_ms, lease_ms, &generation, token)) {
+            qihse_cluster_maintenance_status_t st;
+            qihse_cluster_maintenance_status(gate, &st);
+            if (st.state == QIHSE_MAINT_DRAINING)
+                return qihse_resp_error(session, "BUSY maintenance drain pending; retry STATUS");
+            return qihse_resp_error(session, "BUSY maintenance begin failed or writers are uninstrumented");
+        }
+        if (session->server->failover &&
+            qihse_cluster_failover_pending_failbacks(session->server->failover) != 0u) {
+            qihse_cluster_maintenance_release_trusted(gate, generation, token);
+            OPENSSL_cleanse(token, sizeof(token));
+            return qihse_resp_error(session, "BUSY pending failback ledger prevents maintenance hold");
+        }
+        static const char hex[] = "0123456789abcdef"; char text[64];
+        for (size_t i=0; i<sizeof(token); ++i) { text[i*2]=hex[token[i]>>4]; text[i*2+1]=hex[token[i]&15]; }
+        OPENSSL_cleanse(token, sizeof(token));
+        return qihse_resp_array(session, 3u) && qihse_resp_integer(session, (int64_t)generation) &&
+               qihse_resp_bulk(session, text, sizeof(text)) && qihse_resp_bulk_text(session, "HELD");
+    }
+    if (qihse_resp_arg_equal(&request->argv[2], "RELEASE")) {
+        uint64_t generation; uint8_t token[32];
+        if (request->argc != 5u || !qihse_resp_parse_u64_arg(&request->argv[3], &generation) || request->argv[4].len != 64u)
+            return qihse_resp_error(session, "ERR usage: CLUSTER MAINTENANCE RELEASE <generation> <64-hex-token>");
+        for (size_t i=0; i<32u; ++i) {
+            unsigned char a=request->argv[4].data[i*2], b=request->argv[4].data[i*2+1];
+            int hi=(a>='0'&&a<='9')?a-'0':(a>='a'&&a<='f')?a-'a'+10:(a>='A'&&a<='F')?a-'A'+10:-1;
+            int lo=(b>='0'&&b<='9')?b-'0':(b>='a'&&b<='f')?b-'a'+10:(b>='A'&&b<='F')?b-'A'+10:-1;
+            if (hi<0 || lo<0) { OPENSSL_cleanse(token,sizeof(token)); return qihse_resp_error(session, "ERR invalid maintenance token"); }
+            token[i]=(uint8_t)((hi<<4)|lo);
+        }
+        bool ok=qihse_cluster_maintenance_release_trusted(gate,generation,token);
+        OPENSSL_cleanse(token,sizeof(token));
+        return ok ? qihse_resp_simple(session,"OK") : qihse_resp_error(session,"ERR maintenance release rejected");
+    }
+    return qihse_resp_error(session, "ERR expected CLUSTER MAINTENANCE BEGIN, STATUS or RELEASE");
+}
+
 static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -15412,6 +15551,9 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             }
             break;
         case QIHSE_SWAR4('C', 'L', 'U', 'S'):
+            if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
+                qihse_resp_arg_equal(&request->argv[1], "MAINTENANCE"))
+                return qihse_resp_handle_maintenance(session, request);
             if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER") && request->argc >= 2 &&
                 qihse_resp_arg_equal(&request->argv[1], "PEERAUTH")) {
                 return qihse_resp_handle_cluster_peerauth(session, request);
@@ -16147,11 +16289,15 @@ static void* qihse_resp_kv_sweeper_main(void* argument) {
             struct timespec pause = { 0, 100 * 1000 * 1000L };
             nanosleep(&pause, NULL);
         }
-        if (server->store) {
+        bool admitted = !server->maintenance_gate ||
+            qihse_cluster_maintenance_enter(server->maintenance_gate, QIHSE_MAINT_WRITER_EXPIRY);
+        if (admitted && server->store) {
             pthread_rwlock_wrlock(&server->kv_lock);
             qihse_kv_sweep_expired(server->store);
             pthread_rwlock_unlock(&server->kv_lock);
         }
+        if (admitted && server->maintenance_gate)
+            qihse_cluster_maintenance_leave(server->maintenance_gate, QIHSE_MAINT_WRITER_EXPIRY);
     }
     return NULL;
 }
@@ -16278,6 +16424,20 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->max_clients = supplied->max_clients;
     server->max_request_bytes = supplied->max_request_bytes;
     server->auth_required = supplied->auth_required;
+    server->maintenance_gate = supplied->maintenance_gate;
+    if (server->maintenance_gate) {
+        qihse_cluster_maintenance_register(server->maintenance_gate,
+                                            QIHSE_MAINT_WRITER_RESP, true);
+        qihse_cluster_maintenance_register(server->maintenance_gate,
+                                            QIHSE_MAINT_WRITER_BGSAVE, true);
+        qihse_cluster_maintenance_register(server->maintenance_gate,
+                                            QIHSE_MAINT_WRITER_EXPIRY, true);
+        qihse_cluster_maintenance_register(server->maintenance_gate,
+                                            QIHSE_MAINT_WRITER_TASK_WORKER,
+                                            !supplied->enable_task_workers &&
+                                            !supplied->enable_task_scheduler &&
+                                            supplied->task_scheduler == NULL);
+    }
     server->aimem_service_user_id = supplied->aimem_service_user_id;
     server->unauthenticated_user = qihse_auth_get_user(0);
     server->require_full_coverage = supplied->require_full_coverage;
@@ -16437,6 +16597,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         qihse_cluster_bus_config_t bus_cfg;
         memset(&bus_cfg, 0, sizeof(bus_cfg));
         bus_cfg.topology = server->topology;
+        bus_cfg.maintenance_gate = server->maintenance_gate;
         bus_cfg.local_node_index = local;
         bus_cfg.bus_port = server->bus_port;
         bus_cfg.bind_address = bind_address;
@@ -16451,6 +16612,21 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             return NULL;
         }
         qihse_resp_group_wire_bus(server, server->bus);
+        if (server->maintenance_gate &&
+            (!qihse_cluster_maintenance_register(server->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT, true) ||
+             !qihse_cluster_maintenance_register(server->maintenance_gate, QIHSE_MAINT_WRITER_BUS_GROUP, true) ||
+             !qihse_cluster_maintenance_register(server->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION, true))) {
+            qihse_resp_server_destroy(server);
+            errno = EBUSY;
+            return NULL;
+        }
+    } else if (server->maintenance_gate &&
+               (!qihse_cluster_maintenance_register(server->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT, true) ||
+                !qihse_cluster_maintenance_register(server->maintenance_gate, QIHSE_MAINT_WRITER_BUS_GROUP, true) ||
+                !qihse_cluster_maintenance_register(server->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION, true))) {
+        qihse_resp_server_destroy(server);
+        errno = EBUSY;
+        return NULL;
     }
     /* Phase 3: create failover coordinator if requested */
     if (supplied->enable_failover) {
@@ -16458,6 +16634,7 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         memset(&fo_cfg, 0, sizeof(fo_cfg));
         fo_cfg.topology = server->topology;
         fo_cfg.bus = server->bus;
+        fo_cfg.maintenance_gate = server->maintenance_gate;
         fo_cfg.local_node_index = local;
         fo_cfg.single_coordinator = false;
         /* A successor that took a returned owner's ranges hands them back over
@@ -16477,6 +16654,18 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
                                                    qihse_cluster_failover_on_takeover_cb,
                                                    server->failover);
         }
+        if (server->maintenance_gate &&
+            !qihse_cluster_failover_register_maintenance(server->failover)) {
+            qihse_resp_server_destroy(server);
+            errno = EBUSY;
+            return NULL;
+        }
+    } else if (server->maintenance_gate &&
+               !qihse_cluster_maintenance_register(server->maintenance_gate,
+                   QIHSE_MAINT_WRITER_FAILOVER, true)) {
+        qihse_resp_server_destroy(server);
+        errno = EBUSY;
+        return NULL;
     }
     /* Phase 3: create system guard throttling window if requested */
     if (supplied->enable_guard_throttle) {

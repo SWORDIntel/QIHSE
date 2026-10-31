@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "qihse_cluster_slot.h"
+#include "qihse_cluster_maintenance.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -195,6 +196,7 @@ typedef void (*qihse_cluster_bus_on_takeover_cb)(qihse_cluster_topology_t* topol
 
 typedef struct {
     qihse_cluster_topology_t* topology;
+    qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
     uint16_t local_node_index;
     uint16_t bus_port;
     const char* bind_address;
@@ -434,6 +436,9 @@ typedef struct {
     uint64_t pings_sent;
     uint64_t pongs_received;
     uint64_t slot_updates_received;
+    uint64_t maintenance_slot_updates_rejected;
+    uint64_t maintenance_group_updates_rejected;
+    uint64_t maintenance_federation_rejected;
     uint64_t fail_notices_received;
     uint64_t nodes_marked_unhealthy;
     uint64_t group_updates_received;

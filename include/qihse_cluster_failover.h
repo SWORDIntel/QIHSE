@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_maintenance.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,7 @@ typedef int (*qihse_cluster_failback_fn)(void* user_data, uint16_t first, uint16
 typedef struct {
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
+    qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
     uint16_t local_node_index;
     /* If true, only the local node performs failover (single coordinator
      * mode).  If false, any node may promote replicas (distributed mode,
@@ -62,6 +64,8 @@ qihse_cluster_failover_t* qihse_cluster_failover_create(const qihse_cluster_fail
 qihse_cluster_failover_t* qihse_cluster_failover_create_paused(const qihse_cluster_failover_config_t* config);
 bool qihse_cluster_failover_pause_startup(qihse_cluster_failover_t* fo);
 bool qihse_cluster_failover_is_paused(qihse_cluster_failover_t* fo);
+/* Called by the embedding after automatic and takeover callbacks are installed. */
+bool qihse_cluster_failover_register_maintenance(qihse_cluster_failover_t* fo);
 /* Trusted embedding control: returns true only when a hold was released.
  * Externally reachable callers must authenticate/authorize the release. */
 bool qihse_cluster_failover_resume(qihse_cluster_failover_t* fo);

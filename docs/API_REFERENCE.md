@@ -1347,6 +1347,65 @@ ranges, and takeover after Operator release. `make test-replication-multi-peer`
 covers setter authority/lifetime checks and release denial on real replication
 and low-authority sessions.
 
+### 8.8b Cluster maintenance gate — `include/qihse_cluster_maintenance.h`
+
+Source: `src/spinnaker/qihse_cluster_maintenance.c`.
+Tests: `tests/test_cluster_maintenance.c` (`make test-cluster-maintenance`)
+and `tests/test_cluster_maintenance_resp.c`
+(`make test-cluster-maintenance-resp`).
+
+An opaque `qihse_cluster_maintenance_t` gates every writer path that can move
+durable state, so a staged cutover can hold the node before logical
+snapshots are taken. States: `OPEN`, `DRAINING`, `HELD`, and — fail-closed —
+`EXPIRED_HELD` when the lease runs out before a trusted release.
+
+Embedding APIs:
+
+- `qihse_cluster_maintenance_begin(gate, timeout_ms, lease_ms, &generation,
+  token[32])` starts a hold. It requires **complete coverage**: every writer
+  class must be registered, and it returns the generation and a fresh
+  `RAND_bytes` token that the caller owns and must `OPENSSL_cleanse`.
+- `qihse_cluster_maintenance_release_trusted(gate, generation, token)` is the
+  only trusted release path; it constant-time compares the token with
+  `CRYPTO_memcmp` and rejects mismatches and stale generations.
+- `qihse_cluster_maintenance_enter/leave(gate, writer_class)` admit
+  **individually registered** writer classes while OPEN — a class that is
+  registered participates even if other classes are not, so gate wiring can
+  be added incrementally without deadlocking the node. `begin` remains the
+  strict whole-node barrier.
+- `qihse_cluster_maintenance_status(gate, &st)` exposes state, generation,
+  lease expiry, coverage, per-class registered flags and active counters.
+
+Writer classes (11, in STATUS order): `resp`, `bgsave`, `bus_slot`,
+`failover`, `reclaim`, `bus_group`, `bus_federation`, `replica`, `expiry`,
+`task_worker`, `brain`. Coverage shipped: synchronous RESP dispatch,
+BGSAVE worker, UDP SLOT_UPDATE, bus GROUP_UPDATE/GROUP_ACK, federation
+statement+heartbeat acceptance, failover/promotion/failback, startup
+foreign-slot GC, daemon `ae_main` anti-entropy pull, and RESP expiry. The
+optional brain stays uncovered when enabled, which makes BEGIN fail closed;
+the daemon also disables its task queue, workers and scheduler.
+
+RESP surface (authenticated active SYSTEM-domain Operator only):
+
+```text
+CLUSTER MAINTENANCE STATUS
+CLUSTER MAINTENANCE BEGIN <timeout_ms 0..5000> <lease_ms 1000..1800000>
+CLUSTER MAINTENANCE RELEASE <generation> <64-hex-token>
+```
+
+STATUS replies with a 21-entry array: state name, generation, lease expiry,
+coverage flag, 11 per-class active counters, pending failback count,
+rejected SLOT_UPDATE/GROUP/federation counters, the failover-paused flag,
+and a nested list of 11 `[name, registered]` pairs. The token is never
+readable back. BEGIN is refused while a pending failback ledger exists.
+
+While HELD (or EXPIRED_HELD), RESP admits only `PING`, `INFO`,
+`CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and `REPL.SNAPSHOT.*`; everything
+else is rejected with `BUSY cluster maintenance is held`. `DBSIZE` is
+deliberately excluded from the whitelist (it can fall back to compaction
+when metadata is degraded). Note `CLUSTER`-prefixed dot-form commands
+(`CLUSTER.HEALTH`, `CLUSTER.TOPOLOGY`) are also admitted.
+
 ### 8.9 Scoped consensus — `include/qihse_consensus.h`
 
 Source: `src/federation/qihse_consensus.c`.

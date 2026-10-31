@@ -23,6 +23,7 @@
 #include "qihse_task_queue.h"
 #include "qihse_task_worker.h"
 #include "qihse_task_scheduler.h"
+#include "qihse_cluster_maintenance.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
 /* Forward-declared: the full FTS type lives in qihse_fts.h and is only
@@ -51,6 +52,8 @@ typedef struct {
      * classified projection (AGENTS.md invariant #1). */
     qihse_user_t* fts_autoload_principal;
     qihse_cluster_topology_t* topology;
+    /* Optional borrowed cluster-wide maintenance admission gate. */
+    qihse_cluster_maintenance_t* maintenance_gate;
     const char* bind_address;
     const char* advertise_address;
     const char* node_id;

@@ -1,5 +1,6 @@
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ownership_journal.h"
+#include "qihse_cluster_maintenance.h"
 #include "qihse_endian.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -88,6 +89,7 @@ bool qihse_cluster_derive_overlay_hmac_key(
 
 struct qihse_cluster_bus {
     qihse_cluster_topology_t* topology;
+    qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
     uint16_t local_node_index;
     uint16_t bus_port;
     char bind_address[QIHSE_CLUSTER_HOST_LEN + 1u];
@@ -734,7 +736,7 @@ static void qihse_bus_handle_fail(qihse_cluster_bus_t* bus, uint16_t sender_inde
     }
 }
 
-static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
+static void qihse_bus_handle_slot_update_unfenced(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
     if (payload_len < sizeof(qihse_cluster_bus_slot_update_t)) return;
     qihse_cluster_bus_slot_update_t upd;
     memcpy(&upd, payload, sizeof(upd));
@@ -796,6 +798,20 @@ static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t
                                                    upd.owner_id, upd.config_epoch);
     }
     __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+}
+
+static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
+    if (!bus->maintenance_gate) {
+        qihse_bus_handle_slot_update_unfenced(bus, payload, payload_len);
+        return;
+    }
+    if (!qihse_cluster_maintenance_enter(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT)) {
+        __atomic_add_fetch(&bus->stats.maintenance_slot_updates_rejected, 1u,
+                           __ATOMIC_RELAXED);
+        return; /* drop ownership update; liveness/gossip dispatch continues */
+    }
+    qihse_bus_handle_slot_update_unfenced(bus, payload, payload_len);
+    qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT);
 }
 
 static void qihse_bus_handle_node_update(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
@@ -916,30 +932,44 @@ bool qihse_cluster_bus_node_caps(const qihse_cluster_bus_t* bus, uint16_t node_i
 static void qihse_bus_handle_fed_statement(qihse_cluster_bus_t* bus,
                                            const uint8_t* payload, size_t payload_len) {
     if (!bus->federation_store || !bus->federation_user) return;
-    qihse_federation_gossip_t stmt;
-    if (!qihse_federation_gossip_deserialize(payload, payload_len, &stmt)) return;
-    /* Acceptance re-checks the enrolled key, the trust state, the signature
-     * and the replay window.  A frame that fails never reaches a consumer. */
-    if (qihse_federation_gossip_accept(bus->federation_store, bus->federation_user,
-                                       &stmt) != QIHSE_GOSSIP_ACCEPTED) {
+    if (bus->maintenance_gate &&
+        !qihse_cluster_maintenance_enter(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION)) {
+        __atomic_add_fetch(&bus->stats.maintenance_federation_rejected, 1u, __ATOMIC_RELAXED);
         return;
     }
-    if (bus->on_membership) {
-        qihse_federation_membership_t member;
-        if (qihse_federation_membership_from_statement(&stmt, &member)) {
-            bus->on_membership(bus, &member, bus->on_membership_user_data);
+    qihse_federation_gossip_t stmt;
+    if (qihse_federation_gossip_deserialize(payload, payload_len, &stmt)) {
+        /* Acceptance mutates the durable replay window. */
+        if (qihse_federation_gossip_accept(bus->federation_store, bus->federation_user,
+                                           &stmt) == QIHSE_GOSSIP_ACCEPTED && bus->on_membership) {
+            qihse_federation_membership_t member;
+            if (qihse_federation_membership_from_statement(&stmt, &member))
+                bus->on_membership(bus, &member, bus->on_membership_user_data);
         }
     }
+    if (bus->maintenance_gate)
+        qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
 }
 
 static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
                                            const uint8_t* payload, size_t payload_len) {
     if (!bus->federation_store || !bus->federation_user) return;
+    if (bus->maintenance_gate &&
+        !qihse_cluster_maintenance_enter(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION)) {
+        __atomic_add_fetch(&bus->stats.maintenance_federation_rejected, 1u, __ATOMIC_RELAXED);
+        return;
+    }
     qihse_federation_heartbeat_t hb;
-    if (!qihse_federation_heartbeat_deserialize(payload, payload_len, &hb)) return;
+    if (!qihse_federation_heartbeat_deserialize(payload, payload_len, &hb)) {
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
+        return;
+    }
     /* Verification decides whether the callback runs at all. */
     if (qihse_federation_heartbeat_accept(bus->federation_store, bus->federation_user,
                                          &hb) != QIHSE_GOSSIP_ACCEPTED) {
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
         return;
     }
     if (bus->on_liveness) {
@@ -953,6 +983,8 @@ static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
         obs.health_summary = hb.health_summary;
         bus->on_liveness(bus, &obs, bus->on_liveness_user_data);
     }
+    if (bus->maintenance_gate)
+        qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
 }
 
 static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
@@ -1291,9 +1323,14 @@ static bool qihse_bus_send_fed_statement(qihse_cluster_bus_t* bus) {
         !bus->federation_sign_key || !bus->has_local_node_uuid) {
         return false;
     }
+    if (bus->maintenance_gate &&
+        !qihse_cluster_maintenance_enter(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION))
+        return false;
     uint64_t now = qihse_bus_now_ms();
     if (bus->last_statement_ms != 0 &&
         now - bus->last_statement_ms < bus->statement_ms) {
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
         return false;
     }
     qihse_federation_capability_values_t values;
@@ -1308,12 +1345,17 @@ static bool qihse_bus_send_fed_statement(qihse_cluster_bus_t* bus) {
                                          &bus->federation_boot_id,
                                          &values, &bus->dispatch_endpoint,
                                          bus->federation_sign_key, &stmt)) {
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
         return false;
     }
     bus->last_statement_ms = now;
     (void)qihse_federation_gossip_accept(bus->federation_store,
                                          bus->federation_user, &stmt);
-    return qihse_cluster_bus_broadcast_federation_statement(bus, &stmt);
+    bool sent = qihse_cluster_bus_broadcast_federation_statement(bus, &stmt);
+    if (bus->maintenance_gate)
+        qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_FEDERATION);
+    return sent;
 }
 
 static void* qihse_bus_thread(void* arg) {
@@ -1343,6 +1385,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     qihse_cluster_bus_t* bus = (qihse_cluster_bus_t*)calloc(1, sizeof(*bus));
     if (!bus) return NULL;
     bus->topology = config->topology;
+    bus->maintenance_gate = config->maintenance_gate;
     bus->local_node_index = config->local_node_index;
     bus->bus_port = config->bus_port ? config->bus_port : QIHSE_CLUSTER_BUS_DEFAULT_PORT;
     bus->heartbeat_ms = config->heartbeat_ms ? config->heartbeat_ms : QIHSE_CLUSTER_BUS_HEARTBEAT_MS;
@@ -1371,6 +1414,12 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_membership_user_data = config->on_membership_user_data;
     bus->sock_fd = -1;
     bus->running = false;
+    if (bus->maintenance_gate &&
+        !qihse_cluster_maintenance_register(bus->maintenance_gate,
+                                             QIHSE_MAINT_WRITER_BUS_SLOT, true)) {
+        free(bus);
+        return NULL;
+    }
     if (config->bind_address && strlen(config->bind_address) > QIHSE_CLUSTER_HOST_LEN) {
         free(bus);
         errno = EINVAL;
@@ -1622,11 +1671,18 @@ static void qihse_bus_handle_group_update(qihse_cluster_bus_t* bus, uint16_t sen
     char group[QIHSE_CLUSTER_BUS_GROUP_NAME_MAX + 1u];
     memcpy(group, payload + 12u, group_len);
     group[group_len] = '\0';
-    __atomic_add_fetch(&bus->stats.group_updates_received, 1u, __ATOMIC_RELAXED);
     if (bus->on_group_update) {
+        if (bus->maintenance_gate &&
+            !qihse_cluster_maintenance_enter(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_GROUP)) {
+            __atomic_add_fetch(&bus->stats.maintenance_group_updates_rejected, 1u, __ATOMIC_RELAXED);
+            return;
+        }
         bus->on_group_update(bus, update_id, group, payload + 12u + group_len, body_len,
                              sender, bus->on_group_update_user_data);
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_GROUP);
     }
+    __atomic_add_fetch(&bus->stats.group_updates_received, 1u, __ATOMIC_RELAXED);
 }
 
 static void qihse_bus_handle_group_ack(qihse_cluster_bus_t* bus, uint16_t sender,
@@ -1636,10 +1692,17 @@ static void qihse_bus_handle_group_ack(qihse_cluster_bus_t* bus, uint16_t sender
     uint16_t status = 0;
     memcpy(&update_id, payload, 8u);
     memcpy(&status, payload + 8u, 2u);
-    __atomic_add_fetch(&bus->stats.group_acks_received, 1u, __ATOMIC_RELAXED);
     if (bus->on_group_ack) {
+        if (bus->maintenance_gate &&
+            !qihse_cluster_maintenance_enter(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_GROUP)) {
+            __atomic_add_fetch(&bus->stats.maintenance_group_updates_rejected, 1u, __ATOMIC_RELAXED);
+            return;
+        }
         bus->on_group_ack(bus, update_id, sender, status, bus->on_group_ack_user_data);
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_GROUP);
     }
+    __atomic_add_fetch(&bus->stats.group_acks_received, 1u, __ATOMIC_RELAXED);
 }
 
 bool qihse_cluster_bus_broadcast_node_update(qihse_cluster_bus_t* bus, uint16_t node_index) {
