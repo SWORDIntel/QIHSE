@@ -1,0 +1,10 @@
+#!/bin/sh
+# Gate pushes on the bridge test suite: this fork runs no CI.
+# Opt in once with: git config core.hooksPath hooks
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$here"
+
+python3 -m compileall -q .
+python3 -m unittest discover -s tests -p 'test_*.py'

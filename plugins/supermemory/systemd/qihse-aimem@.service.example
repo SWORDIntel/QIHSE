@@ -1,0 +1,35 @@
+# Example systemd user unit for the QIHSE RESP server acting as the
+# Supermemory-compatible memory backend. Install as
+# ~/.config/systemd/user/qihse-aimem.service and adjust QIHSE_REPO to the
+# checkout path. The env file must be mode 0600 and is read by both the
+# service and the MCP server (QIHSE_AIMEM_ENV).
+#
+# env file (~/.config/qihse-aimem/env):
+#   QIHSE_OPERATOR_PASSWORD=<generated 12+ chars; consumed then cleared by server>
+#   QIHSE_AIMEM_SERVICE_PASSWORD=<distinct generated 12+ chars; consumed then cleared>
+#   QIHSE_AIMEM_SERVICE_USER_ID=65000
+#   QIHSE_AIMEM_SERVICE_TENANT_ID=1
+#   QIHSE_RESP_HOST=127.0.0.1
+#   QIHSE_RESP_PORT=6401
+#   QIHSE_AUTH_USER=AIMEM_SERVICE
+#   QIHSE_AUTH_PASSWORD=<same as QIHSE_AIMEM_SERVICE_PASSWORD>
+#   QIHSE_AIMEM_EMBEDDER_ONNX=<models-dir>/bge-small-en-v1.5
+#
+# The data directory must not be group/other-writable (QIHSE audit
+# integrity refuses it): chmod 700 ~/.local/share/qihse-aimem.
+
+[Unit]
+Description=QIHSE RESP server (AI-memory backend for the Supermemory-compatible MCP)
+After=network.target
+
+[Service]
+Type=simple
+Environment=QIHSE_REPO=%h/src/QIHSE
+EnvironmentFile=%h/.config/qihse-aimem/env
+WorkingDirectory=%h/src/QIHSE
+ExecStart=${QIHSE_REPO}/qihse-redis-server --port ${QIHSE_RESP_PORT} --bind ${QIHSE_RESP_HOST} --require-auth --dir %h/.local/share/qihse-aimem
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
