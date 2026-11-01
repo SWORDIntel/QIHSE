@@ -2662,16 +2662,7 @@ int main(int argc, char** argv) {
     ok = qihse_resp_server_start(server);
     if (ok) {
         bool gc_pending = replayed_journal_entries > 0;
-        bool gc_gate_held = false;
-        if (gc_pending) {
-            gc_gate_held = qihse_cluster_maintenance_enter(
-                maintenance_gate, QIHSE_MAINT_WRITER_RECLAIM);
-            if (!gc_gate_held) {
-                fprintf(stderr, "qihse-cluster-daemon: cannot admit pending reclaim work\n");
-                ok = false;
-                g_stop = 1;
-            }
-        }
+        bool gc_defer_reported = false;
         size_t gc_ticks = 0u;
         struct timespec wait = {0, 100000000L};
         while (!g_stop) {
@@ -2682,33 +2673,33 @@ int main(int argc, char** argv) {
                     qihse_user_t* op = startup_operator;
                     bool has_more = false;
                     if (op && qihse_cluster_topology_is_covered(topology)) {
-                        size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded_gated(
-                            store, topology, indexes[self_index], op, 256u, &has_more,
-                            maintenance_gate);
+                        /* Reclaim mutates slots. A held gate must defer it, not
+                         * fail startup: the node still serves its held-state
+                         * whitelist and reclaim resumes on release. */
+                        if (!qihse_cluster_maintenance_enter(
+                                maintenance_gate, QIHSE_MAINT_WRITER_RECLAIM)) {
+                            if (!gc_defer_reported) {
+                                fprintf(stderr, "qihse-cluster-daemon: pending reclaim work deferred while the maintenance gate is held\n");
+                                gc_defer_reported = true;
+                            }
+                            gc_ticks = 40u;
+                            continue;
+                        }
+                        size_t deleted = qihse_cluster_reclaim_foreign_slots_bounded(
+                            store, topology, indexes[self_index], op, 256u, &has_more);
+                        qihse_cluster_maintenance_leave(maintenance_gate,
+                            QIHSE_MAINT_WRITER_RECLAIM);
                         if (deleted > 0u) {
                             fprintf(stderr, "qihse-cluster-daemon: reclaimed %zu stale foreign-slot key(s)\n", deleted);
                         }
                         gc_pending = has_more && deleted > 0u;
-                        if (!gc_pending && gc_gate_held) {
-                            qihse_cluster_maintenance_leave(maintenance_gate,
-                                QIHSE_MAINT_WRITER_RECLAIM);
-                            gc_gate_held = false;
-                        }
                     } else {
                         gc_pending = false;
-                        if (gc_gate_held) {
-                            qihse_cluster_maintenance_leave(maintenance_gate,
-                                QIHSE_MAINT_WRITER_RECLAIM);
-                            gc_gate_held = false;
-                        }
                     }
                     gc_ticks = 40u; /* 1 s between bounded batches if more remain */
                 }
             }
         }
-        if (gc_gate_held)
-            qihse_cluster_maintenance_leave(maintenance_gate,
-                QIHSE_MAINT_WRITER_RECLAIM);
     }
 shutdown:
     g_stop = 1; /* Also arm the watchdog when listener/worker startup fails. */
