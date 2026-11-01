@@ -65,7 +65,7 @@ the command above:
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 11 | 11 |
-| `include/qihse_kv_store.h` | 30 | 27 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 31 | 28 (3 `static inline`) |
 | `include/qihse_auth.h` | 34 | 34 |
 
 ## Conventions
