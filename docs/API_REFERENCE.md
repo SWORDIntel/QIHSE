@@ -41,9 +41,8 @@ nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
 ```
 
 The nine headers of [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh)
-declare 263 `qihse_*` functions between them (counted in the headers with
-comments stripped), and 260 of those resolve to a symbol in `libqihse.so`. The
-three that do not are the expected exception:
+declare 313 `qihse_*` functions between them, and 310 of those resolve to a
+symbol in `libqihse.so`. The three that do not are the expected exception:
 `qihse_kv_get()`, `qihse_kv_del()` and `qihse_kv_exists()` are `static inline`
 wrappers in `include/qihse_kv_store.h`, so they compile into the caller rather
 than appearing as library symbols. [§8](#8-additional-public-c-surfaces) adds
@@ -53,20 +52,25 @@ source file exists", so a function that appears here is safe to call; a
 function that does not appear here has not been verified and should be read in
 its header first.
 
-The per-header split, declared counted in the header and exported counted with
-the command above:
+The per-header split is generated — do not hand-edit it. Regenerate with
+`make docs-api-counts`; `make docs-api-counts-check` fails when it drifts, and
+the check runs as part of `make test-serial`. Counts are `qihse_*` function
+declarations in the header with comments stripped (macro-generated declarations
+are invisible because the preprocessor is not run), and "exported" means the
+name resolves to a symbol in `libqihse.so` (`nm -D --defined-only`, the command
+above):
 
 | Header | Declared | Exported |
 |---|---|---|
-| `include/qihse_federation.h` | 119 | 119 |
+| `include/qihse_federation.h` | 124 | 124 |
 | `include/qihse_federation_mtls.h` | 11 | 11 |
 | `include/qihse_federation_repl.h` | 13 | 13 |
 | `include/qihse_federation_transport.h` | 16 | 16 |
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 11 | 11 |
-| `include/qihse_kv_store.h` | 31 | 28 (3 `static inline`) |
-| `include/qihse_auth.h` | 34 | 34 |
+| `include/qihse_kv_store.h` | 59 | 56 (3 `static inline`) |
+| `include/qihse_auth.h` | 50 | 50 |
 
 ## Conventions
 

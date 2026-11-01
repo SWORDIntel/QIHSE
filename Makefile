@@ -410,6 +410,8 @@ test-kv-legacy-record-state: lib
 
 test-serial: test-kv-legacy-record-state
 
+test-serial: docs-api-counts-check
+
 .PHONY: test-auth-durable test-auth-archive test-auth-maintenance
 test-auth-durable: lib
 	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_auth_durable tests/test_auth_durable.c $(LDFLAGS)
@@ -1630,6 +1632,14 @@ dev-setup:
 docs:
 	@echo "No generated docs build target exists yet; docs are maintained in markdown under docs/."
 	@echo "Use 'find docs -name \"*.md\" | wc -l' to inspect documentation files."
+
+# The API-surface table in docs/API_REFERENCE.md is generated from the headers.
+.PHONY: docs-api-counts docs-api-counts-check
+docs-api-counts: lib
+	@python3 scripts/api_surface_counts.py --write
+
+docs-api-counts-check: lib
+	@python3 scripts/api_surface_counts.py --check
 
 bench-trinary-codec:
 	$(CC) $(CFLAGS) -o /tmp/qihse_trinary_candidate_bench \
