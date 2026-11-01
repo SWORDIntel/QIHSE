@@ -1370,6 +1370,14 @@ Embedding APIs:
   token[32])` starts a finite-lease hold. It requires **complete coverage**:
   every writer class must be registered, and it returns the generation and a
   fresh `RAND_bytes` token that the caller owns and must `OPENSSL_cleanse`.
+- The daemon's `--kv-sweep-interval SECONDS` (default 30, `0` disables) sets
+  `kv_sweep_interval_seconds`. The RESP sweeper thread only starts when it is
+  non-zero; that sweep calls `qihse_kv_sweep_expired()`, which also triggers
+  SSTable compaction past `KV_SSTABLE_COMPACT_THRESHOLD` live files. Compaction
+  requires the RECLAIM writer admission, so it is fenced out during a hold.
+  With a degraded metadata index, newest-copy detection falls back to
+  first-occurrence-while-scanning-newest-first, and the post-merge re-index
+  clears the degraded state.
 - `qihse_cluster_maintenance_create_startup_pending()` starts non-admitting
   from gate creation. `qihse_cluster_maintenance_seal_startup()` succeeds only
   after complete, instrumented registration and zero active writers; it creates

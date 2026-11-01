@@ -479,6 +479,31 @@ flags; PQC: `--pqc-identity-dir`, `--pqc-trusted-pub` (repeatable),
 `--pqc-require` (refuse cleartext peers — verified by `make
 test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
 
+### Compression/compaction cadence
+
+`--kv-sweep-interval SECONDS` (default 30, `0` disables) is the cadence of the
+background expiry sweeper, which is also what triggers SSTable compaction. The
+RESP sweeper thread only starts when this value is non-zero, so a daemon that
+never sets it never reclaims expired records and never merges SSTables: every
+flush appends one ~530 KB file and reads degrade linearly with history. The
+sweep is a maintenance-class writer, so it is fenced out while a hold is
+installed and resumes by itself after release.
+
+Verify the file count stays bounded and reads stay flat:
+
+```bash
+ls /opt/qihse-data/node<N>/sstable_*.db | wc -l    # expect a handful, not thousands
+# a compacted store logs: qihse-kv: compacted <N> sstable(s) into 1 live file(s)
+grep -i 'qihse-kv:' journalctl -u qihse-node<N> -o cat | tail -3
+```
+
+A degraded metadata index no longer blocks compaction: newest-copy detection
+falls back to first-occurrence-while-scanning-newest-first, and the post-merge
+re-index repairs the index. Compaction failures are logged as
+`qihse-kv: sstable compaction failed` rather than discarded.
+
+### Cutover fence (optional)
+
 A separate `--startup-maintenance-held` option starts the all-writer gate in
 `STARTUP_PENDING` before RESP/bus/failover components or their background
 workers are created. Registration is allowed, writer admission is not. The
@@ -497,7 +522,13 @@ maintenance control remains available while the data-plane writer gate is held.
 Ordinary writes stay rejected. Existing finite-lease holds keep their prior
 command whitelist. Configure the flag in the owner service's
 `ExecStart` alongside the existing secure credential source. Without the flag,
-startup retains the previous OPEN behavior.
+startup retains the OPEN behavior.
+
+This fence is a cutover tool, not a standing posture: production units run
+without it, so a restart comes back serving writes immediately. Add the flag
+only for the duration of a restart-sensitive change, then remove it and
+`systemctl daemon-reload` so the next start is normal. Leaving it installed
+means every restart needs an operator token release before clients can write.
 
 This full data-plane fence is distinct from `--failover-start-paused`, which
 only pauses failover ownership changes. For a restart-sensitive cutover, use
