@@ -313,7 +313,10 @@ class AdminTests(unittest.TestCase):
                    str(Path(IDENTITY) / 'qihse_dsa_pub.pem'), '--pqc-node-id', 'standalone-aimem']
             proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
-                for _ in range(100):
+                # Provisioning hashes multiple passwords at production strength.
+                # Use a wall-clock readiness budget rather than ten seconds of retries.
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
                     if proc.poll() is not None:
                         self.fail(f'standalone server exited early: {proc.returncode}')
                     try:

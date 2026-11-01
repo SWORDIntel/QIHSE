@@ -661,7 +661,7 @@ test-http-lifecycle:
 
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c -Wl,--gc-sections -pthread -lcrypto
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_maintenance.c -Wl,--gc-sections -pthread -lcrypto
 	./build/test_cluster_bus_bind
 
 test-serial: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
@@ -1290,7 +1290,10 @@ test-cluster-failover: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_failover tests/test_cluster_failover.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_failover
 
-test-cluster-maintenance:
+.PHONY: test-cluster-maintenance test-cluster-maintenance-resp
+test-serial: test-cluster-maintenance test-cluster-maintenance-resp
+
+test-cluster-maintenance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance tests/test_cluster_maintenance.c src/spinnaker/qihse_cluster_maintenance.c -pthread $(LDFLAGS)
 	./tests/test_cluster_maintenance
 

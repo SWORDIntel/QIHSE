@@ -244,8 +244,10 @@ class Daemon:
         self.case.fail("isolated QKP authority readiness timed out")
 
     def session(self, username=None, password=None):
+        # Full-strength password verification competes with the 32-job suite;
+        # this tests authority semantics, not authentication latency.
         return self.case.admin.session("127.0.0.1", self.port, self.case.pin,
-                                       user=username, password=password, timeout_ms=3000)
+                                       user=username, password=password, timeout_ms=30000)
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:
