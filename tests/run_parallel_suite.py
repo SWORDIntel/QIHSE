@@ -78,9 +78,12 @@ def run_target(name, logs, jobs=16):
     path = logs / f"{name}.log"
     command = ([sys.executable, "tests/run_gold_parallel.py", "--jobs", str(jobs)]
                if name == "test-gold" else ["make", "--no-print-directory", "-s", name])
-    with path.open("wb") as output:
-        result = subprocess.run(command, cwd=ROOT, env=env, stdout=output,
-                                stderr=subprocess.STDOUT, check=False)
+    with tempfile.TemporaryDirectory(prefix=f"qihse-test-keys-{name}-") as key_dir:
+        os.chmod(key_dir, 0o700)
+        env["QIHSE_KEY_DIR"] = key_dir
+        with path.open("wb") as output:
+            result = subprocess.run(command, cwd=ROOT, env=env, stdout=output,
+                                    stderr=subprocess.STDOUT, check=False)
     return name, result.returncode, time.monotonic() - started, path
 
 

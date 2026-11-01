@@ -80,8 +80,14 @@ def private_file(path, data):
 
 def isolated_env(directory):
     # Retain crypto providers, not operator storage/auth/endpoint configuration.
+    # A subprocess running as root must not fall through to a host identity key
+    # owned by another account when exercising the explicit test-only fallback.
+    key_dir = directory / "empty-qihse-key-dir"
+    key_dir.mkdir(mode=0o700, exist_ok=True)
+    key_dir.chmod(0o700)
     env = {k: v for k, v in os.environ.items() if not k.startswith("QIHSE_")}
-    env.update(QIHSE_DATA_DIR=str(directory), QIHSE_FIPS_MODE="disabled",
+    env.update(QIHSE_DATA_DIR=str(directory), QIHSE_KEY_DIR=str(key_dir),
+               QIHSE_FIPS_MODE="disabled",
                LD_LIBRARY_PATH=str(ROOT) + (":" + env["LD_LIBRARY_PATH"]
                                            if env.get("LD_LIBRARY_PATH") else ""))
     return env
@@ -576,6 +582,7 @@ int fsync(int fd) {
         parent.symlink_to(self.work, target_is_directory=True)
         shared = self.work / "shared"
         shared.mkdir(mode=0o755)
+        shared.chmod(0o755)
         for output in (linked, parent / "output", shared / "output"):
             result = self.cli(self.source, "--authority-export", output,
                               "--transfer-config", self.config, "--expected-position", self.sp)
