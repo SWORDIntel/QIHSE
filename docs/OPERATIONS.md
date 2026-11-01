@@ -528,6 +528,13 @@ redis-cli ... INFO | grep -E 'sst_live_files|index_degraded|kv_sweep_interval'
 systemctl show qihse-node<N> -p ExecStart | grep -o 'kv-sweep-interval [0-9]*'
 ```
 
+Read-only replica caches compact as well. A replica cannot expire records
+(that is a logical mutation), but merging SSTables is a physical rewrite that
+keeps the newest copy of every key, so the sweep still merges a replica's
+backlog above the threshold and logs `qihse-kv: compacted <N> replica
+sstable(s) into 1 live file(s)`. Without that, every cache grew one file per
+pull forever.
+
 With a non-zero interval the first sweep compacts whatever has piled up —
 no manual merge, no downtime, no data movement beyond the rewrite the merge
 does anyway. A store that is already degraded is repaired by that same sweep:

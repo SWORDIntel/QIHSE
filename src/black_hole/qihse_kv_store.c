@@ -2696,8 +2696,28 @@ static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t 
 }
 
 void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
-    if (!store || !store->trie ||
-        __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE)) return;
+    if (!store || !store->trie) return;
+    /* A read-only replica must not expire records (that is a logical
+     * mutation), but it must still compact: merging SSTables is a physical
+     * rewrite that preserves the newest copy of every key. Skipping it left
+     * every replica's file count growing with each pull until reads slowed
+     * the same way they did on node5. */
+    const bool read_only =
+        __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE);
+    if (read_only) {
+        kv_store_wrlock(store);
+        if (store->sstable_live_count >= KV_SSTABLE_COMPACT_THRESHOLD &&
+            !store->recovery_pending && !store->bulk_load_mode) {
+            int32_t before = store->sstable_counter;
+            if (compact_sstables_stream(store) && before > 1) {
+                fprintf(stderr,
+                        "qihse-kv: compacted %d replica sstable(s) into %zu live "
+                        "file(s)\n", before, store->sstable_live_count);
+            }
+        }
+        kv_store_unlock(store);
+        return;
+    }
     kv_store_wrlock(store);
     if (store->recovery_pending) { kv_store_unlock(store); return; }
     if (store->bulk_load_mode) { kv_store_unlock(store); return; }

@@ -124,8 +124,40 @@ int main(void) {
         free(value);
         return 1;
     }
-    printf("sstables %d -> %d -> %d, %d records intact: PASS\n",
-           before, after_first, after, ROUNDS * KEYS_PER_ROUND);
+    /* A read-only replica must compact too: pull cycles append SSTables and a
+     * replica can never expire them away, so without this its file count grows
+     * with every pull.  Rebuild a backlog first, then go read-only. */
+    for (int round = 0; round < ROUNDS; round++) {
+        for (int i = 0; i < KEYS_PER_ROUND; i++) {
+            snprintf(key, sizeof(key), "replica:key:%d:%d", round, i);
+            if (!qihse_kv_set(store, key, value, 0, 0)) {
+                fprintf(stderr, "backlog write failed at round %d\n", round);
+                qihse_kv_store_destroy(store);
+                free(value);
+                return 1;
+            }
+        }
+    }
+    int replica_before = count_sstables(data_dir);
+    if (replica_before < 16) {
+        fprintf(stderr, "expected a replica backlog, found %d sstables\n", replica_before);
+        qihse_kv_store_destroy(store);
+        free(value);
+        return 1;
+    }
+    qihse_kv_store_enable_replica_read_only(store);
+    qihse_kv_sweep_expired(store);
+    int replica_after = count_sstables(data_dir);
+    if (replica_after > 2) {
+        fprintf(stderr, "read-only replica did not compact: %d -> %d\n",
+                replica_before, replica_after);
+        qihse_kv_store_destroy(store);
+        free(value);
+        return 1;
+    }
+    printf("sstables %d -> %d -> %d; replica %d -> %d; %d records intact: PASS\n",
+           before, after_first, after, replica_before, replica_after,
+           ROUNDS * KEYS_PER_ROUND);
     qihse_kv_store_destroy(store);
     free(value);
     return 0;
