@@ -584,6 +584,7 @@ static void usage(const char* argv0) {
         "          [--slot-range FIRST-LAST] [--slot-range-of INDEX:FIRST-LAST]\n"
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
         "          [--failover-start-paused] (until Operator CLUSTER FAILOVER.RESUME)\n"
+        "          [--startup-maintenance-held] (requires authenticated system Operator; release via STARTUP_TOKEN)\n"
         "  Durable principal authority: QIHSE_AUTH_MODE=standalone, QIHSE_AUTH_ACTION=provision|recover.\n"
         "  Required QIHSE_AUTH_ suffixes: STATE_DIR, BOOTSTRAP_FILE, AUTHORITY_ID, NODE_ID, EPOCH,\n"
         "  RECIPIENT_PUBLIC_KEY, RECIPIENT_PRIVATE_KEY, SIGNER_PUBLIC_KEY, SIGNER_PRIVATE_KEY,\n"
@@ -1455,6 +1456,7 @@ int main(int argc, char** argv) {
     const char* data_dir = NULL;
     bool enable_scatter = false;
     bool failover_start_paused = false;
+    bool startup_maintenance_held = false;
     size_t max_clients = 4096u;
     peer_spec_t peers[MAX_PEERS];
     size_t peer_count = 0;
@@ -1529,6 +1531,8 @@ int main(int argc, char** argv) {
             data_dir = argv[++i];
         } else if (strcmp(a, "--failover-start-paused") == 0) {
             failover_start_paused = true;
+        } else if (strcmp(a, "--startup-maintenance-held") == 0) {
+            startup_maintenance_held = true;
         } else if (strcmp(a, "--enable-scatter") == 0) {
             enable_scatter = true;
         } else if (strcmp(a, "--max-clients") == 0 && i + 1 < argc) {
@@ -2052,6 +2056,11 @@ int main(int argc, char** argv) {
         operator_credential_release();
         return 1;
     }
+    if (startup_maintenance_held && !startup_operator) {
+        fprintf(stderr, "qihse-cluster-daemon: startup maintenance hold requires authenticated system Operator credentials\n");
+        operator_credential_release();
+        return 2;
+    }
 
     qihse_user_t* replication_service_principal = replication_configured
         ? replication_service_principal_create(startup_operator, replication_principal_id) : NULL;
@@ -2463,7 +2472,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    qihse_cluster_maintenance_t* maintenance_gate = qihse_cluster_maintenance_create();
+    qihse_cluster_maintenance_t* maintenance_gate = startup_maintenance_held
+        ? qihse_cluster_maintenance_create_startup_pending()
+        : qihse_cluster_maintenance_create();
     if (!maintenance_gate ||
         !qihse_cluster_maintenance_register(maintenance_gate, QIHSE_MAINT_WRITER_RECLAIM, true)) {
         fprintf(stderr, "qihse-cluster-daemon: all-writer maintenance gate registration failed\n");
@@ -2490,6 +2501,21 @@ int main(int argc, char** argv) {
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
         if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
         return 1;
+    }
+    if (startup_maintenance_held) {
+        uint64_t startup_generation = 0;
+        uint8_t startup_token[32];
+        bool sealed = qihse_cluster_maintenance_seal_startup(
+            maintenance_gate, &startup_generation, startup_token);
+        OPENSSL_cleanse(startup_token, sizeof(startup_token));
+        if (!sealed) {
+            fprintf(stderr, "qihse-cluster-daemon: startup maintenance writer coverage incomplete; refusing to start\n");
+            qihse_resp_server_destroy(server);
+            qihse_cluster_maintenance_destroy(maintenance_gate);
+            if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
+            if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
+            return 1;
+        }
     }
     if (failover_start_paused &&
         !qihse_resp_server_start_failover_paused(server, startup_operator)) {

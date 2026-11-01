@@ -122,6 +122,42 @@ bool qihse_kv_sync_store(void *store) {
         process.terminate()
         self.assertEqual(process.wait(timeout=15), 0)
 
+    def test_maintenance_startup_hold_survives_daemon_restart(self):
+        def token(session):
+            reply = session.execute_resp('CLUSTER', 'MAINTENANCE', 'STARTUP_TOKEN')
+            parts = reply.split(b'\r\n')
+            self.assertEqual(parts[0], b'*2')
+            self.assertTrue(parts[1].startswith(b':'))
+            self.assertEqual(parts[2], b'$64')
+            value = parts[3]
+            self.assertEqual(len(value), 64)
+            return int(parts[1][1:]), value
+
+        process, session, _ = self.start(extra_args=('--startup-maintenance-held',))
+        generation1, token1 = token(session)
+        self.assertEqual(session.execute_resp('SET', 'startup-held:blocked', 'x').split(b'\r\n', 1)[0],
+                         b'-BUSY cluster maintenance is held')
+        self.assertEqual(session.execute_resp('CLUSTER', 'MAINTENANCE', 'RELEASE',
+                                              str(generation1), token1.decode()), b'+OK\r\n')
+        self.assertEqual(session.execute_resp('SET', 'startup-held:released', 'x'), b'+OK\r\n')
+        session.close()
+        process.terminate()
+        self.assertEqual(process.wait(timeout=15), 0)
+
+        process, session, _ = self.start(extra_args=('--startup-maintenance-held',))
+        generation2, token2 = token(session)
+        self.assertEqual(session.execute_resp('SET', 'startup-held:restart-blocked', 'x').split(b'\r\n', 1)[0],
+                         b'-BUSY cluster maintenance is held')
+        self.assertGreater(generation2, 0)
+        self.assertNotEqual(generation2, generation1)
+        self.assertNotEqual(token2, token1)
+        self.assertEqual(session.execute_resp('CLUSTER', 'MAINTENANCE', 'RELEASE',
+                                              str(generation2), token2.decode()), b'+OK\r\n')
+        self.assertEqual(session.execute_resp('SET', 'startup-held:restart-released', 'x'), b'+OK\r\n')
+        session.close()
+        process.terminate()
+        self.assertEqual(process.wait(timeout=15), 0)
+
     def test_startup_hold_preserves_ownership_until_operator_resume(self):
         # Reserve an absent peer's endpoints so no unrelated listener can answer.
         with socket.socket() as missing, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bus:

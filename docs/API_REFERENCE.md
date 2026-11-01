@@ -1356,15 +1356,24 @@ and `tests/test_cluster_maintenance_resp.c`
 
 An opaque `qihse_cluster_maintenance_t` gates every writer path that can move
 durable state, so a staged cutover can hold the node before logical
-snapshots are taken. States: `OPEN`, `DRAINING`, `HELD`, and — fail-closed —
-`EXPIRED_HELD` when the lease runs out before a trusted release.
+snapshots are taken. States: `OPEN`, `DRAINING`, `HELD`, fail-closed
+`EXPIRED_HELD` when a lease runs out before trusted release, and
+`STARTUP_PENDING`, which denies writer admission while daemon components
+register their coverage.
 
 Embedding APIs:
 
 - `qihse_cluster_maintenance_begin(gate, timeout_ms, lease_ms, &generation,
-  token[32])` starts a hold. It requires **complete coverage**: every writer
-  class must be registered, and it returns the generation and a fresh
-  `RAND_bytes` token that the caller owns and must `OPENSSL_cleanse`.
+  token[32])` starts a finite-lease hold. It requires **complete coverage**:
+  every writer class must be registered, and it returns the generation and a
+  fresh `RAND_bytes` token that the caller owns and must `OPENSSL_cleanse`.
+- `qihse_cluster_maintenance_create_startup_pending()` starts non-admitting
+  from gate creation. `qihse_cluster_maintenance_seal_startup()` succeeds only
+  after complete, instrumented registration and zero active writers; it creates
+  a non-expiring HELD state with a fresh token. The startup hold remains closed
+  across daemon restart when `--startup-maintenance-held` is configured.
+  `qihse_cluster_maintenance_startup_token()` returns that token only while the
+  startup-created hold is HELD.
 - `qihse_cluster_maintenance_release_trusted(gate, generation, token)` is the
   only trusted release path; it constant-time compares the token with
   `CRYPTO_memcmp` and rejects mismatches and stale generations.
@@ -1391,15 +1400,22 @@ RESP surface (authenticated active SYSTEM-domain Operator only):
 CLUSTER MAINTENANCE STATUS
 CLUSTER MAINTENANCE BEGIN <timeout_ms 0..5000> <lease_ms 1000..1800000>
 CLUSTER MAINTENANCE RELEASE <generation> <64-hex-token>
+CLUSTER MAINTENANCE STARTUP_TOKEN
 ```
 
 STATUS replies with a 21-entry array: state name, generation, lease expiry,
 coverage flag, 11 per-class active counters, pending failback count,
 rejected SLOT_UPDATE/GROUP/federation counters, the failover-paused flag,
-and a nested list of 11 `[name, registered]` pairs. The token is never
-readable back. BEGIN is refused while a pending failback ledger exists.
+and a nested list of 11 `[name, registered]` pairs. STATUS never includes a
+token. `STARTUP_TOKEN` returns generation and token only to an authenticated
+active SYSTEM-domain Operator and only for a startup-created HELD state; the
+returned token is consumed by the existing RELEASE command. BEGIN is refused
+while a pending failback ledger exists. The daemon startup flag requires
+successful authenticated SYSTEM Operator startup credentials and fails closed
+if any writer coverage is incomplete.
 
-While HELD (or EXPIRED_HELD), RESP admits only `PING`, `INFO`,
+While HELD (or EXPIRED_HELD), RESP admits `AUTH`/`HELLO` for authenticated
+control-session setup and only `PING`, `INFO`,
 `CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and `REPL.SNAPSHOT.*`; everything
 else is rejected with `BUSY cluster maintenance is held`. `DBSIZE` is
 deliberately excluded from the whitelist (it can fall back to compaction

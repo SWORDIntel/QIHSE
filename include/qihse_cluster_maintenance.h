@@ -27,7 +27,8 @@ typedef enum {
     QIHSE_MAINT_OPEN = 0,
     QIHSE_MAINT_DRAINING,
     QIHSE_MAINT_HELD,
-    QIHSE_MAINT_EXPIRED_HELD
+    QIHSE_MAINT_EXPIRED_HELD,
+    QIHSE_MAINT_STARTUP_PENDING
 } qihse_maintenance_state_t;
 typedef struct {
     qihse_maintenance_state_t state;
@@ -40,6 +41,16 @@ typedef struct {
 } qihse_cluster_maintenance_status_t;
 
 qihse_cluster_maintenance_t* qihse_cluster_maintenance_create(void);
+/* Startup-pending gates admit no writers while components register. Seal only
+ * after every writer class is registered and instrumented. */
+qihse_cluster_maintenance_t* qihse_cluster_maintenance_create_startup_pending(void);
+bool qihse_cluster_maintenance_seal_startup(qihse_cluster_maintenance_t* gate,
+                                             uint64_t* generation,
+                                             uint8_t token[32]);
+/* Returns the token only while this gate holds its startup-created hold. */
+bool qihse_cluster_maintenance_startup_token(qihse_cluster_maintenance_t* gate,
+                                              uint64_t* generation,
+                                              uint8_t token[32]);
 void qihse_cluster_maintenance_destroy(qihse_cluster_maintenance_t* gate);
 /* Admission is atomic with begin: a successful entry is counted until leave. */
 bool qihse_cluster_maintenance_enter(qihse_cluster_maintenance_t* gate,

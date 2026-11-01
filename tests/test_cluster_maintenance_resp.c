@@ -45,17 +45,35 @@ int main(void){
     assert(qihse_auth_init()&&qihse_auth_bootstrap_operator(OP_PASS)); qihse_user_t*op=qihse_auth_get_user(0); assert(op);
     assert(qihse_auth_create_user(op,991,QIHSE_ROLE_GUEST,0,0,GUEST_PASS,false));
     qihse_kv_store_t*store=qihse_kv_store_create(); assert(store);
-    qihse_cluster_maintenance_t*gate=qihse_cluster_maintenance_create(); assert(gate);
+    qihse_cluster_maintenance_t*gate=qihse_cluster_maintenance_create_startup_pending(); assert(gate);
     qihse_resp_server_config_t cfg; qihse_resp_server_config_init(&cfg); cfg.store=store; cfg.port=0; cfg.auth_required=true; cfg.enable_task_workers=false; cfg.enable_task_scheduler=false; cfg.maintenance_gate=gate;
     qihse_resp_server_t*s=qihse_resp_server_create(&cfg); assert(s);
-    client_t anon=client(s); const char*begin[]={"CLUSTER","MAINTENANCE","BEGIN","0","5000"}; command(&anon,5,begin,"NOPERM"); const char*status[]={"CLUSTER","MAINTENANCE","STATUS"}; command(&anon,3,status,"NOPERM"); const char*rel[]={"CLUSTER","MAINTENANCE","RELEASE","1", "0000000000000000000000000000000000000000000000000000000000000000"}; command(&anon,5,rel,"NOPERM");
-    auth(&anon,"User_991",GUEST_PASS); command(&anon,5,begin,"NOPERM"); command(&anon,3,status,"NOPERM"); command(&anon,5,rel,"NOPERM");
+    client_t anon=client(s); const char*begin[]={"CLUSTER","MAINTENANCE","BEGIN","0","5000"}; command(&anon,5,begin,"NOPERM"); const char*status[]={"CLUSTER","MAINTENANCE","STATUS"}; command(&anon,3,status,"NOPERM"); const char*startup[]={"CLUSTER","MAINTENANCE","STARTUP_TOKEN"}; command(&anon,3,startup,"NOPERM"); const char*rel[]={"CLUSTER","MAINTENANCE","RELEASE","1", "0000000000000000000000000000000000000000000000000000000000000000"}; command(&anon,5,rel,"NOPERM");
+    auth(&anon,"User_991",GUEST_PASS); command(&anon,5,begin,"NOPERM"); command(&anon,3,status,"NOPERM"); command(&anon,3,startup,"NOPERM"); command(&anon,5,rel,"NOPERM");
     client_t admin=client(s); auth(&admin,qihse_user_get_username(op),OP_PASS);
     /* This in-process fixture has no daemon startup-GC loop. Production daemon
      * registers RECLAIM around its actual pending/in-flight work. */
     assert(qihse_cluster_maintenance_register(gate,QIHSE_MAINT_WRITER_RECLAIM,true));
     assert(qihse_cluster_maintenance_register(gate,QIHSE_MAINT_WRITER_REPLICA,true));
     assert(qihse_cluster_maintenance_register(gate,QIHSE_MAINT_WRITER_BRAIN,true));
+    uint64_t startup_generation = 0; uint8_t startup_token[32];
+    assert(qihse_cluster_maintenance_seal_startup(gate, &startup_generation, startup_token));
+    send_command(admin.fd,3,startup); char *startup_reply=reply(&admin);
+    assert(strstr(startup_reply, "$64\r\n"));
+    char startup_gen[32], startup_hex[65];
+    char *startup_p=strchr(startup_reply, ':'); assert(startup_p); startup_p++;
+    char *startup_ge=strstr(startup_p,"\r\n"); assert(startup_ge);
+    snprintf(startup_gen,sizeof startup_gen,"%.*s",(int)(startup_ge-startup_p),startup_p);
+    startup_p=strstr(startup_reply,"$64\r\n"); assert(startup_p); startup_p+=5;
+    memcpy(startup_hex,startup_p,64); startup_hex[64]=0;
+    for(size_t i=0;i<64;i++)assert(isxdigit((unsigned char)startup_hex[i]));
+    assert(strtoull(startup_gen,NULL,10)==startup_generation);
+    free(startup_reply);
+    send_command(anon.fd,3,startup); char *denied_startup=reply(&anon);
+    assert(strstr(denied_startup,"NOPERM") && !strstr(denied_startup,startup_hex));
+    free(denied_startup);
+    const char*startup_release[]={"CLUSTER","MAINTENANCE","RELEASE",startup_gen,startup_hex};
+    command(&admin,5,startup_release,"+OK");
     send_command(admin.fd,5,begin); char*r=reply(&admin); assert(strstr(r,"HELD"));
     char *p=strchr(r,':'); assert(p); char gen[32],token[65]; p++; char *ge=strstr(p,"\r\n"); assert(ge); snprintf(gen,sizeof gen,"%.*s",(int)(ge-p),p);
     p=strstr(r,"$64\r\n"); assert(p); p+=5; memcpy(token,p,64); token[64]=0; for(size_t i=0;i<64;i++)assert(isxdigit((unsigned char)token[i])); free(r);

@@ -15265,6 +15265,8 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         if (!qihse_cluster_maintenance_status(gate, &status))
             return qihse_resp_error(session, "ERR maintenance status unavailable");
         bool safe = qihse_resp_command_is(request, "PING") ||
+                    qihse_resp_command_is(request, "AUTH") ||
+                    qihse_resp_command_is(request, "HELLO") ||
                     qihse_resp_command_is(request, "INFO") ||
                     qihse_resp_command_is(request, "CLUSTER.HEALTH") ||
                     qihse_resp_command_is(request, "CLUSTER.TOPOLOGY") ||
@@ -15418,8 +15420,8 @@ static bool qihse_resp_handle_maintenance(qihse_resp_session_t* session, const q
         if (request->argc != 3u) return qihse_resp_wrong_arity(session, "cluster maintenance status");
         qihse_cluster_maintenance_status_t st;
         if (!qihse_cluster_maintenance_status(gate, &st)) return qihse_resp_error(session, "ERR maintenance status unavailable");
-        static const char* names[] = {"OPEN", "DRAINING", "HELD", "EXPIRED_HELD"};
-        if (st.state < QIHSE_MAINT_OPEN || st.state > QIHSE_MAINT_EXPIRED_HELD) return qihse_resp_error(session, "ERR invalid maintenance state");
+        static const char* names[] = {"OPEN", "DRAINING", "HELD", "EXPIRED_HELD", "STARTUP_PENDING"};
+        if (st.state < QIHSE_MAINT_OPEN || st.state > QIHSE_MAINT_STARTUP_PENDING) return qihse_resp_error(session, "ERR invalid maintenance state");
         qihse_cluster_bus_stats_t bus_stats = {0};
         if (session->server->bus)
             qihse_cluster_bus_stats(session->server->bus, &bus_stats);
@@ -15454,6 +15456,26 @@ static bool qihse_resp_handle_maintenance(qihse_resp_session_t* session, const q
         for (size_t i = 0; ok && i < QIHSE_MAINT_WRITER_CLASS_COUNT; ++i)
             ok = qihse_resp_array(session, 2u) && qihse_resp_bulk_text(session, writer_names[i]) &&
                  qihse_resp_integer(session, st.writer_registered[i] ? 1 : 0);
+        return ok;
+    }
+    if (qihse_resp_arg_equal(&request->argv[2], "STARTUP_TOKEN")) {
+        if (request->argc != 3u)
+            return qihse_resp_wrong_arity(session, "cluster maintenance startup_token");
+        uint64_t generation = 0;
+        uint8_t token[32];
+        if (!qihse_cluster_maintenance_startup_token(gate, &generation, token))
+            return qihse_resp_error(session, "ERR startup maintenance token unavailable");
+        static const char hex[] = "0123456789abcdef";
+        char text[64];
+        for (size_t i = 0; i < sizeof(token); ++i) {
+            text[i * 2] = hex[token[i] >> 4];
+            text[i * 2 + 1] = hex[token[i] & 15];
+        }
+        OPENSSL_cleanse(token, sizeof(token));
+        bool ok = qihse_resp_array(session, 2u) &&
+                  qihse_resp_integer(session, (int64_t)generation) &&
+                  qihse_resp_bulk(session, text, sizeof(text));
+        OPENSSL_cleanse(text, sizeof(text));
         return ok;
     }
     if (qihse_resp_arg_equal(&request->argv[2], "BEGIN")) {

@@ -18,6 +18,8 @@ struct qihse_cluster_maintenance {
     uint64_t active[QIHSE_MAINT_WRITER_CLASS_COUNT];
     bool registered[QIHSE_MAINT_WRITER_CLASS_COUNT];
     bool complete;
+    bool startup_pending;
+    bool startup_held;
 };
 
 static uint64_t monotonic_ms(void) {
@@ -30,7 +32,7 @@ static bool valid_writer(qihse_maintenance_writer_t writer) {
     return (int)writer >= 0 && writer < QIHSE_MAINT_WRITER_CLASS_COUNT;
 }
 
-qihse_cluster_maintenance_t* qihse_cluster_maintenance_create(void) {
+static qihse_cluster_maintenance_t* maintenance_create(bool startup_pending) {
     qihse_cluster_maintenance_t* gate = calloc(1, sizeof(*gate));
     if (!gate) return NULL;
     pthread_condattr_t attr;
@@ -45,13 +47,24 @@ qihse_cluster_maintenance_t* qihse_cluster_maintenance_create(void) {
         pthread_mutex_destroy(&gate->lock); free(gate); return NULL;
     }
     gate->complete = true;
+    gate->startup_pending = startup_pending;
+    if (startup_pending) gate->state = QIHSE_MAINT_STARTUP_PENDING;
     return gate;
+}
+
+qihse_cluster_maintenance_t* qihse_cluster_maintenance_create(void) {
+    return maintenance_create(false);
+}
+
+qihse_cluster_maintenance_t* qihse_cluster_maintenance_create_startup_pending(void) {
+    return maintenance_create(true);
 }
 
 void qihse_cluster_maintenance_destroy(qihse_cluster_maintenance_t* gate) {
     if (!gate) return;
     pthread_mutex_lock(&gate->lock);
-    bool idle = gate->state == QIHSE_MAINT_OPEN;
+    bool idle = gate->state == QIHSE_MAINT_OPEN ||
+                gate->state == QIHSE_MAINT_STARTUP_PENDING;
     for (size_t i = 0; i < QIHSE_MAINT_WRITER_CLASS_COUNT; ++i)
         idle = idle && gate->active[i] == 0;
     pthread_mutex_unlock(&gate->lock);
@@ -67,7 +80,8 @@ bool qihse_cluster_maintenance_register(qihse_cluster_maintenance_t* gate,
                                         bool instrumented) {
     if (!gate || !valid_writer(writer)) return false;
     pthread_mutex_lock(&gate->lock);
-    if (gate->state != QIHSE_MAINT_OPEN) {
+    if (gate->state != QIHSE_MAINT_OPEN &&
+        !(gate->startup_pending && gate->state == QIHSE_MAINT_STARTUP_PENDING)) {
         pthread_mutex_unlock(&gate->lock);
         return false;
     }
@@ -84,7 +98,7 @@ bool qihse_cluster_maintenance_enter(qihse_cluster_maintenance_t* gate,
     /* Uninstrumented writers prevent a global hold, not normal service.
      * Keep independently instrumented paths available while OPEN. */
     bool admitted = gate->state == QIHSE_MAINT_OPEN &&
-                    gate->registered[writer];
+                    !gate->startup_pending && gate->registered[writer];
     if (admitted) gate->active[writer]++;
     pthread_mutex_unlock(&gate->lock);
     return admitted;
@@ -116,7 +130,8 @@ bool qihse_cluster_maintenance_begin(qihse_cluster_maintenance_t* gate,
     uint8_t candidate_token[32];
     if (RAND_bytes(candidate_token, sizeof(candidate_token)) != 1) return false;
     pthread_mutex_lock(&gate->lock);
-    if (gate->state != QIHSE_MAINT_OPEN || !gate->complete) {
+    if (gate->state != QIHSE_MAINT_OPEN || gate->startup_pending ||
+        gate->startup_held || !gate->complete) {
         pthread_mutex_unlock(&gate->lock);
         OPENSSL_cleanse(candidate_token, sizeof(candidate_token));
         return false;
@@ -179,6 +194,52 @@ bool qihse_cluster_maintenance_begin(qihse_cluster_maintenance_t* gate,
     return true;
 }
 
+bool qihse_cluster_maintenance_seal_startup(qihse_cluster_maintenance_t* gate,
+                                             uint64_t* generation,
+                                             uint8_t token[32]) {
+    if (!gate || !generation || !token) return false;
+    uint8_t candidate_token[32];
+    if (RAND_bytes(candidate_token, sizeof(candidate_token)) != 1) return false;
+    pthread_mutex_lock(&gate->lock);
+    bool ready = gate->startup_pending &&
+                 gate->state == QIHSE_MAINT_STARTUP_PENDING &&
+                 gate->complete && drained(gate);
+    if (!ready) {
+        pthread_mutex_unlock(&gate->lock);
+        OPENSSL_cleanse(candidate_token, sizeof(candidate_token));
+        return false;
+    }
+    uint64_t startup_generation = 0;
+    memcpy(&startup_generation, candidate_token, sizeof(startup_generation));
+    startup_generation &= (uint64_t)INT64_MAX;
+    if (startup_generation == 0) startup_generation = 1;
+    gate->generation = startup_generation;
+    memcpy(gate->token, candidate_token, sizeof(gate->token));
+    OPENSSL_cleanse(candidate_token, sizeof(candidate_token));
+    gate->expires_ms = 0;
+    gate->startup_pending = false;
+    gate->startup_held = true;
+    gate->state = QIHSE_MAINT_HELD;
+    *generation = gate->generation;
+    memcpy(token, gate->token, sizeof(gate->token));
+    pthread_mutex_unlock(&gate->lock);
+    return true;
+}
+
+bool qihse_cluster_maintenance_startup_token(qihse_cluster_maintenance_t* gate,
+                                              uint64_t* generation,
+                                              uint8_t token[32]) {
+    if (!gate || !generation || !token) return false;
+    pthread_mutex_lock(&gate->lock);
+    bool ok = gate->startup_held && gate->state == QIHSE_MAINT_HELD;
+    if (ok) {
+        *generation = gate->generation;
+        memcpy(token, gate->token, sizeof(gate->token));
+    }
+    pthread_mutex_unlock(&gate->lock);
+    return ok;
+}
+
 bool qihse_cluster_maintenance_release_trusted(qihse_cluster_maintenance_t* gate,
                                                uint64_t generation,
                                                const uint8_t token[32]) {
@@ -190,6 +251,7 @@ bool qihse_cluster_maintenance_release_trusted(qihse_cluster_maintenance_t* gate
               CRYPTO_memcmp(token, gate->token, sizeof(gate->token)) == 0;
     if (ok) {
         gate->state = QIHSE_MAINT_OPEN;
+        gate->startup_held = false;
         OPENSSL_cleanse(gate->token, sizeof(gate->token));
         gate->expires_ms = 0;
         pthread_cond_broadcast(&gate->changed);
@@ -202,7 +264,8 @@ bool qihse_cluster_maintenance_status(qihse_cluster_maintenance_t* gate,
                                       qihse_cluster_maintenance_status_t* status) {
     if (!gate || !status) return false;
     pthread_mutex_lock(&gate->lock);
-    if (gate->state == QIHSE_MAINT_HELD && monotonic_ms() >= gate->expires_ms)
+    if (gate->state == QIHSE_MAINT_HELD && gate->expires_ms != 0 &&
+        monotonic_ms() >= gate->expires_ms)
         gate->state = QIHSE_MAINT_EXPIRED_HELD;
     memset(status, 0, sizeof(*status));
     status->state = gate->state;
