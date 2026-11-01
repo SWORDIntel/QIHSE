@@ -1378,6 +1378,11 @@ test-kv-read-integrity: lib
 	@status=0; LD_LIBRARY_PATH=. ./tests/test_kv_read_integrity || status=$$?; \
 		rm -f tests/test_kv_read_integrity; exit $$status
 
+test-kv-compaction: lib
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -o tests/test_kv_compaction tests/test_kv_compaction.c -L. -lqihse $(LDFLAGS)
+	@status=0; LD_LIBRARY_PATH=. ./tests/test_kv_compaction || status=$$?; \
+		rm -f tests/test_kv_compaction; exit $$status
+
 test-bytecode: lib
 	$(CC) $(CFLAGS) -o tests/test_bytecode tests/test_bytecode.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_bytecode

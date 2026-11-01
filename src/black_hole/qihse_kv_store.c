@@ -1683,10 +1683,13 @@ typedef bool (*kv_sst_record_cb)(const char* key, const kv_disk_record_t* r, voi
  * Each file is read sequentially; for every physical record the metadata
  * index is probed and the record is emitted only when the index still pins
  * this exact (sstable_id, offset) — i.e. this copy is the newest one, with
- * all older copies in older files filtered out.  Tombstoned/expired records
+ * all older copies in older files filtered out.  A degraded index cannot
+ * answer that question, so the first occurrence of a key while scanning
+ * newest-first is used instead: the result is identical either way.  Tombstoned/expired records
  * and keys shadowed by a newer memtable entry are skipped.  Values are read
  * (the callback receives them) but nothing is merged into RAM: memory stays
- * O(1) beyond the index itself.
+ * O(keys) only for the temporary membership set used while the metadata index
+ * is degraded.
  *
  * `include_tombstones` is the delta exporter's mode: a newest TOMBSTONE is
  * a deletion a delta must be able to carry, so it is emitted instead of
@@ -1695,23 +1698,34 @@ typedef bool (*kv_sst_record_cb)(const char* key, const kv_disk_record_t* r, voi
  * keeps the live-only behavior.
  *
  * Returns 1 when the scan completed, 0 when the callback asked to stop,
- * -1 on error.  Only usable when the index is present and not degraded;
- * callers must provide the compact_sstables_into_memtable() fallback. */
+ * -1 on error.
+ *
+ * Streaming compaction needs an index only to decide which copy of a key is
+ * newest.  Scanning newest file first answers that without one: the first
+ * occurrence of a key is its newest copy.  When the metadata index is absent
+ * or degraded we therefore track seen keys in a temporary membership set, so
+ * compaction still runs and can rebuild a healthy index afterwards.  A
+ * degraded index must never block the merge that repairs it. */
 static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
                               kv_sst_record_cb cb, void* ud) {
     if (!store || !store->trie || !cb) return -1;
-    if (!store->sst_meta || store->sst_meta->degraded) return -1;
+    const bool index_usable = store->sst_meta && !store->sst_meta->degraded;
+    sst_meta_index_t* seen = NULL;
+    if (!index_usable) {
+        seen = sst_meta_index_create();
+        if (!seen) return -1;
+    }
     const char* dir = get_qihse_data_dir();
-    if (!dir) return -1;
+    if (!dir) { sst_meta_index_destroy(seen); return -1; }
     uint64_t now = current_time_ms();
     for (int sid = store->sstable_counter - 1; sid >= 0; sid--) {
         char path[4096];
         int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, sid);
-        if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+        if (n < 0 || (size_t)n >= sizeof(path)) { sst_meta_index_destroy(seen); return -1; }
         int fd = open_secure_read(path);
-        if (fd < 0) { if (errno == ENOENT) continue; return -1; }
+        if (fd < 0) { if (errno == ENOENT) continue; sst_meta_index_destroy(seen); return -1; }
         FILE* f = fdopen(fd, "rb");
-        if (!f) { close(fd); return -1; }
+        if (!f) { close(fd); sst_meta_index_destroy(seen); return -1; }
         kv_disk_record_t r; int rc = 0; int stopped = 0;
         for (;;) {
             long rec_off = ftell(f);
@@ -1731,10 +1745,17 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
             }
             if (rc != 1) break;
             int32_t isid = -1; uint64_t ioff = 0u;
-            bool newest = sst_meta_index_lookup(store->sst_meta, r.key,
-                                                NULL, NULL, NULL, NULL,
-                                                &isid, &ioff) &&
-                          isid == sid && ioff == (uint64_t)(rec_off >= 0 ? rec_off : 0);
+            bool newest;
+            if (index_usable) {
+                newest = sst_meta_index_lookup(store->sst_meta, r.key,
+                                               NULL, NULL, NULL, NULL,
+                                               &isid, &ioff) &&
+                         isid == sid && ioff == (uint64_t)(rec_off >= 0 ? rec_off : 0);
+            } else {
+                newest = !sst_meta_index_lookup(seen, r.key, NULL, NULL, NULL, NULL,
+                                                NULL, NULL);
+                if (newest) sst_meta_index_insert(seen, r.key, 0u, 0u, 0u, 0u, 0, 0u);
+            }
             bool tombstone = (r.flags & KV_FLAG_TOMBSTONE) != 0u;
             bool expired = (!tombstone && r.expire_time_ms != 0u && r.expire_time_ms <= now);
             size_t z = 0u;
@@ -1745,11 +1766,12 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
                 if (!cb(r.key, &r, ud)) stopped = 1;
             }
             disk_record_free(&r);
-            if (stopped) { fclose(f); return 0; }
+            if (stopped) { fclose(f); sst_meta_index_destroy(seen); return 0; }
         }
         fclose(f);
-        if (rc < 0) return -1;
+        if (rc < 0) { sst_meta_index_destroy(seen); return -1; }
     }
+    sst_meta_index_destroy(seen);
     return 1;
 }
 
@@ -1784,9 +1806,6 @@ static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud
 static bool compact_sstables_stream(qihse_kv_store_t* store) {
     if (!store || !store->trie) return false;
     if (store->sstable_counter == 0) return true;
-    if (!store->sst_meta || store->sst_meta->degraded) {
-        return compact_sstables_into_memtable(store);
-    }
     const char* dir = get_qihse_data_dir();
     if (!dir) return false;
     int new_id = store->sstable_counter;
@@ -1822,8 +1841,13 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
          * because sstable_counter covers it. */
         if (store->sst_meta) {
             const kv_read_context_t context = { .legacy_bootstrap = true };
-            if (!sst_index_load_file(store, new_path, new_id, &context))
+            if (!sst_index_load_file(store, new_path, new_id, &context)) {
                 store->sst_meta->degraded = true;
+                fprintf(stderr,
+                        "qihse-kv: re-index of merged sstable %d failed; reads "
+                        "fall back to the scan path until the next compaction\n",
+                        new_id);
+            }
         }
     }
     kv_projection_epoch_advance(store);
@@ -2075,6 +2099,9 @@ denied:
 static bool sst_index_load_file(qihse_kv_store_t* store, const char* path, int32_t sstable_id,
                                 const kv_read_context_t* context) {
     if (!store || !store->sst_meta || !path) return false;
+    /* Fault injection: reproduces a store whose index cannot be built, the
+     * state that used to strand compaction on the memtable path forever. */
+    if (aimem_durability_test_fail_once("sst-index-load")) return false;
     int fd = open_secure_read(path);
     if (fd < 0) return errno == ENOENT;
     FILE* f = fdopen(fd, "rb");
@@ -2689,7 +2716,22 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
     free(ctx.keys);
     if (sst_meta_index_has_expired(store->sst_meta, now) ||
         store->sstable_live_count >= KV_SSTABLE_COMPACT_THRESHOLD) {
-        (void)compact_sstables_stream(store);
+        int32_t before = store->sstable_counter;
+        if (compact_sstables_stream(store)) {
+            if (before > 1) {
+                fprintf(stderr,
+                        "qihse-kv: compacted %d sstable(s) into %zu live file(s), "
+                        "%s index\n",
+                        before, store->sstable_live_count,
+                        (store->sst_meta && !store->sst_meta->degraded)
+                            ? "healthy" : "degraded");
+            }
+        } else {
+            fprintf(stderr,
+                    "qihse-kv: sstable compaction failed; %zu live file(s) "
+                    "retained and reads stay on the scan path\n",
+                    store->sstable_live_count);
+        }
     }
     kv_store_unlock(store);
 }
@@ -3073,8 +3115,12 @@ size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
     free(ctx.keys);
     /* Physically purge the SSTable copies of everything just tombstoned —
      * same on-disk removal guarantee as the old compact-first version. */
-    if (removed > 0 && fast && store->sstable_counter > 0)
-        (void)compact_sstables_stream(store);
+    if (removed > 0 && fast && store->sstable_counter > 0 &&
+        !compact_sstables_stream(store)) {
+        fprintf(stderr,
+                "qihse-kv: post-delete compaction failed; tombstoned copies "
+                "remain in %d sstable(s)\n", store->sstable_counter);
+    }
     kv_store_unlock(store);
     return removed;
 }
