@@ -28,11 +28,17 @@ MIGRATION = SOURCE / "migration/01_setup_postgresql.py"
 
 
 def _migration_statements():
-    """Preserve create_tables() source order, including its literal index loop."""
+    """Preserve create_tables() source order, including its literal index loop.
+
+    The application corpus is an optional external compatibility input. QIHSE
+    provisions its own schema through the pgwire adapter (see
+    test_pgwire_numeric.py); nothing here may require a pre-provisioned
+    PostgreSQL database or fail the suite when the corpus is not checked out.
+    """
     try:
         tree = ast.parse(MIGRATION.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        pytest.fail(f"DIRECTEYE migration source missing: {MIGRATION}")
+        pytest.skip(f"DIRECTEYE migration source unavailable: set DIRECTEYE_SOURCE ({MIGRATION})")
     function = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
                      and node.name == "create_tables"), None)
     if function is None:
