@@ -41,7 +41,7 @@ nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
 ```
 
 The nine headers of [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh)
-declare 313 `qihse_*` functions between them, and 310 of those resolve to a
+declare 314 `qihse_*` functions between them, and 311 of those resolve to a
 symbol in `libqihse.so`. The three that do not are the expected exception:
 `qihse_kv_get()`, `qihse_kv_del()` and `qihse_kv_exists()` are `static inline`
 wrappers in `include/qihse_kv_store.h`, so they compile into the caller rather
@@ -70,7 +70,7 @@ above):
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 11 | 11 |
 | `include/qihse_kv_store.h` | 59 | 56 (3 `static inline`) |
-| `include/qihse_auth.h` | 50 | 50 |
+| `include/qihse_auth.h` | 51 | 51 |
 
 ## Conventions
 
@@ -736,6 +736,38 @@ The daemon sets the cadence with `--kv-sweep-interval SECONDS` (default 30,
 explicitly when the sweeper is disabled.
 
 ## 7. Security and authentication — `include/qihse_auth.h`
+
+### Initializing from a host runtime (CGO, ctypes, plugins)
+
+`qihse_auth_init()` aborts the process when the audit context fails a policy
+check — wrong owner, group/other-writable directory, or an unopenable
+directory. That is deliberate for a daemon, which must not write without audit
+continuity, but it also kills the host process of any library caller: a Go test
+that calls into libqihse dies with `SIGABRT` inside `TestMain`, not with a
+return code it can inspect.
+
+Embedders therefore ask first:
+
+```c
+char reason[256];
+if (!qihse_audit_context_usable(reason, sizeof(reason))) {
+    /* skip, or point QIHSE_DATA_DIR at a private directory and retry */
+}
+if (!qihse_auth_init()) { /* library-level failure, no abort */ }
+```
+
+`qihse_audit_context_usable()` applies the same directory predicates as init
+without aborting, without creating the audit file and without touching the
+writer lock (so it never contends with a live daemon). It reports the specific
+reason, which is also what lands in the daemon's
+`[QIHSE AUDIT] Integrity continuity failure:` line.
+
+The audit directory is `QIHSE_DATA_DIR` when set, otherwise the current
+directory; it must be owned by the calling euid and not group/other writable.
+An embedder that has not chosen a data directory is using its own working
+directory, which is rarely private — hence the abort.
+
+
 
 Source: `core/qihse_auth.c`.
 Tests: `tests/test_auth_privilege_boundary.c`, `tests/test_object_acl.c`,

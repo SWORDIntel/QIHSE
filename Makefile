@@ -411,6 +411,7 @@ test-kv-legacy-record-state: lib
 test-serial: test-kv-legacy-record-state
 
 test-serial: test-docs-api-counts
+test-serial: test-audit-context-probe
 
 .PHONY: test-auth-durable test-auth-archive test-auth-maintenance
 test-auth-durable: lib
@@ -1379,6 +1380,11 @@ test-kv-read-integrity: lib
 	rm -f qihse_integrity.chain*
 	@status=0; LD_LIBRARY_PATH=. ./tests/test_kv_read_integrity || status=$$?; \
 		rm -f tests/test_kv_read_integrity; exit $$status
+
+test-audit-context-probe: lib
+	$(CC) $(CFLAGS) -o tests/test_audit_context_probe tests/test_audit_context_probe.c -L. -lqihse $(LDFLAGS)
+	@status=0; LD_LIBRARY_PATH=. ./tests/test_audit_context_probe || status=$$?; \
+		rm -f tests/test_audit_context_probe; exit $$status
 
 test-kv-compaction: lib
 	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -o tests/test_kv_compaction tests/test_kv_compaction.c -L. -lqihse $(LDFLAGS)

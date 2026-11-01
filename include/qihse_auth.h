@@ -42,6 +42,13 @@ typedef struct qihse_user_s qihse_user_t;
 
 // Global Auth Context. Returns true on success; returns false and fails closed
 // if FIPS/crypto policies fail.
+/* Probe whether qihse_auth_init() would find a usable audit context. init()
+ * aborts the process on a policy failure (wrong owner, group/other writable,
+ * unopenable directory) because a daemon must not write without audit
+ * continuity; an embedded host runtime must be able to ask first. Returns
+ * false and fills reason (may be NULL) instead of aborting. Does not touch the
+ * audit writer lock. */
+bool qihse_audit_context_usable(char *reason, size_t reason_len);
 bool qihse_auth_init(void);
 
 // Bootstrap system operator with explicit password.

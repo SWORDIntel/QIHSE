@@ -542,6 +542,57 @@ static bool write_obfuscated(FILE *f, const char* buffer) {
 
 static bool update_integrity_chain(const char* new_hash);
 
+/* Pre-init probe for embedders. audit_integrity_error() aborts the process,
+ * which is the right posture for a daemon that must not write without audit
+ * continuity but is catastrophic for a library called from a host runtime
+ * (CGO, ctypes): the host dies during initialization. This performs the same
+ * directory predicates and reports them instead. It does not touch the writer
+ * lock, so it never contends with a live daemon. */
+bool qihse_audit_context_usable(char *reason, size_t reason_len) {
+    if (reason && reason_len) reason[0] = '\0';
+    char apath[4096], dirbuf[4096];
+    build_audit_path(apath, sizeof(apath));
+    const char *slash = strrchr(apath, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - apath);
+        if (n >= sizeof(dirbuf)) {
+            if (reason && reason_len) snprintf(reason, reason_len, "audit directory path too long");
+            return false;
+        }
+        if (n == 0) {
+            if (reason && reason_len) snprintf(reason, reason_len, "root audit directory unsupported");
+            return false;
+        }
+        memcpy(dirbuf, apath, n);
+        dirbuf[n] = '\0';
+    } else {
+        snprintf(dirbuf, sizeof(dirbuf), ".");
+    }
+    int fd = open(dirbuf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) {
+        if (reason && reason_len) snprintf(reason, reason_len, "cannot open audit directory");
+        return false;
+    }
+    struct stat st;
+    bool ok = true;
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (reason && reason_len) snprintf(reason, reason_len, "cannot identify audit directory");
+        ok = false;
+    } else if (st.st_uid != geteuid()) {
+        if (reason && reason_len)
+            snprintf(reason, reason_len,
+                     "audit directory is not owned by this process (uid %u, directory uid %u)",
+                     (unsigned)geteuid(), (unsigned)st.st_uid);
+        ok = false;
+    } else if ((st.st_mode & 0022) != 0) {
+        if (reason && reason_len)
+            snprintf(reason, reason_len, "audit directory is group/other writable");
+        ok = false;
+    }
+    close(fd);
+    return ok;
+}
+
 static void audit_integrity_error(const char *reason) {
     fprintf(stderr, "[QIHSE AUDIT] Integrity continuity failure: %s\n", reason);
     /* The void initialization API has no safe degraded mode: writing after

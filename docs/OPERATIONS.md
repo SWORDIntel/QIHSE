@@ -502,6 +502,11 @@ falls back to first-occurrence-while-scanning-newest-first, and the post-merge
 re-index repairs the index. Compaction failures are logged as
 `qihse-kv: sstable compaction failed` rather than discarded.
 
+Embedded callers (CGO, ctypes) must call `qihse_audit_context_usable()`
+before `qihse_auth_init()`: init aborts the process on an audit policy failure,
+which is correct for the daemon and fatal for the host runtime. The probe
+applies the same checks and returns the reason instead.
+
 Nothing here needs a human to notice: above `KV_SSTABLE_HARD_CEILING` (64)
 files the flush path merges inline, so even a disabled cadence or a sweeper
 thread that failed to start cannot let the store run away — it costs one slow
