@@ -1,12 +1,28 @@
-# Fastest rolling cluster bring-up (runbook)
+# Fastest rolling cluster bring-up (historical runbook)
 
-Bring all three owners and the T420 caches up in the shortest wall time
-with the already-deployed gate-enabled packages, failover held throughout,
-and no fence or logical-snapshot gate (fast path). Owner restarts are
-sequenced, never concurrent; independent preparation runs in parallel.
+> **Superseded; do not execute the restart steps below.** The package hashes and
+> service drop-ins in this document predate `--startup-maintenance-held` and
+> only engage failover pause. That flag does not fence ordinary writers, and a
+> replacement process starts its maintenance gate OPEN unless the new flag is
+> present. Refresh each host's package from the exact published source, run the
+> isolated startup-held/restart acceptance test, and update the service
+> `ExecStart` with `--startup-maintenance-held` before using a replacement
+> rollout procedure. Require authenticated SYSTEM-domain Operator startup
+> credentials; after each fenced restart verify `CLUSTER MAINTENANCE STATUS`
+> is HELD with complete coverage and zero active writers. Retrieve the fresh
+> token only through authenticated `CLUSTER MAINTENANCE STARTUP_TOKEN`; never
+> log or persist it. Release with the existing generation/token RELEASE
+> command only after all acceptance gates pass. See `docs/OPERATIONS.md` §3.2.2
+> and `docs/API_REFERENCE.md` §8.8b. T320 remains zero-slot/no-replicate/no-export.
 
-Last verified end-to-end: 2026-10-31 (see docs/API_REFERENCE.md 8.8a/8.8b
-and docs/OPERATIONS.md 3.2.2 for the gate surface).
+This is a retained description of the 2026-10-31 fast-path procedure. It
+sequenced owner restarts and held failover, but did not fence ordinary writers
+across process restart or require logical snapshots. Keep it for historical
+evidence only; the superseding notice above prohibits executing these steps.
+
+Historical run only: 2026-10-31, before the restart-safe writer fence was
+implemented. The cited gate surface is documented for reference, not approval
+to execute this obsolete rollout.
 
 ## Invariants this runbook must preserve
 

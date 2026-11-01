@@ -479,6 +479,31 @@ flags; PQC: `--pqc-identity-dir`, `--pqc-trusted-pub` (repeatable),
 `--pqc-require` (refuse cleartext peers — verified by `make
 test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
 
+A separate `--startup-maintenance-held` option starts the all-writer gate in
+`STARTUP_PENDING` before RESP/bus/failover components or their background
+workers are created. Registration is allowed, writer admission is not. The
+daemon seals the gate to non-expiring `HELD` only when every writer class is
+registered and instrumented and all active counts are zero; incomplete
+coverage aborts startup before the listener starts. This requires authenticated
+SYSTEM-domain Operator startup credentials. On each restart, the process
+creates a fresh generation and token.
+
+Use the authenticated control session to request `CLUSTER MAINTENANCE
+STARTUP_TOKEN`, then pass the returned generation/token directly to
+`CLUSTER MAINTENANCE RELEASE`. Do not place the token in shell history, logs,
+receipts, or persistent files. `STATUS` never includes it. `AUTH`/`HELLO` and
+maintenance control remain available while the data-plane writer gate is held;
+ordinary writes stay rejected. Configure the flag in the owner service's
+`ExecStart` alongside the existing secure credential source. Without the flag,
+startup retains the previous OPEN behavior.
+
+This full data-plane fence is distinct from `--failover-start-paused`, which
+only pauses failover ownership changes. For a restart-sensitive cutover, use
+both controls as required: the maintenance flag blocks writers and the
+failover flag preserves ownership. Verify `CLUSTER MAINTENANCE STATUS` is
+`HELD`, coverage is complete, active counters are zero, and `CLUSTER FAILOVER
+STATUS` is paused before proceeding.
+
 Maintenance hold at startup: `--failover-start-paused` installs the failover
 hold **before the first listen** so a staged restart retains canonical slot
 ownership while configured peers are still absent. Only an authenticated
@@ -689,14 +714,24 @@ RESP surface (authenticated, SYSTEM-domain Operator only):
 CLUSTER MAINTENANCE STATUS
 CLUSTER MAINTENANCE BEGIN <timeout_ms 0..5000> <lease_ms 1000..1800000>
 CLUSTER MAINTENANCE RELEASE <generation> <64-hex-token>
+CLUSTER MAINTENANCE STARTUP_TOKEN
 ```
+
+`STARTUP_TOKEN` is valid only for a startup-created HELD gate and returns a
+RESP array `[generation, 64-hex-token]`. It is not available to anonymous or
+lower-clearance sessions. Startup HELD has no lease expiry; release uses the
+same constant-time generation/token validation as ordinary maintenance. The
+new daemon must be started with `--startup-maintenance-held` on every restart
+that must remain fenced. The legacy `--failover-start-paused` option alone is
+not a writer fence.
 
 STATUS returns a 21-entry array ending in a nested list of 11 `[name,
 registered]` pairs, plus per-class active counters, pending failbacks,
 rejected SLOT_UPDATE/GROUP/federation counters and the failover-paused flag.
 
-While HELD, RESP admits only `PING`, `INFO`, `CLUSTER HEALTH/TOPOLOGY/INFO/
-NODES/SLOTS` and `REPL.SNAPSHOT.*`; everything else gets
+While HELD, RESP admits `AUTH`/`HELLO` for control-session setup and only
+`PING`, `INFO`, `CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and
+`REPL.SNAPSHOT.*`; everything else gets
 `BUSY cluster maintenance is held`. `BEGIN` also refuses while a pending
 failback ledger exists, and `DBSIZE` is excluded from the held whitelist
 (it can take a compaction fallback if metadata is degraded).

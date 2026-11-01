@@ -1305,7 +1305,10 @@ usable. Nothing may treat this UUID as evidence of identity.
 
 A staged restart can retain canonical slot ownership while configured peers are
 still absent. Start `qihse-cluster-daemon --failover-start-paused` to install the
-hold **before the first listen**; normal startup remains unpaused.
+hold **before the first listen**; normal startup remains unpaused. This pauses
+failover only: it does not block ordinary writers. For a restart-safe data-plane
+fence, also use `--startup-maintenance-held` (section 8.8b), which starts the
+maintenance gate non-admitting and seals it HELD before the listener starts.
 
 Embedding APIs:
 

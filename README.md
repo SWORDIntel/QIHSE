@@ -138,7 +138,8 @@ make cluster-daemon
     --index 0 --bind 127.0.0.1 --port 7100 --bus-port 17100 \
     --node 0:127.0.0.1:7100:17100 --slot-range 0-16383 \
     --operator-password 'change-me-12+chars' --dir ./build/node0
-# then, in another shell: AUTH / SET / GET / FTS.BUILD / FTS.SEARCH over RESP
+# For a restart-safe data-plane fence, add --startup-maintenance-held.
+# Release its hold through authenticated CLUSTER MAINTENANCE STARTUP_TOKEN/RELEASE.
 ```
 
 A standalone RESP server is `make redis-server` (`qihse-redis-server`,
