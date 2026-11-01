@@ -251,7 +251,16 @@ static void sst_meta_index_insert(sst_meta_index_t* idx, const char* key,
         j = (j + 1u) & (idx->cap - 1u);
     }
     char* kcopy = strdup(key);
-    if (!kcopy) { idx->degraded = true; return; }
+    if (!kcopy) {
+        if (!idx->degraded) {
+            fprintf(stderr,
+                    "qihse-kv: sstable metadata index degraded (out of memory); "
+                    "reads fall back to scanning every file until the next "
+                    "compaction rebuilds the index\n");
+        }
+        idx->degraded = true;
+        return;
+    }
     idx->slots[j].key = kcopy;
     idx->slots[j].classification = classification;
     idx->slots[j].sci_compartment = sci_compartment;
@@ -2901,6 +2910,17 @@ bool qihse_kv_foreach_meta_bounded_user(qihse_kv_store_t* store,
     return foreach_user_filtered(store, NULL, actor, NULL, cb, user_data,
                                  true, max_classification, allowed_sci);
 }
+bool qihse_kv_sstable_stats(qihse_kv_store_t* store, qihse_kv_sstable_stats_t* out) {
+    if (!store || !out) return false;
+    memset(out, 0, sizeof(*out));
+    kv_store_rdlock(store);
+    out->live_sstable_files = store->sstable_live_count;
+    out->sstable_counter = (size_t)store->sstable_counter;
+    out->index_degraded = !store->sst_meta || store->sst_meta->degraded;
+    kv_store_unlock(store);
+    return true;
+}
+
 bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
                                   qihse_user_t* user, qihse_kv_iter_cb cb,
                                   void* user_data) {

@@ -1979,6 +1979,15 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
     size_t active_clients = server->active_clients;
     pthread_mutex_unlock(&server->state_lock);
     char info[2048];
+    size_t sst_live_files = 0;
+    int sst_degraded = 0;
+    if (server->store) {
+        qihse_kv_sstable_stats_t sst_stats;
+        if (qihse_kv_sstable_stats(server->store, &sst_stats)) {
+            sst_live_files = sst_stats.live_sstable_files;
+            sst_degraded = sst_stats.index_degraded ? 1 : 0;
+        }
+    }
     size_t pubsub_channels = server->pubsub ? qihse_resp_pubsub_channel_count(server->pubsub, NULL) : 0;
     size_t pubsub_patterns = server->pubsub ? qihse_resp_pubsub_pattern_subscription_count(server->pubsub) : 0;
     int len = snprintf(info, sizeof(info),
@@ -1987,10 +1996,14 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
                        "# Clients\r\nconnected_clients:%zu\r\n"
                        "# Pub/Sub\r\nactive_channels:%zu\r\npattern_subscriptions:%zu\r\n"
                        "# Cluster\r\ncluster_enabled:1\r\ncluster_known_nodes:%zu\r\ncluster_slots_assigned:%zu\r\n"
-                       "qihse_crc16_backend:%s\r\n",
+                       "qihse_crc16_backend:%s\r\n"
+                       "# Storage\r\nqihse_sst_live_files:%zu\r\n"
+                       "qihse_sst_index_degraded:%d\r\nqihse_kv_sweep_interval:%u\r\n",
                        server->enable_uwp_bridge ? "1" : "0",
                        active_clients, pubsub_channels, pubsub_patterns,
-                       nodes, assigned, qihse_crc16_backend_name());
+                       nodes, assigned, qihse_crc16_backend_name(),
+                       sst_live_files, sst_degraded,
+                       (unsigned)server->kv_sweep_interval_seconds);
     return len > 0 && (size_t)len < sizeof(info) && qihse_resp_bulk(session, info, (size_t)len);
 }
 
@@ -16518,6 +16531,26 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->cluster_migrate_password = supplied->cluster_migrate_password;
     server->redundancy_peer = supplied->redundancy_peer;
     server->redundancy_peer = supplied->redundancy_peer;
+    if (server->store) {
+        qihse_kv_sstable_stats_t sst_stats;
+        if (qihse_kv_sstable_stats(server->store, &sst_stats) &&
+            sst_stats.live_sstable_files > 64u) {
+            if (server->kv_sweep_interval_seconds == 0) {
+                fprintf(stderr,
+                        "qihse: SSTables are not being compacted and %zu files are "
+                        "already piled up: the expiry sweeper is the only compaction "
+                        "trigger and it is disabled (--kv-sweep-interval 0). Reads "
+                        "scan every file until this is corrected.\n",
+                        sst_stats.live_sstable_files);
+            } else {
+                fprintf(stderr,
+                        "qihse: store opened with %zu SST files; the first expiry "
+                        "sweep will compact them into one (cadence %us)\n",
+                        sst_stats.live_sstable_files,
+                        (unsigned)server->kv_sweep_interval_seconds);
+            }
+        }
+    }
     if (server->kv_sweep_interval_seconds > 0 && server->store) {
         server->sweeper_shutdown = false;
         if (pthread_create(&server->sweeper_thread, NULL, qihse_resp_kv_sweeper_main, server) == 0) {

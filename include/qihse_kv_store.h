@@ -204,6 +204,17 @@ bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
  * only unclassified rows under the same access gate as foreach_user.  This
  * uses the SST metadata index for matching records' disk offsets, avoiding
  * unrelated SST value reads. It still scans in-memory keys/index metadata. */
+/* Storage health for INFO/monitoring: how many SST files a read has to
+ * consult, and whether the metadata index that normally short-circuits that
+ * is degraded. A degraded index means every read scans the files. */
+typedef struct {
+    size_t live_sstable_files;
+    size_t sstable_counter;
+    bool index_degraded;
+} qihse_kv_sstable_stats_t;
+
+bool qihse_kv_sstable_stats(qihse_kv_store_t* store, qihse_kv_sstable_stats_t* out);
+
 bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
                                   qihse_user_t* user, qihse_kv_iter_cb cb,
                                   void* user_data);

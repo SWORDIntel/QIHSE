@@ -58,6 +58,14 @@ int main(void) {
         }
     }
 
+    qihse_kv_sstable_stats_t stats;
+    if (!qihse_kv_sstable_stats(store, &stats) ||
+        stats.live_sstable_files != (size_t)count_sstables(data_dir)) {
+        fprintf(stderr, "stats accessor disagrees with the files on disk\n");
+        qihse_kv_store_destroy(store);
+        free(value);
+        return 1;
+    }
     int before = count_sstables(data_dir);
     if (before < 16) {
         fprintf(stderr, "expected >= 16 sstables before compaction, found %d\n", before);
@@ -108,6 +116,14 @@ int main(void) {
         }
     }
 
+    if (!qihse_kv_sstable_stats(store, &stats) || stats.index_degraded ||
+        stats.live_sstable_files > 2u) {
+        fprintf(stderr, "post-compaction stats unhealthy: files=%zu degraded=%d\n",
+                stats.live_sstable_files, (int)stats.index_degraded);
+        qihse_kv_store_destroy(store);
+        free(value);
+        return 1;
+    }
     printf("sstables %d -> %d -> %d, %d records intact: PASS\n",
            before, after_first, after, ROUNDS * KEYS_PER_ROUND);
     qihse_kv_store_destroy(store);

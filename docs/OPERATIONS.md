@@ -502,6 +502,37 @@ falls back to first-occurrence-while-scanning-newest-first, and the post-merge
 re-index repairs the index. Compaction failures are logged as
 `qihse-kv: sstable compaction failed` rather than discarded.
 
+`INFO` reports the health directly, so this is monitorable instead of a
+surprise:
+
+```text
+# Storage
+qihse_sst_live_files:<n>       # alert if this climbs past a few dozen
+qihse_sst_index_degraded:<0|1> # 1 means every read is scanning all files
+qihse_kv_sweep_interval:<s>    # 0 means no compaction will ever run
+```
+
+The daemon warns on startup when a store opens with more than 64 SST files,
+and names the cause explicitly if the sweeper is disabled. Index degradation
+is logged at the point it happens (`qihse-kv: sstable metadata index degraded
+(out of memory)`), not discovered later as slowness.
+
+### If reads get slow — three commands
+
+```bash
+# 1. is it the storage layer?  thousands of files means yes
+ls /opt/qihse-data/node<N>/sstable_*.db | wc -l
+# 2. is the sweeper running?
+redis-cli ... INFO | grep -E 'sst_live_files|index_degraded|kv_sweep_interval'
+# 3. fix: make sure --kv-sweep-interval is non-zero, then wait one interval
+systemctl show qihse-node<N> -p ExecStart | grep -o 'kv-sweep-interval [0-9]*'
+```
+
+With a non-zero interval the first sweep compacts whatever has piled up —
+no manual merge, no downtime, no data movement beyond the rewrite the merge
+does anyway. A store that is already degraded is repaired by that same sweep:
+the merge runs without the index and the post-merge re-index clears the flag.
+
 ### Cutover fence (optional)
 
 A separate `--startup-maintenance-held` option starts the all-writer gate in
