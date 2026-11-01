@@ -502,6 +502,12 @@ falls back to first-occurrence-while-scanning-newest-first, and the post-merge
 re-index repairs the index. Compaction failures are logged as
 `qihse-kv: sstable compaction failed` rather than discarded.
 
+Nothing here needs a human to notice: above `KV_SSTABLE_HARD_CEILING` (64)
+files the flush path merges inline, so even a disabled cadence or a sweeper
+thread that failed to start cannot let the store run away — it costs one slow
+write instead, and says `qihse-kv: hard-ceiling compaction fired` when it
+happens.
+
 `INFO` reports the health directly, so this is monitorable instead of a
 surprise:
 
@@ -509,7 +515,8 @@ surprise:
 # Storage
 qihse_sst_live_files:<n>       # alert if this climbs past a few dozen
 qihse_sst_index_degraded:<0|1> # 1 means every read is scanning all files
-qihse_kv_sweep_interval:<s>    # 0 means no compaction will ever run
+qihse_kv_sweep_interval:<s>    # 0 means the periodic sweep is off
+qihse_kv_sweeper_running:<0|1> # 0 means the sweep thread failed to start
 ```
 
 The daemon warns on startup when a store opens with more than 64 SST files,

@@ -363,6 +363,16 @@ static void kv_store_wrlock(qihse_kv_store_t* store);
 static void kv_store_unlock(qihse_kv_store_t* store);
 static bool kv_sync_store_locked(qihse_kv_store_t* store);
 bool qihse_kv_sync_store(qihse_kv_store_t* store);
+static bool compact_sstables_stream(qihse_kv_store_t* store);
+
+/* Backstop independent of the sweep clock. The sweep is the normal trigger,
+ * but it stops for good reasons (cadence 0, thread failed to start, a run of
+ * merge failures) and for bad ones (nobody noticed). Waiting on a clock to
+ * bound on-disk state is how a store reaches thousands of files; at this
+ * ceiling a flush merges inline instead. Chosen well above the normal
+ * threshold so the inline path only ever fires when compaction has genuinely
+ * stopped, and costs one slow write rather than unbounded read slowdown. */
+#define KV_SSTABLE_HARD_CEILING 64u
 static void replica_snapshot_marker_namespace(const char* glob, char out[48]);
 
 /* Drop and rebuild an empty SSTable metadata index.  Called whenever SSTables
@@ -1309,6 +1319,15 @@ static bool flush_memtable_to_sstable(qihse_kv_store_t* store) {
     store->sstable_live_count++;
     qihse_trinary_trie_destroy(old);
     (void)rotate_wal_empty(store);
+    if (store->sstable_live_count >= KV_SSTABLE_HARD_CEILING) {
+        int32_t before = store->sstable_counter;
+        if (compact_sstables_stream(store) && before > 1) {
+            fprintf(stderr,
+                    "qihse-kv: hard-ceiling compaction fired at %d sstable(s); "
+                    "the sweep is not keeping up (cadence or thread failure)\n",
+                    before);
+        }
+    }
     return true;
 }
 
@@ -1669,6 +1688,7 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
 /* Compact SSTables once more than this many have accumulated, even if the
  * expiry scan found nothing — bounds file count and reclaims stale copies. */
 #define KV_SSTABLE_COMPACT_THRESHOLD 16
+
 
 static bool sst_index_load_file(qihse_kv_store_t* store, const char* path, int32_t sstable_id,
                                 const kv_read_context_t* context);

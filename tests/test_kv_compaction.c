@@ -124,6 +124,28 @@ int main(void) {
         free(value);
         return 1;
     }
+    /* The backstop: with no sweep call at all, a flush that crosses the hard
+     * ceiling must merge inline. This is what bounds the store when the
+     * sweeper is dead or disabled, instead of waiting for an alert. */
+    for (int round = 0; round < 70; round++) {
+        for (int i = 0; i < KEYS_PER_ROUND; i++) {
+            snprintf(key, sizeof(key), "ceiling:key:%d:%d", round, i);
+            if (!qihse_kv_set(store, key, value, 0, 0)) {
+                fprintf(stderr, "ceiling write failed at round %d\n", round);
+                qihse_kv_store_destroy(store);
+                free(value);
+                return 1;
+            }
+        }
+    }
+    int ceiling_files = count_sstables(data_dir);
+    if (ceiling_files >= 64) {
+        fprintf(stderr, "hard ceiling did not merge inline: %d sstables\n", ceiling_files);
+        qihse_kv_store_destroy(store);
+        free(value);
+        return 1;
+    }
+
     /* A read-only replica must compact too: pull cycles append SSTables and a
      * replica can never expire them away, so without this its file count grows
      * with every pull.  Rebuild a backlog first, then go read-only. */
@@ -155,8 +177,9 @@ int main(void) {
         free(value);
         return 1;
     }
-    printf("sstables %d -> %d -> %d; replica %d -> %d; %d records intact: PASS\n",
-           before, after_first, after, replica_before, replica_after,
+    printf("sstables %d -> %d -> %d; ceiling %d; replica %d -> %d; "
+           "%d records intact: PASS\n",
+           before, after_first, after, ceiling_files, replica_before, replica_after,
            ROUNDS * KEYS_PER_ROUND);
     qihse_kv_store_destroy(store);
     free(value);

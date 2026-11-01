@@ -1998,12 +1998,14 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
                        "# Cluster\r\ncluster_enabled:1\r\ncluster_known_nodes:%zu\r\ncluster_slots_assigned:%zu\r\n"
                        "qihse_crc16_backend:%s\r\n"
                        "# Storage\r\nqihse_sst_live_files:%zu\r\n"
-                       "qihse_sst_index_degraded:%d\r\nqihse_kv_sweep_interval:%u\r\n",
+                       "qihse_sst_index_degraded:%d\r\nqihse_kv_sweep_interval:%u\r\n"
+                       "qihse_kv_sweeper_running:%d\r\n",
                        server->enable_uwp_bridge ? "1" : "0",
                        active_clients, pubsub_channels, pubsub_patterns,
                        nodes, assigned, qihse_crc16_backend_name(),
                        sst_live_files, sst_degraded,
-                       (unsigned)server->kv_sweep_interval_seconds);
+                       (unsigned)server->kv_sweep_interval_seconds,
+                       server->sweeper_started ? 1 : 0);
     return len > 0 && (size_t)len < sizeof(info) && qihse_resp_bulk(session, info, (size_t)len);
 }
 
@@ -16555,6 +16557,13 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
         server->sweeper_shutdown = false;
         if (pthread_create(&server->sweeper_thread, NULL, qihse_resp_kv_sweeper_main, server) == 0) {
             server->sweeper_started = true;
+        } else {
+            /* Silent before: the daemon served on with no expiry reclamation
+             * and no compaction, and the store grew until reads collapsed.
+             * Say it, and keep saying it in INFO (qihse_kv_sweeper_running). */
+            fprintf(stderr,
+                    "qihse: expiry/compaction sweeper thread failed to start; "
+                    "SSTables will only be merged by the flush hard ceiling\n");
         }
     }
     if (!qihse_resp_copy_string(server->bind_address, sizeof(server->bind_address), bind_address) ||

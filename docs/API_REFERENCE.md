@@ -691,9 +691,15 @@ its newest copy; a point read is therefore one file probe, not a scan.
 expired — it merges every SSTable into a single new file, re-indexes it, and
 drops shadowed/expired/tombstoned copies. The other trigger is the fast bulk
 clear path (`qihse_kv_clear_user(..., fast)`), which compacts when it removed
-anything so tombstones do not linger on disk. `sstable_live_count` bounds the
-file count; without a caller for the sweep, every flush appends a file
-forever.
+anything so tombstones do not linger on disk.
+
+`KV_SSTABLE_HARD_CEILING` (64) is a backstop that does not depend on the sweep
+clock: the flush path merges inline once that many live files exist, so a
+disabled cadence, a sweeper thread that failed to start, or a run of merge
+failures cannot let the file count run away. It is deliberately far above the
+normal threshold, so it only fires when compaction has genuinely stopped, and
+the cost is one slow write (`qihse-kv: hard-ceiling compaction fired ...`)
+rather than unbounded read slowdown.
 
 Degraded index: if the metadata index cannot be built (allocation failure, or a
 failed re-index after a merge), `sst_meta->degraded` is set. Newest-copy
@@ -717,10 +723,12 @@ Health surface:
 |---|---|
 | `qihse_sst_live_files` (INFO) | Files a read may have to probe. Alert as it climbs past a few dozen. |
 | `qihse_sst_index_degraded` (INFO) | `1` means every read is scanning all files. |
-| `qihse_kv_sweep_interval` (INFO) | `0` means no compaction will ever run. |
+| `qihse_kv_sweep_interval` (INFO) | `0` means the periodic sweep is off; only the hard ceiling will compact. |
+| `qihse_kv_sweeper_running` (INFO) | `0` means the sweep thread failed to start — a logged startup error, not a silent state. |
 | `qihse-kv: compacted N sstable(s) into M live file(s), <index> index` | A merge completed; names the post-merge index state. |
 | `qihse-kv: compacted N replica sstable(s) into M live file(s)` | The read-only replica path above. |
 | `qihse-kv: sstable compaction failed; N live file(s) retained` | A merge failed; reads stay on the scan path. |
+| `qihse-kv: hard-ceiling compaction fired at N sstable(s)` | Compaction had stopped; the flush path merged inline. Investigate the sweep. |
 | `qihse-kv: sstable metadata index degraded (...)` | Degradation at the point it happens, not inferred from latency. |
 
 The daemon sets the cadence with `--kv-sweep-interval SECONDS` (default 30,
