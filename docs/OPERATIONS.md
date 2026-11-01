@@ -479,7 +479,7 @@ flags; PQC: `--pqc-identity-dir`, `--pqc-trusted-pub` (repeatable),
 `--pqc-require` (refuse cleartext peers — verified by `make
 test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
 
-### Compression/compaction cadence
+### Compaction cadence
 
 `--kv-sweep-interval SECONDS` (default 30, `0` disables) is the cadence of the
 background expiry sweeper, which is also what triggers SSTable compaction. The
@@ -522,9 +522,15 @@ is logged at the point it happens (`qihse-kv: sstable metadata index degraded
 ```bash
 # 1. is it the storage layer?  thousands of files means yes
 ls /opt/qihse-data/node<N>/sstable_*.db | wc -l
-# 2. is the sweeper running?
-redis-cli ... INFO | grep -E 'sst_live_files|index_degraded|kv_sweep_interval'
-# 3. fix: make sure --kv-sweep-interval is non-zero, then wait one interval
+
+# 2. is the sweeper running? INFO is QKP-sealed on a pqc-required node, so read
+#    it through the admin CLI with the operator identity — not redis-cli.
+qihse-admin-cli -H <node-ip> -p <port> \
+  -i /etc/qihse/keys -t /etc/qihse/keys/qihse_dsa_pub_<node>.pem \
+  -n admin-t420 INFO | tr -d '\r' | \
+  grep -E 'qihse_sst_live_files|qihse_sst_index_degraded|qihse_kv_sweep_interval'
+
+# 3. fix: make sure the sweep cadence is non-zero, then wait one interval
 systemctl show qihse-node<N> -p ExecStart | grep -o 'kv-sweep-interval [0-9]*'
 ```
 
