@@ -636,7 +636,9 @@ would silently truncate.
 Source: `src/black_hole/qihse_kv_store.c`.
 Tests: `tests/test_kv_read_integrity.c`, `tests/test_kv_security_regression.c`,
 `tests/test_blob_persistence_regression.c`, `tests/test_incremental_export.c`
-(change sequence and delta export, `make test-incremental-export`).
+(change sequence and delta export, `make test-incremental-export`),
+`tests/test_kv_compaction.c` (SSTable merge, degraded-index recovery, replica
+compaction; `make test-kv-compaction`).
 
 The KV store is the storage substrate the federation APIs write through. The
 `_user` variants are the authorization-aware forms; the context-free forms are
@@ -654,7 +656,8 @@ intentionally restricted to unclassified data.
 | `bool qihse_kv_exists_user(...)`, `bool qihse_kv_exists(...)` | Existence with/without authorization. | `false` |
 | `bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user)` | Set a TTL. | `false` |
 | `int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user)` | Remaining TTL in ms. | `-1` when the key has no expiry; `-2` when it is missing, denied, or already expired |
-| `void qihse_kv_sweep_expired(qihse_kv_store_t* store)` | Evict expired keys. | n/a |
+| `void qihse_kv_sweep_expired(qihse_kv_store_t* store)` | Evict expired keys **and** run SSTable compaction (see below). | n/a |
+| `bool qihse_kv_sstable_stats(qihse_kv_store_t* store, qihse_kv_sstable_stats_t* out)` | Storage health: live SSTable count, monotonically increasing SSTable counter, index-degraded flag. | `false` |
 | `bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store)` | System-guard saturation probe. | `false` |
 | `int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user)` | Authorized export. Denies the whole export if any live record is outside the caller's clearance/SCI. | non-zero |
 | `int qihse_kv_load_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user)` | Authorized import, same rule. | non-zero |
@@ -671,6 +674,54 @@ intentionally restricted to unclassified data.
 | `void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)` | Release a delta record array. | n/a |
 
 ---
+
+### SSTable layout, compaction and storage health
+
+Writes accumulate in a memtable that is flushed to `sstable_<n>.db` once it
+exceeds `LSM_MEMTABLE_MAX` (512 KiB). Reads consult an in-memory key metadata
+index (`sst_meta`) that maps a key to the exact `(sstable_id, offset)` holding
+its newest copy; a point read is therefore one file probe, not a scan.
+
+`qihse_kv_sweep_expired()` is the periodic compaction trigger. Once
+`KV_SSTABLE_COMPACT_THRESHOLD` (16) live files exist — or any indexed record is
+expired — it merges every SSTable into a single new file, re-indexes it, and
+drops shadowed/expired/tombstoned copies. The other trigger is the fast bulk
+clear path (`qihse_kv_clear_user(..., fast)`), which compacts when it removed
+anything so tombstones do not linger on disk. `sstable_live_count` bounds the
+file count; without a caller for the sweep, every flush appends a file
+forever.
+
+Degraded index: if the metadata index cannot be built (allocation failure, or a
+failed re-index after a merge), `sst_meta->degraded` is set. Newest-copy
+detection then falls back to *first occurrence while scanning newest-first*,
+which yields the same answer without an index, so compaction still runs and the
+post-merge re-index clears the flag. A degraded index must never block the
+merge that repairs it. A store left degraded answers every read by scanning all
+files: 7,150 files / 691 MiB measured 7.7 s per GET and 14 s for DBSIZE, versus
+0.08 s / 5 s once merged.
+
+Read-only replicas: `qihse_kv_store_enable_replica_read_only()` refuses logical
+mutations, and `qihse_kv_sweep_expired()` therefore skips expiry-tombstoning on
+such a store. It still compacts above the threshold, because merging is a
+physical rewrite that preserves the newest copy of every key. Without that, a
+replica grew one file per replication pull indefinitely (measured: 277 and 324
+files in two caches, each 7 MiB).
+
+Health surface:
+
+| Signal | Meaning |
+|---|---|
+| `qihse_sst_live_files` (INFO) | Files a read may have to probe. Alert as it climbs past a few dozen. |
+| `qihse_sst_index_degraded` (INFO) | `1` means every read is scanning all files. |
+| `qihse_kv_sweep_interval` (INFO) | `0` means no compaction will ever run. |
+| `qihse-kv: compacted N sstable(s) into M live file(s), <index> index` | A merge completed; names the post-merge index state. |
+| `qihse-kv: compacted N replica sstable(s) into M live file(s)` | The read-only replica path above. |
+| `qihse-kv: sstable compaction failed; N live file(s) retained` | A merge failed; reads stay on the scan path. |
+| `qihse-kv: sstable metadata index degraded (...)` | Degradation at the point it happens, not inferred from latency. |
+
+The daemon sets the cadence with `--kv-sweep-interval SECONDS` (default 30,
+`0` disables) and warns at startup when a store opens above 64 files, stating
+explicitly when the sweeper is disabled.
 
 ## 7. Security and authentication — `include/qihse_auth.h`
 
@@ -1382,7 +1433,9 @@ Embedding APIs:
   from gate creation. `qihse_cluster_maintenance_seal_startup()` succeeds only
   after complete, instrumented registration and zero active writers; it creates
   a non-expiring HELD state with a fresh token. The startup hold remains closed
-  across daemon restart when `--startup-maintenance-held` is configured.
+  across daemon restart when `--startup-maintenance-held` is configured; this
+  is a cutover tool, and production runs without it so a restart resumes
+  serving writes immediately.
   `qihse_cluster_maintenance_startup_token()` returns that token only while the
   startup-created hold is HELD.
 - `qihse_cluster_maintenance_release_trusted(gate, generation, token)` is the
@@ -1414,11 +1467,25 @@ CLUSTER MAINTENANCE RELEASE <generation> <64-hex-token>
 CLUSTER MAINTENANCE STARTUP_TOKEN
 ```
 
-STATUS replies with a 21-entry array: state name, generation, lease expiry,
-coverage flag, 11 per-class active counters, pending failback count,
-rejected SLOT_UPDATE/GROUP/federation counters, the failover-paused flag,
-and a nested list of 11 `[name, registered]` pairs. STATUS never includes a
-token. `STARTUP_TOKEN` returns generation and token only to an authenticated
+STATUS replies with a 21-entry array. Indices are fixed; read them by index,
+not by counting:
+
+| Index | Field |
+|---|---|
+| 0 | state name (`OPEN`, `DRAINING`, `HELD`, `EXPIRED_HELD`, `STARTUP_PENDING`) |
+| 1 | generation |
+| 2 | lease expiry in ms (`0` for a startup-created hold: it never expires) |
+| 3 | writer coverage complete |
+| 4-14 | active counters, in writer-class order |
+| 15 | pending failback count |
+| 16-18 | rejected SLOT_UPDATE / GROUP / federation counters (monotonic) |
+| 19 | failover paused |
+| 20 | nested list of 11 `[name, registered]` pairs |
+
+The rejected counters are cumulative and never decrease; they record holds that
+refused a peer update, so a non-zero value after a maintenance window is
+expected and is not evidence of ongoing churn. Confirm quiescence by sampling
+twice, not by expecting zero. STATUS never includes a token. `STARTUP_TOKEN` returns generation and token only to an authenticated
 active SYSTEM-domain Operator and only for a startup-created HELD state; the
 returned token is consumed by the existing RELEASE command. BEGIN is refused
 while a pending failback ledger exists. The daemon startup flag requires
