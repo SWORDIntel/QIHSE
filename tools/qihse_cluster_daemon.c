@@ -585,6 +585,7 @@ static void usage(const char* argv0) {
         "          [--operator-password PW] [--dir DIR] [--enable-scatter]\n"
         "          [--failover-start-paused] (until Operator CLUSTER FAILOVER.RESUME)\n"
         "          [--startup-maintenance-held] (requires authenticated system Operator; release via STARTUP_TOKEN)\n"
+        "          [--kv-sweep-interval SECONDS] expiration sweep + sstable compaction cadence (0 disables)\n"
         "  Durable principal authority: QIHSE_AUTH_MODE=standalone, QIHSE_AUTH_ACTION=provision|recover.\n"
         "  Required QIHSE_AUTH_ suffixes: STATE_DIR, BOOTSTRAP_FILE, AUTHORITY_ID, NODE_ID, EPOCH,\n"
         "  RECIPIENT_PUBLIC_KEY, RECIPIENT_PRIVATE_KEY, SIGNER_PUBLIC_KEY, SIGNER_PRIVATE_KEY,\n"
@@ -1485,6 +1486,7 @@ int main(int argc, char** argv) {
     size_t repl_glob_count = 0;
     bool replicate_disabled = false;
     uint32_t repl_interval = 60;          /* anti-entropy tick (0 = disabled) */
+    uint32_t kv_sweep_interval = 30;      /* expiry sweep + sstable compaction cadence (0 = disabled) */
     const char* pqc_identity_dir = NULL;  /* --pqc-identity-dir */
     const char* pqc_node_id = NULL;
     const char* replication_source_host = NULL;
@@ -1678,6 +1680,11 @@ int main(int argc, char** argv) {
             if (!*replication_peer_dsa_pub) return usage(argv[0]), 2;
         } else if (strcmp(a, "--pqc-require") == 0) {
             pqc_require = true;
+        } else if (strcmp(a, "--kv-sweep-interval") == 0 && i + 1 < argc) {
+            char* end = NULL; errno = 0;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || !end || *end || v > 86400ul) return usage(argv[0]), 2;
+            kv_sweep_interval = (uint32_t)v;
         } else if (strcmp(a, "--replicate-interval") == 0 && i + 1 < argc) {
             char* end = NULL; errno = 0;
             unsigned long v = strtoul(argv[++i], &end, 10);
@@ -2352,6 +2359,9 @@ int main(int argc, char** argv) {
     config.enable_task_queue = false;
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
+    /* Without a cadence the sweeper thread never starts, so expired records
+     * are never reclaimed and SSTables are never compacted. */
+    config.kv_sweep_interval_seconds = kv_sweep_interval;
     config.consensus_mesh = consensus_mesh;
     config.consensus_blob_context = consensus_mesh ? &consensus_blob_context : NULL;
     config.consensus_allow_client_proposals =
