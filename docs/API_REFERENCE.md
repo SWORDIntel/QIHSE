@@ -1480,11 +1480,21 @@ Test: `tests/test_vector_db.c`, `tests/test_auth_privilege_boundary.c`.
 
 ## 9. Python SDK — `python/qihse/`
 
-The Python package is a `ctypes` binding over `libqihse.so`. It is not a
-reimplementation: each method calls a C entry point. `python/qihse/__init__.py`
-re-exports the engine surface and reports `__version__ = "0.3.0"`; two names are
-reachable only from their module (`Container` in `python/qihse/core.py`,
-`UWPClient` in `python/qihse/uwp.py`).
+The embedded Python APIs are `ctypes` bindings over `libqihse.so`, not
+reimplementations. `python/qihse/__init__.py` lazily re-exports the public
+surface and reports `__version__ = "0.3.0"`; two names are reachable only
+from their module (`Container` in `python/qihse/core.py`, `UWPClient` in
+`python/qihse/uwp.py`).
+
+`import qihse` and `from qihse import Controller` do not load the embedded
+runtime, initialize local authentication/audit state, or require NumPy.
+Requesting an embedded export (for example `VectorDB`), importing its
+module directly, or using `from qihse import *` still loads the native
+bindings with their existing audit requirements. Remote QKP transport
+loads the native crypto bindings when a sealed connection is requested;
+its trusted public keys must be the server's **ML-DSA identity keys**, not
+ML-KEM encryption keys. Transport pinning does not replace principal
+authentication or row-level authorization.
 
 | Module | Public names | Notes |
 |---|---|---|

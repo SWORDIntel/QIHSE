@@ -47,19 +47,42 @@ Usage:
     )
 """
 
-from .core import VectorDB, VectorQuery, VectorResult, DistanceMetric, QueryMode
-from .kv import KVStore
-from .timeseries import TimeSeriesDB
-from .document import DocumentStore
-from .event_stream import EventStream, EventRecord, Durability
-from .uwp import UWPServer
-from .neural import NeuralClassifier, KeystoneClass
-from .anchor import AnchorIndex
-from .hardware import HardwareProfiler, HardwareProfile
-from .fts import FTSIndex, FTSResult
-from .fusion import MultimodalFusion, FusionResult
-from .controller import Controller, Reply, Watch, ControllerError, ControllerServerError
-from .thermal import get_fleet_telemetry, collect_local_telemetry, publish_telemetry
+from importlib import import_module as _import_module
+
+# Remote clients must not initialize embedded authentication or audit storage.
+# Import the native bindings only when an embedded API is actually requested.
+_EXPORT_MODULES = {
+    name: module
+    for module, names in {
+        "core": ("VectorDB", "VectorQuery", "VectorResult", "DistanceMetric", "QueryMode"),
+        "kv": ("KVStore",),
+        "timeseries": ("TimeSeriesDB",),
+        "document": ("DocumentStore",),
+        "event_stream": ("EventStream", "EventRecord", "Durability"),
+        "uwp": ("UWPServer",),
+        "neural": ("NeuralClassifier", "KeystoneClass"),
+        "anchor": ("AnchorIndex",),
+        "hardware": ("HardwareProfiler", "HardwareProfile"),
+        "fts": ("FTSIndex", "FTSResult"),
+        "fusion": ("MultimodalFusion", "FusionResult"),
+        "controller": ("Controller", "Reply", "Watch", "ControllerError", "ControllerServerError"),
+        "thermal": ("get_fleet_telemetry", "collect_local_telemetry", "publish_telemetry"),
+    }.items()
+    for name in names
+}
+
+
+def __getattr__(name):
+    module = _EXPORT_MODULES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
 
 __all__ = [
     "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric", "QueryMode",

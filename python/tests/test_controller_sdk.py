@@ -1,5 +1,5 @@
-# Per-test audit/chain isolation FIRST — the shared library initializes
-# its audit state at import time, before any test code runs.
+# Keep embedded E2E helpers' audit/chain state separate from the checkout.
+# Remote Controller imports must not initialize this state.
 __import__("os").environ.setdefault(
     "QIHSE_DATA_DIR",
     __import__("tempfile").mkdtemp(prefix="qihse_py_ctrl_sdk_root_"))
@@ -58,13 +58,71 @@ if str(PY_PKG_DIR) not in sys.path:
     sys.path.insert(0, str(PY_PKG_DIR))
 
 
+class TestPackageImportBoundary(unittest.TestCase):
+    def test_remote_import_does_not_initialize_embedded_runtime(self):
+        with tempfile.TemporaryDirectory(prefix="qihse_remote_import_") as work:
+            os.chmod(work, 0o775)
+            env = os.environ.copy()
+            env.pop("QIHSE_DATA_DIR", None)
+            env["QIHSE_LIB_PATH"] = os.path.join(work, "absent-libqihse.so")
+            script = '''
+import importlib.abc
+import pathlib
+import sys
+sys.path.insert(0, sys.argv[1])
+class RejectEmbeddedImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in ("qihse.core", "numpy"):
+            raise AssertionError("remote import attempted embedded runtime: " + fullname)
+sys.meta_path.insert(0, RejectEmbeddedImports())
+import qihse
+from qihse import Controller, Reply, Watch, ControllerError, ControllerServerError
+from qihse.controller import Controller as DirectController
+assert Controller is DirectController is qihse.Controller
+assert set(qihse.__all__) == set(qihse._EXPORT_MODULES)
+assert set(qihse.__all__) <= set(dir(qihse))
+assert not hasattr(qihse, "not_a_qihse_export")
+assert "qihse.core" not in sys.modules
+assert "qihse.qkp" not in sys.modules
+assert "numpy" not in sys.modules
+assert not list(pathlib.Path.cwd().iterdir())
+'''
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", script, str(PY_PKG_DIR)],
+                cwd=work, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(os.listdir(work), [])
+
+    def test_embedded_exports_still_load_native_runtime(self):
+        if not (REPO_ROOT / "libqihse.so").is_file():
+            self.skipTest("native library not built")
+        with tempfile.TemporaryDirectory(prefix="qihse_embedded_import_") as work:
+            env = os.environ.copy()
+            env["QIHSE_DATA_DIR"] = work
+            env["QIHSE_LIB_PATH"] = str(REPO_ROOT / "libqihse.so")
+            script = '''
+import importlib
+import sys
+sys.path.insert(0, sys.argv[1])
+import qihse
+assert "qihse.core" not in sys.modules
+from qihse import *
+assert "qihse.core" in sys.modules
+for name, module in qihse._EXPORT_MODULES.items():
+    assert getattr(qihse, name) is getattr(importlib.import_module("qihse." + module), name)
+'''
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", script, str(PY_PKG_DIR)],
+                cwd=work, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 def _load_controller_module():
     """Import qihse.controller without requiring libqihse.so.
 
-    The package __init__ imports the ctypes core (which needs the shared
-    library); the controller SDK itself is pure stdlib, so the framing
-    unit tests stay runnable on hosts without a build.  E2E tests use the
-    real package import and are skipped when the library is absent.
+    Package exports load lazily; the controller SDK is pure stdlib, so
+    framing tests remain runnable on hosts without a native build. E2E
+    tests explicitly import the ctypes core when the library is present.
     """
     try:
         from qihse import controller as mod  # noqa: PLC0415
