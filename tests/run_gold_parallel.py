@@ -68,7 +68,7 @@ def independent(workload):
     return (run.startswith("make -s ") and run[8:] in SAFE) or name in GOLD_SAFE
 
 
-def run_one(workload, areas, workspace, version, pack_id):
+def run_one(workload, areas, workspace, key_root, version, pack_id):
     name, fields, line = workload
     pack_dir = workspace / name
     pack_dir.mkdir()
@@ -78,6 +78,9 @@ def run_one(workload, areas, workspace, version, pack_id):
     log = pack_dir / "result.log"
     started = time.monotonic()
     env = os.environ.copy()
+    key_dir = key_root / name
+    key_dir.mkdir(mode=0o700)
+    env["QIHSE_KEY_DIR"] = str(key_dir)
     env["LD_LIBRARY_PATH"] = "." + (":" + env["LD_LIBRARY_PATH"]
                                     if env.get("LD_LIBRARY_PATH") else "")
     with log.open("wb") as output:
@@ -129,24 +132,30 @@ def main(argv=None):
     if not version or not pack_id:
         parser.error("missing gold pack identity")
     version, pack_id = int(version.group(1)), pack_id.group(1)
-    if version != 1 or gaps or any(w[1]["expect"] != "pass" for w in workloads):
-        # The full runner alone can classify known defects and coverage gaps.
-        return subprocess.run([str(RUNNER), str(PACK)], cwd=ROOT, check=False).returncode
-    fast = [w for w in workloads if independent(w)]
-    slow = [w for w in workloads if not independent(w)]
-    failures = []
-    with tempfile.TemporaryDirectory(prefix="gold-parallel-", dir=ROOT / "build") as tmp:
-        workspace = Path(tmp)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            tasks = [pool.submit(run_one, w, areas, workspace, version, pack_id) for w in fast]
-            for task in concurrent.futures.as_completed(tasks):
-                result = task.result()
+    with tempfile.TemporaryDirectory(prefix="gold-test-keys-") as key_tmp:
+        key_root = Path(key_tmp)
+        if version != 1 or gaps or any(w[1]["expect"] != "pass" for w in workloads):
+            # The full runner alone can classify known defects and coverage gaps.
+            env = os.environ.copy()
+            env["QIHSE_KEY_DIR"] = str(key_root)
+            return subprocess.run([str(RUNNER), str(PACK)], cwd=ROOT, env=env,
+                                  check=False).returncode
+        fast = [w for w in workloads if independent(w)]
+        slow = [w for w in workloads if not independent(w)]
+        failures = []
+        with tempfile.TemporaryDirectory(prefix="gold-parallel-", dir=ROOT / "build") as tmp:
+            workspace = Path(tmp)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                tasks = [pool.submit(run_one, w, areas, workspace, key_root, version, pack_id)
+                         for w in fast]
+                for task in concurrent.futures.as_completed(tasks):
+                    result = task.result()
+                    if report(result):
+                        failures.append(result[0])
+            for workload in slow:
+                result = run_one(workload, areas, workspace, key_root, version, pack_id)
                 if report(result):
                     failures.append(result[0])
-        for workload in slow:
-            result = run_one(workload, areas, workspace, version, pack_id)
-            if report(result):
-                failures.append(result[0])
     print(f"GOLD: {len(areas)} areas, {len(workloads)} workloads, "
           f"{len(failures)} failed" + (f": {', '.join(failures)}" if failures else ""))
     return 1 if failures else 0

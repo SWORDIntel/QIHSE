@@ -1,10 +1,16 @@
 """Manifest and scheduling invariants for the complete parallel suite."""
 
+import os
 import re
+import stat
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from run_parallel_suite import ROOT, SAFE, plan, test_targets
+from run_gold_parallel import run_one
+from run_parallel_suite import ROOT, SAFE, plan, run_target, test_targets
 
 
 class ParallelSuiteTests(unittest.TestCase):
@@ -61,6 +67,44 @@ class ParallelSuiteTests(unittest.TestCase):
     def test_continuation_and_repeated_rules(self):
         targets = test_targets("test-serial: test-one \\\n    test-two\ntest-serial: test-three\n")
         self.assertEqual(targets, ["test-one", "test-two", "test-three"])
+
+    def test_target_gets_private_temporary_key_directory(self):
+        captured = {}
+
+        def fake_run(command, *, cwd, env, stdout, stderr, check):
+            key_dir = Path(env["QIHSE_KEY_DIR"])
+            captured.update(command=command, key_dir=key_dir,
+                            mode=stat.S_IMODE(key_dir.stat().st_mode))
+            return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory(prefix="suite-test-logs-") as logs:
+            with patch.dict(os.environ, {"QIHSE_KEY_DIR": "/etc/qihse/keys"}), \
+                 patch("run_parallel_suite.subprocess.run", side_effect=fake_run):
+                result = run_target("test-probe", Path(logs))
+        self.assertEqual(result[1], 0)
+        self.assertEqual(captured["mode"], 0o700)
+        self.assertNotEqual(str(captured["key_dir"]), "/etc/qihse/keys")
+        self.assertFalse(captured["key_dir"].exists())
+
+    def test_gold_workload_gets_private_temporary_key_directory(self):
+        captured = {}
+
+        def fake_run(command, *, cwd, env, stdout, stderr, check):
+            key_dir = Path(env["QIHSE_KEY_DIR"])
+            captured.update(command=command, key_dir=key_dir,
+                            mode=stat.S_IMODE(key_dir.stat().st_mode))
+            return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory(prefix="gold-test-keys-") as key_tmp, \
+             tempfile.TemporaryDirectory(prefix="gold-test-work-", dir=ROOT / "build") as work:
+            with patch.dict(os.environ, {"QIHSE_KEY_DIR": "/etc/qihse/keys"}), \
+                 patch("run_gold_parallel.subprocess.run", side_effect=fake_run):
+                result = run_one(("test-probe", {"area": "unit"}, "workload test-probe"),
+                                 {"unit": "area unit"}, Path(work), Path(key_tmp), 1, "unit")
+            self.assertEqual(result[1], 0)
+            self.assertEqual(captured["mode"], 0o700)
+            self.assertNotEqual(str(captured["key_dir"]), "/etc/qihse/keys")
+            self.assertTrue(captured["key_dir"].is_dir())
 
 
 if __name__ == "__main__":
