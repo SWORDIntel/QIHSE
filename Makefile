@@ -410,7 +410,7 @@ test-kv-legacy-record-state: lib
 
 test-serial: test-kv-legacy-record-state
 
-test-serial: docs-api-counts-check
+test-serial: test-docs-api-counts
 
 .PHONY: test-auth-durable test-auth-archive test-auth-maintenance
 test-auth-durable: lib
@@ -1634,11 +1634,11 @@ docs:
 	@echo "Use 'find docs -name \"*.md\" | wc -l' to inspect documentation files."
 
 # The API-surface table in docs/API_REFERENCE.md is generated from the headers.
-.PHONY: docs-api-counts docs-api-counts-check
+.PHONY: docs-api-counts test-docs-api-counts
 docs-api-counts: lib
 	@python3 scripts/api_surface_counts.py --write
 
-docs-api-counts-check: lib
+test-docs-api-counts: lib
 	@python3 scripts/api_surface_counts.py --check
 
 bench-trinary-codec:

@@ -53,7 +53,7 @@ function that does not appear here has not been verified and should be read in
 its header first.
 
 The per-header split is generated — do not hand-edit it. Regenerate with
-`make docs-api-counts`; `make docs-api-counts-check` fails when it drifts, and
+`make docs-api-counts`; `make test-docs-api-counts` fails when it drifts, and
 the check runs as part of `make test-serial`. Counts are `qihse_*` function
 declarations in the header with comments stripped (macro-generated declarations
 are invisible because the preprocessor is not run), and "exported" means the
