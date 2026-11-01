@@ -15264,9 +15264,10 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session, const qihse_resp_
         qihse_cluster_maintenance_status_t status;
         if (!qihse_cluster_maintenance_status(gate, &status))
             return qihse_resp_error(session, "ERR maintenance status unavailable");
+        bool startup_mode = qihse_cluster_maintenance_startup_mode(gate);
         bool safe = qihse_resp_command_is(request, "PING") ||
-                    qihse_resp_command_is(request, "AUTH") ||
-                    qihse_resp_command_is(request, "HELLO") ||
+                    (startup_mode && (qihse_resp_command_is(request, "AUTH") ||
+                                      qihse_resp_command_is(request, "HELLO"))) ||
                     qihse_resp_command_is(request, "INFO") ||
                     qihse_resp_command_is(request, "CLUSTER.HEALTH") ||
                     qihse_resp_command_is(request, "CLUSTER.TOPOLOGY") ||

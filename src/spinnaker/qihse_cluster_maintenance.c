@@ -240,6 +240,14 @@ bool qihse_cluster_maintenance_startup_token(qihse_cluster_maintenance_t* gate,
     return ok;
 }
 
+bool qihse_cluster_maintenance_startup_mode(qihse_cluster_maintenance_t* gate) {
+    if (!gate) return false;
+    pthread_mutex_lock(&gate->lock);
+    bool startup_mode = gate->startup_pending || gate->startup_held;
+    pthread_mutex_unlock(&gate->lock);
+    return startup_mode;
+}
+
 bool qihse_cluster_maintenance_release_trusted(qihse_cluster_maintenance_t* gate,
                                                uint64_t generation,
                                                const uint8_t token[32]) {

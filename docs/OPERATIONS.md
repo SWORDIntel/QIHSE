@@ -491,9 +491,11 @@ creates a fresh generation and token.
 Use the authenticated control session to request `CLUSTER MAINTENANCE
 STARTUP_TOKEN`, then pass the returned generation/token directly to
 `CLUSTER MAINTENANCE RELEASE`. Do not place the token in shell history, logs,
-receipts, or persistent files. `STATUS` never includes it. `AUTH`/`HELLO` and
-maintenance control remain available while the data-plane writer gate is held;
-ordinary writes stay rejected. Configure the flag in the owner service's
+receipts, or persistent files. `STATUS` never includes it. During startup-pending
+and startup-held, `AUTH`/`HELLO` permit authenticated control-session setup;
+maintenance control remains available while the data-plane writer gate is held.
+Ordinary writes stay rejected. Existing finite-lease holds keep their prior
+command whitelist. Configure the flag in the owner service's
 `ExecStart` alongside the existing secure credential source. Without the flag,
 startup retains the previous OPEN behavior.
 

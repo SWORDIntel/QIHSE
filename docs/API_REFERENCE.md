@@ -1417,10 +1417,12 @@ while a pending failback ledger exists. The daemon startup flag requires
 successful authenticated SYSTEM Operator startup credentials and fails closed
 if any writer coverage is incomplete.
 
-While HELD (or EXPIRED_HELD), RESP admits `AUTH`/`HELLO` for authenticated
-control-session setup and only `PING`, `INFO`,
-`CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and `REPL.SNAPSHOT.*`; everything
-else is rejected with `BUSY cluster maintenance is held`. `DBSIZE` is
+During `STARTUP_PENDING` and startup-created `HELD`, RESP additionally admits
+`AUTH`/`HELLO` for control-session setup. All HELD states admit `PING`, `INFO`,
+`CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and `REPL.SNAPSHOT.*`; other commands
+are rejected with `BUSY cluster maintenance is held` except authenticated
+maintenance controls. Ordinary finite-lease holds do not admit `AUTH`/`HELLO`.
+`DBSIZE` is
 deliberately excluded from the whitelist (it can fall back to compaction
 when metadata is degraded). Note `CLUSTER`-prefixed dot-form commands
 (`CLUSTER.HEALTH`, `CLUSTER.TOPOLOGY`) are also admitted.

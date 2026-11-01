@@ -51,6 +51,8 @@ bool qihse_cluster_maintenance_seal_startup(qihse_cluster_maintenance_t* gate,
 bool qihse_cluster_maintenance_startup_token(qihse_cluster_maintenance_t* gate,
                                               uint64_t* generation,
                                               uint8_t token[32]);
+/* True from startup registration through release of its startup-created hold. */
+bool qihse_cluster_maintenance_startup_mode(qihse_cluster_maintenance_t* gate);
 void qihse_cluster_maintenance_destroy(qihse_cluster_maintenance_t* gate);
 /* Admission is atomic with begin: a successful entry is counted until leave. */
 bool qihse_cluster_maintenance_enter(qihse_cluster_maintenance_t* gate,

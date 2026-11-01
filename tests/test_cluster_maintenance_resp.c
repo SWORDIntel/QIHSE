@@ -75,6 +75,7 @@ int main(void){
     const char*startup_release[]={"CLUSTER","MAINTENANCE","RELEASE",startup_gen,startup_hex};
     command(&admin,5,startup_release,"+OK");
     send_command(admin.fd,5,begin); char*r=reply(&admin); assert(strstr(r,"HELD"));
+    const char*reauth[]={"AUTH",qihse_user_get_username(op),OP_PASS}; command(&admin,3,reauth,"BUSY");
     char *p=strchr(r,':'); assert(p); char gen[32],token[65]; p++; char *ge=strstr(p,"\r\n"); assert(ge); snprintf(gen,sizeof gen,"%.*s",(int)(ge-p),p);
     p=strstr(r,"$64\r\n"); assert(p); p+=5; memcpy(token,p,64); token[64]=0; for(size_t i=0;i<64;i++)assert(isxdigit((unsigned char)token[i])); free(r);
     send_command(admin.fd,3,status); r=reply(&admin); assert(strstr(r,"HELD")&&strstr(r,"\r\n:1\r\n:0\r\n:0\r\n:0\r\n:0\r\n:0\r\n")&&strstr(r,"task_worker")&&strstr(r,"bus_federation")&&strstr(r,"brain")&&!strstr(r,token)); free(r);
