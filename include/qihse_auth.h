@@ -49,6 +49,11 @@ typedef struct qihse_user_s qihse_user_t;
  * false and fills reason (may be NULL) instead of aborting. Does not touch the
  * audit writer lock. */
 bool qihse_audit_context_usable(char *reason, size_t reason_len);
+/* Companion probe: whether the single-writer audit lock is free. A running
+ * daemon holds it for its lifetime, so even root aborts at init when pointed at
+ * a live data directory — an embedder must use its own QIHSE_DATA_DIR. Takes
+ * the lock non-blockingly and releases it immediately; does not write. */
+bool qihse_audit_writer_lock_available(char *reason, size_t reason_len);
 bool qihse_auth_init(void);
 
 // Bootstrap system operator with explicit password.

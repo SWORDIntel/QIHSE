@@ -593,6 +593,41 @@ bool qihse_audit_context_usable(char *reason, size_t reason_len) {
     return ok;
 }
 
+/* Second half of the embedder probe: is the single-writer audit lock free?
+ * audit_integrity_error() aborts when it is not, and no amount of privilege
+ * helps — a running daemon owns that lock for its lifetime. Taking it
+ * non-blockingly and releasing at once is the only faithful check; a live
+ * holder is unaffected by the failed attempt, and the window in which a free
+ * lock is held here is microseconds, before any write. */
+bool qihse_audit_writer_lock_available(char *reason, size_t reason_len) {
+    if (reason && reason_len) reason[0] = '\0';
+    char path[4096];
+    build_state_path(path, sizeof(path), AUDIT_WRITER_LOCK_FILE);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return true;   /* init creates it */
+        if (reason && reason_len)
+            snprintf(reason, reason_len, "cannot open audit writer lock");
+        return false;
+    }
+    bool ok = true;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (reason && reason_len) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN)
+                snprintf(reason, reason_len,
+                         "audit writer lock is held by another process (a live "
+                         "daemon owns it; use a separate QIHSE_DATA_DIR)");
+            else
+                snprintf(reason, reason_len, "audit writer lock is not lockable");
+        }
+        ok = false;
+    } else {
+        (void)flock(fd, LOCK_UN);
+    }
+    close(fd);
+    return ok;
+}
+
 static void audit_integrity_error(const char *reason) {
     fprintf(stderr, "[QIHSE AUDIT] Integrity continuity failure: %s\n", reason);
     /* The void initialization API has no safe degraded mode: writing after

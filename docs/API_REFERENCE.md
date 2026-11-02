@@ -41,7 +41,7 @@ nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
 ```
 
 The nine headers of [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh)
-declare 314 `qihse_*` functions between them, and 311 of those resolve to a
+declare 315 `qihse_*` functions between them, and 312 of those resolve to a
 symbol in `libqihse.so`. The three that do not are the expected exception:
 `qihse_kv_get()`, `qihse_kv_del()` and `qihse_kv_exists()` are `static inline`
 wrappers in `include/qihse_kv_store.h`, so they compile into the caller rather
@@ -70,7 +70,7 @@ above):
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 11 | 11 |
 | `include/qihse_kv_store.h` | 59 | 56 (3 `static inline`) |
-| `include/qihse_auth.h` | 51 | 51 |
+| `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
 
@@ -758,9 +758,25 @@ if (!qihse_auth_init()) { /* library-level failure, no abort */ }
 
 `qihse_audit_context_usable()` applies the same directory predicates as init
 without aborting, without creating the audit file and without touching the
-writer lock (so it never contends with a live daemon). It reports the specific
-reason, which is also what lands in the daemon's
+writer lock (so it never contends with a live daemon). `qihse_audit_writer_lock_available()`
+is its companion: it takes the single-writer lock non-blockingly, releases at
+once, and reports whether a live daemon already owns it. Both report the
+specific reason, which is also what lands in the daemon's
 `[QIHSE AUDIT] Integrity continuity failure:` line.
+
+The two failures are distinct and easy to confuse:
+
+| Situation | `context` | `lock` | Initializing aborts with |
+|---|---|---|---|
+| Private dir, no daemon | ok | ok | — |
+| Dir unreadable to this uid | refused | refused | `cannot access directory` |
+| **Live daemon using that dir** | ok | **refused** | `audit writer lock is unavailable or unsafe` |
+
+The third row is the trap: audit is single-writer by design, so privilege does
+not help — a root process pointed at a running daemon's data directory still
+aborts. An embedder that needs live data must read it through the daemon's RESP
+interface; one that only needs the library initialized must use its own
+`QIHSE_DATA_DIR`.
 
 The audit directory is `QIHSE_DATA_DIR` when set, otherwise the current
 directory; it must be owned by the calling euid and not group/other writable.

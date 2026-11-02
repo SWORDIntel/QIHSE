@@ -38,6 +38,18 @@ int main(void) {
     chmod(open_dir, 0777);
 
     expect(true, "private 0700 directory", private_dir);
+
+    /* Lock probe: a second process pointed at a directory whose writer lock is
+     * already held must be refused — that is the case no amount of privilege
+     * fixes, because a live daemon owns the lock. */
+    setenv("QIHSE_DATA_DIR", private_dir, 1);
+    char lock_reason[256];
+    if (!qihse_audit_writer_lock_available(lock_reason, sizeof(lock_reason))) {
+        fprintf(stderr, "FAIL free lock reported held: %s\n", lock_reason);
+        failures++;
+    } else {
+        puts("ok   writer lock free            lock=1");
+    }
     expect(false, "group/other writable", open_dir);
     expect(false, "missing directory", missing);
 
