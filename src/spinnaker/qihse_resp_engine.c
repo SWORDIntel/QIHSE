@@ -5701,6 +5701,23 @@ static bool qihse_resp_keys_collect_cb(const char* key, const char* value, void*
     return true;
 }
 
+static bool qihse_resp_keys_collect_key_cb(const char* key, void* user_data) {
+    return qihse_resp_keys_collect_cb(key, NULL, user_data);
+}
+
+static size_t qihse_resp_glob_literal_prefix_len(const char* pattern) {
+    if (!pattern) return 0;
+    size_t len = 0;
+    while (pattern[len] != '\0' &&
+           pattern[len] != '*' &&
+           pattern[len] != '?' &&
+           pattern[len] != '[' &&
+           pattern[len] != '\\') {
+        len++;
+    }
+    return len;
+}
+
 /* Collect matching keys under the session principal. Returns false only on
  * allocation failure of the list itself (the reply is still usable). */
 static bool qihse_resp_keys_collect(qihse_resp_session_t* session, const char* pattern,
@@ -5711,8 +5728,27 @@ static bool qihse_resp_keys_collect(qihse_resp_session_t* session, const char* p
     list->keys = (char**)calloc(list->cap, sizeof(char*));
     if (!list->keys) return false;
     pthread_rwlock_rdlock(&session->server->kv_lock);
-    qihse_kv_foreach_user(session->server->store, session->user,
-                          qihse_resp_keys_collect_cb, list);
+    if (!qihse_kv_foreach_key_user(session->server->store, session->user,
+                                   qihse_resp_keys_collect_key_cb, list)) {
+        size_t prefix_len = qihse_resp_glob_literal_prefix_len(pattern);
+        char* prefix = NULL;
+        if (prefix_len > 0) {
+            prefix = (char*)malloc(prefix_len + 1);
+            if (prefix) {
+                memcpy(prefix, pattern, prefix_len);
+                prefix[prefix_len] = '\0';
+            }
+        }
+        if (prefix) {
+            qihse_kv_foreach_prefix_user(session->server->store, prefix,
+                                         session->user,
+                                         qihse_resp_keys_collect_cb, list);
+            free(prefix);
+        } else {
+            qihse_kv_foreach_user(session->server->store, session->user,
+                                  qihse_resp_keys_collect_cb, list);
+        }
+    }
     pthread_rwlock_unlock(&session->server->kv_lock);
     return true;
 }
