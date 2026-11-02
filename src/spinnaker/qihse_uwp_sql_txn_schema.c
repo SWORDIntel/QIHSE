@@ -75,6 +75,105 @@ static const char* uwp_sql_find_keyword(const char* sql, const char* keyword);
 static UWP_THREAD_LOCAL qihse_sql_ast_t* uwp_bound_ast;
 static UWP_THREAD_LOCAL const qihse_uwp_sql_param_t* uwp_bound_params;
 static UWP_THREAD_LOCAL size_t uwp_bound_count;
+static UWP_THREAD_LOCAL qihse_uwp_sql_result_t* uwp_typed_result;
+
+static void uwp_typed_cell_clear(qihse_col_value_t* cell) {
+    if (cell && !cell->is_null &&
+        (cell->type == QIHSE_TS_STRING || cell->type == QIHSE_TS_UUID ||
+         cell->type == QIHSE_TS_JSONB || cell->type == QIHSE_TS_NUMERIC ||
+         cell->type == QIHSE_TS_TSVECTOR))
+        free(cell->v.str);
+}
+
+static bool uwp_typed_row_copy(const qihse_col_value_t* values,
+                               const int* projection, size_t count,
+                               qihse_col_value_t** out) {
+    qihse_col_value_t* row = calloc(count ? count : 1, sizeof(*row));
+    if (!row) return false;
+    size_t copied_bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        int col = projection[i];
+        if (col < 0) goto fail;
+        row[i] = values[col];
+        if (!values[col].is_null &&
+            (values[col].type == QIHSE_TS_STRING ||
+             values[col].type == QIHSE_TS_UUID ||
+             values[col].type == QIHSE_TS_JSONB ||
+             values[col].type == QIHSE_TS_NUMERIC ||
+             values[col].type == QIHSE_TS_TSVECTOR)) {
+            row[i].v.str = NULL;
+            if (!values[col].v.str ||
+                copied_bytes > QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES)
+                goto fail;
+            size_t len = strnlen(values[col].v.str,
+                QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES - copied_bytes + 1);
+            if (len > QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES - copied_bytes)
+                goto fail;
+            copied_bytes += len;
+            if (!(row[i].v.str = strdup(values[col].v.str))) goto fail;
+        }
+    }
+    *out = row;
+    return true;
+fail:
+    for (size_t i = 0; i < count; ++i) uwp_typed_cell_clear(&row[i]);
+    free(row);
+    return false;
+}
+
+static void uwp_typed_row_free(qihse_col_value_t* row, size_t count) {
+    if (!row) return;
+    for (size_t i = 0; i < count; ++i) uwp_typed_cell_clear(&row[i]);
+    free(row);
+}
+
+static bool uwp_typed_result_append(qihse_uwp_sql_result_t* result,
+                                   qihse_col_value_t* row) {
+    if (!result || !row ||
+        result->nrows >= QIHSE_UWP_SQL_MAX_TYPED_RESULT_ROWS ||
+        result->nrows >= SIZE_MAX / sizeof(*result->rows))
+        return false;
+    size_t added = 0;
+    for (size_t i = 0; i < result->ncolumns; ++i) {
+        const qihse_col_value_t* cell = &row[i];
+        if (cell->is_null || (cell->type != QIHSE_TS_STRING &&
+            cell->type != QIHSE_TS_UUID && cell->type != QIHSE_TS_JSONB &&
+            cell->type != QIHSE_TS_NUMERIC && cell->type != QIHSE_TS_TSVECTOR))
+            continue;
+        if (!cell->v.str || added > QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES)
+            return false;
+        size_t len = strnlen(cell->v.str,
+            QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES - added + 1);
+        if (len > QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES - added)
+            return false;
+        added += len;
+    }
+    if (result->retained_bytes > QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES - added)
+        return false;
+    qihse_col_value_t** rows = realloc(result->rows,
+        (result->nrows + 1) * sizeof(*result->rows));
+    if (!rows) return false;
+    result->rows = rows;
+    result->rows[result->nrows++] = row;
+    result->retained_bytes += added;
+    return true;
+}
+
+static int32_t uwp_typed_result_oid(qihse_ts_type_t type) {
+    switch (type) {
+        case QIHSE_TS_INT32: return 23;
+        case QIHSE_TS_INT64: return 20;
+        case QIHSE_TS_FLOAT: return 700;
+        case QIHSE_TS_STRING: return 25;
+        case QIHSE_TS_UUID: return 2950;
+        case QIHSE_TS_JSONB: return 3802;
+        case QIHSE_TS_BOOLEAN: return 16;
+        case QIHSE_TS_TIMESTAMPTZ: return 1184;
+        case QIHSE_TS_NUMERIC: return 1700;
+        case QIHSE_TS_TSVECTOR: return 3614;
+        default: return 0;
+    }
+}
 
 /* Temporary bridge: transaction ownership is per worker thread, not per
  * connection. C3 must move this pointer into its connection-state struct. */
@@ -3886,6 +3985,8 @@ typedef struct {
     int order_ascending;
     qihse_col_value_t best_key;
     uwp_text_buffer_t best_row;       /* only one candidate, never all matches */
+    qihse_uwp_sql_result_t* typed_result;
+    qihse_col_value_t* best_typed_row;
     bool has_best;
 } uwp_sql_select_scan_t;
 
@@ -4061,8 +4162,16 @@ static bool uwp_sql_select_row(const qihse_col_value_t* values,
             scan->failed = 1;
             return false;
         }
+        qihse_col_value_t* typed_copy = NULL;
+        if (scan->typed_result && !uwp_typed_row_copy(values,
+                scan->projection, scan->projection_count, &typed_copy)) {
+            free(key_copy);
+            scan->failed = 1;
+            return false;
+        }
         uwp_text_buffer_t candidate = {0};
-        if (!uwp_sql_select_project(scan, values, num_cols, &candidate)) {
+        if (!scan->typed_result &&
+            !uwp_sql_select_project(scan, values, num_cols, &candidate)) {
             free(key_copy);
             uwp_text_destroy(&candidate);
             scan->failed = 1;
@@ -4073,6 +4182,8 @@ static bool uwp_sql_select_row(const qihse_col_value_t* values,
             scan->best_key.type == QIHSE_TS_NUMERIC || scan->best_key.type == QIHSE_TS_TSVECTOR))
             free(scan->best_key.v.str);
         uwp_text_destroy(&scan->best_row);
+        uwp_typed_row_free(scan->best_typed_row, scan->projection_count);
+        scan->best_typed_row = typed_copy;
         scan->best_row = candidate;
         scan->best_key = *key;
         if (key_copy) scan->best_key.v.str = key_copy;
@@ -4084,7 +4195,20 @@ static bool uwp_sql_select_row(const qihse_col_value_t* values,
     }
     if (scan->matched++ < (size_t)(ast->offset > 0 ? ast->offset : 0))
         return true;
-    if (!uwp_sql_select_project(scan, values, num_cols, scan->response)) {
+    qihse_col_value_t* typed_copy = NULL;
+    if (scan->typed_result && !uwp_typed_row_copy(values,
+            scan->projection, scan->projection_count, &typed_copy)) {
+        scan->failed = 1;
+        return false;
+    }
+    if (!scan->typed_result &&
+        !uwp_sql_select_project(scan, values, num_cols, scan->response)) {
+        scan->failed = 1;
+        return false;
+    }
+    if (scan->typed_result &&
+        !uwp_typed_result_append(scan->typed_result, typed_copy)) {
+        uwp_typed_row_free(typed_copy, scan->projection_count);
         scan->failed = 1;
         return false;
     }
@@ -4498,7 +4622,17 @@ static int uwp_sql_execute_select(qihse_uwp_context_t* ctx,
         return -1;
     }
 
-    for (size_t i = 0; i < projection_count; ++i) {
+    if (uwp_typed_result) {
+        if (projection_count > QIHSE_UWP_SQL_MAX_RESULT_COLUMNS) {
+            ok = false;
+        } else {
+            uwp_typed_result->columns = calloc(projection_count,
+                sizeof(*uwp_typed_result->columns));
+            if (!uwp_typed_result->columns) ok = false;
+            else uwp_typed_result->ncolumns = projection_count;
+        }
+    }
+    for (size_t i = 0; i < projection_count && ok; ++i) {
         const char* name = NULL;
         if (select_star || !ast->select_items[i].alias ||
             ast->select_items[i].alias[0] == '\0') {
@@ -4512,6 +4646,18 @@ static int uwp_sql_execute_select(qihse_uwp_context_t* ctx,
                                       i ? "\t" : "", name) != 0) {
             ok = false;
             break;
+        }
+        if (uwp_typed_result) {
+            const qihse_col_def_t* def = qihse_table_col_def(
+                table, (size_t)projection[i]);
+            size_t name_len = strlen(name);
+            if (!def || name_len >= sizeof(uwp_typed_result->columns[i].name)) {
+                ok = false;
+                break;
+            }
+            memcpy(uwp_typed_result->columns[i].name, name, name_len + 1);
+            uwp_typed_result->columns[i].type = def->type;
+            uwp_typed_result->columns[i].oid = uwp_typed_result_oid(def->type);
         }
     }
     if (ok && uwp_text_appendf(response, "\n") != 0) ok = false;
@@ -4536,6 +4682,7 @@ static int uwp_sql_execute_select(qihse_uwp_context_t* ctx,
         .projection_count = projection_count,
         .condition_columns = condition_columns,
         .response = response,
+        .typed_result = uwp_typed_result,
         .user = user,
         .labels = labels,
         .order_column = order_column,
@@ -4552,8 +4699,17 @@ static int uwp_sql_execute_select(qihse_uwp_context_t* ctx,
     }
     if (scan.failed || response->failed) ok = false;
     if (ok && order_column >= 0 && scan.has_best) {
-        if (uwp_text_reserve(response, scan.best_row.len) != 0) ok = false;
-        else {
+        if (scan.typed_result) {
+            scan.emitted = 1;
+            if (!scan.best_typed_row || !uwp_typed_result_append(
+                    scan.typed_result, scan.best_typed_row)) {
+                ok = false;
+            } else {
+                scan.best_typed_row = NULL;
+            }
+        } else if (uwp_text_reserve(response, scan.best_row.len) != 0) {
+            ok = false;
+        } else {
             memcpy(response->data + response->len, scan.best_row.data,
                    scan.best_row.len);
             response->len += scan.best_row.len;
@@ -4566,6 +4722,7 @@ static int uwp_sql_execute_select(qihse_uwp_context_t* ctx,
         scan.best_key.type == QIHSE_TS_NUMERIC || scan.best_key.type == QIHSE_TS_TSVECTOR))
         free(scan.best_key.v.str);
     uwp_text_destroy(&scan.best_row);
+    uwp_typed_row_free(scan.best_typed_row, scan.projection_count);
     if (ok && uwp_text_appendf(response, "OK stmt_type=SELECT rows=%zu\n",
                                scan.emitted) != 0)
         ok = false;
@@ -6340,6 +6497,99 @@ uwp_sts_result_t qihse_uwp_sql_execute_params(qihse_uwp_context_t* ctx,
     if (ast) qihse_sql_ast_free(ast);
     for (size_t i = 0; i < nparams; ++i) free(values[i]);
     return rc;
+}
+
+uwp_sts_result_t qihse_sql_execute_user(qihse_uwp_context_t* ctx,
+    const char* sql, const qihse_uwp_sql_param_t* params, size_t nparams,
+    qihse_txn_t** current_txn, qihse_user_t* user,
+    qihse_uwp_write_fn write_fn, void* write_ctx) {
+    if (nparams == 0) {
+        if (!ctx) return UWP_STS_ERR_NO_CTX;
+        if (!user) return UWP_STS_ERR_PERM;
+        if (!sql || !current_txn) return UWP_STS_ERR_ARGS;
+        return uwp_dispatch_sql(ctx, 0x02, (const uint8_t*)sql,
+            strlen(sql) + 1, current_txn, user, -1, write_fn, write_ctx);
+    }
+    return qihse_uwp_sql_execute_params(ctx, sql, params, nparams,
+        current_txn, user, write_fn, write_ctx);
+}
+
+typedef struct {
+    char line[256];
+    size_t len;
+    bool status_seen;
+    size_t affected_rows;
+} uwp_typed_status_capture_t;
+
+static ssize_t uwp_typed_status_write(void* opaque, const void* data, size_t len) {
+    uwp_typed_status_capture_t* capture = opaque;
+    const unsigned char* bytes = data;
+    for (size_t i = 0; i < len; ++i) {
+        if (bytes[i] != '\n') {
+            if (capture->len + 1 < sizeof(capture->line))
+                capture->line[capture->len++] = (char)bytes[i];
+            else
+                capture->len = 0;
+            continue;
+        }
+        capture->line[capture->len] = '\0';
+        if (!strncmp(capture->line, "OK ", 3)) {
+            capture->status_seen = true;
+            char* rows = strstr(capture->line, " rows=");
+            if (rows) {
+                char* end = NULL;
+                unsigned long long count = strtoull(rows + 6, &end, 10);
+                if (end != rows + 6 && (*end == '\0' || *end == ' '))
+                    capture->affected_rows = count > SIZE_MAX ? SIZE_MAX :
+                        (size_t)count;
+            }
+        }
+        capture->len = 0;
+    }
+    return (ssize_t)len;
+}
+
+void qihse_uwp_sql_result_free(qihse_uwp_sql_result_t* result) {
+    if (!result) return;
+    for (size_t i = 0; i < result->nrows; ++i)
+        uwp_typed_row_free(result->rows[i], result->ncolumns);
+    free(result->rows);
+    free(result->columns);
+    free(result);
+}
+
+uwp_sts_result_t qihse_uwp_sql_execute_typed_user(
+    qihse_uwp_context_t* ctx, const char* sql,
+    const qihse_uwp_sql_param_t* params, size_t nparams,
+    qihse_txn_t** current_txn, qihse_user_t* user,
+    qihse_uwp_sql_result_t** result_out) {
+    if (!result_out) return UWP_STS_ERR_ARGS;
+    *result_out = NULL;
+    if (!sql || !current_txn || (nparams && !params))
+        return UWP_STS_ERR_ARGS;
+    if (!user) return UWP_STS_ERR_PERM;
+    if (!ctx) return UWP_STS_ERR_NO_CTX;
+    qihse_sql_ast_t* ast = qihse_parse_sql_to_ast(sql);
+    if (!ast) return UWP_STS_ERR_FAILED;
+    qihse_uwp_sql_result_t* result = calloc(1, sizeof(*result));
+    if (!result) { qihse_sql_ast_free(ast); return UWP_STS_ERR_FAILED; }
+    result->statement_type = ast->stmt_type;
+    qihse_sql_ast_free(ast);
+
+    uwp_typed_status_capture_t status = {0};
+    qihse_uwp_sql_result_t* previous = uwp_typed_result;
+    uwp_typed_result = result;
+    uwp_sts_result_t rc = qihse_sql_execute_user(ctx, sql, params, nparams,
+        current_txn, user, uwp_typed_status_write, &status);
+    uwp_typed_result = previous;
+    if (rc != UWP_STS_OK || !status.status_seen ||
+        (result->statement_type == QIHSE_SQL_SELECT && !result->columns)) {
+        qihse_uwp_sql_result_free(result);
+        return rc == UWP_STS_OK ? UWP_STS_ERR_FAILED : rc;
+    }
+    result->affected_rows = status.affected_rows;
+    *result_out = result;
+    return UWP_STS_OK;
 }
 
 uwp_sts_result_t qihse_uwp_sql_select_type_oids(qihse_uwp_context_t* ctx,

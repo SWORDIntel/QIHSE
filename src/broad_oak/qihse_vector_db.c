@@ -8954,10 +8954,11 @@ qihse_result_set_t* qihse_execute_sql_user(
         return NULL;
     }
 
-    // Scaffold: In full implementation, we would hand this string to libpg_query,
-    // translate the PG AST to QQL AST, and then execute.
-
-    return qihse_execute_qql_user(vdb, user, "MATCH (n) /* Transpiled from SQL */");
+    /* This legacy result type can represent only vector IDs and scores. No SQL
+     * grammar is implemented here, so never substitute a generic QQL scan. */
+    (void)vdb;
+    errno = ENOTSUP;
+    return NULL;
 }
 
 void qihse_free_result_set(qihse_result_set_t* rs) {

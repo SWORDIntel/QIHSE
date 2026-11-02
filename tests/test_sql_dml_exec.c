@@ -727,7 +727,26 @@ static void test_insert_populates_row_store(qihse_uwp_context_t* ctx,
     assert(run_sql(ctx, user, "SELECT * FROM t_typed", &out) == UWP_STS_OK);
     expect_reply(&out, "id\tuid\tdoc\tenabled\tcreated\tnote\n"
         "7\t\\N\t\\N\t\\N\t\\N\t\nOK stmt_type=SELECT rows=1");
-
+    qihse_txn_t* typed_txn = NULL;
+    qihse_uwp_sql_result_t* typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(ctx,
+        "SELECT uid, doc, note FROM t_typed WHERE id = 7", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed && typed->ncolumns == 3 && typed->nrows == 1);
+    assert(typed->rows[0][0].is_null && typed->rows[0][1].is_null &&
+           !typed->rows[0][2].is_null && typed->rows[0][2].v.str &&
+           !strcmp(typed->rows[0][2].v.str, ""));
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(ctx,
+        "UPDATE t_typed SET note = 'changed' WHERE id = 7", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed && typed->statement_type == QIHSE_SQL_UPDATE &&
+           typed->ncolumns == 0 && typed->nrows == 0 &&
+           typed->affected_rows == 1);
+    qihse_uwp_sql_result_free(typed);
+    assert(run_sql(ctx, user, "UPDATE t_typed SET note = '' WHERE id = 7",
+                   &out) == UWP_STS_OK);
     assert(run_sql(ctx, user,
         "CREATE TABLE t_literal_null (id INT, note TEXT DEFAULT 'fallback')",
         &out) == UWP_STS_OK);
@@ -830,6 +849,31 @@ static void test_durable_keys(qihse_user_t* user) {
     assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
     assert(run_sql_txn(&ctx, user, "INSERT INTO dkeys VALUES (1, 'a'), (2, 'b')", &txn, &out) == UWP_STS_OK);
     assert(run_sql_txn(&ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
+    qihse_uwp_sql_result_t* typed = NULL;
+    qihse_txn_t* typed_txn = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(&ctx,
+        "SELECT id, code FROM dkeys WHERE id = 1", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed && typed->statement_type == QIHSE_SQL_SELECT &&
+           typed->ncolumns == 2 && typed->nrows == 1 &&
+           typed->affected_rows == 1);
+    assert(!strcmp(typed->columns[0].name, "id") &&
+           typed->columns[0].type == QIHSE_TS_INT32 &&
+           typed->columns[0].oid == 23);
+    assert(typed->rows[0][0].v.i32 == 1 &&
+           !strcmp(typed->rows[0][1].v.str, "a"));
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    qihse_uwp_sql_param_t typed_param = {
+        .oid = 23, .data = (const uint8_t*)"2", .len = 1, .format = 0
+    };
+    assert(qihse_uwp_sql_execute_typed_user(&ctx,
+        "SELECT id, code FROM dkeys WHERE id = $1", &typed_param, 1,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed && typed->nrows == 1 && typed->rows[0][0].v.i32 == 2 &&
+           !strcmp(typed->rows[0][1].v.str, "b"));
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
     qihse_table_t* table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "dkeys");
     assert(table && qihse_table_row_count(table) == 2);
     assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
@@ -881,6 +925,14 @@ static void test_durable_keys(qihse_user_t* user) {
 static void test_create_constraint_boundary(qihse_uwp_context_t* ctx,
                                             qihse_user_t* user) {
     uwp_reply_buf_t out;
+    qihse_uwp_sql_result_t* typed = NULL;
+    qihse_txn_t* txn = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(ctx,
+        "CREATE TABLE typed_ddl_result (id INT)", NULL, 0,
+        &txn, user, &typed) == UWP_STS_OK);
+    assert(typed && typed->statement_type == QIHSE_SQL_CREATE &&
+           typed->ncolumns == 0 && typed->nrows == 0);
+    qihse_uwp_sql_result_free(typed);
     /* Extension installation is a durable-catalog operation. Its successful
      * execution and recovery are covered by the durable fixture above. */
     assert(run_sql(ctx, user, "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"", &out) != UWP_STS_OK);
@@ -944,7 +996,6 @@ static void test_create_constraint_boundary(qihse_uwp_context_t* ctx,
     expect_reply(&out, "refused");
     assert(qihse_table_row_count(table) == 1);
 
-    qihse_txn_t* txn = NULL;
     assert(run_sql_txn(ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
     assert(run_sql_txn(ctx, user,
         "INSERT INTO t_required (id, name) VALUES (5, 'ok')",
@@ -1300,6 +1351,32 @@ static void test_directeye_ordered_lookup(qihse_uwp_context_t* ctx,
                         "ORDER BY created_at DESC LIMIT 1";
     assert(run_sql(ctx, low, query, &out) == UWP_STS_OK);
     expect_reply(&out, "target\t20\tallowed-new\t17\t1\t0\nOK stmt_type=SELECT rows=1");
+    qihse_uwp_sql_result_t* typed = NULL;
+    qihse_txn_t* typed_txn = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(ctx,
+        "SELECT identifier, created_at, payload FROM osint_records "
+        "WHERE identifier = 'target' ORDER BY created_at DESC LIMIT 1",
+        NULL, 0, &typed_txn, low, &typed) == UWP_STS_OK);
+    assert(typed && typed->statement_type == QIHSE_SQL_SELECT &&
+           typed->ncolumns == 3 && typed->nrows == 1 &&
+           typed->affected_rows == 1);
+    assert(!strcmp(typed->columns[0].name, "identifier") &&
+           typed->columns[0].type == QIHSE_TS_STRING &&
+           typed->columns[0].oid == 25);
+    assert(!strcmp(typed->columns[1].name, "created_at") &&
+           typed->columns[1].type == QIHSE_TS_INT64 &&
+           typed->columns[1].oid == 20);
+    assert(!strcmp(typed->rows[0][0].v.str, "target") &&
+           typed->rows[0][1].v.i64 == 20 &&
+           !strcmp(typed->rows[0][2].v.str, "allowed-new"));
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(ctx,
+        "SELECT payload FROM osint_records WHERE payload = 'high-secret'",
+        NULL, 0, &typed_txn, low, &typed) == UWP_STS_OK);
+    assert(typed && typed->ncolumns == 1 && typed->nrows == 0 &&
+           typed->rows == NULL);
+    qihse_uwp_sql_result_free(typed);
     expect_reply_absent(&out, "high-secret");
     expect_reply_absent(&out, "other-tenant");
     expect_reply_absent(&out, "wrong-id");
@@ -1435,6 +1512,17 @@ static void test_exact_numeric_predicates(qihse_uwp_context_t* ctx,
     printf("PASS exact NUMERIC predicates: indexed/unindexed equality, ranges, mutations and NULL\n");
 }
 
+static void test_legacy_vector_sql_rejected(qihse_user_t* user) {
+    qihse_vector_db_t vdb = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_AUTO, NULL, NULL, QIHSE_VDB_OPEN_CREATE);
+    assert(vdb != NULL);
+    errno = 0;
+    qihse_result_set_t* result = qihse_execute_sql_user(
+        vdb, user, "SELECT * FROM documents");
+    assert(result == NULL && errno == ENOTSUP);
+    qihse_vector_db_close(vdb);
+}
+
 int main(void) {
     assert(mkdir("build", 0700) == 0 || errno == EEXIST);
 {
@@ -1445,6 +1533,7 @@ int main(void) {
     qihse_auth_init();
     qihse_user_t* operator_user = qihse_auth_get_user(0);
     assert(operator_user != NULL);
+    test_legacy_vector_sql_rejected(operator_user);
 
     /* The SQL dispatcher only requires ctx->sql_engine to be non-NULL; the
      * executor does not dereference it (the row store is process-wide). */

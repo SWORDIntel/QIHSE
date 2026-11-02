@@ -73,6 +73,18 @@ PostgreSQL storage or exactly-once guarantees. The legacy multi-engine pgwire
 handler has no transaction manager and refuses transaction control; it is not an
 alternate route to this contract.
 
+Embedded relational callers use `qihse_uwp_sql_execute_typed_user()` with this
+same UWP context, an authenticated `qihse_user_t`, and caller-owned
+`qihse_txn_t **` state. It returns owned column metadata and typed SELECT cells;
+NULL remains distinct from zero and empty strings. Cells are copied at the
+projection point rather than reconstructed from the tab-separated protocol
+reply. DDL/DML return statement type and affected-row count. The result is
+bounded (64 columns, 100,000 rows, 64 MiB retained string data), and exceeding a
+bound or invoking an unsupported typed SELECT shape fails instead of truncating.
+The vector-only `qihse_execute_sql_user()` has no UWP context and is deprecated;
+it returns `ENOTSUP` rather than mapping arbitrary SQL to a generic QQL scan.
+Use native QQL for vector search.
+
 Supported durable CREATE TABLE types are INT, BIGINT, FLOAT, DOUBLE, TEXT,
 VARCHAR, BOOL, UUID, JSONB, TIMESTAMPTZ, NUMERIC(p,s) and TSVECTOR. Native NULL is
 separate from empty/zero/false; JSONB is validated text, not PostgreSQL's physical

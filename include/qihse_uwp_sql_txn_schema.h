@@ -99,6 +99,8 @@ char* qihse_uwp_sql_execute_dml(const qihse_sql_ast_t* ast, qihse_user_t* user);
 /* Extended pgwire binds: caller retains bytes until execute returns. NULL is
  * represented only by is_null; a text value of "NULL" is ordinary text. */
 #define QIHSE_UWP_SQL_MAX_RESULT_COLUMNS 64u
+#define QIHSE_UWP_SQL_MAX_TYPED_RESULT_ROWS 100000u
+#define QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES (64u * 1024u * 1024u)
 #define QIHSE_UWP_SQL_MAX_BIND_BYTES 1048576u
 typedef struct {
     uint32_t oid;                /* 0 requests schema inference */
@@ -112,6 +114,22 @@ typedef struct {
     char name[128];
     int32_t oid;
 } qihse_uwp_sql_result_column_t;
+
+typedef struct {
+    char name[128];
+    int32_t oid;
+    qihse_ts_type_t type;
+} qihse_uwp_sql_typed_column_t;
+
+typedef struct {
+    qihse_sql_stmt_type_t statement_type;
+    size_t ncolumns;
+    qihse_uwp_sql_typed_column_t* columns;
+    size_t nrows;
+    qihse_col_value_t** rows; /* each row and string cell is owned */
+    size_t affected_rows;
+    size_t retained_bytes;
+} qihse_uwp_sql_result_t;
 
 typedef struct {
     size_t nparams;
@@ -132,6 +150,32 @@ uwp_sts_result_t qihse_uwp_sql_execute_params(qihse_uwp_context_t* ctx,
     const char* sql, const qihse_uwp_sql_param_t* params, size_t nparams,
     qihse_txn_t** current_txn, qihse_user_t* user,
     qihse_uwp_write_fn write_fn, void* write_ctx);
+
+/* Streaming embedded SQL entry point. Uses the same authenticated SQL
+ * dispatcher as pgwire; current_txn is caller-owned state and may span
+ * statement calls. SELECT rows and command status are emitted through write_fn
+ * in the native tab-separated response format. Bind metadata is available via
+ * qihse_uwp_sql_describe(). Prefer qihse_uwp_sql_execute_typed_user() when
+ * embedded callers need typed values instead of the wire-format stream. */
+uwp_sts_result_t qihse_sql_execute_user(qihse_uwp_context_t* ctx,
+    const char* sql, const qihse_uwp_sql_param_t* params, size_t nparams,
+    qihse_txn_t** current_txn, qihse_user_t* user,
+    qihse_uwp_write_fn write_fn, void* write_ctx);
+
+/* Execute through the durable authenticated SQL engine and return structured
+ * results. SELECT cells are copied before wire serialization; NULL is distinct
+ * from zero and empty strings. Results are bounded to
+ * QIHSE_UWP_SQL_MAX_TYPED_RESULT_ROWS,
+ * QIHSE_UWP_SQL_MAX_TYPED_RESULT_BYTES and
+ * QIHSE_UWP_SQL_MAX_RESULT_COLUMNS; exceeding a bound fails the query rather
+ * than truncating. The caller owns the result and transaction state. On error,
+ * *result_out is NULL. */
+uwp_sts_result_t qihse_uwp_sql_execute_typed_user(
+    qihse_uwp_context_t* ctx, const char* sql,
+    const qihse_uwp_sql_param_t* params, size_t nparams,
+    qihse_txn_t** current_txn, qihse_user_t* user,
+    qihse_uwp_sql_result_t** result_out);
+void qihse_uwp_sql_result_free(qihse_uwp_sql_result_t* result);
 
 /* Resolve a completed, authenticated single-table SELECT's result columns from
  * the live catalog. Copies OIDs under the SQL dispatch lock; never exposes

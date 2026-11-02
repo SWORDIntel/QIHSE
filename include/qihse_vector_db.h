@@ -939,8 +939,11 @@ qihse_result_set_t* qihse_execute_qql_user(
 );
 
 /**
- * Execute a legacy SQL string by dynamically translating it into QIHSE graph operations.
- * Requires the native SQL parser module to be linked into the framework.
+ * Deprecated compatibility entry point. The vector-only result type cannot
+ * represent relational SQL, and this entry point does not have the durable UWP
+ * context required by the SQL engine. It therefore returns NULL with ENOTSUP
+ * for SQL requests; use qihse_uwp_sql_execute_typed_user() from
+ * qihse_uwp_sql_txn_schema.h for context-backed typed SQL results.
  *
  * `user` MUST be an explicit authenticated security context; NULL fails closed
  * with EACCES and returns NULL (AGENTS.md invariant 1).
