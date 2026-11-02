@@ -3906,12 +3906,18 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
     ctx.max_bytes = max_bytes;
     ctx.ok = true;
 
-    /* This can compact a degraded index and otherwise reads both the trie
-     * and SSTable metadata as one snapshot.  Serialize the complete walk so
-     * concurrent writes cannot move records between those two sources. */
-    kv_store_wrlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return -1; }
+    /* This reads the trie and SSTable metadata as one snapshot: writers are
+     * excluded for the whole walk, so records cannot move between the two
+     * sources. A READ lock is sufficient for that and lets other readers
+     * (interactive KEYS/GET/DBSIZE) proceed concurrently — holding a write
+     * lock here serialized every replica delta pull against the entire
+     * interactive read path for seconds at a time. The degraded fallback
+     * below materializes records into the trie, which mutates, so it alone
+     * upgrades to the write lock. */
     bool fast = store->sst_meta && !store->sst_meta->degraded;
+    if (fast) kv_store_rdlock(store);
+    else kv_store_wrlock(store);
+    if (store->recovery_pending) { kv_store_unlock(store); return -1; }
     if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return -1; }
     qihse_trinary_trie_foreach(store->trie, delta_trie_cb, &ctx);
     if (ctx.ok && fast) {
