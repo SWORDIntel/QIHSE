@@ -611,6 +611,12 @@ bool qihse_audit_writer_lock_available(char *reason, size_t reason_len) {
         return false;
     }
     bool ok = true;
+    /* flock is per open-file-description, so a process that already holds the
+     * lock fails this very probe. Report our own hold as available: it is. */
+    if (audit_writer_lock_fd >= 0 && strcmp(path, audit_writer_lock_path) == 0) {
+        close(fd);
+        return true;
+    }
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (reason && reason_len) {
             if (errno == EWOULDBLOCK || errno == EAGAIN)
