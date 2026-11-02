@@ -772,7 +772,8 @@ To simplify secure certificate generation and daemon configuration, use
 #### Durability & Verification
 
 - Snapshot creation records a durable intent and streams consistent rows in chunks.
-- Delta enumeration requests one row at a time with monotonic `REPL.ACK` progression.
+- Delta enumeration requests one row at a time with monotonic `REPL.ACK` progression, holding a shared store read lock (`kv_store_rdlock`) when `sst_meta` is healthy so replica polling never blocks concurrent reader sessions.
+- RESP `KEYS` and `SCAN` (`qihse_resp_keys_collect`) enumerate matching keys in RAM via `qihse_kv_foreach_key_user` (or `qihse_kv_foreach_prefix_user` on the literal prefix before any glob metacharacter for peer-claim sessions) without materializing or ZSTD-decompressing SSTable values on disk.
 - Compaction retains tombstones across baseline boundaries until acknowledged.
 - Code-level validation is verified by `make test-replica-qkp` and `make test-replica-crash`.
 - Real-world deployment smoke testing was verified across Proxmox LXC containers
