@@ -36,6 +36,7 @@ typedef struct {
     void* server;
 } qihse_resp_cluster_context_t;
 
+bool qihse_resp_cluster_subcommand_mutates(size_t argc, const qihse_resp_arg_t* argv);
 bool qihse_resp_cluster_dispatch(qihse_resp_cluster_context_t* context, size_t argc, const qihse_resp_arg_t* argv);
 
 #ifdef __cplusplus

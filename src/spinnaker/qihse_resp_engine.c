@@ -24,6 +24,7 @@
 #include "qihse_fabric_index.h"
 #include "qihse_fusion.h"
 #include "qihse_fts.h"
+#include "qihse_resp_fts_namespace.h"
 #include "qihse_consensus_blob.h"
 #include "qihse_consensus_mesh.h"
 #include "qihse_consensus_prefix_point_challenge.h"
@@ -291,13 +292,39 @@ typedef struct {
     qihse_metric_series_t* xdp_ingest_denied;
 } qihse_resp_telemetry_t;
 
+typedef struct {
+    qihse_resp_fts_namespace_t scope;
+    qihse_fts_index_t* index;
+    char** keys;
+    uint64_t key_count;
+    uint64_t key_cap;
+    uint64_t generation;
+    bool built;
+} qihse_resp_fts_scope_state_t;
+
+typedef struct qihse_resp_fts_tenant_state {
+    uint32_t tenant_id;
+    qihse_fts_index_t* index;
+    char** keys;
+    uint64_t key_count;
+    uint64_t key_cap;
+    uint64_t generation;
+    bool built;
+    struct qihse_resp_fts_tenant_state* next;
+} qihse_resp_fts_tenant_state_t;
+
 struct qihse_resp_server {
     qihse_kv_store_t* store;
     qihse_vector_db_t vdb;
     qihse_tsdb_t* tsdb;
     qihse_column_store_t* column_store;
-    /* Optional full-text index for VECHYBRID.  Caller-owned, like vdb. */
+    /* System-domain FTS projection supplied at startup; tenant-default and
+     * registered APP projections have independent engine-owned indexes. */
     qihse_fts_index_t* fts;
+    qihse_resp_fts_namespace_registry_t* fts_namespaces;
+    qihse_resp_fts_scope_state_t* fts_app_scopes;
+    size_t fts_app_scope_count;
+    qihse_resp_fts_tenant_state_t* fts_tenant_scopes;
     qihse_cluster_topology_t* topology;
     bool owns_topology;
     char bind_address[QIHSE_CLUSTER_HOST_LEN + 1u];
@@ -3151,7 +3178,21 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
  * The FTS clause is REQUIRED: this command exists to exercise the fused
  * path, and a plain vector search is VECSEARCH's job.  An unconfigured FTS
  * index is an explicit error, not a silent fallback to vector-only. */
+static qihse_resp_fts_tenant_state_t* qihse_resp_fts_tenant_state(
+        qihse_resp_server_t* server, uint32_t tenant_id, bool create);
+
 static bool qihse_resp_handle_vechybrid(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    qihse_user_t* user = session->user;
+    if (!user || !qihse_auth_user_is_active(user))
+        return qihse_resp_error(session, "NOPERM authenticated principal required");
+    uint32_t tenant_id = qihse_user_get_tenant_id(user);
+    qihse_resp_fts_tenant_state_t* tenant_state = NULL;
+    if (tenant_id == QIHSE_TENANT_SYSTEM) {
+        if (qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session, "NOPERM system-domain VECHYBRID requires an Operator");
+    } else {
+        tenant_state = qihse_resp_fts_tenant_state(session->server, tenant_id, false);
+    }
     if (request->argc < 4 || !session->server->vdb)
         return !session->server->vdb
             ? qihse_resp_error(session, "ERR vector database is not configured")
@@ -3169,8 +3210,13 @@ static bool qihse_resp_handle_vechybrid(qihse_resp_session_t* session, const qih
     const qihse_resp_arg_t* fts_arg = &request->argv[3u + dims + 1u];
     if (fts_arg->len == 0 || fts_arg->len >= 1024u)
         return qihse_resp_error(session, "ERR invalid FTS query");
-    if (!session->server->fts)
-        return qihse_resp_error(session, "ERR full-text index is not configured");
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    qihse_fts_index_t* scoped_fts = tenant_state ? tenant_state->index : session->server->fts;
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
+    if (!scoped_fts)
+        return qihse_resp_error(session, tenant_state
+            ? "ERR full-text projection is not built for this tenant"
+            : "ERR full-text index is not configured");
 
     float* vector = (float*)malloc(dims * sizeof(*vector));
     if (!vector) return qihse_resp_error(session, "OOM out of memory");
@@ -3209,16 +3255,28 @@ static bool qihse_resp_handle_vechybrid(qihse_resp_session_t* session, const qih
     mreq.queries = &mq;
     mreq.num_queries = 1u;
     mreq.top_k = (int)top_k;
-    mreq.user = session->user;
-    mreq.fts_index = session->server->fts;
+    mreq.user = user;
     mreq.fts_query = fts_query;
     mreq.fts_weight = 1.0f;
 
+    /* Hold the projection lock through fusion: a concurrent BUILD may replace
+     * the per-tenant index, and the vector layer reads it synchronously. */
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    mreq.fts_index = tenant_state ? tenant_state->index : session->server->fts;
+    if (!mreq.fts_index) {
+        pthread_mutex_unlock(&session->server->fts_meta_lock);
+        free(vector);
+        free(fts_query);
+        return qihse_resp_error(session, tenant_state
+            ? "ERR full-text projection is not built for this tenant"
+            : "ERR full-text index is not configured");
+    }
     pthread_mutex_lock(&session->server->vdb_lock);
     size_t n = 0;
     qihse_fusion_result_t* fused =
         qihse_vector_db_search_multimodal(session->server->vdb, &mreq, &n);
     pthread_mutex_unlock(&session->server->vdb_lock);
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
     free(vector);
     free(fts_query);
     if (!fused)
@@ -5880,6 +5938,11 @@ static bool qihse_resp_fts_build_cb(const char* key, const char* value,
                                     void* user_data) {
     fts_build_ctx_t* b = (fts_build_ctx_t*)user_data;
     if (!b || !b->keys || !key) return false;
+    if (b->namespace_scope) {
+        if (!qihse_resp_fts_namespace_key_allowed(b->namespace_scope, key)) return true;
+    } else if (!qihse_resp_fts_default_key_allowed(qihse_user_get_tenant_id(b->user), key)) {
+        return true;
+    }
     if (b->pattern && fnmatch(b->pattern, key, 0) != 0) return true;
     if (b->count >= b->cap) return false;
 
@@ -5904,6 +5967,28 @@ static bool qihse_resp_fts_build_cb(const char* key, const char* value,
     if (!b->keys[b->count]) { b->map_full = true; return false; }
     b->count++;
     return true;
+}
+
+static qihse_resp_fts_tenant_state_t* qihse_resp_fts_tenant_state(
+        qihse_resp_server_t* server, uint32_t tenant_id, bool create) {
+    if (!server || tenant_id == QIHSE_TENANT_SYSTEM) return NULL;
+    pthread_mutex_lock(&server->fts_meta_lock);
+    qihse_resp_fts_tenant_state_t* state = server->fts_tenant_scopes;
+    size_t count = 0u;
+    while (state && state->tenant_id != tenant_id) {
+        ++count;
+        state = state->next;
+    }
+    if (!state && create && count < QIHSE_RESP_FTS_NAMESPACE_MAX_ENTRIES) {
+        state = (qihse_resp_fts_tenant_state_t*)calloc(1u, sizeof(*state));
+        if (state) {
+            state->tenant_id = tenant_id;
+            state->next = server->fts_tenant_scopes;
+            server->fts_tenant_scopes = state;
+        }
+    }
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    return state;
 }
 
 /* Rebuild the live index from the store as `user`, replacing the current one.
@@ -5972,6 +6057,55 @@ static bool qihse_resp_fts_rebuild(qihse_resp_server_t* server, qihse_user_t* us
     /* b.count == cap means the bound was reached: remaining records were
      * not indexed. The count is the honest reply either way. */
     *out_count = b.count;
+    return true;
+}
+
+static bool qihse_resp_fts_rebuild_tenant(qihse_resp_server_t* server, qihse_user_t* user,
+                                          qihse_resp_fts_tenant_state_t* state,
+                                          const char* pattern, uint64_t* out_count,
+                                          char* err, size_t err_cap) {
+    if (!server || !server->store || !user || !state ||
+        state->tenant_id != qihse_user_get_tenant_id(user) ||
+        state->tenant_id == QIHSE_TENANT_SYSTEM) {
+        snprintf(err, err_cap, "tenant projection is not authorized for this principal");
+        return false;
+    }
+    pthread_mutex_lock(&server->fts_meta_lock);
+    qihse_fts_index_t* fresh = qihse_fts_create();
+    char** keys = fresh ? (char**)calloc(QIHSE_RESP_FTS_MAX_DOCS + 1u, sizeof(*keys)) : NULL;
+    if (!fresh || !keys) {
+        qihse_fts_destroy(fresh);
+        free(keys);
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "out of memory");
+        return false;
+    }
+    fts_build_ctx_t build;
+    memset(&build, 0, sizeof(build));
+    build.index = fresh;
+    build.user = user;
+    build.pattern = pattern;
+    build.keys = keys;
+    build.cap = QIHSE_RESP_FTS_MAX_DOCS;
+    pthread_rwlock_rdlock(&server->kv_lock);
+    uint64_t generation = qihse_kv_change_seq(server->store);
+    qihse_kv_foreach_meta_user(server->store, user, qihse_resp_fts_build_cb, &build);
+    pthread_rwlock_unlock(&server->kv_lock);
+
+    qihse_fts_index_t* old = state->index;
+    char** old_keys = state->keys;
+    uint64_t old_count = state->key_count;
+    state->index = fresh;
+    state->keys = keys;
+    state->key_count = build.count;
+    state->key_cap = build.cap;
+    state->generation = generation;
+    state->built = true;
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    for (uint64_t i = 0; i < old_count; ++i) free(old_keys[i]);
+    free(old_keys);
+    qihse_fts_destroy(old);
+    *out_count = build.count;
     return true;
 }
 
@@ -6049,6 +6183,9 @@ typedef struct {
     uint64_t generation;      /* KV change sequence the index was built against */
     uint64_t index_size;
     uint64_t index_digest;
+    uint32_t tenant_id;
+    char namespace_name[QIHSE_RESP_FTS_NAMESPACE_MAX_NAME + 1u];
+    uint8_t namespace_digest[QIHSE_RESP_FTS_NAMESPACE_DIGEST_BYTES];
     uint32_t doc_count;
     char** keys;              /* keys[doc_id - 1]; caller frees */
 } qihse_resp_fts_sidecar_t;
@@ -6065,6 +6202,7 @@ static void qihse_resp_fts_sidecar_free(qihse_resp_fts_sidecar_t* sidecar) {
  * directory. A failed write leaves no temp file behind. */
 static bool qihse_resp_fts_write_sidecar(const char* path, uint64_t generation,
                                          uint64_t index_size, uint64_t index_digest,
+                                         const qihse_resp_fts_namespace_t* scope,
                                          char* const* keys, uint64_t count) {
     char tmp[1200];
     int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
@@ -6077,11 +6215,17 @@ static bool qihse_resp_fts_write_sidecar(const char* path, uint64_t generation,
     uint32_t magic = QIHSE_RESP_FTS_KEYS_MAGIC;
     uint32_t version = QIHSE_RESP_FTS_KEYS_VERSION;
     uint32_t doc_count = (uint32_t)count;
-    uint32_t reserved = 0u;
+    uint32_t tenant_id = scope ? scope->tenant_id : QIHSE_TENANT_SYSTEM;
+    uint8_t namespace_digest[QIHSE_RESP_FTS_NAMESPACE_DIGEST_BYTES] = {0};
+    if (scope) memcpy(namespace_digest, scope->artifact_digest, sizeof(namespace_digest));
+    uint32_t name_len = scope ? (uint32_t)strlen(scope->name) : 0u;
     bool ok = fwrite(&magic, sizeof(magic), 1u, f) == 1u &&
               fwrite(&version, sizeof(version), 1u, f) == 1u &&
               fwrite(&doc_count, sizeof(doc_count), 1u, f) == 1u &&
-              fwrite(&reserved, sizeof(reserved), 1u, f) == 1u &&
+              fwrite(&tenant_id, sizeof(tenant_id), 1u, f) == 1u &&
+              fwrite(&name_len, sizeof(name_len), 1u, f) == 1u &&
+              (!name_len || fwrite(scope->name, 1u, name_len, f) == name_len) &&
+              fwrite(namespace_digest, sizeof(namespace_digest), 1u, f) == 1u &&
               fwrite(&generation, sizeof(generation), 1u, f) == 1u &&
               fwrite(&index_size, sizeof(index_size), 1u, f) == 1u &&
               fwrite(&index_digest, sizeof(index_digest), 1u, f) == 1u;
@@ -6116,7 +6260,9 @@ static bool qihse_resp_fts_read_sidecar(const char* path,
     if (!f) { close(fd); return false; }
     uint64_t file_size = (uint64_t)st.st_size;
 
-    uint32_t magic = 0u, version = 0u, doc_count = 0u, reserved = 0u;
+    uint32_t magic = 0u, version = 0u, doc_count = 0u, tenant_id = 0u, name_len = 0u;
+    char namespace_name[QIHSE_RESP_FTS_NAMESPACE_MAX_NAME + 1u] = {0};
+    uint8_t namespace_digest[QIHSE_RESP_FTS_NAMESPACE_DIGEST_BYTES] = {0};
     uint64_t generation = 0u, index_size = 0u, index_digest = 0u;
     /* Declared before the first goto: every failure path below unwinds
      * through `fail`, and an uninitialised `keys` there would free garbage. */
@@ -6124,7 +6270,12 @@ static bool qihse_resp_fts_read_sidecar(const char* path,
     if (fread(&magic, sizeof(magic), 1u, f) != 1u || magic != QIHSE_RESP_FTS_KEYS_MAGIC ||
         fread(&version, sizeof(version), 1u, f) != 1u || version != QIHSE_RESP_FTS_KEYS_VERSION ||
         fread(&doc_count, sizeof(doc_count), 1u, f) != 1u ||
-        fread(&reserved, sizeof(reserved), 1u, f) != 1u ||
+        fread(&tenant_id, sizeof(tenant_id), 1u, f) != 1u ||
+        fread(&name_len, sizeof(name_len), 1u, f) != 1u ||
+        name_len > QIHSE_RESP_FTS_NAMESPACE_MAX_NAME ||
+        (name_len && fread(namespace_name, 1u, name_len, f) != name_len) ||
+        (name_len && memchr(namespace_name, '\0', name_len) != NULL) ||
+        fread(namespace_digest, sizeof(namespace_digest), 1u, f) != 1u ||
         fread(&generation, sizeof(generation), 1u, f) != 1u ||
         fread(&index_size, sizeof(index_size), 1u, f) != 1u ||
         fread(&index_digest, sizeof(index_digest), 1u, f) != 1u) goto fail;
@@ -6151,6 +6302,9 @@ static bool qihse_resp_fts_read_sidecar(const char* path,
     if (fgetc(f) != EOF) goto fail;
     fclose(f);
     out->generation = generation;
+    out->tenant_id = tenant_id;
+    memcpy(out->namespace_name, namespace_name, sizeof(namespace_name));
+    memcpy(out->namespace_digest, namespace_digest, sizeof(namespace_digest));
     out->index_size = index_size;
     out->index_digest = index_digest;
     out->doc_count = doc_count;
@@ -6197,6 +6351,12 @@ static qihse_resp_fts_load_status_t qihse_resp_fts_load_artifact(
     qihse_resp_fts_sidecar_t sidecar;
     if (!qihse_resp_fts_read_sidecar(keys_path, &sidecar))
         return QIHSE_RESP_FTS_LOAD_UNAVAILABLE;
+    uint8_t empty_digest[QIHSE_RESP_FTS_NAMESPACE_DIGEST_BYTES] = {0};
+    if (sidecar.tenant_id != QIHSE_TENANT_SYSTEM || sidecar.namespace_name[0] ||
+        memcmp(sidecar.namespace_digest, empty_digest, sizeof(empty_digest)) != 0) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return QIHSE_RESP_FTS_LOAD_CORRUPT;
+    }
 
     uint64_t index_size = 0u, index_digest = 0u;
     if (!qihse_resp_fts_file_digest(index_path, &index_size, &index_digest)) {
@@ -6353,7 +6513,7 @@ static bool qihse_resp_fts_save_artifact(qihse_resp_server_t* server,
     if (saved) {
         saved = qihse_resp_fts_file_digest(index_path, &index_size, &index_digest) &&
                 qihse_resp_fts_write_sidecar(keys_path, generation, index_size,
-                                             index_digest, server->fts_keys,
+                                             index_digest, NULL, server->fts_keys,
                                              key_count);
     }
     pthread_mutex_unlock(&server->fts_meta_lock);
@@ -6366,9 +6526,10 @@ static bool qihse_resp_fts_save_artifact(qihse_resp_server_t* server,
     return true;
 }
 
-/* Startup autoload, run once from server create before anything can connect.
- * Runs as the explicitly configured principal — never as an inferred or NULL
- * identity — and is best effort: on any failure FTS.* stays memory-only. */
+static bool qihse_resp_fts_load_app_artifact(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        qihse_resp_fts_scope_state_t* state);
+
 /* Startup autoload. Runs on its own thread so restoring a projection never
  * delays the listener: on a real corpus the artifact is hundreds of MB and
  * decoding it costs minutes of CPU and gigabytes of RSS, which is exactly the
@@ -6382,25 +6543,45 @@ static bool qihse_resp_fts_save_artifact(qihse_resp_server_t* server,
  * behaviour of an unbuilt index. */
 static void* qihse_resp_fts_autoload_worker(void* argument) {
     qihse_resp_server_t* server = (qihse_resp_server_t*)argument;
+    qihse_user_t* user = server->fts_autoload_principal;
+    if (!user || !qihse_auth_user_is_active(user)) {
+        fprintf(stderr, "qihse: fts autoload skipped (configured principal is inactive)\n");
+        return NULL;
+    }
     uint64_t count = 0u;
     uint64_t lag = 0u;
-    qihse_resp_fts_load_status_t status =
-        qihse_resp_fts_load_artifact(server, server->fts_autoload_principal, &count, &lag);
-    if (status == QIHSE_RESP_FTS_LOAD_OK) {
-        fprintf(stderr, "qihse: fts autoload restored %llu documents (%llu mutations "
-                        "behind the store)\n",
-                (unsigned long long)count, (unsigned long long)lag);
-    } else {
-        fprintf(stderr, "qihse: fts autoload skipped (%s); run FTS.BUILD to "
-                        "rebuild, then FTS.SAVE\n",
-                qihse_resp_fts_load_reason(status));
+    uint32_t tenant_id = qihse_user_get_tenant_id(user);
+    bool system_operator = tenant_id == QIHSE_TENANT_SYSTEM &&
+                           qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+    if (server->fts && system_operator) {
+        qihse_resp_fts_load_status_t status =
+            qihse_resp_fts_load_artifact(server, user, &count, &lag);
+        if (status == QIHSE_RESP_FTS_LOAD_OK) {
+            fprintf(stderr, "qihse: fts autoload restored %llu documents (%llu mutations "
+                            "behind the store)\n",
+                    (unsigned long long)count, (unsigned long long)lag);
+        } else {
+            fprintf(stderr, "qihse: fts autoload skipped (%s); run FTS.BUILD to "
+                            "rebuild, then FTS.SAVE\n",
+                    qihse_resp_fts_load_reason(status));
+        }
+    }
+    if (user) {
+        for (size_t i = 0; i < server->fts_app_scope_count; ++i) {
+            qihse_resp_fts_scope_state_t* state = &server->fts_app_scopes[i];
+            if (!system_operator && state->scope.tenant_id != tenant_id) continue;
+            if (qihse_resp_fts_load_app_artifact(server, user, state))
+                fprintf(stderr, "qihse: fts autoload restored APP tenant %u namespace %s\n",
+                        state->scope.tenant_id, state->scope.name);
+        }
     }
     return NULL;
 }
 
 static void qihse_resp_fts_autoload_start(qihse_resp_server_t* server) {
     if (!server->fts_persist_dir[0] || !server->fts_autoload_principal ||
-        !server->fts || !server->store)
+        !qihse_auth_user_is_active(server->fts_autoload_principal) || !server->store ||
+        (!server->fts && server->fts_app_scope_count == 0u))
         return;
     if (pthread_create(&server->fts_autoload_thread, NULL,
                        qihse_resp_fts_autoload_worker, server) == 0) {
@@ -6446,8 +6627,84 @@ static bool qihse_resp_handle_fts_load(qihse_resp_session_t* session, const qihs
            qihse_resp_bulk_text(session, lag == 0u ? "fresh" : "stale");
 }
 
+static qihse_resp_fts_scope_state_t* qihse_resp_fts_app_state(qihse_resp_server_t* server,
+                                                               qihse_user_t* user,
+                                                               const qihse_resp_arg_t* name_arg) {
+    if (!server || !user || !qihse_auth_user_is_active(user) || !name_arg ||
+        name_arg->len == 0u || name_arg->len > QIHSE_RESP_FTS_NAMESPACE_MAX_NAME) return NULL;
+    char name[QIHSE_RESP_FTS_NAMESPACE_MAX_NAME + 1u];
+    memcpy(name, name_arg->data, name_arg->len);
+    name[name_arg->len] = '\0';
+    qihse_resp_fts_namespace_t scope;
+    if (!qihse_resp_fts_namespace_resolve(server->fts_namespaces,
+            qihse_user_get_tenant_id(user), name, &scope)) return NULL;
+    for (size_t i = 0; i < server->fts_app_scope_count; ++i)
+        if (server->fts_app_scopes[i].scope.tenant_id == scope.tenant_id &&
+            strcmp(server->fts_app_scopes[i].scope.name, scope.name) == 0)
+            return &server->fts_app_scopes[i];
+    return NULL;
+}
+
+static bool qihse_resp_fts_rebuild_app(qihse_resp_server_t* server, qihse_user_t* user,
+                                       qihse_resp_fts_scope_state_t* state,
+                                       uint64_t* out_count, char* err, size_t err_cap) {
+    if (!server->store || !user || !state || !state->scope.tenant_id ||
+        qihse_user_get_tenant_id(user) != state->scope.tenant_id) {
+        snprintf(err, err_cap, "namespace is not authorized for this principal");
+        return false;
+    }
+    pthread_mutex_lock(&server->fts_meta_lock);
+    qihse_fts_index_t* fresh = qihse_fts_create();
+    char** keys = fresh ? (char**)calloc(QIHSE_RESP_FTS_MAX_DOCS + 1u, sizeof(char*)) : NULL;
+    if (!fresh || !keys) {
+        qihse_fts_destroy(fresh);
+        free(keys);
+        pthread_mutex_unlock(&server->fts_meta_lock);
+        snprintf(err, err_cap, "out of memory");
+        return false;
+    }
+    fts_build_ctx_t b;
+    memset(&b, 0, sizeof(b));
+    b.index = fresh;
+    b.user = user;
+    b.namespace_scope = &state->scope;
+    b.keys = keys;
+    b.cap = QIHSE_RESP_FTS_MAX_DOCS;
+    pthread_rwlock_rdlock(&server->kv_lock);
+    uint64_t generation = qihse_kv_change_seq(server->store);
+    qihse_kv_foreach_meta_user(server->store, user, qihse_resp_fts_build_cb, &b);
+    pthread_rwlock_unlock(&server->kv_lock);
+    qihse_fts_index_t* old = state->index;
+    char** old_keys = state->keys;
+    uint64_t old_count = state->key_count;
+    state->index = fresh;
+    state->keys = keys;
+    state->key_count = b.count;
+    state->key_cap = b.cap;
+    state->generation = generation;
+    state->built = true;
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    for (uint64_t i = 0; i < old_count; ++i) free(old_keys[i]);
+    free(old_keys);
+    qihse_fts_destroy(old);
+    *out_count = b.count;
+    return true;
+}
+
 static bool qihse_resp_handle_fts_build(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc != 2) return qihse_resp_wrong_arity(session, "fts.build");
+    qihse_user_t* user = session->user;
+    if (!user || !qihse_auth_user_is_active(user))
+        return qihse_resp_error(session, "NOPERM authenticated principal required");
+    uint32_t tenant_id = qihse_user_get_tenant_id(user);
+    qihse_resp_fts_tenant_state_t* tenant_state = NULL;
+    if (tenant_id == QIHSE_TENANT_SYSTEM) {
+        if (qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session, "NOPERM system-domain FTS build requires an Operator");
+    } else {
+        tenant_state = qihse_resp_fts_tenant_state(session->server, tenant_id, true);
+        if (!tenant_state) return qihse_resp_error(session, "ERR could not allocate tenant FTS state");
+    }
     if (request->argv[1].len == 0u || request->argv[1].len > QIHSE_RESP_FTS_MAX_PATTERN) {
         return qihse_resp_error(session, "ERR invalid key pattern");
     }
@@ -6457,8 +6714,12 @@ static bool qihse_resp_handle_fts_build(qihse_resp_session_t* session, const qih
 
     uint64_t count = 0u;
     char err[128];
-    if (!qihse_resp_fts_rebuild(session->server, session->user, pattern_buf,
-                                &count, err, sizeof(err))) {
+    bool rebuilt = tenant_state
+        ? qihse_resp_fts_rebuild_tenant(session->server, user, tenant_state,
+                                        pattern_buf, &count, err, sizeof(err))
+        : qihse_resp_fts_rebuild(session->server, user, pattern_buf,
+                                 &count, err, sizeof(err));
+    if (!rebuilt) {
         char msg[192];
         snprintf(msg, sizeof(msg), "ERR %s", err);
         return qihse_resp_error(session, msg);
@@ -6466,9 +6727,226 @@ static bool qihse_resp_handle_fts_build(qihse_resp_session_t* session, const qih
     return qihse_resp_integer(session, (int64_t)count);
 }
 
+static bool qihse_resp_handle_fts_build_app(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "fts.build.app");
+    if (!session->user) return qihse_resp_error(session, "NOPERM authenticated principal required");
+    qihse_resp_fts_scope_state_t* state = qihse_resp_fts_app_state(session->server, session->user, &request->argv[1]);
+    if (!state) return qihse_resp_error(session, "NOPERM unregistered FTS namespace");
+    uint64_t count = 0u;
+    char err[128];
+    if (!qihse_resp_fts_rebuild_app(session->server, session->user, state,
+                                    &count, err, sizeof(err))) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "ERR %s", err);
+        return qihse_resp_error(session, msg);
+    }
+    return qihse_resp_integer(session, (int64_t)count);
+}
+
+static bool qihse_resp_handle_fts_search_app(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc < 3 || request->argc > 4) return qihse_resp_wrong_arity(session, "fts.search.app");
+    if (!session->user) return qihse_resp_error(session, "NOPERM authenticated principal required");
+    qihse_resp_fts_scope_state_t* state = qihse_resp_fts_app_state(session->server, session->user, &request->argv[1]);
+    if (!state) return qihse_resp_error(session, "NOPERM unregistered FTS namespace");
+    if (request->argv[2].len == 0u || request->argv[2].len > QIHSE_RESP_FTS_MAX_QUERY)
+        return qihse_resp_error(session, "ERR invalid query");
+    uint64_t limit = QIHSE_RESP_FTS_DEFAULT_LIMIT;
+    if (request->argc == 4 && (!qihse_resp_parse_u64_arg(&request->argv[3], &limit) || limit == 0u))
+        return qihse_resp_error(session, "ERR invalid limit");
+    if (limit > QIHSE_RESP_FTS_MAX_LIMIT) limit = QIHSE_RESP_FTS_MAX_LIMIT;
+    char query[QIHSE_RESP_FTS_MAX_QUERY + 1u];
+    memcpy(query, request->argv[2].data, request->argv[2].len);
+    query[request->argv[2].len] = '\0';
+    qihse_fts_result_t hits[QIHSE_RESP_FTS_MAX_LIMIT];
+    char* hit_keys[QIHSE_RESP_FTS_MAX_LIMIT] = {0};
+    int n = 0;
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    if (state->index && state->built)
+        n = qihse_fts_search_user(state->index, query, session->user, hits, (int)limit);
+    for (int i = 0; i < n; ++i)
+        if (hits[i].doc_id && hits[i].doc_id <= state->key_count && state->keys[hits[i].doc_id - 1u])
+            hit_keys[i] = strdup(state->keys[hits[i].doc_id - 1u]);
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
+    if (n < 0) {
+        for (int i = 0; i < (int)QIHSE_RESP_FTS_MAX_LIMIT; ++i) free(hit_keys[i]);
+        return qihse_resp_error(session, "ERR search failed");
+    }
+    bool ok = qihse_resp_array(session, (size_t)n * 2u);
+    for (int i = 0; ok && i < n; ++i) {
+        char score[32];
+        snprintf(score, sizeof(score), "%.6g", (double)hits[i].bm25_score);
+        ok = qihse_resp_bulk_text(session, hit_keys[i] ? hit_keys[i] : "") &&
+             qihse_resp_bulk_text(session, score);
+    }
+    for (int i = 0; i < n; ++i) free(hit_keys[i]);
+    return ok;
+}
+
+static bool qihse_resp_fts_app_paths(qihse_resp_server_t* server,
+                                    const qihse_resp_fts_scope_state_t* state,
+                                    char* index, size_t index_cap, char* keys, size_t keys_cap) {
+    return server->fts_persist_dir[0] &&
+        qihse_resp_fts_namespace_artifact_paths(server->fts_persist_dir, &state->scope,
+                                                index, index_cap, keys, keys_cap);
+}
+
+static bool qihse_resp_fts_load_app_artifact(
+        qihse_resp_server_t* server, qihse_user_t* user,
+        qihse_resp_fts_scope_state_t* state) {
+    if (!server || !server->store || !user || !state ||
+        !qihse_auth_user_is_active(user)) return false;
+    uint32_t tenant_id = qihse_user_get_tenant_id(user);
+    bool system_operator = tenant_id == QIHSE_TENANT_SYSTEM &&
+                           qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+    if (!system_operator && tenant_id != state->scope.tenant_id) return false;
+    char index[1200], keys[1200];
+    if (!qihse_resp_fts_app_paths(server, state, index, sizeof(index), keys, sizeof(keys)))
+        return false;
+    qihse_resp_fts_sidecar_t sidecar;
+    if (!qihse_resp_fts_read_sidecar(keys, &sidecar)) return false;
+    if (sidecar.tenant_id != state->scope.tenant_id ||
+        strcmp(sidecar.namespace_name, state->scope.name) != 0 ||
+        memcmp(sidecar.namespace_digest, state->scope.artifact_digest,
+               sizeof(state->scope.artifact_digest)) != 0) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return false;
+    }
+    for (uint32_t i = 0; i < sidecar.doc_count; ++i) {
+        if (!qihse_resp_fts_namespace_key_allowed(&state->scope, sidecar.keys[i])) {
+            qihse_resp_fts_sidecar_free(&sidecar);
+            return false;
+        }
+    }
+    uint64_t size = 0u, digest = 0u;
+    if (!qihse_resp_fts_file_digest(index, &size, &digest) ||
+        size != sidecar.index_size || digest != sidecar.index_digest ||
+        sidecar.generation > qihse_kv_change_seq(server->store)) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return false;
+    }
+    qihse_fts_index_t* loaded = qihse_fts_load(index, user);
+    if (!loaded || qihse_fts_doc_count(loaded) != sidecar.doc_count) {
+        qihse_fts_destroy(loaded);
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return false;
+    }
+    pthread_mutex_lock(&server->fts_meta_lock);
+    qihse_fts_index_t* old = state->index;
+    char** old_keys = state->keys;
+    uint64_t old_count = state->key_count;
+    state->index = loaded;
+    state->keys = sidecar.keys;
+    state->key_count = sidecar.doc_count;
+    state->key_cap = sidecar.doc_count;
+    state->generation = sidecar.generation;
+    state->built = true;
+    sidecar.keys = NULL;
+    sidecar.doc_count = 0u;
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    for (uint64_t i = 0; i < old_count; ++i) free(old_keys[i]);
+    free(old_keys);
+    qihse_fts_destroy(old);
+    return true;
+}
+
+static bool qihse_resp_handle_fts_save_app(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "fts.save.app");
+    if (!session->user) return qihse_resp_error(session, "NOPERM authenticated principal required");
+    qihse_resp_fts_scope_state_t* state = qihse_resp_fts_app_state(session->server, session->user, &request->argv[1]);
+    if (!state) return qihse_resp_error(session, "NOPERM unregistered FTS namespace");
+    char index[1200], keys[1200];
+    if (!qihse_resp_fts_app_paths(session->server, state, index, sizeof(index), keys, sizeof(keys)))
+        return qihse_resp_error(session, "ERR full-text persistence is not configured");
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    if (!state->index || !state->built) {
+        pthread_mutex_unlock(&session->server->fts_meta_lock);
+        return qihse_resp_error(session, "ERR namespace index has never been built");
+    }
+    pthread_rwlock_wrlock(&session->server->kv_lock);
+    bool store_synced = qihse_kv_sync_store(session->server->store);
+    pthread_rwlock_unlock(&session->server->kv_lock);
+    bool saved = store_synced && qihse_fts_save(state->index, index, session->user);
+    uint64_t size = 0u, digest = 0u;
+    if (saved) saved = qihse_resp_fts_file_digest(index, &size, &digest) &&
+        qihse_resp_fts_write_sidecar(keys, state->generation, size, digest,
+                                     &state->scope, state->keys, state->key_count);
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
+    if (!saved)
+        return qihse_resp_error(session, "ERR namespace artifact write failed or documents are unauthorized");
+    return qihse_resp_simple(session, "OK");
+}
+
+static bool qihse_resp_handle_fts_load_app(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
+    if (request->argc != 2) return qihse_resp_wrong_arity(session, "fts.load.app");
+    if (!session->user) return qihse_resp_error(session, "NOPERM authenticated principal required");
+    qihse_resp_fts_scope_state_t* state = qihse_resp_fts_app_state(session->server, session->user, &request->argv[1]);
+    if (!state) return qihse_resp_error(session, "NOPERM unregistered FTS namespace");
+    char index[1200], keys[1200];
+    if (!session->server->store ||
+        !qihse_resp_fts_app_paths(session->server, state, index, sizeof(index), keys, sizeof(keys)))
+        return qihse_resp_error(session, "ERR full-text persistence or store is not configured");
+    qihse_resp_fts_sidecar_t sidecar;
+    if (!qihse_resp_fts_read_sidecar(keys, &sidecar))
+        return qihse_resp_error(session, "ERR namespace artifact is unavailable or corrupt");
+    if (sidecar.tenant_id != state->scope.tenant_id ||
+        strcmp(sidecar.namespace_name, state->scope.name) != 0 ||
+        memcmp(sidecar.namespace_digest, state->scope.artifact_digest,
+               sizeof(state->scope.artifact_digest)) != 0) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return qihse_resp_error(session, "ERR namespace artifact identity mismatch");
+    }
+    for (uint32_t i = 0; i < sidecar.doc_count; ++i) {
+        if (!qihse_resp_fts_namespace_key_allowed(&state->scope, sidecar.keys[i])) {
+            qihse_resp_fts_sidecar_free(&sidecar);
+            return qihse_resp_error(session, "ERR namespace sidecar contains an out-of-scope key");
+        }
+    }
+    uint64_t size = 0u, digest = 0u;
+    if (!qihse_resp_fts_file_digest(index, &size, &digest) || size != sidecar.index_size || digest != sidecar.index_digest ||
+        sidecar.generation > qihse_kv_change_seq(session->server->store)) {
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return qihse_resp_error(session, "ERR namespace artifact is corrupt or ahead of the store");
+    }
+    qihse_fts_index_t* loaded = qihse_fts_load(index, session->user);
+    if (!loaded || qihse_fts_doc_count(loaded) != sidecar.doc_count) {
+        qihse_fts_destroy(loaded);
+        qihse_resp_fts_sidecar_free(&sidecar);
+        return qihse_resp_error(session, "ERR namespace artifact is unauthorized or corrupt");
+    }
+    pthread_mutex_lock(&session->server->fts_meta_lock);
+    qihse_fts_index_t* old = state->index;
+    char** old_keys = state->keys;
+    uint64_t old_count = state->key_count;
+    state->index = loaded;
+    state->keys = sidecar.keys;
+    state->key_count = sidecar.doc_count;
+    state->key_cap = sidecar.doc_count;
+    state->generation = sidecar.generation;
+    state->built = true;
+    sidecar.keys = NULL;
+    sidecar.doc_count = 0u;
+    pthread_mutex_unlock(&session->server->fts_meta_lock);
+    for (uint64_t i = 0; i < old_count; ++i) free(old_keys[i]);
+    free(old_keys);
+    qihse_fts_destroy(old);
+    return qihse_resp_simple(session, "OK");
+}
+
 static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 2 || request->argc > 3) return qihse_resp_wrong_arity(session, "fts.search");
-    if (!session->server->fts) return qihse_resp_error(session, "ERR full-text index is not configured");
+    qihse_user_t* user = session->user;
+    if (!user || !qihse_auth_user_is_active(user))
+        return qihse_resp_error(session, "NOPERM authenticated principal required");
+    uint32_t tenant_id = qihse_user_get_tenant_id(user);
+    qihse_resp_fts_tenant_state_t* tenant_state = NULL;
+    if (tenant_id == QIHSE_TENANT_SYSTEM) {
+        if (qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR)
+            return qihse_resp_error(session, "NOPERM system-domain FTS search requires an Operator");
+        if (!session->server->fts)
+            return qihse_resp_error(session, "ERR full-text index is not configured");
+    } else {
+        tenant_state = qihse_resp_fts_tenant_state(session->server, tenant_id, false);
+    }
     if (request->argv[1].len == 0u || request->argv[1].len > QIHSE_RESP_FTS_MAX_QUERY) {
         return qihse_resp_error(session, "ERR invalid query");
     }
@@ -6483,26 +6961,27 @@ static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qi
     memcpy(query_buf, request->argv[1].data, request->argv[1].len);
     query_buf[request->argv[1].len] = '\0';
 
-    /* Snapshot the hits under the lock: BUILD/LOAD may swap the index and
-     * free the key map the moment we unlock, so copy the key strings out. */
+    /* Snapshot hits and keys together: rebuild swaps each tenant's index and
+     * key map atomically under this lock. */
     qihse_fts_result_t hits[QIHSE_RESP_FTS_MAX_LIMIT];
-    char* hit_keys[QIHSE_RESP_FTS_MAX_LIMIT];
+    char* hit_keys[QIHSE_RESP_FTS_MAX_LIMIT] = {0};
     int n = 0;
     pthread_mutex_lock(&session->server->fts_meta_lock);
-    if (session->server->fts) {
-        n = qihse_fts_search_user(session->server->fts, query_buf, session->user,
-                                  hits, (int)limit);
+    qihse_fts_index_t* index = tenant_state ? tenant_state->index : session->server->fts;
+    char** keys = tenant_state ? tenant_state->keys : session->server->fts_keys;
+    uint64_t key_count = tenant_state ? tenant_state->key_count : session->server->fts_key_count;
+    if (index) {
+        n = qihse_fts_search_user(index, query_buf, user, hits, (int)limit);
         for (int i = 0; i < n; i++) {
-            hit_keys[i] = NULL;
-            if (hits[i].doc_id >= 1u && hits[i].doc_id <= session->server->fts_key_count) {
-                const char* k = session->server->fts_keys[hits[i].doc_id - 1u];
-                if (k) hit_keys[i] = strdup(k);
+            if (hits[i].doc_id >= 1u && hits[i].doc_id <= key_count) {
+                const char* key = keys[hits[i].doc_id - 1u];
+                if (key) hit_keys[i] = strdup(key);
             }
         }
     }
     pthread_mutex_unlock(&session->server->fts_meta_lock);
     if (n < 0) {
-        for (int i = 0; i < n && i < QIHSE_RESP_FTS_MAX_LIMIT; i++) free(hit_keys[i]);
+        for (size_t i = 0; i < QIHSE_RESP_FTS_MAX_LIMIT; ++i) free(hit_keys[i]);
         return qihse_resp_error(session, "ERR search failed");
     }
     bool built = qihse_resp_array(session, (size_t)n * 2u);
@@ -6512,7 +6991,7 @@ static bool qihse_resp_handle_fts_search(qihse_resp_session_t* session, const qi
         built = qihse_resp_bulk_text(session, hit_keys[i] ? hit_keys[i] : "") &&
                 qihse_resp_bulk_text(session, score);
     }
-    for (int i = 0; i < n && i < QIHSE_RESP_FTS_MAX_LIMIT; i++) free(hit_keys[i]);
+    for (size_t i = 0; i < QIHSE_RESP_FTS_MAX_LIMIT; ++i) free(hit_keys[i]);
     return built;
 }
 
@@ -11188,6 +11667,10 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"authority.export", qihse_resp_handle_authority, DSP_ADMIN},
     {"authority.import", qihse_resp_handle_authority, DSP_ADMIN | DSP_BUSY_WRITE},
     {"authority.checkpoint", qihse_resp_handle_authority, DSP_ADMIN | DSP_BUSY_WRITE},
+    {"fts.build.app", qihse_resp_handle_fts_build_app, DSP_BUSY_WRITE},
+    {"fts.search.app", qihse_resp_handle_fts_search_app, 0},
+    {"fts.save.app", qihse_resp_handle_fts_save_app, DSP_BUSY_WRITE},
+    {"fts.load.app", qihse_resp_handle_fts_load_app, DSP_BUSY_WRITE},
 };
 
 #define RESP_DISPATCH_MAP_CAP 256u
@@ -11785,6 +12268,13 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
     return 0;
 }
 
+static bool qihse_resp_session_is_system_operator(const qihse_resp_session_t* session) {
+    return session && session->server && session->server->auth_required && session->user &&
+           qihse_auth_user_is_active(session->user) &&
+           qihse_user_get_tenant_id(session->user) == QIHSE_TENANT_SYSTEM &&
+           qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR;
+}
+
 /* ---------------------------------------------------------------------------
  * CLUSTER MOVESLOTS <first>-<last> <host>:<port>  (system domain only)
  * Parses the request and delegates to qihse_cluster_handoff_range(), the same
@@ -11792,8 +12282,8 @@ int qihse_cluster_handoff_range(qihse_resp_server_t* server, uint16_t first, uin
  * ------------------------------------------------------------------------- */
 static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM) {
-        return qihse_resp_error(session, "NOPERM MOVESLOTS is restricted to the system domain");
+    if (!qihse_resp_session_is_system_operator(session)) {
+        return qihse_resp_error(session, "NOPERM active system Operator required");
     }
     if (request->argc != 4) return qihse_resp_error(session, "ERR usage: CLUSTER MOVESLOTS <first>-<last> <host>:<port>");
 
@@ -11868,9 +12358,8 @@ static bool qihse_resp_handle_moveslots(qihse_resp_session_t* session, const qih
  * ------------------------------------------------------------------------- */
 static bool qihse_resp_handle_reclaim(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (!session->server->store) return qihse_resp_error(session, "ERR key-value store is not configured");
-    if (!session->user || qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
-        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR) {
-        return qihse_resp_error(session, "NOPERM RECLAIM is restricted to the system domain administrator");
+    if (!qihse_resp_session_is_system_operator(session)) {
+        return qihse_resp_error(session, "NOPERM active system Operator required");
     }
     if (request->argc != 2 && request->argc != 3) {
         return qihse_resp_error(session, "ERR usage: CLUSTER RECLAIM [limit]");
@@ -15797,16 +16286,16 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             if (cmd_len == 7u && qihse_resp_command_is(request, "CLUSTER")) {
                 if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "FAILOVER.RESUME")) {
                     if (request->argc != 2) return qihse_resp_wrong_arity(session, "cluster failover.resume");
-                    if (!session->server->auth_required || !session->user ||
-                        !qihse_auth_user_is_active(session->user) ||
-                        qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM ||
-                        qihse_user_get_role(session->user) != QIHSE_ROLE_OPERATOR)
+                    if (!qihse_resp_session_is_system_operator(session))
                         return qihse_resp_error(session, "NOPERM active system Operator required");
                     if (!session->server->failover)
                         return qihse_resp_error(session, "ERR failover is not configured");
                     bool resumed = qihse_cluster_failover_resume(session->server->failover);
                     return qihse_resp_simple(session, resumed ? "RESUMED" : "ALREADY-RUNNING");
                 }
+                if (qihse_resp_cluster_subcommand_mutates(request->argc, request->argv) &&
+                    !qihse_resp_session_is_system_operator(session))
+                    return qihse_resp_error(session, "NOPERM active system Operator required");
                 if (request->argc >= 2 && qihse_resp_arg_equal(&request->argv[1], "MOVESLOTS")) {
                     return qihse_resp_handle_moveslots(session, request);
                 }
@@ -16472,6 +16961,46 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     }
     qihse_resp_server_t* server = (qihse_resp_server_t*)calloc(1, sizeof(*server));
     if (!server) return NULL;
+    if (supplied->fts_namespace_count > QIHSE_RESP_FTS_NAMESPACE_MAX_ENTRIES ||
+        (supplied->fts_namespace_count && !supplied->fts_namespaces)) {
+        free(server);
+        errno = EINVAL;
+        return NULL;
+    }
+    server->fts_namespaces = qihse_resp_fts_namespace_registry_create();
+    if (!server->fts_namespaces) { free(server); return NULL; }
+    for (size_t i = 0; i < supplied->fts_namespace_count; ++i) {
+        const qihse_resp_fts_namespace_config_t* mapping = &supplied->fts_namespaces[i];
+        if (!qihse_resp_fts_namespace_register(server->fts_namespaces,
+                mapping->tenant_id, mapping->canonical_name,
+                mapping->allowlisted_key_glob)) {
+            qihse_resp_fts_namespace_registry_destroy(server->fts_namespaces);
+            free(server);
+            errno = EINVAL;
+            return NULL;
+        }
+    }
+    if (supplied->fts_namespace_count) {
+        server->fts_app_scopes = (qihse_resp_fts_scope_state_t*)calloc(
+            supplied->fts_namespace_count, sizeof(*server->fts_app_scopes));
+        if (!server->fts_app_scopes) {
+            qihse_resp_fts_namespace_registry_destroy(server->fts_namespaces);
+            free(server);
+            return NULL;
+        }
+        server->fts_app_scope_count = supplied->fts_namespace_count;
+        for (size_t i = 0; i < supplied->fts_namespace_count; ++i) {
+            const qihse_resp_fts_namespace_config_t* mapping = &supplied->fts_namespaces[i];
+            if (!qihse_resp_fts_namespace_resolve(server->fts_namespaces, mapping->tenant_id,
+                    mapping->canonical_name, &server->fts_app_scopes[i].scope)) {
+                free(server->fts_app_scopes);
+                qihse_resp_fts_namespace_registry_destroy(server->fts_namespaces);
+                free(server);
+                errno = EINVAL;
+                return NULL;
+            }
+        }
+    }
     server->store = supplied->store;
     server->vdb = supplied->vdb;
     server->tsdb = supplied->tsdb;
@@ -17205,6 +17734,23 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
         free(server->fts_keys);
     }
     qihse_fts_destroy(server->fts);
+    for (size_t i = 0; i < server->fts_app_scope_count; ++i) {
+        qihse_resp_fts_scope_state_t* state = &server->fts_app_scopes[i];
+        for (uint64_t k = 0; k < state->key_count; ++k) free(state->keys[k]);
+        free(state->keys);
+        qihse_fts_destroy(state->index);
+    }
+    free(server->fts_app_scopes);
+    qihse_resp_fts_tenant_state_t* tenant_fts = server->fts_tenant_scopes;
+    while (tenant_fts) {
+        qihse_resp_fts_tenant_state_t* next = tenant_fts->next;
+        for (uint64_t k = 0; k < tenant_fts->key_count; ++k) free(tenant_fts->keys[k]);
+        free(tenant_fts->keys);
+        qihse_fts_destroy(tenant_fts->index);
+        free(tenant_fts);
+        tenant_fts = next;
+    }
+    qihse_resp_fts_namespace_registry_destroy(server->fts_namespaces);
     pthread_mutex_destroy(&server->fts_meta_lock);
     /* A BGSAVE worker may still hold kv_lock write-side: join it BEFORE the
      * store and locks are torn down. Workers are one-shot; the join only

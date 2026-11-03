@@ -127,6 +127,22 @@ int main(void) {
     assert(strstr(reply, "*3\r\n") != NULL);
     printf("PASS vechybrid: fused vector+FTS result set over RESP\n");
 
+    /* A tenant's VECHYBRID call must use its tenant-default projection, not
+     * the system index supplied in config.fts. */
+    qihse_user_t* tenant_user = qihse_auth_create_tenant_user(
+        op, 77u, 7701u, QIHSE_ROLE_GUEST, 0u, 0u, "HybridTenantPass1!", false);
+    assert(tenant_user != NULL);
+    assert(qihse_kv_set_user(store, "t:77/hybrid/doc", "tenant scoped hybrid marker",
+                             0u, 0u, op));
+    const char* tenant_build[] = { "FTS.BUILD", "*" };
+    assert(run_cmd(tenant_user, 2u, tenant_build, reply, sizeof reply));
+    assert(strcmp(reply, ":1\r\n") == 0);
+    const char* tenant_hybrid[] = { "VECHYBRID", "4", "3", "1", "0", "0", "0",
+                                    "FTS", "tenant scoped hybrid marker" };
+    assert(run_cmd(tenant_user, 9u, tenant_hybrid, reply, sizeof reply));
+    assert(reply[0] == '*' && reply_has_id(reply, 1u));
+    printf("PASS vechybrid: tenant caller uses its own default FTS projection\n");
+
     /* ── the FTS clause is required; missing/unconfigured is explicit ── */
     const char* nofts[] = { "VECHYBRID", "4", "3", "1", "0", "0", "0" };
     assert(run_cmd(op, 7u, nofts, reply, sizeof reply));

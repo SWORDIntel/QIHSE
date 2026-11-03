@@ -161,7 +161,9 @@ static bool read_file(const char* path, char* out, size_t cap, size_t* out_len) 
 }
 
 static qihse_resp_server_t* make_server(qihse_kv_store_t* store, qihse_user_t* operator_user,
-                                        const char* fts_dir) {
+                                        const char* fts_dir,
+                                        const qihse_resp_fts_namespace_config_t* namespaces,
+                                        size_t namespace_count) {
     qihse_resp_server_config_t config;
     qihse_resp_server_config_init(&config);
     config.store = store;
@@ -171,6 +173,8 @@ static qihse_resp_server_t* make_server(qihse_kv_store_t* store, qihse_user_t* o
     config.auth_required = true;
     config.fts_persist_directory = fts_dir;
     config.fts_autoload_principal = operator_user;
+    config.fts_namespaces = namespaces;
+    config.fts_namespace_count = namespace_count;
     config.enable_task_queue = false;
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
@@ -197,13 +201,15 @@ int main(void) {
     assert(qihse_auth_bootstrap_operator(OPERATOR_PASSWORD));
     qihse_user_t* operator_user = qihse_auth_get_user(0u);
     assert(operator_user != NULL);
-    qihse_user_t* guest = qihse_auth_create_user(operator_user, GUEST_USER_ID,
-                                                 QIHSE_ROLE_GUEST, 0, 0,
-                                                 GUEST_PASSWORD, false);
-    assert(guest != NULL);
-    /* qihse_auth_create_user() refuses nothing here, but a low-clearance
-     * principal that is not actually low-clearance would make the negative
-     * half of this test vacuous. */
+    qihse_user_t* guest = qihse_auth_create_tenant_user(operator_user, 77u,
+                                                        GUEST_USER_ID, QIHSE_ROLE_GUEST,
+                                                        0, 0, GUEST_PASSWORD, false);
+    qihse_user_t* tenant88 = qihse_auth_create_tenant_user(operator_user, 88u,
+                                                           71u, QIHSE_ROLE_GUEST,
+                                                           0, 0, "FtsPersistT881!", false);
+    assert(guest != NULL && tenant88 != NULL);
+    /* Keep the negative principal both low-clearance and genuinely tenant
+     * scoped, so the legacy-index isolation check is not vacuous. */
     assert(qihse_user_get_role(guest) == QIHSE_ROLE_GUEST);
     assert(!qihse_auth_can_access(guest, SECRET_CLASS, 0));
 
@@ -211,17 +217,28 @@ int main(void) {
     assert(store != NULL);
     assert(qihse_kv_set_user(store, PUBLIC_KEY, PUBLIC_TEXT, 0, 0, operator_user));
     assert(qihse_kv_set_user(store, SECRET_KEY, SECRET_TEXT, SECRET_CLASS, 0, operator_user));
+    assert(qihse_kv_set_user(store, "t:77/app/doc", "tenant seventy seven catalog", 0, 0, operator_user));
+    assert(qihse_kv_set_user(store, "t:88/app/doc", "tenant eighty eight catalog", 0, 0, operator_user));
+    const qihse_resp_fts_namespace_config_t namespaces[] = {
+        { 77u, "catalog", "t:77/app/*" },
+        { 88u, "catalog", "t:88/app/*" }
+    };
 
-    qihse_resp_server_t* server = make_server(store, operator_user, fts_dir);
+    qihse_resp_server_t* server = make_server(store, operator_user, fts_dir, namespaces, 2u);
     test_client_t op;
     test_client_t gst;
+    test_client_t t88;
     client_open(&op, server);
     client_open(&gst, server);
+    client_open(&t88, server);
 
     char* reply = auth(&op, "GODMODE_OP", OPERATOR_PASSWORD);
     assert(strcmp(reply, "+OK\r\n") == 0);
     free(reply);
     reply = auth(&gst, "User_70", GUEST_PASSWORD);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    reply = auth(&t88, "User_71", "FtsPersistT881!");
     assert(strcmp(reply, "+OK\r\n") == 0);
     free(reply);
 
@@ -236,17 +253,190 @@ int main(void) {
     assert(strstr(reply, SECRET_KEY) != NULL);
     free(reply);
 
-    /* ── invariant #3: the low-clearance principal sees no high data ───── */
-    reply = cmd(&gst, 2, search);
+    /* Tenant-default builds own independent indexes, even though the caller
+     * supplied one system-domain index in config. */
+    const char* tenant_build[] = { "FTS.BUILD", "*" };
+    reply = cmd(&gst, 2, tenant_build);
+    assert(strcmp(reply, ":1\r\n") == 0);
+    free(reply);
+    reply = cmd(&t88, 2, tenant_build);
+    assert(strcmp(reply, ":1\r\n") == 0);
+    free(reply);
+    const char* search_seventy[] = { "FTS.SEARCH", "seventy" };
+    reply = cmd(&gst, 2, search_seventy);
+    assert(strstr(reply, "t:77/app/doc") != NULL && strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    const char* search_eighty[] = { "FTS.SEARCH", "eighty" };
+    reply = cmd(&gst, 2, search_eighty);
+    assert(strstr(reply, "t:77/app/doc") == NULL && strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    reply = cmd(&t88, 2, search_eighty);
+    assert(strstr(reply, "t:88/app/doc") != NULL && strstr(reply, "t:77/app/doc") == NULL);
+    free(reply);
+    reply = cmd(&t88, 2, search_seventy);
+    assert(strstr(reply, "t:77/app/doc") == NULL && strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    reply = cmd(&op, 2, search);
+    assert(strstr(reply, SECRET_KEY) != NULL && strstr(reply, "t:77/app/doc") == NULL &&
+           strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    printf("[PASS] tenant-default FTS indexes are isolated from each other and the system index\n");
+
+    /* The same registered application name remains isolated by caller tenant.
+     * BUILD.APP accepts only the registered name, never a request glob. */
+    const char* build_app[] = { "FTS.BUILD.APP", "catalog" };
+    reply = cmd(&gst, 2, build_app);
+    assert(strcmp(reply, ":1\r\n") == 0);
+    free(reply);
+    reply = cmd(&t88, 2, build_app);
+    assert(strcmp(reply, ":1\r\n") == 0);
+    free(reply);
+    const char* search_app[] = { "FTS.SEARCH.APP", "catalog", "seventy" };
+    reply = cmd(&gst, 3, search_app);
+    assert(strstr(reply, "t:77/app/doc") != NULL && strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    reply = cmd(&t88, 3, search_app);
+    assert(strstr(reply, "t:77/app/doc") == NULL && strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    const char* search_app88[] = { "FTS.SEARCH.APP", "catalog", "eighty" };
+    reply = cmd(&t88, 3, search_app88);
+    assert(strstr(reply, "t:88/app/doc") != NULL && strstr(reply, "t:77/app/doc") == NULL);
+    free(reply);
+    const char* unregistered_app[] = { "FTS.BUILD.APP", "unknown" };
+    reply = cmd(&gst, 2, unregistered_app);
+    assert(strncmp(reply, "-NOPERM", 7) == 0);
+    free(reply);
+    const char* request_glob[] = { "FTS.BUILD.APP", "catalog", "*" };
+    reply = cmd(&gst, 3, request_glob);
+    assert(strncmp(reply, "-ERR", 4) == 0);
+    free(reply);
+    printf("[PASS] APP commands isolate same-name tenant scopes and reject unregistered names/globs\n");
+    const char* save_app[] = { "FTS.SAVE.APP", "catalog" };
+    reply = cmd(&gst, 2, save_app);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    reply = cmd(&t88, 2, save_app);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+
+    /* Restart with the explicit system Operator autoload identity. It may
+     * restore only scopes registered in this server configuration; each
+     * artifact is still checked against its tenant/name sidecar identity. */
+    qihse_resp_server_t* autoload_server = make_server(store, operator_user,
+                                                       fts_dir, namespaces, 2u);
+    test_client_t autoload_client;
+    client_open(&autoload_client, autoload_server);
+    reply = auth(&autoload_client, "User_70", GUEST_PASSWORD);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    struct timespec autoload_pause = { .tv_sec = 0, .tv_nsec = 10000000L };
+    bool app_autoloaded = false;
+    for (unsigned attempt = 0; attempt < 300u && !app_autoloaded; ++attempt) {
+        reply = cmd(&autoload_client, 3, search_app);
+        app_autoloaded = strstr(reply, "t:77/app/doc") != NULL;
+        free(reply);
+        if (!app_autoloaded) nanosleep(&autoload_pause, NULL);
+    }
+    assert(app_autoloaded);
+    test_client_t autoload_client88;
+    client_open(&autoload_client88, autoload_server);
+    reply = auth(&autoload_client88, "User_71", "FtsPersistT881!");
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    bool app88_autoloaded = false;
+    for (unsigned attempt = 0; attempt < 300u && !app88_autoloaded; ++attempt) {
+        reply = cmd(&autoload_client88, 3, search_app88);
+        app88_autoloaded = strstr(reply, "t:88/app/doc") != NULL &&
+                           strstr(reply, "t:77/app/doc") == NULL;
+        free(reply);
+        if (!app88_autoloaded) nanosleep(&autoload_pause, NULL);
+    }
+    assert(app88_autoloaded);
+    client_close(&autoload_client);
+    client_close(&autoload_client88);
+    qihse_resp_server_destroy(autoload_server);
+
+    /* A tenant autoload principal must not restore another tenant's scope. */
+    qihse_resp_server_t* tenant_autoload_server = make_server(store, guest,
+                                                              fts_dir, namespaces, 2u);
+    test_client_t tenant_autoload_client;
+    client_open(&tenant_autoload_client, tenant_autoload_server);
+    reply = auth(&tenant_autoload_client, "User_70", GUEST_PASSWORD);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    bool tenant_scope_autoloaded = false;
+    for (unsigned attempt = 0; attempt < 300u && !tenant_scope_autoloaded; ++attempt) {
+        reply = cmd(&tenant_autoload_client, 3, search_app);
+        tenant_scope_autoloaded = strstr(reply, "t:77/app/doc") != NULL;
+        free(reply);
+        if (!tenant_scope_autoloaded) nanosleep(&autoload_pause, NULL);
+    }
+    assert(tenant_scope_autoloaded);
+    test_client_t denied_autoload_client;
+    client_open(&denied_autoload_client, tenant_autoload_server);
+    reply = auth(&denied_autoload_client, "User_71", "FtsPersistT881!");
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    reply = cmd(&denied_autoload_client, 3, search_app88);
     assert(strcmp(reply, "*0\r\n") == 0);
     free(reply);
-    const char* search_public[] = { "FTS.SEARCH", "public" };
-    reply = cmd(&gst, 2, search_public);
-    assert(strstr(reply, PUBLIC_KEY) != NULL);
-    assert(strstr(reply, SECRET_KEY) == NULL);
-    assert(strstr(reply, SECRET_TEXT) == NULL);
+    client_close(&tenant_autoload_client);
+    client_close(&denied_autoload_client);
+    qihse_resp_server_destroy(tenant_autoload_server);
+    printf("[PASS] startup autoload restores only the explicitly identified tenant's APP scope\n");
+
+    qihse_resp_fts_namespace_registry_t* registry = qihse_resp_fts_namespace_registry_create();
+    assert(registry != NULL);
+    assert(qihse_resp_fts_namespace_register(registry, 77u, "catalog", "t:77/app/*"));
+    assert(qihse_resp_fts_namespace_register(registry, 88u, "catalog", "t:88/app/*"));
+    qihse_resp_fts_namespace_t scope77, scope88;
+    assert(qihse_resp_fts_namespace_resolve(registry, 77u, "catalog", &scope77));
+    assert(qihse_resp_fts_namespace_resolve(registry, 88u, "catalog", &scope88));
+    char app_index77[768], app_keys77[768], app_index88[768], app_keys88[768];
+    assert(qihse_resp_fts_namespace_artifact_paths(fts_dir, &scope77, app_index77,
+            sizeof(app_index77), app_keys77, sizeof(app_keys77)));
+    assert(qihse_resp_fts_namespace_artifact_paths(fts_dir, &scope88, app_index88,
+            sizeof(app_index88), app_keys88, sizeof(app_keys88)));
+    assert(strcmp(app_index77, app_index88) != 0 && strcmp(app_keys77, app_keys88) != 0);
+    uint8_t app_sidecar[512], app_sidecar88[512];
+    size_t app_sidecar_len = 0, app_sidecar88_len = 0;
+    assert(read_file(app_keys77, (char*)app_sidecar, sizeof(app_sidecar), &app_sidecar_len));
+    assert(read_file(app_keys88, (char*)app_sidecar88, sizeof(app_sidecar88), &app_sidecar88_len));
+    uint32_t app_tenant = 0, app_name_len = 0;
+    memcpy(&app_tenant, app_sidecar + 12u, sizeof(app_tenant));
+    memcpy(&app_name_len, app_sidecar + 16u, sizeof(app_name_len));
+    assert(app_tenant == 77u && app_name_len == strlen("catalog"));
+    assert(app_sidecar_len >= 20u + app_name_len + sizeof(scope77.artifact_digest));
+    assert(memcmp(app_sidecar + 20u, "catalog", app_name_len) == 0);
+    assert(memcmp(app_sidecar + 20u + app_name_len, scope77.artifact_digest,
+                  sizeof(scope77.artifact_digest)) == 0);
+    assert(app_sidecar88_len <= sizeof(app_sidecar88));
+    FILE* swapped = fopen(app_keys77, "wb");
+    assert(swapped != NULL);
+    assert(fwrite(app_sidecar88, 1u, app_sidecar88_len, swapped) == app_sidecar88_len);
+    assert(fclose(swapped) == 0);
+    const char* load_app[] = { "FTS.LOAD.APP", "catalog" };
+    reply = cmd(&gst, 2, load_app);
+    assert(strstr(reply, "identity mismatch") != NULL);
     free(reply);
-    printf("[PASS] FTS.SEARCH filters a high-clearance index for a guest\n");
+    swapped = fopen(app_keys77, "wb");
+    assert(swapped != NULL);
+    assert(fwrite(app_sidecar, 1u, app_sidecar_len, swapped) == app_sidecar_len);
+    assert(fclose(swapped) == 0);
+    qihse_resp_fts_namespace_registry_destroy(registry);
+    reply = cmd(&gst, 2, load_app);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    reply = cmd(&t88, 2, load_app);
+    assert(strcmp(reply, "+OK\r\n") == 0);
+    free(reply);
+    reply = cmd(&gst, 3, search_app);
+    assert(strstr(reply, "t:77/app/doc") != NULL && strstr(reply, "t:88/app/doc") == NULL);
+    free(reply);
+    reply = cmd(&t88, 3, search_app88);
+    assert(strstr(reply, "t:88/app/doc") != NULL && strstr(reply, "t:77/app/doc") == NULL);
+    free(reply);
+    printf("[PASS] APP SAVE/LOAD round-trips matching tenant/name scopes\n");
 
     /* ── SAVE writes a private pair ────────────────────────────────────── */
     const char* save[] = { "FTS.SAVE" };
@@ -258,7 +448,16 @@ int main(void) {
     assert((st.st_mode & 0777) == 0600);
     assert(stat(keys_path, &st) == 0 && S_ISREG(st.st_mode));
     assert((st.st_mode & 0777) == 0600);
-    printf("[PASS] FTS.SAVE writes a mode-0600 artifact and sidecar\n");
+    uint8_t sidecar_header[64];
+    uint32_t sidecar_version = 0, sidecar_tenant = UINT32_MAX, namespace_name_len = UINT32_MAX;
+    size_t identity_len = 0;
+    assert(read_file(keys_path, (char*)sidecar_header, sizeof(sidecar_header), &identity_len));
+    assert(identity_len >= 20u);
+    memcpy(&sidecar_version, sidecar_header + 4u, sizeof(sidecar_version));
+    memcpy(&sidecar_tenant, sidecar_header + 12u, sizeof(sidecar_tenant));
+    memcpy(&namespace_name_len, sidecar_header + 16u, sizeof(namespace_name_len));
+    assert(sidecar_version == 2u && sidecar_tenant == 0u && namespace_name_len == 0u);
+    printf("[PASS] FTS.SAVE writes a mode-0600 version-2 system-identity sidecar\n");
 
     /* A refused low-clearance save must not have touched the pair. */
     char index_before[64 * 1024];
@@ -340,9 +539,10 @@ int main(void) {
     /* ── restart: autoload restores without an explicit FTS.BUILD ──────── */
     client_close(&op);
     client_close(&gst);
+    client_close(&t88);
     qihse_resp_server_destroy(server);
 
-    server = make_server(store, operator_user, fts_dir);
+    server = make_server(store, operator_user, fts_dir, namespaces, 2u);
     test_client_t op2;
     client_open(&op2, server);
     reply = auth(&op2, "GODMODE_OP", OPERATOR_PASSWORD);

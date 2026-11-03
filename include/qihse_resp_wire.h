@@ -24,8 +24,15 @@
 #include "qihse_task_worker.h"
 #include "qihse_task_scheduler.h"
 #include "qihse_cluster_maintenance.h"
+#include "qihse_resp_fts_namespace.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
+typedef struct qihse_resp_fts_namespace_registry qihse_resp_fts_namespace_registry_t;
+typedef struct {
+    uint32_t tenant_id;
+    const char* canonical_name;
+    const char* allowlisted_key_glob;
+} qihse_resp_fts_namespace_config_t;
 /* Forward-declared: the full FTS type lives in qihse_fts.h and is only
  * dereferenced by the fusion path in the engine. */
 typedef struct qihse_fts_index qihse_fts_index_t;
@@ -35,22 +42,25 @@ typedef struct {
     qihse_vector_db_t vdb;
     qihse_tsdb_t* tsdb;
     qihse_column_store_t* column_store;
-    /* Optional full-text index for VECHYBRID (hybrid FTS+vector RRF
-     * fusion). The server owns it from create onward: FTS.BUILD/LOAD replace
-     * and free it, and it is destroyed with the server. NULL = VECHYBRID and
-     * FTS.* refuse explicitly. */
+    /* Optional system-domain full-text index for system-Operator FTS.BUILD,
+     * FTS.SEARCH, SAVE/LOAD and VECHYBRID. Tenant-default indexes are created
+     * independently by the server; registered APP scopes add another tenant-
+     * bound subdivision. NULL disables only the system-domain projection. */
     qihse_fts_index_t* fts;
-    /* Optional durable FTS projection (FTS.SAVE / FTS.LOAD). The engine
-     * writes `<dir>/fts-index.qfts` plus a `<dir>/fts-index.keys` sidecar
-     * holding the doc-id -> KV key map the index is defined over. NULL or
-     * empty disables both commands and the startup autoload, and the index
-     * stays memory-only. Never taken from a request. */
+    /* Optional FTS artifact root. Legacy FTS.SAVE/LOAD use the system-domain
+     * `fts-index.qfts` and `fts-index.keys`; APP artifacts use tenant/name-
+     * derived paths under the same root. NULL or empty disables persistence
+     * and autoload for both forms. Never taken from a request. */
     const char* fts_persist_directory;
     /* Principal the startup autoload runs as. NULL disables autoload even
      * when a directory is configured. It must be supplied explicitly: a
      * forgotten principal must not decay into a context-free read of a
      * classified projection (AGENTS.md invariant #1). */
     qihse_user_t* fts_autoload_principal;
+    /* Explicit startup namespace mappings. Names/globs are copied and validated;
+     * no namespace is inferred from a key prefix or application label. */
+    const qihse_resp_fts_namespace_config_t* fts_namespaces;
+    size_t fts_namespace_count;
     qihse_cluster_topology_t* topology;
     /* Optional borrowed cluster-wide maintenance admission gate. */
     qihse_cluster_maintenance_t* maintenance_gate;

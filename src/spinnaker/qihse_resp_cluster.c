@@ -946,6 +946,19 @@ static bool qihse_resp_handle_help(qihse_resp_cluster_context_t* context, size_t
     return qihse_resp_emit_buffer(context, &response);
 }
 
+bool qihse_resp_cluster_subcommand_mutates(size_t argc, const qihse_resp_arg_t* argv) {
+    if (argc < 2u || !argv) return false;
+    return qihse_resp_arg_equals(&argv[1], "MEET") ||
+           qihse_resp_arg_equals(&argv[1], "ADDSLOTS") ||
+           qihse_resp_arg_equals(&argv[1], "DELSLOTS") ||
+           qihse_resp_arg_equals(&argv[1], "SETSLOT") ||
+           qihse_resp_arg_equals(&argv[1], "REPLICATE") ||
+           qihse_resp_arg_equals(&argv[1], "FAILOVER") ||
+           qihse_resp_arg_equals(&argv[1], "FAILOVER.RESUME") ||
+           qihse_resp_arg_equals(&argv[1], "MOVESLOTS") ||
+           qihse_resp_arg_equals(&argv[1], "RECLAIM");
+}
+
 bool qihse_resp_cluster_dispatch(qihse_resp_cluster_context_t* context, size_t argc, const qihse_resp_arg_t* argv) {
     if (!context || !context->output) return false;
     if (argc == 0 || !argv) return qihse_resp_emit_string(context, "-ERR malformed command\r\n");

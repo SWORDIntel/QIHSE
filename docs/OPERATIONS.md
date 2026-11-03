@@ -463,8 +463,29 @@ Verified behavior (2026-09-26):
 - A node with no `--slot-range` answers `SET`/`GET` with
   `-CLUSTERDOWN Hash slot not served` — a single-node deployment must own
   `0-16383`.
-- `FTS.BUILD <glob>` then `FTS.SEARCH <query>` works against the node's local
-  KV (in-memory BM25 index; resets on restart).
+- Default FTS (`FTS.BUILD <glob>` / `FTS.SEARCH <query> [limit]`) uses a
+  separate in-memory projection for each authenticated tenant. The caller glob
+  is intersected with the tenant-default key filter; it cannot widen access to
+  another tenant or the `commons/` domain. The configured `config.fts` index is
+  reserved for the system-domain Operator. `FTS.SAVE` / `FTS.LOAD` remain
+  system-Operator-only and persist only that system projection. `VECHYBRID`
+  uses the caller's tenant-default projection (or the system projection for an
+  Operator). Builds are capped at 1,000,000 documents.
+- Registered APP scopes are configured at startup as `(tenant_id, canonical
+  name, allowlisted key glob)`. `FTS.BUILD.APP <name>` takes exactly the
+  registered name and uses the configured glob; the request cannot supply a
+  glob. `FTS.SEARCH.APP <name> <query> [limit]`, `FTS.SAVE.APP <name>` and
+  `FTS.LOAD.APP <name>` resolve against the authenticated caller's tenant.
+  APP artifacts have scope-specific paths and version-2 sidecars binding the
+  tenant ID, canonical app name/digest, generation, and index digest; loads
+  reject an identity mismatch. Startup autoload uses only the explicitly
+  configured `fts_autoload_principal`: a tenant principal restores that
+  tenant's registered scopes; a system Operator may restore configured scopes
+  across tenants. Default tenant indexes are in-memory; legacy `FTS.SAVE` and
+  `FTS.LOAD` persist only the system-domain projection. The real-RESP
+  regression `make test-fts-persist-adapter` covers independent tenant-default
+  and same-name APP scopes, APP startup autoload, unregistered names, rejected
+  request globs, APP SAVE/LOAD and sidecar scope identity.
 - Needs `LD_LIBRARY_PATH=.` when invoked directly (the Makefile targets set
   it for you).
 

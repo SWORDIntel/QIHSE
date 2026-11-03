@@ -266,6 +266,25 @@ int main(void) {
     assert(strcmp(response, ":12182\r\n") == 0);
     free(response);
 
+    const char* cluster_mutators[][5] = {
+        { "CLUSTER", "MEET", "127.0.0.1", "7002", NULL },
+        { "CLUSTER", "ADDSLOTS", "30000", NULL, NULL },
+        { "CLUSTER", "DELSLOTS", "0", NULL, NULL },
+        { "CLUSTER", "SETSLOT", "0", "STABLE", NULL },
+        { "CLUSTER", "REPLICATE", "0123456789012345678901234567890123456789", NULL, NULL },
+        { "CLUSTER", "FAILOVER", NULL, NULL, NULL },
+        { "CLUSTER", "MOVESLOTS", "0", "127.0.0.1:7002", NULL },
+        { "CLUSTER", "RECLAIM", NULL, NULL, NULL },
+        { "CLUSTER", "FAILOVER.RESUME", NULL, NULL, NULL }
+    };
+    const size_t cluster_mutator_argc[] = { 4u, 3u, 3u, 4u, 3u, 2u, 4u, 2u, 2u };
+    for (size_t i = 0; i < sizeof(cluster_mutator_argc) / sizeof(cluster_mutator_argc[0]); i++) {
+        send_command(client.fd, cluster_mutator_argc[i], cluster_mutators[i]);
+        response = read_response(&client);
+        assert(strcmp(response, "-NOPERM active system Operator required\r\n") == 0);
+        free(response);
+    }
+
     static const char slots[] = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n";
     send_all(client.fd, slots, sizeof(slots) - 1u);
     response = read_response(&client);
@@ -486,6 +505,89 @@ int main(void) {
     }
 
     qihse_resp_server_destroy(server);
+
+    /* Repeat the CLUSTER authorization checks with real authenticated
+     * principals; the auth-disabled fixture above only exercises the
+     * fail-closed configuration gate. */
+    static const char operator_password[] = "RespClusterOperatorPass123!";
+    static const char analyst_password[] = "RespClusterAnalystPass123!";
+    static const char tenant_password[] = "RespClusterTenantPass123!";
+    assert(qihse_auth_bootstrap_operator(operator_password));
+    qihse_user_t* operator_user = qihse_auth_get_user(0u);
+    assert(operator_user != NULL);
+    qihse_user_t* analyst_user = qihse_auth_create_user(operator_user, 701u,
+        QIHSE_ROLE_ANALYST, 0u, 0u, analyst_password, false);
+    qihse_user_t* tenant_user = qihse_auth_create_tenant_user(operator_user, 42u, 702u,
+        QIHSE_ROLE_ANALYST, 0u, 0u, tenant_password, false);
+    assert(analyst_user && tenant_user);
+
+    qihse_resp_server_config_init(&config);
+    config.store = store;
+    config.topology = topology;
+    config.local_node_index = local;
+    config.port = 0;
+    config.auth_required = true;
+    qihse_resp_server_t* auth_server = qihse_resp_server_create(&config);
+    assert(auth_server != NULL);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    args.server = auth_server;
+    args.fd = sockets[1];
+    assert(pthread_create(&thread, NULL, server_thread, &args) == 0);
+    test_client_t auth_client = {0};
+    auth_client.fd = sockets[0];
+    const char* auth_users[][3] = {
+        { "AUTH", "User_701", analyst_password },
+        { "AUTH", "User_702", tenant_password }
+    };
+    for (size_t principal = 0; principal < 2u; ++principal) {
+        send_command(auth_client.fd, 3u, auth_users[principal]);
+        response = read_response(&auth_client);
+        assert(strcmp(response, "+OK\r\n") == 0);
+        free(response);
+        for (size_t i = 0; i < sizeof(cluster_mutator_argc) / sizeof(cluster_mutator_argc[0]); ++i) {
+            send_command(auth_client.fd, cluster_mutator_argc[i], cluster_mutators[i]);
+            response = read_response(&auth_client);
+            assert(strcmp(response, "-NOPERM active system Operator required\r\n") == 0);
+            free(response);
+        }
+        const char* readonly[] = { "CLUSTER", "KEYSLOT", "foo" };
+        send_command(auth_client.fd, 3u, readonly);
+        response = read_response(&auth_client);
+        assert(strcmp(response, ":12182\r\n") == 0);
+        free(response);
+    }
+    const char* quit_nonoperator[] = { "QUIT" };
+    send_command(auth_client.fd, 1u, quit_nonoperator);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    close(auth_client.fd);
+    pthread_join(thread, NULL);
+
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    args.fd = sockets[1];
+    assert(pthread_create(&thread, NULL, server_thread, &args) == 0);
+    memset(&auth_client, 0, sizeof(auth_client));
+    auth_client.fd = sockets[0];
+    const char* operator_auth[] = { "AUTH", qihse_user_get_username(operator_user), operator_password };
+    send_command(auth_client.fd, 3u, operator_auth);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    const char* add_slot[] = { "CLUSTER", "ADDSLOTS", "30000" };
+    send_command(auth_client.fd, 3u, add_slot);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "-NOPERM active system Operator required\r\n") != 0);
+    free(response);
+    const char* quit_operator[] = { "QUIT" };
+    send_command(auth_client.fd, 1u, quit_operator);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    close(auth_client.fd);
+    pthread_join(thread, NULL);
+    qihse_resp_server_destroy(auth_server);
+
     qihse_cluster_topology_destroy(topology);
     qihse_column_store_destroy(columns);
     qihse_tsdb_destroy(tsdb);

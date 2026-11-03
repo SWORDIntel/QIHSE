@@ -1747,7 +1747,7 @@ actually depends on.
 
 | Protocol | Implementation | Notes |
 |---|---|---|
-| RESP2 / RESP3 | `src/spinnaker/qihse_resp_engine.c` | Redis-compatible command set plus the `FEDERATION.*` extension surface |
+| RESP2 / RESP3 | `src/spinnaker/qihse_resp_engine.c` | Redis-compatible command set plus `FEDERATION.*`; see [§10.3](#103-resp-cluster-mutation-authorization-and-fts-scopes) for cluster authorization and FTS scope rules |
 | PostgreSQL wire | `src/spinnaker/qihse_pg_wire.c` | Simple and extended query flows, transactions, virtual catalogs |
 | MongoDB wire | `src/spinnaker/qihse_mongo_wire.c` | BSON, CRUD, query operators, aggregation pipeline, admin commands |
 | Bolt / Cypher | `src/spinnaker/qihse_bolt.c`, `src/tractable/qihse_cypher_*.c` | Bolt 4.x handshake, PackStream, message flow |
@@ -1825,6 +1825,45 @@ dispatch that did not happen. Both gaps are recorded in
 `fabric:job:<job-id>` and are what `FABRIC.RESULT` returns. Verified by
 `tests/test_fabric_jobs.c` (`make test-fabric-jobs`) and the `fabric-job-model`
 gold workload.
+
+### 10.3 RESP cluster mutation authorization and FTS scopes
+
+All RESP cluster topology mutations require an active authenticated system
+Operator: `MEET`, `ADDSLOTS`, `DELSLOTS`, `SETSLOT`, `REPLICATE`, `FAILOVER`,
+`FAILOVER.RESUME`, `MOVESLOTS`, and `RECLAIM`. Read-only cluster queries such as
+`SLOTS`, `NODES`, `INFO`, `MYID`, and `KEYSLOT` do not use that mutation gate.
+Authentication-disabled and missing/inactive identities fail closed.
+
+Default FTS commands use a separate in-memory projection for each authenticated
+tenant. `FTS.BUILD <glob>` intersects the requested glob with that tenant's
+allowed key scope; `FTS.SEARCH <query> [limit]` searches only the same tenant's
+projection. The system-domain projection uses the configured `config.fts` index;
+legacy `FTS.SAVE` and `FTS.LOAD` remain system-Operator-only. Tenant-default
+projections are in-memory.
+
+An application scope must be registered in `qihse_resp_server_config_t` via
+`fts_namespaces` with a tenant ID, canonical name, and allowlisted key glob.
+Commands are `FTS.BUILD.APP <name>`, `FTS.SEARCH.APP <name> <query> [limit]`,
+`FTS.SAVE.APP <name>`, and `FTS.LOAD.APP <name>`. The request cannot supply or
+widen the registered glob. Each `(tenant, name)` has independent index state and
+artifacts; sidecars bind the tenant, canonical name/digest, generation, and
+index digest. Startup APP autoload uses only the explicitly configured
+`fts_autoload_principal`, and restores only that tenant's registered scopes
+(except a configured system Operator, who may restore the server's explicitly
+registered scopes).
+
+The server copies and validates each `qihse_resp_fts_namespace_config_t`
+(`tenant_id`, `canonical_name`, `allowlisted_key_glob`) from
+`qihse_resp_server_config_t.fts_namespaces` at creation; the caller retains
+ownership of the input array and strings. The installed
+`include/qihse_resp_fts_namespace.h` helpers expose bounded registry creation,
+registration/resolution, default/registered key-scope checks, and safe
+scope-derived artifact paths. Names, globs, and artifact identity are trusted
+startup configuration, never request data.
+
+Verified by `tests/test_resp_cluster.c` (`make test-resp-cluster`),
+`tests/test_fts_persist_adapter.c` (`make test-fts-persist-adapter`), and
+`tests/test_resp_hybrid.c` (`make test-resp-hybrid`).
 
 ---
 

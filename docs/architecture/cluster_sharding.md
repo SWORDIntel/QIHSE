@@ -601,8 +601,12 @@ Nodes may join without a pre-shared topology: launch with `--join SEED_HOST:SEED
 
 ## Slot load shift (CLUSTER MOVESLOTS)
 
-`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` is restricted to the system
-domain. The daemon does not configure the legacy RESP target credential while
+`CLUSTER MOVESLOTS <first>-<last> <host>:<port>` requires an active,
+authenticated system-domain Operator. All mutating RESP cluster commands
+(`MEET`, `ADDSLOTS`, `DELSLOTS`, `SETSLOT`, `REPLICATE`, `FAILOVER`,
+`FAILOVER.RESUME`, `MOVESLOTS`, and `RECLAIM`) enforce the same gate; read-only
+cluster queries remain available without it. The daemon does not configure the
+legacy RESP target credential while
 slot transfer lacks pinned QKP transport. For a range containing data, the
 handoff now refuses before changing ownership if target authentication is
 unavailable; an empty range can still be assigned to the target. The hermetic
