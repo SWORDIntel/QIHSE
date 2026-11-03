@@ -238,6 +238,13 @@ if [ "$VERBOSE" -eq 1 ]; then
     echo "Extra flags:  $CFLAGS_EXTRA"
 fi
 
+for tool in cmake ninja; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Required build tool '$tool' not found — install CMake and Ninja." >&2
+        exit 1
+    fi
+done
+
 if [ "$CLEAN" -eq 1 ]; then
     make clean
 fi

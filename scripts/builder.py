@@ -10,6 +10,7 @@ Theme: SWORD cyber-dark (#08080a bg, #e50000 accent, Share Tech Mono spirit).
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import re
 import shlex
@@ -518,6 +519,74 @@ DEPS = [
     ("tree-sitter",  "vendor/tree-sitter",   "SQL parser grammar (tree-sitter)"),
 ]
 
+
+def _dependency_prefix() -> Path:
+    override = os.environ.get("QIHSE_DEPS_PREFIX")
+    if override:
+        return Path(override)
+    makefile = (ROOT / "Makefile").read_text()
+    match = re.search(r"^QIHSE_DEPS_PREFIX\s*\?=\s*(.+)$", makefile, re.MULTILINE)
+    if not match:
+        return ROOT / "build" / "deps"
+    value = match.group(1).strip().replace("$(CURDIR)", str(ROOT))
+    return Path(value)
+
+
+def _nonempty(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _loadable_library(path: Path) -> bool:
+    if not _nonempty(path):
+        return False
+    try:
+        ctypes.CDLL(str(path))
+        return True
+    except OSError:
+        return False
+
+
+def _liboqs_package_ready() -> bool:
+    prefix = _dependency_prefix()
+    candidates = [
+        (prefix / "lib" / "liboqs.so",
+         prefix / "lib" / "cmake" / "liboqs" / "liboqsConfig.cmake"),
+        (ROOT / "vendor" / "liboqs" / "build" / "lib" / "liboqs.so",
+         ROOT / "vendor" / "liboqs" / "build" / "lib" / "cmake" / "liboqs" / "liboqsConfig.cmake"),
+        (ROOT / "vendor" / "liboqs" / "build" / "lib" / "liboqs.so",
+         ROOT / "vendor" / "liboqs" / "build" / "liboqsConfig.cmake"),
+    ]
+    return any(_loadable_library(library) and _nonempty(config)
+               for library, config in candidates)
+
+
+def _provider_usable(path: Path) -> bool:
+    if not _nonempty(path) or not shutil.which("openssl"):
+        return False
+    env = os.environ.copy()
+    env["OPENSSL_MODULES"] = str(path.parent)
+    result = subprocess.run(
+        ["openssl", "list", "-providers", "-provider", "oqsprovider"],
+        capture_output=True, text=True, env=env,
+    )
+    return result.returncode == 0 and "oqsprovider" in result.stdout and "status: active" in result.stdout
+
+
+def _oqs_provider_ready() -> bool:
+    prefix = _dependency_prefix()
+    candidates = [
+        prefix / "lib" / "ossl-modules" / "oqsprovider.so",
+        ROOT / "vendor" / "oqs-provider" / "build" / "lib" / "oqsprovider.so",
+    ]
+    module_dir = os.environ.get("OPENSSL_MODULES")
+    if module_dir:
+        candidates.insert(0, Path(module_dir) / "oqsprovider.so")
+    return any(_provider_usable(path) for path in candidates)
+
+
 APT_DEPS = [
     ("gcc", "gcc"),
     ("g++", "g++"),
@@ -556,10 +625,18 @@ def install_apt_deps(missing: list[str]) -> None:
 def ensure_submodule(name: str, path: str, desc: str) -> None:
     full = ROOT / path
     info(f"Checking {c(name, CYAN)} — {desc}")
-    if not (full / "CMakeLists.txt").exists() and not (full / "Makefile").exists() and not (full / "lib").exists():
-        warn(f"{name} not present, initializing submodule...")
+    if not (full / "CMakeLists.txt").is_file() and not (full / "Makefile").is_file():
+        warn(f"{name} source not present, initializing submodule...")
         run(["git", "submodule", "update", "--init", "--recursive", path], cwd=ROOT)
-    ok(f"{name} ready")
+    if not (full / "CMakeLists.txt").is_file() and not (full / "Makefile").is_file():
+        fail(f"{name} source/configuration is unavailable after submodule initialization")
+        sys.exit(1)
+    if name == "liboqs" and _liboqs_package_ready():
+        ok(f"{name} package config and shared library usable")
+    elif name == "oqs-provider" and _oqs_provider_ready():
+        ok(f"{name} module loads in OpenSSL")
+    else:
+        info(f"{name} source available; package artifacts will be verified by the build target")
 
 
 def ensure_tree_sitter() -> None:
@@ -662,9 +739,22 @@ def build(march: str | None, target: str, clean: bool, jobs: int,
 
     if proc.returncode == 0:
         ok(f"Build successful — {target}")
+        report_build_readiness(target)
     else:
         fail(f"Build failed (exit {proc.returncode})")
         sys.exit(proc.returncode)
+
+
+def report_build_readiness(target: str) -> None:
+    """Report independently whether core, provider, and test artifacts are usable."""
+    core_ready = _loadable_library(ROOT / "libqihse.so")
+    provider_ready = _oqs_provider_ready()
+    test_artifacts = [ROOT / "tests/qihse_server", ROOT / "tests/qihse_test"]
+    tests_ready = any(_nonempty(path) and os.access(path, os.X_OK)
+                      for path in test_artifacts)
+    info(f"Readiness — core library: {'ready (loadable)' if core_ready else 'not built or unusable'}")
+    info(f"Readiness — PQC provider: {'ready (OpenSSL load verified)' if provider_ready else 'not built or unusable'}")
+    info(f"Readiness — test binaries: {'available' if tests_ready else 'not built'} (goal: {target})")
 
 
 def install_opt(dest: Path) -> None:

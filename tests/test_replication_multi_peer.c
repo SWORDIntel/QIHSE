@@ -698,6 +698,19 @@ int main(void) {
     deny_data_plane(a);
     deny_data_plane(b);
     close_peer(a); close_peer(b);
+    /* Exercise the real acknowledged write path, then read it immediately
+     * from the same node before a cold store reopen. */
+    real_client_t *writer = connect_peer(server, &first, &source, "unknown");
+    auth_root(writer);
+    const char *write_client[] = {"SET", "acknowledged", "durable-value"};
+    char *write_reply = command(writer, 3u, write_client, NULL);
+    assert(strcmp(write_reply, "+OK\r\n") == 0);
+    free(write_reply);
+    const char *read_client[] = {"GET", "acknowledged"};
+    char *read_reply = command(writer, 2u, read_client, NULL);
+    assert(strstr(read_reply, "durable-value"));
+    free(read_reply);
+    close_peer(writer);
     qihse_resp_server_stop(server);
     assert(!qihse_resp_server_start_failover_paused(server, op));
     qihse_resp_server_destroy(server);
@@ -734,6 +747,14 @@ int main(void) {
      * configured as an Operator: server creation rejects that configuration. */
     cfg.replication_service_principal = op;
     assert(qihse_resp_server_create(&cfg) == NULL);
+    qihse_kv_store_destroy(store);
+    /* Cold reopen the configured store after the acknowledged wire write.
+     * This catches replies issued before the durable record is recoverable. */
+    store = qihse_kv_store_create_user(op);
+    assert(store);
+    char *durable = qihse_kv_get_user(store, "acknowledged", op);
+    assert(durable && strcmp(durable, "durable-value") == 0);
+    free(durable);
     qihse_kv_store_destroy(store);
     puts("replication multi-peer real QKP/source authorization: OK");
     return 0;

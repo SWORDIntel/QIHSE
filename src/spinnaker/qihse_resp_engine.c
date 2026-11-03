@@ -2005,9 +2005,9 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
     pthread_mutex_lock(&server->state_lock);
     size_t active_clients = server->active_clients;
     pthread_mutex_unlock(&server->state_lock);
-    char info[2048];
+    char info[3072];
     size_t sst_live_files = 0;
-    int sst_degraded = 0;
+    int sst_degraded = 1; /* Unknown is degraded, never success-shaped. */
     if (server->store) {
         qihse_kv_sstable_stats_t sst_stats;
         if (qihse_kv_sstable_stats(server->store, &sst_stats)) {
@@ -2015,6 +2015,18 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
             sst_degraded = sst_stats.index_degraded ? 1 : 0;
         }
     }
+    int fts_state = 0; /* 0=unavailable, 1=healthy, 2=stale. */
+    uint64_t fts_generation = 0, store_generation = 0;
+    pthread_mutex_lock(&server->fts_meta_lock);
+    if (server->fts && server->fts_built && server->store) {
+        fts_generation = server->fts_generation;
+        pthread_rwlock_rdlock(&server->kv_lock);
+        store_generation = qihse_kv_change_seq(server->store);
+        pthread_rwlock_unlock(&server->kv_lock);
+        fts_state = fts_generation == store_generation ? 1 : 2;
+    }
+    pthread_mutex_unlock(&server->fts_meta_lock);
+    const char* health = (!server->store || sst_degraded || fts_state == 2) ? "degraded" : "healthy";
     size_t pubsub_channels = server->pubsub ? qihse_resp_pubsub_channel_count(server->pubsub, NULL) : 0;
     size_t pubsub_patterns = server->pubsub ? qihse_resp_pubsub_pattern_subscription_count(server->pubsub) : 0;
     int len = snprintf(info, sizeof(info),
@@ -2026,13 +2038,23 @@ static bool qihse_resp_handle_info(qihse_resp_session_t* session) {
                        "qihse_crc16_backend:%s\r\n"
                        "# Storage\r\nqihse_sst_live_files:%zu\r\n"
                        "qihse_sst_index_degraded:%d\r\nqihse_kv_sweep_interval:%u\r\n"
-                       "qihse_kv_sweeper_running:%d\r\n",
+                       "qihse_kv_sweeper_running:%d\r\n"
+                       "# Health\r\nqihse_health_status:%s\r\n"
+                       "qihse_health_reason_storage:%s\r\n"
+                       "qihse_fts_projection_state:%s\r\n"
+                       "qihse_fts_projection_generation:%llu\r\n"
+                       "qihse_fts_store_generation:%llu\r\n",
                        server->enable_uwp_bridge ? "1" : "0",
                        active_clients, pubsub_channels, pubsub_patterns,
                        nodes, assigned, qihse_crc16_backend_name(),
                        sst_live_files, sst_degraded,
                        (unsigned)server->kv_sweep_interval_seconds,
-                       server->sweeper_started ? 1 : 0);
+                       server->sweeper_started ? 1 : 0,
+                       health,
+                       server->store ? (sst_degraded ? "degraded" : "healthy") : "unavailable",
+                       fts_state == 1 ? "healthy" : (fts_state == 2 ? "stale" : "unavailable"),
+                       (unsigned long long)fts_generation,
+                       (unsigned long long)store_generation);
     return len > 0 && (size_t)len < sizeof(info) && qihse_resp_bulk(session, info, (size_t)len);
 }
 
@@ -5905,11 +5927,11 @@ static bool qihse_resp_handle_scan(qihse_resp_session_t* session, const qihse_re
  * rather than silently serving an index that no longer describes the store.
  *
  * Bounds: pattern ≤ 256B, query ≤ 1024B, limit ∈ [1,100] (default 20),
- * 100k documents max, 1MB of text per document. BUILD and LOAD hold
+ * 1,000,000 documents max, 1MB of text per document. BUILD and LOAD hold
  * fts_meta_lock across the swap, so concurrent SEARCHes wait rather than race
  * it; lock order is fts_meta_lock → kv_lock only. */
 
-#define QIHSE_RESP_FTS_MAX_DOCS      100000u
+#define QIHSE_RESP_FTS_MAX_DOCS      1000000u
 #define QIHSE_RESP_FTS_MAX_PATTERN   256u
 #define QIHSE_RESP_FTS_MAX_QUERY     1024u
 #define QIHSE_RESP_FTS_DEFAULT_LIMIT 20u
@@ -5921,12 +5943,13 @@ static bool qihse_resp_handle_scan(qihse_resp_session_t* session, const qihse_re
 #define QIHSE_RESP_FTS_INDEX_NAME    "fts-index.qfts"
 #define QIHSE_RESP_FTS_KEYS_NAME     "fts-index.keys"
 #define QIHSE_RESP_FTS_KEYS_MAGIC    0x53594B51u /* "QKYS", little-endian */
-#define QIHSE_RESP_FTS_KEYS_VERSION  1u
+#define QIHSE_RESP_FTS_KEYS_VERSION  2u
 
 typedef struct {
     qihse_fts_index_t* index;
     qihse_user_t* user;
     const char* pattern;
+    const qihse_resp_fts_namespace_t* namespace_scope;
     char** keys;        /* keys[doc_id - 1]; engine-owned map, dense */
     uint64_t count;
     uint64_t cap;

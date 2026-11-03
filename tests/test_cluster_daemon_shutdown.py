@@ -110,6 +110,24 @@ bool qihse_kv_sync_store(void *store) {
                        check=True, capture_output=True, timeout=30)
         return library
 
+    def test_consensus_auth_without_publication_api_never_listens(self):
+        with socket.socket() as listener, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as bus:
+            listener.bind(('127.0.0.1', 0))
+            bus.bind(('127.0.0.1', 0))
+            port = listener.getsockname()[1]
+            bus_port = bus.getsockname()[1]
+        env = self.env.copy()
+        env['QIHSE_AUTH_MODE'] = 'consensus'
+        result = subprocess.run([
+            str(ROOT / 'qihse-cluster-daemon'), '--index', '0', '--bind', '127.0.0.1',
+            '--port', str(port), '--bus-port', str(bus_port), '--dir', str(self.root / 'data')],
+            env=env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr.decode(errors='replace'))
+        self.assertIn(b'missing committed-authority replay and atomic auth-publication interface',
+                      result.stderr)
+        with socket.socket() as probe:
+            self.assertNotEqual(probe.connect_ex(('127.0.0.1', port)), 0)
+
     def test_ack_survives_sigterm_without_save(self):
         process, session, _ = self.start()
         self.assertEqual(session.execute_resp('SET', 'shutdown:ack', 'durable-value'), b'+OK\r\n')

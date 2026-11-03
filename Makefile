@@ -536,14 +536,16 @@ xdp-kern: src/networking/qihse_xdp_kern.c
 	    -o src/networking/qihse_xdp.o
 	@echo "qihse_xdp.o build successful"
 
+QIHSE_DEPS_PREFIX ?= /usr/local
+
 lib: liboqs oqs-provider $(LIB_TARGET)
 
 # ---------------------------------------------------------------------------
 # liboqs — post-quantum cryptography library (submodule)
 # ---------------------------------------------------------------------------
 liboqs:
-	@if [ -f /usr/local/lib/liboqs.so ] || [ -f vendor/liboqs/build/lib/liboqs.so ]; then \
-		echo "liboqs ready."; \
+	@if { [ -s $(QIHSE_DEPS_PREFIX)/lib/liboqs.so ] && ldd -r $(QIHSE_DEPS_PREFIX)/lib/liboqs.so >/dev/null 2>&1 && [ -s $(QIHSE_DEPS_PREFIX)/lib/cmake/liboqs/liboqsConfig.cmake ]; } || { [ -s vendor/liboqs/build/lib/liboqs.so ] && ldd -r vendor/liboqs/build/lib/liboqs.so >/dev/null 2>&1 && find vendor/liboqs/build -type f -name liboqsConfig.cmake -size +0c -print -quit | grep -q .; }; then \
+		echo "liboqs package ready."; \
 	else \
 		if [ ! -f vendor/liboqs/CMakeLists.txt ]; then \
 			echo "Initializing liboqs submodule..."; \
@@ -551,17 +553,22 @@ liboqs:
 		fi; \
 		echo "Building liboqs..."; \
 		cd vendor/liboqs && mkdir -p build && cd build && \
-		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON .. 2>&1 && \
-		ninja 2>&1; (ninja install 2>&1 || true); \
-		echo "liboqs build successful"; \
+		cmake -GNinja -DCMAKE_INSTALL_PREFIX=$(QIHSE_DEPS_PREFIX) -DBUILD_SHARED_LIBS=ON .. 2>&1 && \
+		ninja 2>&1 && \
+		test -s lib/liboqs.so && ldd -r lib/liboqs.so >/dev/null 2>&1 && \
+		find . -name liboqsConfig.cmake -type f -print -quit | grep -q . && \
+		ninja install 2>&1 && \
+		test -s $(QIHSE_DEPS_PREFIX)/lib/liboqs.so && \
+		test -s $(QIHSE_DEPS_PREFIX)/lib/cmake/liboqs/liboqsConfig.cmake && \
+		echo "liboqs build and install successful"; \
 	fi
 
 # ---------------------------------------------------------------------------
 # oqs-provider — OpenSSL 3.x provider bridging liboqs PQC algorithms
 # ---------------------------------------------------------------------------
 oqs-provider: liboqs
-	@if [ -f /usr/local/lib/ossl-modules/oqsprovider.so ] || [ -f vendor/oqs-provider/build/lib/oqsprovider.so ]; then \
-		echo "oqs-provider ready."; \
+	@if { [ -s $(QIHSE_DEPS_PREFIX)/lib/ossl-modules/oqsprovider.so ] && OPENSSL_MODULES=$(QIHSE_DEPS_PREFIX)/lib/ossl-modules openssl list -providers -provider-path $(QIHSE_DEPS_PREFIX)/lib/ossl-modules -provider oqsprovider 2>/dev/null | grep -q oqsprovider; } || { [ -s vendor/oqs-provider/build/lib/oqsprovider.so ] && OPENSSL_MODULES=$(CURDIR)/vendor/oqs-provider/build/lib openssl list -providers -provider-path $(CURDIR)/vendor/oqs-provider/build/lib -provider oqsprovider 2>/dev/null | grep -q oqsprovider; }; then \
+		echo "oqs-provider usable."; \
 	else \
 		if [ ! -f vendor/oqs-provider/CMakeLists.txt ]; then \
 			echo "Initializing oqs-provider submodule..."; \
@@ -569,14 +576,18 @@ oqs-provider: liboqs
 		fi; \
 		echo "Building oqs-provider..."; \
 		cd vendor/oqs-provider && mkdir -p build && cd build && \
-		cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr/local \
+		cmake -GNinja -DCMAKE_INSTALL_PREFIX=$(QIHSE_DEPS_PREFIX) \
 			-DOPENSSL_ROOT_DIR=/usr \
 			-DOPENSSL_INCLUDE_DIR=/usr/include \
 			-DOPENSSL_CRYPTO_LIBRARY=/usr/lib/x86_64-linux-gnu/libcrypto.so \
 			-DOPENSSL_SSL_LIBRARY=/usr/lib/x86_64-linux-gnu/libssl.so \
-			-Dliboqs_DIR=$(if $(wildcard /usr/local/lib/cmake/liboqs/liboqsConfig.cmake),/usr/local/lib/cmake/liboqs,$(CURDIR)/vendor/liboqs/build) .. 2>&1 && \
-		ninja 2>&1; (ninja install 2>&1 || true); \
-		echo "oqs-provider build successful"; \
+			-Dliboqs_DIR=$(if $(wildcard $(QIHSE_DEPS_PREFIX)/lib/cmake/liboqs/liboqsConfig.cmake),$(QIHSE_DEPS_PREFIX)/lib/cmake/liboqs,$(CURDIR)/vendor/liboqs/build) .. 2>&1 && \
+		ninja 2>&1 && \
+		test -s lib/oqsprovider.so && \
+		ninja install 2>&1 && \
+		test -s $(QIHSE_DEPS_PREFIX)/lib/ossl-modules/oqsprovider.so && \
+		OPENSSL_MODULES=$(QIHSE_DEPS_PREFIX)/lib/ossl-modules openssl list -providers -provider oqsprovider 2>/dev/null | grep -q oqsprovider && \
+		echo "oqs-provider build, install, and load successful"; \
 	fi
 
 CSRCS = $(filter %.c, $(SRCS))
@@ -1106,7 +1117,7 @@ test-edge-persistence: lib
 
 test-serial: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-qkp-access-negative test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-consensus-wire test-consensus-snapshot-stage test-consensus-channel test-consensus-mesh test-consensus-blob-channel test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-aimem-resp test-aimem-durable-crash test-aimem-replay-recovery test-aimem-qh05-08 test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-table-store-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
 
-test-serial: test-aimem-scope-index
+test-serial: test-build-verification test-aimem-scope-index
 test-serial: test-aimem-qh08 test-aimem-qh08-resp
 test-serial: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
 test-serial: test-wal-durability
@@ -1645,7 +1656,9 @@ docs:
 	@echo "Use 'find docs -name \"*.md\" | wc -l' to inspect documentation files."
 
 # The API-surface table in docs/API_REFERENCE.md is generated from the headers.
-.PHONY: docs-api-counts test-docs-api-counts
+.PHONY: test-build-verification docs-api-counts test-docs-api-counts
+test-build-verification:
+	@python3 tests/test_build_verification.py
 docs-api-counts: lib
 	@python3 scripts/api_surface_counts.py --write
 
@@ -1871,7 +1884,7 @@ PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_l
     qihse_sql_row_index.h qihse_uwp_sql_txn_schema.h \
     qihse_pg_wire.h qihse_cluster_slot.h qihse_crc16.h \
     qihse_clickhouse_sql.h qihse_http_api.h \
-    qihse_resp_engine.h qihse_resp_wire.h qihse_qkp.h qihse_resp_cluster.h \
+    qihse_resp_engine.h qihse_resp_wire.h qihse_resp_fts_namespace.h qihse_qkp.h qihse_resp_cluster.h \
     qihse_cluster_bus.h qihse_cluster_maintenance.h qihse_cluster_failover.h qihse_cluster_scatter.h \
     qihse_system_guard.h qihse_quota.h qihse_blob.h qihse_bundle.h \
     qihse_consensus.h qihse_consensus_blob.h qihse_consensus_blob_channel.h \
@@ -1957,7 +1970,12 @@ test-fts-persist-adapter: lib
 	$(CC) $(CFLAGS) -o tests/test_fts_persist_adapter tests/test_fts_persist_adapter.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_fts_persist_adapter
 
-test-serial: test-fts-persist-adapter
+test-serial: test-fts-persist-adapter test-fts-namespace
+
+.PHONY: test-fts-namespace
+test-fts-namespace: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_fts_namespace tests/test_fts_namespace.c src/spinnaker/qihse_resp_fts_namespace.c $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_fts_namespace
 
 # Isolated real pinned-QKP shutdown durability and failure-exit regressions.
 .PHONY: test-cluster-daemon-shutdown
@@ -1974,3 +1992,10 @@ test-replication-multi-peer: lib keygen
 	LD_LIBRARY_PATH=. ./tests/test_replication_multi_peer
 
 test-serial: test-replication-multi-peer
+
+test-serial: test-qihse-deps
+
+.PHONY: test-qihse-deps
+test-qihse-deps:
+	python3 tools/qihse_deps.py validate
+	PYTHONPATH=tests python3 -m unittest -v test_qihse_deps

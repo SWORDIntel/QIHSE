@@ -31,6 +31,7 @@ lib/
 !/tests/test_public_api_install.py
 !/tests/test_python_pg_tls.py
 !/tests/test_machine_token_refresh.py
+!/tests/test_qihse_deps.py
 /tests/bench_*
 /tests/test_aggregate_hardened
 /tests/test_auth_privilege_boundary

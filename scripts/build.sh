@@ -22,7 +22,7 @@ progress() {
     fi
 }
 
-TOTAL=4
+TOTAL=6
 printf "\n  \033[38;5;196m\033[1mQ I H S E\033[0m \033[2mbootstrap\033[0m\n\n"
 
 # Step 1: Find python3
@@ -53,7 +53,21 @@ if ! command -v gcc >/dev/null 2>&1; then
     exit 1
 fi
 
-# Step 4: Launch builder
-progress 4 $TOTAL "Launching builder"
+# Step 4: Check CMake
+progress 4 $TOTAL "Checking CMake"
+if ! command -v cmake >/dev/null 2>&1; then
+    printf "\n  \033[38;5;196m✗ cmake not found — install CMake\033[0m\n" >&2
+    exit 1
+fi
+
+# Step 5: Check Ninja
+progress 5 $TOTAL "Checking Ninja"
+if ! command -v ninja >/dev/null 2>&1; then
+    printf "\n  \033[38;5;196m✗ ninja not found — install Ninja\033[0m\n" >&2
+    exit 1
+fi
+
+# Step 6: Launch builder
+progress 6 $TOTAL "Launching builder"
 printf "\n"
 exec "$PYTHON" "$SCRIPT_DIR/builder.py" "$@"

@@ -132,9 +132,14 @@ static bool daemon_auth_startup(const char* password, bool auth_required,
         }
         return true;
     }
-    if (strcmp(mode, "consensus") == 0 ||
-        (strcmp(mode, "standalone") == 0 && consensus_requested)) {
-        fprintf(stderr, "auth authority: consensus durability UNSUPPORTED; no standalone fallback\n");
+    if (strcmp(mode, "consensus") == 0) {
+        fprintf(stderr,
+                "auth authority: consensus mode unavailable: missing committed-authority replay and atomic auth-publication interface, applied/auth-published watermarks, and quorum-backed freshness/read barrier; refusing listener start\n");
+        return false;
+    }
+    if (strcmp(mode, "standalone") == 0 && consensus_requested) {
+        fprintf(stderr,
+                "auth authority: standalone authority cannot serve a consensus daemon; missing consensus publication and quorum-freshness interfaces; refusing standalone fallback\n");
         return false;
     }
     if (strcmp(mode, "standalone") != 0 || !auth_required || !password || !*password) {

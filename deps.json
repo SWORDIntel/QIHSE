@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "repository": "QIHSE",
+  "items": [
+    {
+      "id": "fts-resumable-indexing",
+      "title": "Resumable incremental FTS indexing",
+      "status": "planned",
+      "description": "Replace one-shot capped builds with resumable indexing and explicit complete, indexed, and remaining results.",
+      "depends_on": ["fts-namespace-isolation"],
+      "evidence": ["src/spinnaker/qihse_resp_engine.c", "docs/API_REFERENCE.md"],
+      "acceptance": ["A capped build reports incomplete work instead of a success-shaped count.", "A caller can resume without losing prior indexed progress.", "Results expose complete, indexed, and remaining counts."]
+    },
+    {
+      "id": "fts-namespace-isolation",
+      "title": "Tenant and APP FTS namespace isolation",
+      "status": "complete",
+      "description": "Keep default FTS projections tenant-local and APP projections bound to registered tenant/name namespaces.",
+      "depends_on": [],
+      "evidence": ["src/spinnaker/qihse_resp_fts_namespace.c", "tests/test_fts_persist_adapter.c", "docs/API_REFERENCE.md"],
+      "acceptance": ["Unrelated tenants and registered APP namespaces cannot see each other's indexed keys.", "Persistence and autoload remain bound to the configured scope."]
+    },
+    {
+      "id": "node-convergence-reporting",
+      "title": "Per-node replication convergence reports",
+      "status": "partial",
+      "description": "Report missing records, divergent digests, orphaned keys, and replication lag per peer; current REPL.STATUS reports only partial counts and sync timestamps.",
+      "depends_on": ["acknowledged-write-restart-recovery"],
+      "evidence": ["src/spinnaker/qihse_resp_engine.c", "tests/test_replication_multi_peer.c", "docs/API_REFERENCE.md"],
+      "acceptance": ["Reports identify the peer and missing-record count.", "Reports include comparable digests for divergent records.", "Reports expose a bounded, meaningful per-peer lag measure.", "Orphaned-key counts and sync failures are explicit."]
+    },
+    {
+      "id": "degraded-health-reporting",
+      "title": "Structured degraded-health reporting",
+      "status": "partial",
+      "description": "Expose partial hydration, stale indexes, and failed seeds as structured health details; current published INFO does not cover all of these states.",
+      "depends_on": ["fts-resumable-indexing", "node-convergence-reporting"],
+      "evidence": ["src/spinnaker/qihse_resp_engine.c", "docs/API_REFERENCE.md"],
+      "acceptance": ["Health distinguishes healthy, degraded, and unavailable states.", "Partial hydration, stale indexes, and failed seeds have actionable reasons.", "Unknown state is not reported as healthy."]
+    },
+    {
+      "id": "acknowledged-write-restart-recovery",
+      "title": "Acknowledged-write read-back and restart regression coverage",
+      "status": "planned",
+      "description": "Add regression coverage for read-back after an acknowledged write and recovery after restart, including intermittent nil-GET behavior.",
+      "depends_on": [],
+      "evidence": ["tests/test_replication_multi_peer.c", "src/black_hole/qihse_kv_store.c"],
+      "acceptance": ["An acknowledged write is immediately readable through the RESP path.", "The value is recovered after a cold restart of the actual store.", "A regression reproduces and prevents the intermittent nil-GET behavior."]
+    }
+  ]
+}
