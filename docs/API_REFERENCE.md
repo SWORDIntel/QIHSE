@@ -1894,6 +1894,13 @@ structured health object, FTS projection freshness, partial-hydration state, or
 failed-seed details. Acknowledged-write read-back and cold-restart recovery are
 not separate RESP commands or status fields.
 
+Implementation sequencing for these RESP gaps is tracked in the repository-root
+`deps.json`; inspect it with `python3 tools/qihse_deps.py list` or `order`. This
+is an engineering dependency graph, not part of the RESP protocol. Namespace
+isolation is complete; resumable indexing depends on it, convergence reporting
+depends on acknowledged-write recovery coverage, and degraded-health reporting
+depends on the indexing and convergence signals.
+
 ---
 
 ## 11. Configuration knobs
