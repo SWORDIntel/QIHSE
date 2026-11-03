@@ -874,6 +874,38 @@ static void test_durable_keys(qihse_user_t* user) {
            !strcmp(typed->rows[0][1].v.str, "b"));
     qihse_uwp_sql_result_free(typed);
     typed = NULL;
+    assert(run_sql(&ctx, user,
+        "CREATE TABLE typed_txn (id INT PRIMARY KEY, note TEXT)", &out) == UWP_STS_OK);
+    assert(qihse_uwp_sql_execute_typed_user(&ctx, "BEGIN", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(&ctx,
+        "INSERT INTO typed_txn VALUES (1, 'rolled back')", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(&ctx, "ROLLBACK", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed_txn == NULL);
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_table_row_count(qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "typed_txn")) == 0);
+    assert(qihse_uwp_sql_execute_typed_user(&ctx, "BEGIN", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(&ctx,
+        "INSERT INTO typed_txn VALUES (2, 'committed')", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(&ctx, "COMMIT", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed_txn == NULL);
+    qihse_uwp_sql_result_free(typed);
+    typed = NULL;
     qihse_table_t* table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "dkeys");
     assert(table && qihse_table_row_count(table) == 2);
     assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
@@ -910,6 +942,16 @@ static void test_durable_keys(qihse_user_t* user) {
     assert(qihse_table_row_count(qihse_table_store_find_table(qihse_uwp_sql_table_store(), "dkeys")) == 2);
     assert(qihse_schema_has_extension(ctx.schema, "uuid-ossp"));
     assert(qihse_table_row_count(qihse_table_store_find_table(qihse_uwp_sql_table_store(), "ddefault")) == 2);
+    qihse_table_t* typed_txn_table = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "typed_txn");
+    assert(typed_txn_table && qihse_table_row_count(typed_txn_table) == 1);
+    typed = NULL;
+    assert(qihse_uwp_sql_execute_typed_user(&ctx,
+        "SELECT id, note FROM typed_txn WHERE id = 2", NULL, 0,
+        &typed_txn, user, &typed) == UWP_STS_OK);
+    assert(typed && typed->nrows == 1 && typed->rows[0][0].v.i32 == 2 &&
+           !strcmp(typed->rows[0][1].v.str, "committed"));
+    qihse_uwp_sql_result_free(typed);
     assert(qihse_schema_get_table(ctx.schema, "dkeys")->columns[0].is_primary_key);
     assert(qihse_schema_get_table(ctx.schema, "dkeys")->columns[1].is_unique);
     assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
