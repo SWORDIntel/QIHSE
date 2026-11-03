@@ -1841,6 +1841,14 @@ projection. The system-domain projection uses the configured `config.fts` index;
 legacy `FTS.SAVE` and `FTS.LOAD` remain system-Operator-only. Tenant-default
 projections are in-memory.
 
+`FTS.BUILD <glob>` is a full rebuild, not an incremental/resumable operation;
+it replies with a RESP integer containing the number of indexed documents.
+Each build replaces the previous projection. The current implementation caps a
+build at 100,000 documents and 1 MiB of text per document. If the document cap
+is reached, the integer is the indexed count only: the protocol does not expose
+a completion flag, total matching count, remaining count, or resume cursor, so a
+count at the cap does not prove that every matching key was indexed.
+
 An application scope must be registered in `qihse_resp_server_config_t` via
 `fts_namespaces` with a tenant ID, canonical name, and allowlisted key glob.
 Commands are `FTS.BUILD.APP <name>`, `FTS.SEARCH.APP <name> <query> [limit]`,
@@ -1864,6 +1872,27 @@ startup configuration, never request data.
 Verified by `tests/test_resp_cluster.c` (`make test-resp-cluster`),
 `tests/test_fts_persist_adapter.c` (`make test-fts-persist-adapter`), and
 `tests/test_resp_hybrid.c` (`make test-resp-hybrid`).
+
+### Replicated-key convergence status
+
+The node-local replicated-key registry is managed with `REPL.MARK <glob>`,
+`REPL.MARKS`, and `REPL.UNMARK <glob>`. `REPL.STATUS` returns an array of bulk
+text lines: one `glob ...` line per marked pattern and one `peer ...` line per
+configured peer. The glob line reports its source (`flag` or `runtime`), local
+record count, and local-only/orphaned count. Peer lines report the peer address,
+last successful sync time (`-1` if none), pull count, divergent-record count,
+and whether the last sync succeeded. These are counts and timestamps, not
+record digests or an explicit replication-lag measurement; the protocol also
+does not return a separate missing-record total. `REPL.PULL <glob> <host:port>`
+returns the number of records pulled. Missing records are repaired by the
+anti-entropy path; conflicting values and local-only records are reported, not
+automatically overwritten or deleted by that path.
+
+On the currently published RESP server, `INFO` reports storage-index state via
+`qihse_sst_live_files` and `qihse_sst_index_degraded`; it does not expose a
+structured health object, FTS projection freshness, partial-hydration state, or
+failed-seed details. Acknowledged-write read-back and cold-restart recovery are
+not separate RESP commands or status fields.
 
 ---
 
