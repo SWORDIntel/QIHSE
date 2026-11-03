@@ -372,10 +372,19 @@ open and preserves the bytes rather than risking deletion of an acknowledged
 record. Incomplete earlier segments also remain errors. A positive short append
 permanently fences that handle before rotation: appends, flushes, replay and
 checkpoint pruning fail until close and successful reopen. An exclusive directory
-lock prevents competing WAL writer handles across processes. This WAL is not connected
-to UWP SQL commits; SQL schema/row atomic replay, fsynced SQL commit acknowledgement,
-and cross-process SQL state publication remain outstanding. The separate opt-in
-native table-store snapshot is not a wired UWP durability guarantee.
+lock prevents competing WAL writer handles across processes. This WAL is not
+connected to UWP SQL commits; SQL durability instead uses the native
+table-store snapshot (v5) path: `qihse_uwp_sql_open_durable` binds a validated
+catalog to that store, `qihse_table_txn_commit_group[_retry]` fsyncs the
+whole-store snapshot (rows, catalog and retry receipts) before acknowledging,
+and a post-rename failure is reported as ambiguous rather than acknowledged.
+The acknowledged-operation-ID survives-kill gate is enforced by
+`tests/test_table_store_crash.c` (run via `make test-table-store-crash`): a
+child that receives a COMMITTED acknowledgement and is immediately SIGKILLed
+leaves recoverable rows and retry receipts, an unacknowledged shadow leaves no
+partial state, and a multi-table group is recovered atomically. Cross-process
+SQL state publication through a long-lived service remains outstanding, and
+the tractable WAL remains unused by SQL commits.
 
 ### WAL Operations
 
@@ -510,5 +519,6 @@ The `mvcc-committed-delete` gold workload
 (`tests/gold/workloads/gold_mvcc_committed_delete.c`) asserts the same rule
 independently.
 
-Not covered: predicate/range serialization, SQL WAL recovery, and WAL segment
-rotation under load.
+Not covered: predicate/range serialization, SQL WAL recovery (the durable SQL
+snapshot path is crash-tested separately by `make test-table-store-crash`), and
+WAL segment rotation under load.

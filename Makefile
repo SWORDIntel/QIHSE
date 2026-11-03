@@ -1110,6 +1110,7 @@ test-serial: test-aimem-scope-index
 test-serial: test-aimem-qh08 test-aimem-qh08-resp
 test-serial: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
 test-serial: test-wal-durability
+test-serial: test-table-store-crash
 test-serial: test-python-pg-sdk
 test-serial: test-pg-wire-txn test-schema-recovery test-pgwire-service test-pgwire-app-compat
 
@@ -1222,6 +1223,10 @@ test-sql-dml-exec: lib
 test-table-store-txn: lib
 	$(CC) $(CFLAGS) -o tests/test_table_store_txn tests/test_table_store_txn.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_table_store_txn
+
+test-table-store-crash: lib
+	$(CC) $(CFLAGS) -o tests/test_table_store_crash tests/test_table_store_crash.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_table_store_crash
 
 test-bolt: lib
 	$(CC) $(CFLAGS) -o tests/test_bolt tests/test_bolt.c -L. -lqihse $(LDFLAGS)
