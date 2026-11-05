@@ -175,3 +175,98 @@ done:
     if (raw[0]) unlink(raw);
     return ok;
 }
+
+/* FILE adapter lets the canonical authenticated KV decoder check each record's
+ * labels before materializing its value. No expanded snapshot is written. */
+typedef struct {
+    FILE *source;
+    ZSTD_DCtx *decoder;
+    qihse_user_t *principal;
+    unsigned char buffer[CG_BLOCK];
+    ZSTD_inBuffer input;
+    uint64_t expected, total;
+    bool input_eof, ended;
+} cg_decode_stream;
+static ssize_t decode_read(void *cookie, char *output, size_t capacity) {
+    cg_decode_stream *s = cookie;
+    if (!active(s->principal)) return -1;
+    if (s->ended) return 0;
+    ZSTD_outBuffer out = {output, capacity, 0};
+    while (out.pos == 0) {
+        if (s->input.pos == s->input.size && !s->input_eof) {
+            size_t n = fread(s->buffer, 1, sizeof(s->buffer), s->source);
+            if (ferror(s->source)) { errno = EIO; return -1; }
+            s->input = (ZSTD_inBuffer){s->buffer, n, 0};
+            s->input_eof = feof(s->source);
+        }
+        size_t remaining = ZSTD_decompressStream(s->decoder, &out, &s->input);
+        if (ZSTD_isError(remaining) || out.pos > s->expected - s->total) {
+            errno = EINVAL; return -1;
+        }
+        s->total += out.pos;
+        if (!remaining) {
+            /* Validate the complete frame/trailer before exposing EOF. A
+             * second frame or any suffix is forbidden by the container. */
+            if (s->total != s->expected || s->input.pos != s->input.size ||
+                fgetc(s->source) != EOF || ferror(s->source)) {
+                errno = EINVAL; return -1;
+            }
+            s->ended = true;
+            return (ssize_t)out.pos;
+        }
+        if (!out.pos && s->input_eof && s->input.pos == s->input.size) {
+            errno = EINVAL; return -1;
+        }
+    }
+    return (ssize_t)out.pos;
+}
+qihse_kv_store_t *cg_storage_open(const char *path, qihse_user_t *user,
+                                 size_t max_bytes, size_t max_records) {
+    if (!active(user)) return NULL;
+    if (!path || !max_bytes || !max_records) { errno = EINVAL; return NULL; }
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat info;
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < 0) {
+        close(fd); errno = EINVAL; return NULL;
+    }
+    FILE *source = fdopen(fd, "rb");
+    if (!source) { close(fd); return NULL; }
+    unsigned char header[16];
+    size_t n = fread(header, 1, sizeof(header), source);
+    qihse_kv_store_t *store = NULL;
+    int error = EINVAL;
+    cg_decode_stream *state = NULL;
+    FILE *decoded = NULL;
+    if (ferror(source)) { error = EIO; goto done; }
+    if (n < 4 || memcmp(header, "QCGZ", 4)) {
+        if ((uint64_t)info.st_size > max_bytes) { error = EFBIG; goto done; }
+        rewind(source);
+        store = qihse_kv_open_snapshot_user(source, user, max_bytes, max_records);
+        error = errno;
+        goto done;
+    }
+    if (n != sizeof(header) || memcmp(header, magic, 8) || get64(header + 8) > CG_STORAGE_MAX)
+        goto done;
+    if (get64(header + 8) > max_bytes) { error = EFBIG; goto done; }
+    state = calloc(1, sizeof(*state));
+    if (!state) { error = ENOMEM; goto done; }
+    state->source = source; state->principal = user; state->expected = get64(header + 8);
+    state->decoder = ZSTD_createDCtx();
+    if (!state->decoder) { error = ENOMEM; goto done; }
+    if (ZSTD_isError(ZSTD_DCtx_setParameter(state->decoder, ZSTD_d_windowLogMax, 23))) goto done;
+    cookie_io_functions_t io = {.read = decode_read};
+    decoded = fopencookie(state, "rb", io);
+    if (!decoded) { error = errno; goto done; }
+    store = qihse_kv_open_snapshot_user(decoded, user, max_bytes, max_records);
+    error = errno;
+    if (store && (!state->ended || ferror(decoded))) {
+        qihse_kv_store_destroy(store); store = NULL; error = EINVAL;
+    }
+done:
+    if (decoded) fclose(decoded);
+    if (state) { ZSTD_freeDCtx(state->decoder); free(state); }
+    fclose(source);
+    if (!store) errno = error;
+    return store;
+}

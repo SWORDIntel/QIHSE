@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include "qihse_trinary_trie.h"
 #include "qihse_auth.h"
 
@@ -23,6 +24,19 @@ typedef struct qihse_kv_replica_snapshot qihse_kv_replica_snapshot_t;
  * Authorization failure rejects the open, never filters data or repairs WAL.
  * Pending-image recovery additionally requires this explicit principal. */
 qihse_kv_store_t* qihse_kv_store_create_user(qihse_user_t* user);
+/* Open a bounded immutable in-memory snapshot from the current FILE position.
+ * Does not close stream or read/write the configured data directory. Every
+ * encoded label (including expired/tombstoned records) is authorized before
+ * its payload is read. NULL/inactive principal, malformed/duplicate records
+ * and I/O failure return NULL without publishing a partial store. Metadata,
+ * expiry, flags and sequence numbers are retained. Ordinary writes, restore,
+ * sync and replica mutations are rejected on the returned handle. Reads and
+ * explicit authorized exports remain supported. max_bytes counts encoded
+ * bytes; max_records bounds trie/node overhead. Limits must both be nonzero.
+ * errno: EACCES authorization, EFBIG bytes, E2BIG records, EINVAL format.
+ * Call qihse_kv_store_destroy() to release the detached handle. */
+qihse_kv_store_t* qihse_kv_open_snapshot_user(FILE* stream, qihse_user_t* user,
+                                             size_t max_bytes, size_t max_records);
 /* Legacy internal bootstrap mode, deliberately separate from authenticated
  * open. Does not authorize pending-image recovery; not a user-facing adapter. */
 qihse_kv_store_t* qihse_kv_store_create(void);
