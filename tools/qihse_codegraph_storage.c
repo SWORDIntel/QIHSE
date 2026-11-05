@@ -27,8 +27,10 @@ static bool temporary(char path[PATH_MAX], int *fd) {
     struct stat st;
     if (!dir || lstat(dir, &st) || !S_ISDIR(st.st_mode) ||
         st.st_uid != geteuid() || (st.st_mode & 0077)) return false;
-    if (snprintf(path, PATH_MAX, "%s/.codegraph-codec-XXXXXX", dir) >= PATH_MAX)
+    if (snprintf(path, PATH_MAX, "%s/.codegraph-codec-XXXXXX", dir) >= PATH_MAX) {
+        path[0] = '\0';
         return false;
+    }
     *fd = mkstemp(path);
     if (*fd < 0) path[0] = '\0';
     return *fd >= 0;
@@ -71,8 +73,10 @@ bool cg_storage_save(qihse_kv_store_t *store, const char *path, qihse_user_t *us
     if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 ||
         (uint64_t)st.st_size > CG_STORAGE_MAX) goto done;
     in = fdopen(fd, "rb"); if (!in) goto done; fd = -1;
-    if (snprintf(output, sizeof(output), "%s.codec-XXXXXX", path) >= (int)sizeof(output))
+    if (snprintf(output, sizeof(output), "%s.codec-XXXXXX", path) >= (int)sizeof(output)) {
+        output[0] = '\0';
         goto done;
+    }
     fd = mkstemp(output); if (fd < 0) { output[0] = '\0'; goto done; }
     out = fdopen(fd, "wb"); if (!out) goto done; fd = -1;
     unsigned char header[16]; memcpy(header, magic, 8); put64(header + 8, (uint64_t)st.st_size);
