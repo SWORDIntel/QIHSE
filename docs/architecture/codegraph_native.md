@@ -21,9 +21,9 @@ make qihse-codegraph
 make test-codegraph
 ~~~
 
-This optional target needs libqihse.so, OpenSSL and json-c development files.
+This optional target needs libqihse.so, OpenSSL, json-c and Zstandard development files.
 It does not add a new mandatory dependency to the main QIHSE library or to HAX.
-On Debian: install libjson-c-dev and libssl-dev if not present.
+On Debian: install libjson-c-dev, libssl-dev and libzstd-dev if not present.
 
 Run with the QIHSE repo's libqihse.so on the loader path, or install that
 library through the normal QIHSE procedure.
