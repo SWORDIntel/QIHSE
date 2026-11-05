@@ -15,6 +15,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 from test_codegraph_native import git, snapshot
 
@@ -108,6 +109,22 @@ def main() -> None:
         assert manifest() == original
         assert set(state.glob("graph-*.kv")) == generation_files
 
+        # A matching input digest cannot authorize reuse of an unreadable or
+        # unsupported current snapshot. Re-import must repair it by publication.
+        for damage in ("unknown-format", "corrupt-snapshot"):
+            damaged = manifest()
+            damaged_name = damaged["snapshot"]
+            if damage == "unknown-format":
+                damaged["storage_format"] = "unsupported-storage-version"
+                manifest_path.write_text(json.dumps(damaged))
+            else:
+                (state / damaged_name).write_bytes(b"damaged compact snapshot")
+            repaired = invoke("import", "--input", str(source))
+            assert repaired["status"] == "published", (damage, repaired)
+            assert manifest()["snapshot"] != damaged_name
+            assert invoke("status")["fresh"]
+        original = manifest()
+
         # Create an independently serialized old-format snapshot using the SDK.
         helper_source = root / "legacy_writer.c"
         helper_source.write_text(LEGACY_WRITER)
@@ -118,11 +135,12 @@ def main() -> None:
                         str(helper_source), "-L" + str(binary.parent), "-lqihse", *json_flags,
                         "-o", str(helper)], check=True, capture_output=True)
         helper_data = root / "writer-state"
-        helper_data.mkdir()
-        legacy_path = state / "graph-legacy-fixture.kv"
-        subprocess.run([str(helper), str(source), str(legacy_path)],
-                       env={**env, "QIHSE_DATA_DIR": str(helper_data)},
-                       check=True, capture_output=True, timeout=90)
+        helper_data.mkdir(mode=0o700)
+        legacy_path = state / ("graph-" + "1" * 64 + "-legacy.kv")
+        fixture_result = subprocess.run([str(helper), str(source), str(legacy_path)],
+                                        env={**env, "QIHSE_DATA_DIR": str(helper_data)},
+                                        capture_output=True, timeout=90)
+        assert fixture_result.returncode == 0, (fixture_result.stdout, fixture_result.stderr)
         legacy = {k: v for k, v in original.items()
                   if k not in ("storage_format", "previous_snapshot")}
         legacy.update(snapshot=legacy_path.name,
@@ -138,6 +156,10 @@ def main() -> None:
         converted = manifest()
         assert converted["storage_format"] == "qihse-codegraph-zstd-v1"
         assert converted["snapshot"] != legacy_path.name
+        legacy_bytes = legacy_path.stat().st_size
+        compact_bytes = (state / converted["snapshot"]).stat().st_size
+        print(f"Synthetic fixture bytes: legacy={legacy_bytes}, compact={compact_bytes}", flush=True)
+        assert compact_bytes < legacy_bytes
         for key in ("head", "worktree", "freshness", "input_sha256", "nodes", "edges",
                     "unresolved_edges"):
             assert converted[key] == legacy[key], (key, converted, legacy)
@@ -155,26 +177,29 @@ def main() -> None:
 
         # GC cannot remove current/previous, active runtime, unmanaged runtime,
         # or files not in the generation namespace.
-        obsolete = state / "graph-obsolete-fixture.kv"
+        obsolete = state / ("graph-" + "2" * 64 + "-unused.kv")
         obsolete.write_bytes(b"obsolete synthetic generation")
         unrelated = state / "operator-note.txt"
         unrelated.write_text("retain")
+        malformed = state / "graph-unmanaged-fixture.kv"
+        malformed.write_bytes(b"not a managed generation")
         unmanaged = state / ".runtime-legacy"
-        unmanaged.mkdir()
+        unmanaged.mkdir(mode=0o700)
         (unmanaged / "marker").write_text("retain")
         dead = state / ".runtime-dead"
-        dead.mkdir()
-        (dead / ".lease").touch()
+        dead.mkdir(mode=0o700)
+        (dead / ".lease").touch(mode=0o600)
         (dead / "marker").write_text("reclaim")
         active = state / ".runtime-active"
-        active.mkdir()
+        active.mkdir(mode=0o700)
+        (active / ".lease").touch(mode=0o600)
         with (active / ".lease").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             invoke("gc")
             assert active.is_dir(), "GC removed a locked runtime"
         assert not obsolete.exists()
         assert not dead.exists()
-        assert unmanaged.is_dir() and unrelated.is_file()
+        assert unmanaged.is_dir() and unrelated.is_file() and malformed.is_file()
         current = manifest()
         assert (state / current["snapshot"]).is_file()
         if current.get("previous_snapshot"):
@@ -183,6 +208,16 @@ def main() -> None:
         invoke("gc")
         assert not active.exists(), "GC did not reclaim a released runtime"
         assert invoke("context", "--symbol", "caller", "--depth", "2")["evidence"] == baseline["evidence"]
+        # Reader loading and GC must coordinate across separate processes.
+        def concurrent_operation(index: int) -> None:
+            if index % 3 == 0:
+                invoke("gc")
+            else:
+                report = invoke("context", "--symbol", "caller", "--depth", "2")
+                assert report["evidence"] == baseline["evidence"]
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            list(workers.map(concurrent_operation, range(9)))
+        assert invoke("status")["fresh"]
     print("CodeGraph compact storage, migration, deduplication and GC: PASS")
 
 
