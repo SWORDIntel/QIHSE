@@ -1970,16 +1970,17 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 
 
 # CodeGraph: optional native C review engine using QIHSE graph + KV snapshots.
-# Only requires json-c and OpenSSL in addition to the existing QIHSE library.
+# Requires json-c, OpenSSL and libzstd only for this optional executable.
 # This is NOT linked into HAX and adds no mandatory dependency to libqihse.so.
 .PHONY: test-codegraph
-qihse-codegraph: tools/qihse_codegraph.c $(LIB_TARGET)
+qihse-codegraph: tools/qihse_codegraph.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_storage.h $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core \
-	  $< -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl) \
+	  $< tools/qihse_codegraph_storage.c -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl libzstd) \
 	  $(LDFLAGS) -Wl,-rpath,'$$ORIGIN'
 
-test-codegraph: qihse-codegraph
+test-codegraph: qihse-codegraph test-codegraph-codec
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_storage.py --binary ./qihse-codegraph
 
 # QIHSE Studio: ASP.NET Core 8 + React SPA real-time operations display
 .PHONY: studio install-studio
@@ -2030,3 +2031,12 @@ test-serial: test-qihse-deps
 test-qihse-deps:
 	python3 tools/qihse_deps.py validate
 	PYTHONPATH=tests python3 -m unittest -v test_qihse_deps
+
+.PHONY: test-codegraph-codec
+test-codegraph-codec: $(LIB_TARGET)
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
+	  tests/test_codegraph_storage.c tools/qihse_codegraph_storage.c -o tests/test_codegraph_storage \
+	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	./tests/test_codegraph_storage
+
+test-serial: test-codegraph
