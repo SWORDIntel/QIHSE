@@ -134,6 +134,7 @@ static void simap_destroy(str_id_map_t* m) {
 
 typedef struct {
     char* composite_key; /* "label\0prop\0value" */
+    size_t composite_length;
     uint64_t* ids;
     size_t count;
     size_t cap;
@@ -162,10 +163,17 @@ static char* make_composite(const char* label, const char* prop,
 }
 
 static prop_entry_t* pmap_find(prop_map_t* m, const char* ck, size_t cklen) {
-    uint64_t h = fnv1a(ck);
+    /* The components contain NUL separators. Hashing as a C string would
+     * hash only the label and put all same-label values into one probe chain. */
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < cklen; ++i) {
+        h ^= (unsigned char)ck[i];
+        h *= 1099511628211ULL;
+    }
     size_t idx = h % m->num_buckets;
     while (m->buckets[idx].composite_key) {
-        if (memcmp(m->buckets[idx].composite_key, ck, cklen) == 0)
+        if (m->buckets[idx].composite_length == cklen &&
+            memcmp(m->buckets[idx].composite_key, ck, cklen) == 0)
             return &m->buckets[idx];
         idx = (idx + 1) % m->num_buckets;
     }
@@ -180,11 +188,8 @@ static void pmap_add(prop_map_t* m, const char* label, const char* prop,
         pmap_init(m, oldn * 2);
         for (size_t i = 0; i < oldn; ++i) {
             if (oldb[i].composite_key) {
-                size_t cklen = strlen(oldb[i].composite_key) + 1 +
-                               strlen(oldb[i].composite_key + strlen(oldb[i].composite_key) + 1) + 1 +
-                               strlen(oldb[i].composite_key + strlen(oldb[i].composite_key) + 1 +
-                                      strlen(oldb[i].composite_key + strlen(oldb[i].composite_key) + 1) + 1) + 1;
-                prop_entry_t* nb = pmap_find(m, oldb[i].composite_key, cklen);
+                prop_entry_t* nb = pmap_find(m, oldb[i].composite_key,
+                                             oldb[i].composite_length);
                 *nb = oldb[i];
                 m->count++;
             }
@@ -196,6 +201,7 @@ static void pmap_add(prop_map_t* m, const char* label, const char* prop,
     prop_entry_t* b = pmap_find(m, ck, cklen);
     if (!b->composite_key) {
         b->composite_key = ck;
+        b->composite_length = cklen;
         b->ids = NULL; b->count = 0; b->cap = 0;
         m->count++;
     } else {
