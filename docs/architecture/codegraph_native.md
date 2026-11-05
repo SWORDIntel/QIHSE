@@ -30,7 +30,15 @@ library through the normal QIHSE procedure.
 
 ## Index pipeline
 
-In the source repository you intend to analyse:
+From the QIHSE checkout, use the rebuild wrapper for a progress bar and
+compatibility with older CRG exporters:
+
+~~~bash
+./tools/qihse-codegraph-reindex --repo ../your-repository
+~~~
+
+With a CRG exporter that already emits the required v2 freshness fields, the
+underlying pipeline can also be run in the source repository:
 
 ~~~bash
 code-review-graph build
