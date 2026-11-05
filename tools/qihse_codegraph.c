@@ -269,12 +269,25 @@ static bool snapshot_name(const char *name) {
               (name[i] >= 'A' && name[i] <= 'Z'))) return false;
     return true;
 }
+/* Keep the ownership lease until every data entry has been removed. A crash
+ * during a large cleanup must leave a runtime that later GC can still identify. */
 static int delete_scratch_entry(const char *path, const struct stat *st, int flags,
                                 struct FTW *ftw) {
     (void)st;
     (void)flags;
-    (void)ftw;
+    if (ftw->level == 0 || (ftw->level == 1 && !strcmp(path + ftw->base, ".lease")))
+        return 0;
     return remove(path);
+}
+static int remove_scratch(const char *path) {
+    if (nftw(path, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS)) return -1;
+    char lease[PATH_MAX];
+    if (snprintf(lease, sizeof(lease), "%s/.lease", path) >= (int)sizeof(lease)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (unlink(lease) && errno != ENOENT) return -1;
+    return rmdir(path);
 }
 static void graph_close(cg_state *st) {
     if (st->graph)
@@ -301,7 +314,7 @@ static void graph_close(cg_state *st) {
         qihse_audit_shutdown();
     }
     if (st->scratch[0] &&
-        nftw(st->scratch, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS))
+        remove_scratch(st->scratch))
         fprintf(stderr, "CodeGraph scratch cleanup failed: %s\n", strerror(errno));
     if (st->lease_fd >= 0) close(st->lease_fd);
     if (st->lifecycle_fd >= 0) close(st->lifecycle_fd);
@@ -840,6 +853,9 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
 static int compare_node_id(const void *a, const void *b) {
     return strcmp(((const cg_node *)a)->id, ((const cg_node *)b)->id);
 }
+static int compare_node_pointer_id(const void *a, const void *b) {
+    return strcmp((*(cg_node *const *)a)->id, (*(cg_node *const *)b)->id);
+}
 static int compare_node_name(const void *a, const void *b) {
     const cg_node *x = *(cg_node *const *)a, *y = *(cg_node *const *)b;
     int order = strcasecmp(x->name, y->name);
@@ -1173,7 +1189,7 @@ static int collect_snapshots(cg_state *st) {
                 goto done;
             int fd = private_lock(lease, LOCK_EX | LOCK_NB, false);
             if (fd < 0) continue; /* Active or legacy/unmanaged scratch: preserve. */
-            int failure = nftw(path, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS);
+            int failure = remove_scratch(path);
             close(fd);
             if (failure) goto done;
             runtimes++;
@@ -1642,8 +1658,9 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
         evidence_limit = 1;
     if (compact && evidence_limit > 16)
         evidence_limit = 16;
+    /* 0 = unseen, 1 = matched seed, 2 + hop = admitted to the bounded walk.
+     * Seed candidates outside the output limit remain eligible as neighbours. */
     uint8_t *visited = calloc(st->nn + 2, sizeof(*visited));
-    uint8_t *distance = calloc(st->nn + 2, sizeof(*distance));
     uint64_t *queue = calloc(max_nodes + 1, sizeof(*queue));
     graph_adj_t *edges = calloc(2048, sizeof(*edges));
     struct json_object *found = json_object_new_array();
@@ -1653,7 +1670,7 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
     struct json_object *gaps = json_object_new_array();
     bool truncated = false;
     size_t start = 0, used = 0, seeds = 0;
-    if (!visited || !distance || !queue || !edges) {
+    if (!visited || !queue || !edges) {
         json_object_put(report);
         if (changed) {
             for (size_t i = 0; i < nfiles; ++i)
@@ -1661,7 +1678,6 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
             free(changed);
         }
         free(visited);
-        free(distance);
         free(queue);
         free(edges);
         json_object_put(found);
@@ -1694,11 +1710,11 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
         bool prefix = !strcmp(mode, "prefix");
         bool substring =
             !strcmp(mode, "substring") || (!strcmp(mode, "auto") && !exact && !separator);
-        size_t matches = 0;
+        size_t matches = 0, name_length = strlen(name);
         for (size_t i = substring ? 0 : first; i < st->nn; ++i) {
             cg_node *node = st->by_name[i];
             bool match = substring ? strcasestr(node->name, name) != NULL
-                         : prefix  ? !strncasecmp(node->name, name, strlen(name))
+                         : prefix  ? !strncasecmp(node->name, name, name_length)
                                    : !strcasecmp(node->name, name);
             if (!match && !substring)
                 break;
@@ -1720,16 +1736,15 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
         for (size_t i = first; i < st->nn && !strcmp(st->by_file[i]->file, files[f]); ++i)
             select_seed(st, st->by_file[i], visited, queue, max_nodes, &used, &seeds, &truncated);
     }
-    memset(visited, 0, st->nn + 2);
     for (size_t i = 0; i < used; ++i)
-        visited[queue[i]] = 1;
+        visited[queue[i]] = 2;
     seed_ms += monotonic_ms() - plan_start;
     double walk_start = monotonic_ms();
     size_t shown = 0;
     while (start < used) {
         uint64_t id = queue[start++];
         cg_node *node = st->by_vertex[id];
-        int hop = distance[id];
+        int hop = visited[id] - 2;
         double risk = 0.10 + (node->is_test ? 0.0 : 0.25) + (hop == 0 ? 0.2 : 0.1 / (hop + 1));
         if (strcasestr(node->name, "auth") || strcasestr(node->name, "crypto") ||
             strcasestr(node->name, "alloc"))
@@ -1766,14 +1781,13 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
                               : impact_edge(adj->edge_type, incoming)))
                     continue;
                 uint64_t neighbor = adj->neighbor_id;
-                if (neighbor > st->nn || visited[neighbor])
+                if (neighbor > st->nn || visited[neighbor] >= 2)
                     continue;
                 if (used >= max_nodes) {
                     truncated = true;
                     continue;
                 }
-                visited[neighbor] = 1;
-                distance[neighbor] = (uint8_t)(hop + 1);
+                visited[neighbor] = (uint8_t)(hop + 3);
                 queue[used++] = neighbor;
                 /* Explain each included relationship with its original
                  * source line and confidence. No guessed targets are here. */
@@ -1814,9 +1828,14 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
     /* A missing direct test edge is a test-coverage hint, never a claim that
      * the function is untested. Caller-level and dynamic coverage differ. */
     if (!strcmp(action, "review")) {
-        for (size_t i = 0; i < st->nn && json_object_array_length(gaps) < 40; ++i) {
-            cg_node *node = &st->nodes[i];
-            if (!visited[node->vertex] || node->is_test || !node->file[0])
+        /* Preserve the original ID order while examining only visited nodes. */
+        cg_node *review_nodes[256];
+        for (size_t i = 0; i < used; ++i)
+            review_nodes[i] = st->by_vertex[queue[i]];
+        qsort(review_nodes, used, sizeof(*review_nodes), compare_node_pointer_id);
+        for (size_t i = 0; i < used && json_object_array_length(gaps) < 40; ++i) {
+            cg_node *node = review_nodes[i];
+            if (node->is_test || !node->file[0])
                 continue;
             bool has_test = false;
             size_t n = qihse_graph_get_neighbors(st->graph, node->vertex, GRAPH_DIR_OUTGOING,
@@ -1871,7 +1890,6 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
         free(changed);
     }
     free(visited);
-    free(distance);
     free(queue);
     free(edges);
     *rc = seeds || (!symbol && nfiles == 0) ? 0 : 2;
