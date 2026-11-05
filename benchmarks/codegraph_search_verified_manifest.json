@@ -1,0 +1,11 @@
+{
+  "pinned_directory": "/tmp/codegraph-verified-pin-a3wwaeeu",
+  "schema_version": 1,
+  "artifacts": {
+    "qihse-codegraph": "c2fad157f4c36d896479672e175246f6dd054907e2e2e65aae97ec468e5d2f89",
+    "libqihse.so": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+    "tools/qihse_codegraph.c": "44673e20f9af2348ed70cb771eddc63aafbb4287032418a1170d509469bdac8c"
+  },
+  "export_sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b",
+  "note": "Final graph pool with structural manifest comparison, unique generation reservation and commit-aware capability rotation; original unchanged library isolates unrelated KV batch API work."
+}

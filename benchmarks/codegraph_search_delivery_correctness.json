@@ -1,0 +1,868 @@
+{
+  "binary_sha256": "072c99019a094fbc2d7fc77bc9ca909d043ca63fd02acf71c75d855d34318feb",
+  "same_original_cold_single_nodes_and_relation_evidence": true,
+  "actual_requests": {
+    "cold": 66,
+    "warm": 3800,
+    "cli": 4400
+  },
+  "checks": [
+    {
+      "transport": "cold",
+      "case": "unique_depth_1",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "unique_depth_2",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "unique_depth_3",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "unique_depth_4",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "unique_depth_5",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "missing",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "ambiguous",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "tight_budget",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "batch_valid",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "batch",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "narrow_depth_1",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "narrow_depth_2",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "narrow_depth_3",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "narrow_depth_4",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "narrow_depth_5",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "high_degree_query",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "high_degree_impact",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "unresolved_query",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cold",
+      "case": "unresolved_impact",
+      "concurrency": 1,
+      "samples": 3,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_1",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_2",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_3",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_4",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_5",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "missing",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "ambiguous",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "tight_budget",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "batch_valid",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "batch",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_1",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_2",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_3",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_4",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_5",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "high_degree_query",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "high_degree_impact",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unresolved_query",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unresolved_impact",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_1",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_2",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_3",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_4",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unique_depth_5",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "missing",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "ambiguous",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "tight_budget",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "batch_valid",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "batch",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_1",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_2",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_3",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_4",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "narrow_depth_5",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "high_degree_query",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "high_degree_impact",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unresolved_query",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "warm",
+      "case": "unresolved_impact",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_1",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_2",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_3",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_4",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_5",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "missing",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "ambiguous",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "tight_budget",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "batch_valid",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "batch",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_1",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_2",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_3",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_4",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_5",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "high_degree_query",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "high_degree_impact",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unresolved_query",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unresolved_impact",
+      "concurrency": 1,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_1",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_2",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_3",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_4",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unique_depth_5",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "missing",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "ambiguous",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "tight_budget",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "batch_valid",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "batch",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_1",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_2",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_3",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_4",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "narrow_depth_5",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "high_degree_query",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "high_degree_impact",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unresolved_query",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    },
+    {
+      "transport": "cli",
+      "case": "unresolved_impact",
+      "concurrency": 4,
+      "samples": 100,
+      "all_fresh": true,
+      "deterministic_nodes_and_evidence": true,
+      "unexpected_errors": 0
+    }
+  ],
+  "unexpected_errors": 0,
+  "note": "CLI batch is ordered singles; mixed batch intentionally includes a missing third seed. New normal metadata and deduplicated socket batch contract differ from original."
+}

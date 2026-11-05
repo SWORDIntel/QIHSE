@@ -1,0 +1,2392 @@
+{
+  "binary": "/tmp/codegraph-search-original-f0s_5ap6/qihse-codegraph",
+  "binary_sha256": "59bf1b1adf82fe6971d8f7048e556d37487a6db46fe03473225d05af66175854",
+  "cases": [
+    {
+      "depth": 1,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "unique_depth_1",
+      "symbol": "GraphStore"
+    },
+    {
+      "depth": 2,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "unique_depth_2",
+      "symbol": "GraphStore"
+    },
+    {
+      "depth": 5,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "unique_depth_5",
+      "symbol": "GraphStore"
+    },
+    {
+      "depth": 2,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "missing",
+      "symbol": "__codegraph_benchmark_absent_91f700__"
+    },
+    {
+      "depth": 2,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "ambiguous",
+      "symbol": "setup_method"
+    },
+    {
+      "depth": 5,
+      "limit": 1,
+      "max_tokens": 128,
+      "name": "tight_budget",
+      "symbol": "GraphStore"
+    },
+    {
+      "depth": 2,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "batch",
+      "symbols": [
+        "GraphStore",
+        "setup_method",
+        "__codegraph_benchmark_absent_91f700__"
+      ]
+    }
+  ],
+  "completed_at_unix": 1793744378.380438,
+  "export_header": {
+    "format": "qihse-codegraph-v1",
+    "head": "e162ebcd79623e670eab721954eb142842c12e89",
+    "t": "h",
+    "version": 1,
+    "worktree": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  "export_sha256": "b4d976cefb249ae85ce11bf150a64eea6b9d53c78936717bf381cce9f22cf29b",
+  "library_sha256": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+  "logical_cpus": 40,
+  "measurements": [
+    {
+      "case": "unique_depth_1",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 69835.03128297161,
+      "raw": [
+        {
+          "cpu_ms": 16020.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "peak_rss_kib": 293716,
+          "returncode": 0,
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16143.677138024941
+        },
+        {
+          "cpu_ms": 21009.999999999996,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "peak_rss_kib": 294792,
+          "returncode": 0,
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 22696.246288949624
+        },
+        {
+          "cpu_ms": 24260.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "peak_rss_kib": 293284,
+          "returncode": 0,
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 30984.935658983886
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 21009.999999999996,
+          "p95": 23935.0,
+          "p99": 24195.0
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "peak_rss_kib": {
+          "p50": 293716.0,
+          "p95": 294684.4,
+          "p99": 294770.48
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 22696.246288949624,
+          "p95": 30156.06672198046,
+          "p99": 30819.1618715832
+        }
+      },
+      "throughput_per_second": 0.0429583827040042
+    },
+    {
+      "case": "unique_depth_2",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 54731.01781203877,
+      "raw": [
+        {
+          "cpu_ms": 18450.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "peak_rss_kib": 294140,
+          "returncode": 0,
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19284.019463928416
+        },
+        {
+          "cpu_ms": 18080.000000000004,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "peak_rss_kib": 294908,
+          "returncode": 0,
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 18531.3347770134
+        },
+        {
+          "cpu_ms": 16630.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "peak_rss_kib": 293432,
+          "returncode": 0,
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16909.45321205072
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 18080.000000000004,
+          "p95": 18413.0,
+          "p99": 18442.6
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "peak_rss_kib": {
+          "p50": 294140.0,
+          "p95": 294831.2,
+          "p99": 294892.64
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 18531.3347770134,
+          "p95": 19208.750995236915,
+          "p99": 19268.965770190116
+        }
+      },
+      "throughput_per_second": 0.054813524760361984
+    },
+    {
+      "case": "unique_depth_5",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 50456.00711205043,
+      "raw": [
+        {
+          "cpu_ms": 17230.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "peak_rss_kib": 295204,
+          "returncode": 0,
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 17674.29534601979
+        },
+        {
+          "cpu_ms": 16110.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "peak_rss_kib": 294484,
+          "returncode": 0,
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16341.126670013182
+        },
+        {
+          "cpu_ms": 16180.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "peak_rss_kib": 294672,
+          "returncode": 0,
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16434.398257057182
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 16180.0,
+          "p95": 17125.0,
+          "p99": 17209.0
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "peak_rss_kib": {
+          "p50": 294672.0,
+          "p95": 295150.8,
+          "p99": 295193.36
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 16434.398257057182,
+          "p95": 17550.30563712353,
+          "p99": 17649.497404240537
+        }
+      },
+      "throughput_per_second": 0.059457736981401145
+    },
+    {
+      "case": "missing",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 56733.834575046785,
+      "raw": [
+        {
+          "cpu_ms": 17350.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "peak_rss_kib": 294068,
+          "returncode": 2,
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "stderr": "Command exited with non-zero status 2\n",
+          "truncated": false,
+          "wall_ms": 17538.28103991691
+        },
+        {
+          "cpu_ms": 20070.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "peak_rss_kib": 294160,
+          "returncode": 2,
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "stderr": "Command exited with non-zero status 2\n",
+          "truncated": false,
+          "wall_ms": 23046.116239973344
+        },
+        {
+          "cpu_ms": 15860.000000000002,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "peak_rss_kib": 294484,
+          "returncode": 2,
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "stderr": "Command exited with non-zero status 2\n",
+          "truncated": false,
+          "wall_ms": 16147.363708005287
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 17350.0,
+          "p95": 19798.0,
+          "p99": 20015.6
+        },
+        "errors": 3,
+        "output_bytes": {
+          "p50": 544.0,
+          "p95": 544.0,
+          "p99": 544.0
+        },
+        "peak_rss_kib": {
+          "p50": 294160.0,
+          "p95": 294451.6,
+          "p99": 294477.52
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 17538.28103991691,
+          "p95": 22495.3327199677,
+          "p99": 22935.959535972215
+        }
+      },
+      "throughput_per_second": 0.05287849873837875
+    },
+    {
+      "case": "ambiguous",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 47168.02328801714,
+      "raw": [
+        {
+          "cpu_ms": 14750.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "peak_rss_kib": 294568,
+          "returncode": 0,
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 15088.843515957706
+        },
+        {
+          "cpu_ms": 15060.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "peak_rss_kib": 295440,
+          "returncode": 0,
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 15412.987319985405
+        },
+        {
+          "cpu_ms": 16329.999999999998,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "peak_rss_kib": 294164,
+          "returncode": 0,
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16660.545594990253
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 15060.0,
+          "p95": 16202.999999999998,
+          "p99": 16304.599999999999
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 9305.0,
+          "p95": 9305.0,
+          "p99": 9305.0
+        },
+        "peak_rss_kib": {
+          "p50": 294568.0,
+          "p95": 295352.8,
+          "p99": 295422.56
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 15412.987319985405,
+          "p95": 16535.78976748977,
+          "p99": 16635.594429490156
+        }
+      },
+      "throughput_per_second": 0.06360241093169022
+    },
+    {
+      "case": "tight_budget",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 48356.89148900565,
+      "raw": [
+        {
+          "cpu_ms": 15790.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "peak_rss_kib": 294216,
+          "returncode": 0,
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16017.788720084354
+        },
+        {
+          "cpu_ms": 16160.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "peak_rss_kib": 294476,
+          "returncode": 0,
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 16419.61384995375
+        },
+        {
+          "cpu_ms": 15790.000000000002,
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "peak_rss_kib": 293808,
+          "returncode": 0,
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 15917.368910973892
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 15790.000000000002,
+          "p95": 16123.0,
+          "p99": 16152.6
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 728.0,
+          "p95": 728.0,
+          "p99": 728.0
+        },
+        "peak_rss_kib": {
+          "p50": 294216.0,
+          "p95": 294450.0,
+          "p99": 294470.8
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 16017.788720084354,
+          "p95": 16379.431336966809,
+          "p99": 16411.57734735636
+        }
+      },
+      "throughput_per_second": 0.062038727213929286
+    },
+    {
+      "case": "batch",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 202991.0765499808,
+      "raw": [
+        {
+          "cpu_ms": 55830.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "members": [
+            {
+              "cpu_ms": 17570.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 295488,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 18454.366229008883
+            },
+            {
+              "cpu_ms": 20220.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 294580,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 20795.948360930197
+            },
+            {
+              "cpu_ms": 18040.000000000004,
+              "error": "no indexed seed nodes; refresh or narrow query",
+              "fresh": true,
+              "node_count": 0,
+              "output_bytes": 544,
+              "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+              "peak_rss_kib": 295116,
+              "returncode": 2,
+              "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+              "stderr": "Command exited with non-zero status 2\n",
+              "truncated": false,
+              "wall_ms": 18063.416228047572
+            }
+          ],
+          "output_bytes": 23574,
+          "peak_rss_kib": 295488,
+          "wall_ms": 57313.73081798665
+        },
+        {
+          "cpu_ms": 66030.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "members": [
+            {
+              "cpu_ms": 18900.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 294416,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 20918.652947992086
+            },
+            {
+              "cpu_ms": 23450.000000000004,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 293788,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 37339.34288693126
+            },
+            {
+              "cpu_ms": 23680.0,
+              "error": "no indexed seed nodes; refresh or narrow query",
+              "fresh": true,
+              "node_count": 0,
+              "output_bytes": 544,
+              "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+              "peak_rss_kib": 293836,
+              "returncode": 2,
+              "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+              "stderr": "Command exited with non-zero status 2\n",
+              "truncated": false,
+              "wall_ms": 26181.06901203282
+            }
+          ],
+          "output_bytes": 23574,
+          "peak_rss_kib": 294416,
+          "wall_ms": 84439.06484695617
+        },
+        {
+          "cpu_ms": 57550.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "members": [
+            {
+              "cpu_ms": 21790.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 294552,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 25349.396032979712
+            },
+            {
+              "cpu_ms": 16200.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 295452,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 16204.90069303196
+            },
+            {
+              "cpu_ms": 19560.000000000004,
+              "error": "no indexed seed nodes; refresh or narrow query",
+              "fresh": true,
+              "node_count": 0,
+              "output_bytes": 544,
+              "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+              "peak_rss_kib": 294824,
+              "returncode": 2,
+              "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+              "stderr": "Command exited with non-zero status 2\n",
+              "truncated": false,
+              "wall_ms": 19668.2408049237
+            }
+          ],
+          "output_bytes": 23574,
+          "peak_rss_kib": 295452,
+          "wall_ms": 61222.53753093537
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 57550.0,
+          "p95": 65182.0,
+          "p99": 65860.4
+        },
+        "errors": 3,
+        "output_bytes": {
+          "p50": 23574.0,
+          "p95": 23574.0,
+          "p99": 23574.0
+        },
+        "peak_rss_kib": {
+          "p50": 295452.0,
+          "p95": 295484.4,
+          "p99": 295487.28
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 61222.53753093537,
+          "p95": 82117.41211535409,
+          "p99": 83974.73430063576
+        }
+      },
+      "throughput_per_second": 0.014778974775580024
+    },
+    {
+      "case": "unique_depth_1",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 20318.04969604127,
+      "raw": [
+        {
+          "cpu_ms": 18430.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "peak_rss_kib": 293824,
+          "returncode": 0,
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 18649.80826911051
+        },
+        {
+          "cpu_ms": 19919.999999999996,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "peak_rss_kib": 294508,
+          "returncode": 0,
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 20310.9263330698
+        },
+        {
+          "cpu_ms": 19380.000000000004,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "peak_rss_kib": 294552,
+          "returncode": 0,
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19698.953225975856
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 19380.000000000004,
+          "p95": 19865.999999999996,
+          "p99": 19909.199999999997
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "peak_rss_kib": {
+          "p50": 294508.0,
+          "p95": 294547.6,
+          "p99": 294551.12
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 19698.953225975856,
+          "p95": 20249.729022360407,
+          "p99": 20298.686870927922
+        }
+      },
+      "throughput_per_second": 0.14765196684131127
+    },
+    {
+      "case": "unique_depth_2",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 34975.14365497045,
+      "raw": [
+        {
+          "cpu_ms": 24960.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "peak_rss_kib": 293756,
+          "returncode": 0,
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 32234.154402976856
+        },
+        {
+          "cpu_ms": 23480.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "peak_rss_kib": 294604,
+          "returncode": 0,
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 25326.85896498151
+        },
+        {
+          "cpu_ms": 25150.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "peak_rss_kib": 293872,
+          "returncode": 0,
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 34958.821228006855
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 24960.0,
+          "p95": 25131.0,
+          "p99": 25146.2
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "peak_rss_kib": {
+          "p50": 293872.0,
+          "p95": 294530.8,
+          "p99": 294589.36
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 32234.154402976856,
+          "p95": 34686.354545503855,
+          "p99": 34904.327891506255
+        }
+      },
+      "throughput_per_second": 0.08577520165735356
+    },
+    {
+      "case": "unique_depth_5",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 29914.747042930685,
+      "raw": [
+        {
+          "cpu_ms": 23090.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "peak_rss_kib": 293312,
+          "returncode": 0,
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 29909.445532015525
+        },
+        {
+          "cpu_ms": 23500.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "peak_rss_kib": 294868,
+          "returncode": 0,
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 29368.617226951756
+        },
+        {
+          "cpu_ms": 23820.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "peak_rss_kib": 293520,
+          "returncode": 0,
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 29043.02937106695
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 23500.0,
+          "p95": 23788.0,
+          "p99": 23813.6
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "peak_rss_kib": {
+          "p50": 293520.0,
+          "p95": 294733.2,
+          "p99": 294841.04
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 29368.617226951756,
+          "p95": 29855.362701509148,
+          "p99": 29898.62896591425
+        }
+      },
+      "throughput_per_second": 0.10028498638797437
+    },
+    {
+      "case": "missing",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 20361.729759024456,
+      "raw": [
+        {
+          "cpu_ms": 18880.000000000004,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "peak_rss_kib": 295108,
+          "returncode": 2,
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "stderr": "Command exited with non-zero status 2\n",
+          "truncated": false,
+          "wall_ms": 18911.06120799668
+        },
+        {
+          "cpu_ms": 19570.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "peak_rss_kib": 295192,
+          "returncode": 2,
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "stderr": "Command exited with non-zero status 2\n",
+          "truncated": false,
+          "wall_ms": 19706.91284991335
+        },
+        {
+          "cpu_ms": 20230.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "peak_rss_kib": 294108,
+          "returncode": 2,
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "stderr": "Command exited with non-zero status 2\n",
+          "truncated": false,
+          "wall_ms": 20355.692752986215
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 19570.0,
+          "p95": 20164.0,
+          "p99": 20216.8
+        },
+        "errors": 3,
+        "output_bytes": {
+          "p50": 544.0,
+          "p95": 544.0,
+          "p99": 544.0
+        },
+        "peak_rss_kib": {
+          "p50": 295108.0,
+          "p95": 295183.6,
+          "p99": 295190.32
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 19706.91284991335,
+          "p95": 20290.81476267893,
+          "p99": 20342.717154924758
+        }
+      },
+      "throughput_per_second": 0.14733522325972231
+    },
+    {
+      "case": "ambiguous",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 19785.553089925088,
+      "raw": [
+        {
+          "cpu_ms": 19560.000000000004,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "peak_rss_kib": 295748,
+          "returncode": 0,
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19616.89574306365
+        },
+        {
+          "cpu_ms": 19770.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "peak_rss_kib": 295448,
+          "returncode": 0,
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19781.685796915554
+        },
+        {
+          "cpu_ms": 18290.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "peak_rss_kib": 294800,
+          "returncode": 0,
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 18316.258486011066
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 19560.000000000004,
+          "p95": 19749.0,
+          "p99": 19765.8
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 9305.0,
+          "p95": 9305.0,
+          "p99": 9305.0
+        },
+        "peak_rss_kib": {
+          "p50": 295448.0,
+          "p95": 295718.0,
+          "p99": 295742.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 19616.89574306365,
+          "p95": 19765.206791530363,
+          "p99": 19778.389995838515
+        }
+      },
+      "throughput_per_second": 0.15162578404379387
+    },
+    {
+      "case": "tight_budget",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 19903.83660502266,
+      "raw": [
+        {
+          "cpu_ms": 19280.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "peak_rss_kib": 294780,
+          "returncode": 0,
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19382.049261941575
+        },
+        {
+          "cpu_ms": 19220.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "peak_rss_kib": 295600,
+          "returncode": 0,
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19362.766967969947
+        },
+        {
+          "cpu_ms": 19840.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "peak_rss_kib": 294252,
+          "returncode": 0,
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "stderr": "",
+          "truncated": true,
+          "wall_ms": 19900.985509040765
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 19280.0,
+          "p95": 19784.0,
+          "p99": 19828.8
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 728.0,
+          "p95": 728.0,
+          "p99": 728.0
+        },
+        "peak_rss_kib": {
+          "p50": 294780.0,
+          "p95": 295518.0,
+          "p99": 295583.6
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 19382.049261941575,
+          "p95": 19849.091884330846,
+          "p99": 19890.60678409878
+        }
+      },
+      "throughput_per_second": 0.1507247099909854
+    },
+    {
+      "case": "batch",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "cold",
+      "phase_wall_ms": 55242.09451396018,
+      "raw": [
+        {
+          "cpu_ms": 53970.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "members": [
+            {
+              "cpu_ms": 18490.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 295112,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 18526.398652000353
+            },
+            {
+              "cpu_ms": 16780.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 294780,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 16818.41082801111
+            },
+            {
+              "cpu_ms": 18700.0,
+              "error": "no indexed seed nodes; refresh or narrow query",
+              "fresh": true,
+              "node_count": 0,
+              "output_bytes": 544,
+              "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+              "peak_rss_kib": 293756,
+              "returncode": 2,
+              "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+              "stderr": "Command exited with non-zero status 2\n",
+              "truncated": false,
+              "wall_ms": 18753.414339968003
+            }
+          ],
+          "output_bytes": 23574,
+          "peak_rss_kib": 295112,
+          "wall_ms": 54098.22381997947
+        },
+        {
+          "cpu_ms": 53560.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "members": [
+            {
+              "cpu_ms": 18860.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 295132,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 18888.579698977992
+            },
+            {
+              "cpu_ms": 16480.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 296028,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 16538.06888696272
+            },
+            {
+              "cpu_ms": 18220.0,
+              "error": "no indexed seed nodes; refresh or narrow query",
+              "fresh": true,
+              "node_count": 0,
+              "output_bytes": 544,
+              "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+              "peak_rss_kib": 295280,
+              "returncode": 2,
+              "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+              "stderr": "Command exited with non-zero status 2\n",
+              "truncated": false,
+              "wall_ms": 18276.941035990603
+            }
+          ],
+          "output_bytes": 23574,
+          "peak_rss_kib": 296028,
+          "wall_ms": 53703.589621931314
+        },
+        {
+          "cpu_ms": 55040.0,
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "members": [
+            {
+              "cpu_ms": 19030.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 295088,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 19072.453015018255
+            },
+            {
+              "cpu_ms": 17290.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 294812,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 17409.312971052714
+            },
+            {
+              "cpu_ms": 18720.0,
+              "error": "no indexed seed nodes; refresh or narrow query",
+              "fresh": true,
+              "node_count": 0,
+              "output_bytes": 544,
+              "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+              "peak_rss_kib": 294856,
+              "returncode": 2,
+              "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+              "stderr": "Command exited with non-zero status 2\n",
+              "truncated": false,
+              "wall_ms": 18752.9723480111
+            }
+          ],
+          "output_bytes": 23574,
+          "peak_rss_kib": 295088,
+          "wall_ms": 55234.73833408207
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 53970.0,
+          "p95": 54933.0,
+          "p99": 55018.6
+        },
+        "errors": 3,
+        "output_bytes": {
+          "p50": 23574.0,
+          "p95": 23574.0,
+          "p99": 23574.0
+        },
+        "peak_rss_kib": {
+          "p50": 295112.0,
+          "p95": 295936.4,
+          "p99": 296009.68
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 54098.22381997947,
+          "p95": 55121.08688267181,
+          "p99": 55212.008043800015
+        }
+      },
+      "throughput_per_second": 0.0543064130061519
+    },
+    {
+      "case": "unique_depth_1",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 310.0,
+      "phase_wall_ms": 851.5735979890451,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "truncated": true,
+          "wall_ms": 251.55778706539422
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "truncated": true,
+          "wall_ms": 294.36077002901584
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "truncated": true,
+          "wall_ms": 298.87321998830885
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 17360.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 294.36077002901584,
+          "p95": 298.42197499237955,
+          "p99": 298.782970989123
+        }
+      },
+      "throughput_per_second": 3.5228898677511524,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 13725,
+        "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+        "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "unique_depth_2",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 340.0,
+      "phase_wall_ms": 888.5869679506868,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "truncated": true,
+          "wall_ms": 296.05007893405855
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "truncated": true,
+          "wall_ms": 299.33709604665637
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "truncated": true,
+          "wall_ms": 284.8148780176416
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 17840.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 296.05007893405855,
+          "p95": 299.0083943353966,
+          "p99": 299.2713557044044
+        }
+      },
+      "throughput_per_second": 3.3761467455670457,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 13725,
+        "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+        "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "unique_depth_5",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 350.0,
+      "phase_wall_ms": 921.413499978371,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "truncated": true,
+          "wall_ms": 315.3140159556642
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "truncated": true,
+          "wall_ms": 300.32093601766974
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "truncated": true,
+          "wall_ms": 297.5347279570997
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 18300.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 300.32093601766974,
+          "p95": 313.81470796186477,
+          "p99": 315.0141543569043
+        }
+      },
+      "throughput_per_second": 3.255867208447045,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 13725,
+        "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+        "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "missing",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 370.0,
+      "phase_wall_ms": 930.2915540756658,
+      "raw": [
+        {
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "truncated": false,
+          "wall_ms": 322.8944579605013
+        },
+        {
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "truncated": false,
+          "wall_ms": 310.36386999767274
+        },
+        {
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "truncated": false,
+          "wall_ms": 294.51576294377446
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 18790.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 3,
+        "output_bytes": {
+          "p50": 544.0,
+          "p95": 544.0,
+          "p99": 544.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 310.36386999767274,
+          "p95": 321.64139916421846,
+          "p99": 322.64384620124474
+        }
+      },
+      "throughput_per_second": 3.2247954814346227,
+      "warmup": {
+        "error": "no indexed seed nodes; refresh or narrow query",
+        "fresh": true,
+        "node_count": 0,
+        "output_bytes": 544,
+        "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+        "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+        "truncated": false,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "ambiguous",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 340.0,
+      "phase_wall_ms": 889.0110629145056,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "truncated": true,
+          "wall_ms": 284.2081659473479
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "truncated": true,
+          "wall_ms": 303.0852380907163
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "truncated": true,
+          "wall_ms": 297.07453795708716
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 19230.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 9305.0,
+          "p95": 9305.0,
+          "p99": 9305.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 297.07453795708716,
+          "p95": 302.4841680773534,
+          "p99": 302.9650240880437
+        }
+      },
+      "throughput_per_second": 3.374536184246004,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 9305,
+        "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+        "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "tight_budget",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 360.0,
+      "phase_wall_ms": 894.1756709245965,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "truncated": true,
+          "wall_ms": 312.37507495097816
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "truncated": true,
+          "wall_ms": 301.49180709850043
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "truncated": true,
+          "wall_ms": 277.9510080581531
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 19720.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 728.0,
+          "p95": 728.0,
+          "p99": 728.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 301.49180709850043,
+          "p95": 311.2867481657304,
+          "p99": 312.1574095939286
+        }
+      },
+      "throughput_per_second": 3.355045431842198,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 1,
+        "output_bytes": 728,
+        "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+        "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "batch",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 330.0,
+      "phase_wall_ms": 825.9578279685229,
+      "raw": [
+        {
+          "error": "CodeGraph batch context failed or changed",
+          "fresh": null,
+          "node_count": 0,
+          "output_bytes": 54,
+          "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+          "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+          "truncated": null,
+          "wall_ms": 301.5859790612012
+        },
+        {
+          "error": "CodeGraph batch context failed or changed",
+          "fresh": null,
+          "node_count": 0,
+          "output_bytes": 54,
+          "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+          "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+          "truncated": null,
+          "wall_ms": 267.57003692910075
+        },
+        {
+          "error": "CodeGraph batch context failed or changed",
+          "fresh": null,
+          "node_count": 0,
+          "output_bytes": 54,
+          "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+          "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+          "truncated": null,
+          "wall_ms": 254.82328399084508
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 20170.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 3,
+        "output_bytes": {
+          "p50": 54.0,
+          "p95": 54.0,
+          "p99": 54.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 267.57003692910075,
+          "p95": 298.18438484799117,
+          "p99": 300.9056602185592
+        }
+      },
+      "throughput_per_second": 3.63214670097458,
+      "warmup": {
+        "error": "CodeGraph batch context failed or changed",
+        "fresh": null,
+        "node_count": 0,
+        "output_bytes": 54,
+        "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+        "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+        "truncated": null,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "unique_depth_1",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 330.0,
+      "phase_wall_ms": 838.6069209082052,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "truncated": true,
+          "wall_ms": 321.7729179887101
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "truncated": true,
+          "wall_ms": 576.847463962622
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+          "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+          "truncated": true,
+          "wall_ms": 834.7232370870188
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 20620.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 576.847463962622,
+          "p95": 808.9356597745791,
+          "p99": 829.5657216245309
+        }
+      },
+      "throughput_per_second": 3.5773613658602077,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 13725,
+        "output_sha256": "1b40388c3269dfcdc80ec51708e00cd16bdfe557899f4ca994abf065a42c5fd3",
+        "semantic_sha256": "2f3491db8321a6c49ae79ee912cd84f4d416133c5cf7a8127fa3e1ed5f742cfd",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "unique_depth_2",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 270.0,
+      "phase_wall_ms": 691.5098229655996,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "truncated": true,
+          "wall_ms": 246.64831103291363
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "truncated": true,
+          "wall_ms": 468.59943703748286
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+          "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+          "truncated": true,
+          "wall_ms": 687.5700079835951
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 20980.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 468.59943703748286,
+          "p95": 665.6729508889839,
+          "p99": 683.1905965646729
+        }
+      },
+      "throughput_per_second": 4.338333166598041,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 13725,
+        "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+        "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "unique_depth_5",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 290.0,
+      "phase_wall_ms": 791.1295220255852,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "truncated": true,
+          "wall_ms": 250.6013959646225
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "truncated": true,
+          "wall_ms": 526.4971930300817
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 13725,
+          "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+          "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+          "truncated": true,
+          "wall_ms": 787.6105660106987
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 21370.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 13725.0,
+          "p95": 13725.0,
+          "p99": 13725.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 526.4971930300817,
+          "p95": 761.499228712637,
+          "p99": 782.3882985510863
+        }
+      },
+      "throughput_per_second": 3.792046582105654,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 13725,
+        "output_sha256": "d1a087cbfe4bf65af57af17ecce7c442eb9d7fc0b38706342229727c1148d166",
+        "semantic_sha256": "40ec56eed4a60eae24916e76c3a3205e23e83b7f6d6d462cbfd9e8a70e6eb5ba",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "missing",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 360.0,
+      "phase_wall_ms": 902.0086410455406,
+      "raw": [
+        {
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "truncated": false,
+          "wall_ms": 292.81323694158345
+        },
+        {
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "truncated": false,
+          "wall_ms": 899.9915579333901
+        },
+        {
+          "error": "no indexed seed nodes; refresh or narrow query",
+          "fresh": true,
+          "node_count": 0,
+          "output_bytes": 544,
+          "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+          "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+          "truncated": false,
+          "wall_ms": 602.3553280392662
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 21860.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 3,
+        "output_bytes": {
+          "p50": 544.0,
+          "p95": 544.0,
+          "p99": 544.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 602.3553280392662,
+          "p95": 870.2279349439777,
+          "p99": 894.0388333355077
+        }
+      },
+      "throughput_per_second": 3.325910488532156,
+      "warmup": {
+        "error": "no indexed seed nodes; refresh or narrow query",
+        "fresh": true,
+        "node_count": 0,
+        "output_bytes": 544,
+        "output_sha256": "0f0de416ee00d906721400fe49508e1c980772a7b835694cef49882e616d39ea",
+        "semantic_sha256": "6bceeb517b682b362e55573ffe31e324dc3c18a60196c131cd37f4fdb5e25add",
+        "truncated": false,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "ambiguous",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 350.0,
+      "phase_wall_ms": 824.5479260804132,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "truncated": true,
+          "wall_ms": 821.4818679261953
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "truncated": true,
+          "wall_ms": 280.85933602415025
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 50,
+          "output_bytes": 9305,
+          "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+          "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+          "truncated": true,
+          "wall_ms": 531.8153280531988
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 22310.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 9305.0,
+          "p95": 9305.0,
+          "p99": 9305.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 531.8153280531988,
+          "p95": 792.5152139388956,
+          "p99": 815.6885371287353
+        }
+      },
+      "throughput_per_second": 3.6383573411685814,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 50,
+        "output_bytes": 9305,
+        "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+        "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "tight_budget",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 330.0,
+      "phase_wall_ms": 846.4622619794682,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "truncated": true,
+          "wall_ms": 320.70715399459004
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "truncated": true,
+          "wall_ms": 844.2089880118147
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 1,
+          "output_bytes": 728,
+          "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+          "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+          "truncated": true,
+          "wall_ms": 584.2642060015351
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 22740.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 728.0,
+          "p95": 728.0,
+          "p99": 728.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 584.2642060015351,
+          "p95": 818.2145098107867,
+          "p99": 839.0100923716091
+        }
+      },
+      "throughput_per_second": 3.544162728512483,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 1,
+        "output_bytes": 728,
+        "output_sha256": "4029ea3bb94e2d3594f9fa3655ac9f9f6fc5109523abe830812cf49d19c25d74",
+        "semantic_sha256": "12fff923f2cb36495a7e8fd4fdb2308d78cb01d4858c10a916296305a381a387",
+        "truncated": true,
+        "wall_ms": 0
+      }
+    },
+    {
+      "case": "batch",
+      "concurrency": 4,
+      "effective_concurrency": 3,
+      "mode": "resident",
+      "phase_cpu_ms": 330.0,
+      "phase_wall_ms": 805.7756070047617,
+      "raw": [
+        {
+          "error": "CodeGraph batch context failed or changed",
+          "fresh": null,
+          "node_count": 0,
+          "output_bytes": 54,
+          "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+          "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+          "truncated": null,
+          "wall_ms": 289.96320196893066
+        },
+        {
+          "error": "CodeGraph batch context failed or changed",
+          "fresh": null,
+          "node_count": 0,
+          "output_bytes": 54,
+          "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+          "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+          "truncated": null,
+          "wall_ms": 516.5394119685516
+        },
+        {
+          "error": "CodeGraph batch context failed or changed",
+          "fresh": null,
+          "node_count": 0,
+          "output_bytes": 54,
+          "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+          "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+          "truncated": null,
+          "wall_ms": 803.5912399645895
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 23180.0,
+        "peak_rss_kib": 296104,
+        "rss_kib": 296104
+      },
+      "summary": {
+        "errors": 3,
+        "output_bytes": {
+          "p50": 54.0,
+          "p95": 54.0,
+          "p99": 54.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 516.5394119685516,
+          "p95": 774.8860571649857,
+          "p99": 797.8502034046687
+        }
+      },
+      "throughput_per_second": 3.7231208960912014,
+      "warmup": {
+        "error": "CodeGraph batch context failed or changed",
+        "fresh": null,
+        "node_count": 0,
+        "output_bytes": 54,
+        "output_sha256": "c35242f776c53f3d6c09191e5e758d3f676a3c27a1df86249724fb898f7dc0ce",
+        "semantic_sha256": "b4f7f27678a392c89551bb98b787748e482fb67c322048dc161d9895b26c9f4e",
+        "truncated": null,
+        "wall_ms": 0
+      }
+    }
+  ],
+  "methodology": {
+    "batch_cold": "ordered independent CLI calls; sum bytes/time, maximum RSS",
+    "cold": "fresh process; filesystem caches not evicted",
+    "cpu": "cold GNU time user+system; resident SELF ONLY /proc ticks phase delta (excludes Git child CPU)",
+    "percentiles": "linear interpolation over recorded raw samples",
+    "resident": "authenticated Unix socket; graph loaded once",
+    "rss": "cold GNU time maximum RSS; resident /proc VmHWM"
+  },
+  "platform": "Linux-7.0.14-25-pve-x86_64-with-glibc2.41",
+  "repo": "/tmp/codegraph-search-measured-s6y5js4s/repo",
+  "resident_initial_resources": {
+    "cpu_ms": 16930.0,
+    "peak_rss_kib": 295980,
+    "rss_kib": 295980
+  },
+  "resident_startup_ms": 16952.887553023174,
+  "schema_version": 1,
+  "measurement_notes": [
+    "Initial harness saved before later metadata refinements; all raw measured samples retained unchanged.",
+    "Requested concurrency 4 with only 3 samples ran at effective concurrency 3; explicitly annotated.",
+    "Warmup time and generation-load time were not measured in this initial run; see baseline_warm for measured startup and generation load.",
+    "Missing-symbol and mixed-batch errors are expected API behavior, not infrastructure failures.",
+    "Cold batch consists of ordered separate CLI invocations; resident mixed batch fails atomically, so those response bytes are not equivalent work."
+  ],
+  "source_commit": "e162ebcd79623e670eab721954eb142842c12e89",
+  "started_at_unix": 1793743613.1464546
+}

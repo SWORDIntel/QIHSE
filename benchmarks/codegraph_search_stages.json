@@ -1,0 +1,338 @@
+{
+  "measurement": {
+    "compiler_command": [
+      "gcc",
+      "-O2",
+      "-no-pie",
+      "-I/opt/QIHSE/include",
+      "/tmp/codegraph-stage-original.o",
+      "/tmp/codegraph-stage-probes.c",
+      "/tmp/codegraph-stage-auth.c",
+      "-o",
+      "/tmp/codegraph-stage-original",
+      "-L/tmp/codegraph-search-original-f0s_5ap6",
+      "-lqihse",
+      "-I/usr/include/json-c",
+      "-ljson-c",
+      "-lssl",
+      "-lcrypto",
+      "-Wl,-rpath,/tmp/codegraph-search-original-f0s_5ap6",
+      "-Wl,--wrap=qihse_auth_init",
+      "-Wl,--wrap=qihse_auth_bootstrap_operator",
+      "-Wl,--wrap=qihse_auth_authenticate_id",
+      "-Wl,--wrap=qihse_auth_create_user",
+      "-Wl,--wrap=qihse_kv_load_user"
+    ],
+    "kind": "selectively instrumented ORIGINAL source + library calls; not used for headline latency; concurrent full suite active",
+    "samples": [
+      {
+        "events": [
+          {
+            "stage": "init",
+            "wall_us": "29473"
+          },
+          {
+            "stage": "bootstrap",
+            "wall_us": "1376705"
+          },
+          {
+            "stage": "authenticate",
+            "wall_us": "1373420"
+          },
+          {
+            "stage": "create_reader",
+            "wall_us": "1354360"
+          },
+          {
+            "stage": "authenticate",
+            "wall_us": "1419648"
+          },
+          {
+            "cpu_us": "6031281",
+            "function": "graph_open",
+            "pid": "3995316",
+            "wall_us": "6022962"
+          },
+          {
+            "cpu_us": "335850",
+            "function": "sha256_file",
+            "pid": "3995316",
+            "wall_us": "336409"
+          },
+          {
+            "stage": "snapshot_kv_load",
+            "wall_us": "2385442"
+          },
+          {
+            "cpu_us": "4785776",
+            "function": "build_native_graph",
+            "pid": "3995316",
+            "wall_us": "4780707"
+          },
+          {
+            "cpu_us": "7663900",
+            "function": "load_snapshot",
+            "pid": "3995316",
+            "wall_us": "7659519"
+          },
+          {
+            "cpu_us": "16977",
+            "function": "git_capture",
+            "pid": "3995316",
+            "wall_us": "32981"
+          },
+          {
+            "cpu_us": "9429",
+            "function": "git_capture",
+            "pid": "3995316",
+            "wall_us": "31572"
+          },
+          {
+            "cpu_us": "12832",
+            "function": "git_capture",
+            "pid": "3995316",
+            "wall_us": "41845"
+          },
+          {
+            "cpu_us": "39398",
+            "function": "freshness",
+            "pid": "3995316",
+            "wall_us": "106563"
+          },
+          {
+            "cpu_us": "265",
+            "function": "print_json",
+            "pid": "3995316",
+            "wall_us": "266"
+          },
+          {
+            "cpu_us": "42433",
+            "function": "query_graph",
+            "pid": "3995316",
+            "wall_us": "109598"
+          },
+          {
+            "cpu_us": "13825043",
+            "function": "main",
+            "pid": "3995316",
+            "wall_us": "13879483"
+          }
+        ],
+        "returncode": 0,
+        "stderr": "CG_AUTH stage=init wall_us=29473\nCG_AUTH stage=bootstrap wall_us=1376705\nCG_AUTH stage=authenticate wall_us=1373420\nCG_AUTH stage=create_reader wall_us=1354360\nCG_AUTH stage=authenticate wall_us=1419648\nCG_STAGE pid=3995316 function=0x4070b0 wall_us=6022962 cpu_us=6031281\nCG_STAGE pid=3995316 function=0x406b60 wall_us=336409 cpu_us=335850\nCG_AUTH stage=snapshot_kv_load wall_us=2385442\nCG_STAGE pid=3995316 function=0x4053d0 wall_us=4780707 cpu_us=4785776\nCG_STAGE pid=3995316 function=0x406cc0 wall_us=7659519 cpu_us=7663900\nCG_STAGE pid=3995316 function=0x405740 wall_us=32981 cpu_us=16977\nCG_STAGE pid=3995316 function=0x405740 wall_us=31572 cpu_us=9429\nCG_STAGE pid=3995316 function=0x405740 wall_us=41845 cpu_us=12832\nCG_STAGE pid=3995316 function=0x4059f0 wall_us=106563 cpu_us=39398\nCG_STAGE pid=3995316 function=0x4060a0 wall_us=266 cpu_us=265\nCG_STAGE pid=3995316 function=0x408140 wall_us=109598 cpu_us=42433\nCG_STAGE pid=3995316 function=0x403880 wall_us=13879483 cpu_us=13825043\n",
+        "wall_ms": 13948.175883037038
+      },
+      {
+        "events": [
+          {
+            "stage": "init",
+            "wall_us": "25534"
+          },
+          {
+            "stage": "bootstrap",
+            "wall_us": "1508887"
+          },
+          {
+            "stage": "authenticate",
+            "wall_us": "1578722"
+          },
+          {
+            "stage": "create_reader",
+            "wall_us": "1624691"
+          },
+          {
+            "stage": "authenticate",
+            "wall_us": "1491150"
+          },
+          {
+            "cpu_us": "6740906",
+            "function": "graph_open",
+            "pid": "3996418",
+            "wall_us": "6738372"
+          },
+          {
+            "cpu_us": "357094",
+            "function": "sha256_file",
+            "pid": "3996418",
+            "wall_us": "357122"
+          },
+          {
+            "stage": "snapshot_kv_load",
+            "wall_us": "2506766"
+          },
+          {
+            "cpu_us": "5444407",
+            "function": "build_native_graph",
+            "pid": "3996418",
+            "wall_us": "5434538"
+          },
+          {
+            "cpu_us": "8327731",
+            "function": "load_snapshot",
+            "pid": "3996418",
+            "wall_us": "8318431"
+          },
+          {
+            "cpu_us": "17616",
+            "function": "git_capture",
+            "pid": "3996418",
+            "wall_us": "42469"
+          },
+          {
+            "cpu_us": "13080",
+            "function": "git_capture",
+            "pid": "3996418",
+            "wall_us": "51373"
+          },
+          {
+            "cpu_us": "17239",
+            "function": "git_capture",
+            "pid": "3996418",
+            "wall_us": "47081"
+          },
+          {
+            "cpu_us": "48229",
+            "function": "freshness",
+            "pid": "3996418",
+            "wall_us": "141223"
+          },
+          {
+            "cpu_us": "344",
+            "function": "print_json",
+            "pid": "3996418",
+            "wall_us": "345"
+          },
+          {
+            "cpu_us": "55079",
+            "function": "query_graph",
+            "pid": "3996418",
+            "wall_us": "148074"
+          },
+          {
+            "cpu_us": "15231720",
+            "function": "main",
+            "pid": "3996418",
+            "wall_us": "15312911"
+          }
+        ],
+        "returncode": 0,
+        "stderr": "CG_AUTH stage=init wall_us=25534\nCG_AUTH stage=bootstrap wall_us=1508887\nCG_AUTH stage=authenticate wall_us=1578722\nCG_AUTH stage=create_reader wall_us=1624691\nCG_AUTH stage=authenticate wall_us=1491150\nCG_STAGE pid=3996418 function=0x4070b0 wall_us=6738372 cpu_us=6740906\nCG_STAGE pid=3996418 function=0x406b60 wall_us=357122 cpu_us=357094\nCG_AUTH stage=snapshot_kv_load wall_us=2506766\nCG_STAGE pid=3996418 function=0x4053d0 wall_us=5434538 cpu_us=5444407\nCG_STAGE pid=3996418 function=0x406cc0 wall_us=8318431 cpu_us=8327731\nCG_STAGE pid=3996418 function=0x405740 wall_us=42469 cpu_us=17616\nCG_STAGE pid=3996418 function=0x405740 wall_us=51373 cpu_us=13080\nCG_STAGE pid=3996418 function=0x405740 wall_us=47081 cpu_us=17239\nCG_STAGE pid=3996418 function=0x4059f0 wall_us=141223 cpu_us=48229\nCG_STAGE pid=3996418 function=0x4060a0 wall_us=345 cpu_us=344\nCG_STAGE pid=3996418 function=0x408140 wall_us=148074 cpu_us=55079\nCG_STAGE pid=3996418 function=0x403880 wall_us=15312911 cpu_us=15231720\n",
+        "wall_ms": 15394.42671299912
+      },
+      {
+        "events": [
+          {
+            "stage": "init",
+            "wall_us": "22375"
+          },
+          {
+            "stage": "bootstrap",
+            "wall_us": "1381688"
+          },
+          {
+            "stage": "authenticate",
+            "wall_us": "1495644"
+          },
+          {
+            "stage": "create_reader",
+            "wall_us": "1609517"
+          },
+          {
+            "stage": "authenticate",
+            "wall_us": "1488192"
+          },
+          {
+            "cpu_us": "6472116",
+            "function": "graph_open",
+            "pid": "3997605",
+            "wall_us": "6464298"
+          },
+          {
+            "cpu_us": "357000",
+            "function": "sha256_file",
+            "pid": "3997605",
+            "wall_us": "357250"
+          },
+          {
+            "stage": "snapshot_kv_load",
+            "wall_us": "3141308"
+          },
+          {
+            "cpu_us": "6890356",
+            "function": "build_native_graph",
+            "pid": "3997605",
+            "wall_us": "7433755"
+          },
+          {
+            "cpu_us": "10453159",
+            "function": "load_snapshot",
+            "pid": "3997605",
+            "wall_us": "11114408"
+          },
+          {
+            "cpu_us": "23893",
+            "function": "git_capture",
+            "pid": "3997605",
+            "wall_us": "59610"
+          },
+          {
+            "cpu_us": "19459",
+            "function": "git_capture",
+            "pid": "3997605",
+            "wall_us": "65610"
+          },
+          {
+            "cpu_us": "19503",
+            "function": "git_capture",
+            "pid": "3997605",
+            "wall_us": "97090"
+          },
+          {
+            "cpu_us": "63171",
+            "function": "freshness",
+            "pid": "3997605",
+            "wall_us": "222931"
+          },
+          {
+            "cpu_us": "481",
+            "function": "print_json",
+            "pid": "3997605",
+            "wall_us": "584"
+          },
+          {
+            "cpu_us": "67053",
+            "function": "query_graph",
+            "pid": "3997605",
+            "wall_us": "227356"
+          },
+          {
+            "cpu_us": "17135553",
+            "function": "main",
+            "pid": "3997605",
+            "wall_us": "17975275"
+          }
+        ],
+        "returncode": 0,
+        "stderr": "CG_AUTH stage=init wall_us=22375\nCG_AUTH stage=bootstrap wall_us=1381688\nCG_AUTH stage=authenticate wall_us=1495644\nCG_AUTH stage=create_reader wall_us=1609517\nCG_AUTH stage=authenticate wall_us=1488192\nCG_STAGE pid=3997605 function=0x4070b0 wall_us=6464298 cpu_us=6472116\nCG_STAGE pid=3997605 function=0x406b60 wall_us=357250 cpu_us=357000\nCG_AUTH stage=snapshot_kv_load wall_us=3141308\nCG_STAGE pid=3997605 function=0x4053d0 wall_us=7433755 cpu_us=6890356\nCG_STAGE pid=3997605 function=0x406cc0 wall_us=11114408 cpu_us=10453159\nCG_STAGE pid=3997605 function=0x405740 wall_us=59610 cpu_us=23893\nCG_STAGE pid=3997605 function=0x405740 wall_us=65610 cpu_us=19459\nCG_STAGE pid=3997605 function=0x405740 wall_us=97090 cpu_us=19503\nCG_STAGE pid=3997605 function=0x4059f0 wall_us=222931 cpu_us=63171\nCG_STAGE pid=3997605 function=0x4060a0 wall_us=584 cpu_us=481\nCG_STAGE pid=3997605 function=0x408140 wall_us=227356 cpu_us=67053\nCG_STAGE pid=3997605 function=0x403880 wall_us=17975275 cpu_us=17135553\n",
+        "wall_ms": 18086.70462295413
+      }
+    ]
+  },
+  "measurement_input_sha256": "1c720eddd1854661045c0c53e3d857bbba9f2d4b0fc0f2fde8954b3f7de3982c",
+  "probe_sources": {
+    "/tmp/codegraph-stage-auth.c": {
+      "sha256": "61609a85e43ebbee3159e6e52c130d3a7e7e5b8baf5eda80a08a350c5073a88a",
+      "text": "#include \"qihse_auth.h\"\n#include \"qihse_kv_store.h\"\nextern int __real_qihse_kv_load_user(qihse_kv_store_t *,const char *,qihse_user_t *);\n#include <stdint.h>\n#include <stdio.h>\n#include <time.h>\nstatic uint64_t stamp(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }\n#define REPORT(name) fprintf(stderr,\"CG_AUTH stage=%s wall_us=%llu\\n\",name,(unsigned long long)((stamp()-start)/1000))\nint __wrap_qihse_kv_load_user(qihse_kv_store_t *store,const char *path,qihse_user_t *user) { uint64_t start=stamp(); int value=__real_qihse_kv_load_user(store,path,user); REPORT(\"snapshot_kv_load\"); return value; }\nextern bool __real_qihse_auth_init(void);\nbool __wrap_qihse_auth_init(void) { uint64_t start=stamp(); bool value=__real_qihse_auth_init(); REPORT(\"init\"); return value; }\nextern bool __real_qihse_auth_bootstrap_operator(const char *);\nbool __wrap_qihse_auth_bootstrap_operator(const char *password) { uint64_t start=stamp(); bool value=__real_qihse_auth_bootstrap_operator(password); REPORT(\"bootstrap\"); return value; }\nextern qihse_user_t *__real_qihse_auth_authenticate_id(uint32_t,const char *);\nqihse_user_t *__wrap_qihse_auth_authenticate_id(uint32_t id,const char *password) { uint64_t start=stamp(); qihse_user_t *value=__real_qihse_auth_authenticate_id(id,password); REPORT(\"authenticate\"); return value; }\nextern qihse_user_t *__real_qihse_auth_create_user(const qihse_user_t *,uint32_t,uint16_t,uint16_t,uint16_t,const char *,bool);\nqihse_user_t *__wrap_qihse_auth_create_user(const qihse_user_t *creator,uint32_t id,uint16_t role,uint16_t level,uint16_t sci,const char *password,bool hardware) { uint64_t start=stamp(); qihse_user_t *value=__real_qihse_auth_create_user(creator,id,role,level,sci,password,hardware); REPORT(\"create_reader\"); return value; }\n"
+    },
+    "/tmp/codegraph-stage-probes.c": {
+      "sha256": "c021c0c55d8b5288ed78c8152cf451c30b2d5bcf272bd3bd7db68c908c5e4e1c",
+      "text": "#define _GNU_SOURCE\n#include <stdint.h>\n#include <stdio.h>\n#include <time.h>\n#include <unistd.h>\nstruct frame { void *function; uint64_t wall, cpu; };\nstatic struct frame frames[64];\nstatic unsigned depth;\nstatic uint64_t stamp(clockid_t id) { struct timespec ts; clock_gettime(id, &ts); return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }\nvoid __cyg_profile_func_enter(void *function, void *caller) {\n    (void)caller;\n    if (depth < 64) frames[depth] = (struct frame){function, stamp(CLOCK_MONOTONIC), stamp(CLOCK_PROCESS_CPUTIME_ID)};\n    depth++;\n}\nvoid __cyg_profile_func_exit(void *function, void *caller) {\n    (void)caller;\n    if (!depth || --depth >= 64) return;\n    uint64_t wall = stamp(CLOCK_MONOTONIC), cpu = stamp(CLOCK_PROCESS_CPUTIME_ID);\n    struct frame *f = &frames[depth];\n    if (f->function == function) fprintf(stderr, \"CG_STAGE pid=%ld function=%p wall_us=%llu cpu_us=%llu\\n\", (long)getpid(), function, (unsigned long long)((wall-f->wall)/1000), (unsigned long long)((cpu-f->cpu)/1000));\n}\n"
+    }
+  },
+  "reproducibility_note": "Measured by main during concurrent full suite; diagnostic evidence only, not headline latency. Original object compilation argv pending main; current compiler_command only links instrumented object.",
+  "schema_version": 1,
+  "original_source_sha256": "bf3e2c95888d544f326754f41d971cc0bd93d057c0947a8dccf1aab79c0dd9ae",
+  "original_binary_sha256": "59bf1b1adf82fe6971d8f7048e556d37487a6db46fe03473225d05af66175854",
+  "original_library_sha256": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+  "stage_interpretation": "Function probes report inclusive nested spans; do not sum graph_open/auth wrappers or load_snapshot/KV/build spans. Original query_graph includes its freshness call; candidate separated query timings are not directly equivalent to that inclusive span. GCC function CPU clock excludes separately executed Git child CPU. Linker auth wrappers record wall only."
+}

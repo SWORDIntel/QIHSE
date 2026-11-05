@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "allocation_semantics": "Allocation calls/bytes are diagnostic observer totals, not live/peak memory. LD_PRELOAD interposition covers the wrapped allocation APIs and includes probe overhead; Valgrind changes execution timing. Do not substitute diagnostic wall time for uninstrumented headline samples.",
+  "note": "Exact diagnostic artifacts, not compiled into production. Intentionally byte-preserved rather than reformatted. Initial stage JSON embeds earlier probes; standalone probes match detailed profile epoch.",
+  "artifacts": [
+    {
+      "source": "/tmp/codegraph-stage-probes.c",
+      "path": "benchmarks/codegraph_search_stage_probes.c",
+      "sha256": "7c0b5940008be2a1391bb34996d2014db035cdd7e14710b32ecb73b1b4f5224e"
+    },
+    {
+      "source": "/tmp/codegraph-stage-auth.c",
+      "path": "benchmarks/codegraph_search_stage_auth.c",
+      "sha256": "61609a85e43ebbee3159e6e52c130d3a7e7e5b8baf5eda80a08a350c5073a88a"
+    },
+    {
+      "source": "/tmp/codegraph-alloc-probes.c",
+      "path": "benchmarks/codegraph_search_alloc_probes.c",
+      "sha256": "b03ec22a15fd7eeb85e50cd0dbb1597f1ee887b856191cf004dbd445a4bdd5cf"
+    },
+    {
+      "source": "/tmp/codegraph-stage-original-source.c",
+      "path": "benchmarks/codegraph_search_stage_original_source.c",
+      "sha256": "4b4616e54309170e41f03bd8839f621a56fba1aaa50c55ab2d6b079e5f318524"
+    },
+    {
+      "source": "/tmp/codegraph-detailed-stage-baseline.json",
+      "path": "benchmarks/codegraph_search_detailed_stages.json",
+      "sha256": "fa934d3c7b039485005abca2fe8c732c588421e65a0f78b759f9d7333b9691dc"
+    },
+    {
+      "source": "/tmp/codegraph-warm-probe-baseline.json",
+      "path": "benchmarks/codegraph_search_warm_allocations.json",
+      "sha256": "24c2dfb72884a02841a16d97144befe6149dba8e67e7c134964ec44ba37a79a1"
+    }
+  ]
+}

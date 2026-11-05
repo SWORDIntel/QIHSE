@@ -44,6 +44,31 @@ bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* val
                        uint16_t classification, uint16_t sci_compartment,
                        qihse_user_t* user);
 
+#define QIHSE_KV_DURABLE_BATCH_MAX_RECORDS 4096u
+#define QIHSE_KV_DURABLE_BATCH_MAX_BYTES (64u * 1024u * 1024u)
+
+typedef struct {
+    const char* key;
+    const char* value;
+    uint64_t expire_time_ms; /* absolute Unix milliseconds; zero means no expiry */
+    uint16_t classification;
+    uint16_t sci_compartment;
+} qihse_kv_batch_set_record_t;
+
+/* WAL-preserving durable SETs under one store write lock. Requires an active
+ * authenticated user authorized for every incoming AND existing label. Rejects
+ * empty batches, duplicate keys, bulk-load/replica-read-only/recovery states,
+ * and batches exceeding either bound above (bytes include 40 WAL header bytes
+ * per record plus key/value bytes, excluding C terminators). Caller-owned
+ * strings/records must remain unchanged until return.
+ * True means every record reached the WAL, fflush and exactly one fdatasync
+ * succeeded; no memtable rotation occurs. This is NOT an atomic transaction:
+ * false after mutation starts may leave a recoverable prefix, and fences all
+ * data operations until reopen. Preflight refusal changes no store state. */
+bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store,
+                                     const qihse_kv_batch_set_record_t* records,
+                                     size_t count, qihse_user_t* user);
+
 /* Apply one ordered record received from the configured single primary.
  * The caller must serialize this with all other store writes (normally by
  * holding the engine's kv_lock write-side).  Source sequence is preserved in

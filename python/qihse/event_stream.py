@@ -28,7 +28,7 @@ import ctypes
 import hashlib
 import os
 from enum import IntEnum
-from typing import Iterator, Optional, Callable
+from typing import Iterator, Optional, Callable, NamedTuple, Sequence
 from .core import _lib
 
 # ctypes has no free(); libc does (same idiom as core.py/kv.py)
@@ -59,6 +59,26 @@ class _RecordHeader(ctypes.Structure):
     ]
 
 _RecordHeader_p = ctypes.POINTER(_RecordHeader)
+
+class _Scope(ctypes.Structure):
+    _fields_ = [("topic", ctypes.c_char_p),
+                ("classification", ctypes.c_uint16),
+                ("sci", ctypes.c_uint16)]
+
+class _BatchRecord(ctypes.Structure):
+    _fields_ = [("schema_id", ctypes.c_uint32),
+                ("event_id", ctypes.POINTER(ctypes.c_uint8)),
+                ("payload", ctypes.POINTER(ctypes.c_uint8)),
+                ("payload_size", ctypes.c_size_t)]
+
+class _BatchResult(ctypes.Structure):
+    _fields_ = [("stream_offset", ctypes.c_uint64),
+                ("duplicate", ctypes.c_bool)]
+
+class _ReadRecord(ctypes.Structure):
+    _fields_ = [("header", _RecordHeader),
+                ("payload", ctypes.POINTER(ctypes.c_uint8)),
+                ("payload_size", ctypes.c_size_t)]
 
 # Durability enum
 class Durability(IntEnum):
@@ -127,10 +147,41 @@ _lib.qihse_event_stream_consume_zero_copy.argtypes = [
 ]
 _lib.qihse_event_stream_consume_zero_copy.restype = ctypes.c_bool
 
+_lib.qihse_event_stream_append_batch.argtypes = [
+    _EventStream_p, ctypes.c_void_p, ctypes.POINTER(_Scope),
+    ctypes.POINTER(_BatchRecord), ctypes.c_size_t, ctypes.POINTER(_BatchResult),
+]
+_lib.qihse_event_stream_append_batch.restype = ctypes.c_bool
+_lib.qihse_event_stream_read_batch.argtypes = [
+    _EventStream_p, ctypes.c_void_p, ctypes.POINTER(_Scope),
+    ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(_ReadRecord), ctypes.c_size_t,
+    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+]
+_lib.qihse_event_stream_read_batch.restype = ctypes.c_bool
+_lib.qihse_event_stream_batch_free.argtypes = [ctypes.POINTER(_ReadRecord), ctypes.c_size_t]
+_lib.qihse_event_stream_batch_free.restype = None
+_lib.qihse_event_stream_archive_id.argtypes = [
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint8),
+]
+_lib.qihse_event_stream_archive_id.restype = ctypes.c_bool
+_lib.qihse_event_stream_member_id.argtypes = [
+    ctypes.POINTER(ctypes.c_uint8), ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint8),
+]
+_lib.qihse_event_stream_member_id.restype = ctypes.c_bool
+
 
 # ---------------------------------------------------------------------------
 # Python wrapper classes
 # ---------------------------------------------------------------------------
+
+class EventScope(NamedTuple):
+    """Tenant is derived from ``user``; class/SCI are explicit scope labels."""
+    topic: str
+    classification: int
+    sci: int
+
 
 class EventRecord:
     """A record read from the event stream."""
@@ -212,19 +263,91 @@ class EventStream:
         )
 
     def append_record(self, topic: str, schema_id: int,
-                      event_id: bytes, payload: bytes) -> int:
-        """
-        Append a record with explicit schema ID and event ID.
-        Returns the stream offset, or 0 on failure (e.g. duplicate event ID).
+                      event_id: bytes, payload: bytes) -> Optional[int]:
+        """Append a V1 record; return its physical byte offset or ``None`` on failure.
+
+        The native C ABI retains its historical offset-plus-one return encoding; this
+        Python method normalizes successful offsets (including offset zero).
         """
         if self._read_only:
             raise PermissionError("EventStream is read-only")
         if len(event_id) != EVENT_ID_SIZE:
             raise ValueError(f"event_id must be {EVENT_ID_SIZE} bytes, got {len(event_id)}")
-        return _lib.qihse_event_stream_append_record(
+        offset_plus_one = _lib.qihse_event_stream_append_record(
             self._ptr, topic.encode("utf-8"), ctypes.c_uint32(schema_id),
             event_id, payload, len(payload)
         )
+        return int(offset_plus_one - 1) if offset_plus_one else None
+
+    def append_batch(self, scope: EventScope, records: Sequence[dict], *, user) -> list:
+        """Append a bounded authenticated V2 batch; ``user`` must be an active native principal.
+
+        Each record mapping has ``schema_id``, ``payload`` and optional 48-byte ``event_id``.
+        Duplicate IDs are idempotent only for identical schema and payload. A conflicting ID
+        raises ``RuntimeError``; no scoped read/write path accepts a missing user context.
+        """
+        if self._read_only:
+            raise PermissionError("EventStream is read-only")
+        if user is None:
+            raise ValueError("scoped event batches require an authenticated user")
+        if not isinstance(scope, EventScope):
+            scope = EventScope(*scope)
+        c_scope = _Scope(scope.topic.encode("utf-8"), int(scope.classification), int(scope.sci))
+        native_records = (_BatchRecord * len(records))()
+        native_results = (_BatchResult * len(records))()
+        keepalive = []
+        for i, item in enumerate(records):
+            payload = bytes(item["payload"])
+            event_id = item.get("event_id")
+            if event_id is not None:
+                event_id = bytes(event_id)
+                if len(event_id) != EVENT_ID_SIZE:
+                    raise ValueError(f"event_id must be {EVENT_ID_SIZE} bytes")
+                id_buf = (ctypes.c_uint8 * EVENT_ID_SIZE).from_buffer_copy(event_id)
+                keepalive.append(id_buf)
+                id_ptr = ctypes.cast(id_buf, ctypes.POINTER(ctypes.c_uint8))
+            else:
+                id_ptr = ctypes.POINTER(ctypes.c_uint8)()
+            if payload:
+                payload_buf = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
+                keepalive.append(payload_buf)
+                payload_ptr = ctypes.cast(payload_buf, ctypes.POINTER(ctypes.c_uint8))
+            else:
+                payload_ptr = ctypes.POINTER(ctypes.c_uint8)()
+            native_records[i] = _BatchRecord(int(item["schema_id"]), id_ptr,
+                                             payload_ptr, len(payload))
+        if not _lib.qihse_event_stream_append_batch(
+                self._ptr, user, ctypes.byref(c_scope), native_records,
+                len(records), native_results):
+            raise RuntimeError("authenticated event batch rejected or durability failed")
+        return [(int(r.stream_offset), bool(r.duplicate)) for r in native_results]
+
+    def read_batch(self, scope: EventScope, cursor: int = 0, *, user,
+                   capacity: int = 256, max_payload_bytes: int = 4 * 1024 * 1024):
+        """Read a bounded authenticated page; returns ``(records, next_byte_cursor)``."""
+        if user is None:
+            raise ValueError("scoped event reads require an authenticated user")
+        if not isinstance(scope, EventScope):
+            scope = EventScope(*scope)
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        c_scope = _Scope(scope.topic.encode("utf-8"), int(scope.classification), int(scope.sci))
+        native = (_ReadRecord * capacity)()
+        c_cursor = ctypes.c_uint64(cursor)
+        count = ctypes.c_size_t()
+        if not _lib.qihse_event_stream_read_batch(
+                self._ptr, user, ctypes.byref(c_scope), ctypes.byref(c_cursor), native,
+                capacity, max_payload_bytes, ctypes.byref(count)):
+            raise RuntimeError("authenticated event batch read failed")
+        try:
+            result = []
+            for i in range(count.value):
+                row = native[i]
+                payload = ctypes.string_at(row.payload, row.payload_size) if row.payload_size else b""
+                result.append(EventRecord(row.header, payload))
+            return result, int(c_cursor.value)
+        finally:
+            _lib.qihse_event_stream_batch_free(native, count.value)
 
     def read(self, topic: str, stream_offset: int) -> Optional[EventRecord]:
         """Read a single record by stream offset."""
@@ -302,6 +425,32 @@ class EventStream:
             ctypes.c_uint64(offset), ctypes.c_int(socket_fd),
             ctypes.c_size_t(count)
         )
+
+    @staticmethod
+    def compute_archive_id(archive: bytes, scan_version: str, schema_id: int) -> bytes:
+        """Return the stable archive SHA-384 identity bound to scan/schema version."""
+        data = bytes(archive)
+        buffer = (ctypes.c_uint8 * EVENT_ID_SIZE)()
+        source = (ctypes.c_uint8 * len(data)).from_buffer_copy(data) if data else None
+        if not _lib.qihse_event_stream_archive_id(source, len(data), scan_version.encode("utf-8"),
+                                                   int(schema_id), buffer):
+            raise ValueError("archive identity inputs rejected")
+        return bytes(buffer)
+
+    @staticmethod
+    def compute_member_id(archive_id: bytes, member_name: str,
+                          scan_version: str, schema_id: int) -> bytes:
+        """Return member identity bound to archive ID, exact name, scan and schema versions."""
+        archive = bytes(archive_id)
+        if len(archive) != EVENT_ID_SIZE:
+            raise ValueError(f"archive_id must be {EVENT_ID_SIZE} bytes")
+        source = (ctypes.c_uint8 * EVENT_ID_SIZE).from_buffer_copy(archive)
+        buffer = (ctypes.c_uint8 * EVENT_ID_SIZE)()
+        if not _lib.qihse_event_stream_member_id(source, member_name.encode("utf-8"),
+                                                  scan_version.encode("utf-8"),
+                                                  int(schema_id), buffer):
+            raise ValueError("member identity inputs rejected")
+        return bytes(buffer)
 
     @staticmethod
     def compute_event_id(topic: str, payload: bytes) -> bytes:

@@ -1,0 +1,8 @@
+{
+  "pin": "/tmp/codegraph-hot-pin-qvd557fl",
+  "sha256": {
+    "qihse_codegraph.c": "b3108abf4b74393a7562f0d1dfd146d222648101581da077b171753005aecd18",
+    "libqihse.so": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+    "qihse-codegraph": "d238494910befd5247746400b474589cf51e8bc8212581fadf3e24a14029ca6a"
+  }
+}

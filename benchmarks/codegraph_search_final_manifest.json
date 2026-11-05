@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "pinned_directory": "/tmp/codegraph-final-pin-lq5hpksu",
+  "source_revision": "5be911708d47887399c753293990ec815fd0a7cd",
+  "artifacts": {
+    "qihse-codegraph": "656b14df6e1a2424a69b55f7ad75625b13c9228a767d4dc4008c33decf32100d",
+    "libqihse.so": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+    "tools/qihse_codegraph.c": "d5eee17009321758c1957b0a18d7189e5ec3e737359ae94711b4ddb5d82bd0f2"
+  },
+  "library_policy": "Original e5a0c8 frozen library in both baseline and final measurements; concurrent uncommitted KV batch-API changes in live checkout excluded from performance comparison. Current checkout graph and native checks run separately.",
+  "paired_export_sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b"
+}

@@ -1,0 +1,24 @@
+{
+  "held_reservation": {
+    "offset": 1024,
+    "length": 1024
+  },
+  "new_reservation_mib": 1024,
+  "checks": [
+    {
+      "budget_mib": 1024,
+      "returncode": 1,
+      "response": {
+        "error": "CodeGraph resident memory budget unavailable"
+      }
+    },
+    {
+      "budget_mib": 2048,
+      "returncode": 1,
+      "response": {
+        "error": "CodeGraph repo/runtime not available"
+      }
+    }
+  ],
+  "review_disposition": "Reported early-gap admission bug not reproduced: code scans full lock map before claiming. Missing fragmented/lowered-budget regression added."
+}

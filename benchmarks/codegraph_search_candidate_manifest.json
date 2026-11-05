@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "pinned_directory": "/tmp/codegraph-search-release-7it0uqlh",
+  "qihse-codegraph": "8060859a4b03b9f1bff6874f823aafc50562aa3a10cb3cd7e9671df38f76b6b5",
+  "libqihse.so": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+  "tools/qihse_codegraph.c": "579b6e19404a2ea3b259804ca5ac8ad50844e914891c924838735edc5f9cbb68",
+  "verification": "Source original hashes before and after copy and pinned artifact hashes all matched. Library exactly unchanged from preserved baseline. Main coord8148 reports extended native contract suite PASS then final total receive deadline fix; final release recheck running. Main explicitly released sampling. No prior candidate pins used for measurements.",
+  "paired_export_sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b"
+}

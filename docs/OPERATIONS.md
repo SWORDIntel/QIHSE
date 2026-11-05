@@ -503,10 +503,12 @@ test-pqc-handshake`). Ports: one RESP port and one cluster-bus port per node.
 ### Compaction cadence
 
 `--kv-sweep-interval SECONDS` (default 30, `0` disables) is the cadence of the
-background expiry sweeper, which is also what triggers SSTable compaction. The
-RESP sweeper thread only starts when this value is non-zero, so a daemon that
-never sets it never reclaims expired records and never merges SSTables: every
-flush appends one ~530 KB file and reads degrade linearly with history. The
+background expiry sweeper, which is also what triggers SSTable compaction. Both
+`qihse-cluster-daemon` and the standalone `qihse-redis-server` expose this option
+and default it to 30 seconds. The RESP sweeper thread only starts when this value
+is non-zero, so a daemon that never sets it never reclaims expired records
+and never merges SSTables: every flush appends one ~530 KB file, so read
+latency degrades linearly with history. The
 sweep is a maintenance-class writer, so it is fenced out while a hold is
 installed and resumes by itself after release.
 

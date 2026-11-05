@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "repository": "/tmp/codegraph-search-measured-s6y5js4s/repo",
+  "source_repository": "/home/john/Documents/code-review-graph",
+  "source_commit": "e162ebcd79623e670eab721954eb142842c12e89",
+  "source_kind": "Clean local clone of real tracked source; official CRG parser and exporter, no synthetic graph",
+  "parsed_files": 368,
+  "nodes": 8361,
+  "edges": 76358,
+  "unresolved_edges": 47796,
+  "structural_records_sha256": "260143bd02f8c37f3a4eaa11f71e6b33c4497ec08e37a7ce1bf338c9a30dfedf",
+  "structural_digest_method": "SHA256 of json.dumps of ordered parsed node/edge records with sort_keys=True,separators=(',',':'); metadata/trailer excluded",
+  "baseline_export": {
+    "path": "/tmp/codegraph-search-measured-s6y5js4s/repo/.code-review-graph/graph.qihse.jsonl",
+    "sha256": "b4d976cefb249ae85ce11bf150a64eea6b9d53c78936717bf381cce9f22cf29b",
+    "body_sha256": "704e967e65b86645cf821b38be7803b3c224c6a78eaf3158fd7ac4ce773960e1",
+    "worktree": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+    "exporter": "Installed official CRG executable in source repository .venv/bin/code-review-graph"
+  },
+  "candidate_export": {
+    "path": "/tmp/codegraph-search-measured-s6y5js4s/repo/.code-review-graph/graph.v2.qihse.jsonl",
+    "sha256": "0d89e32606cfbdfbe923d59139f471556ae34b2fda8793fee663b3e398639f0a",
+    "body_sha256": "fedc5a3b6aab584454e0871ccc5cccc526960175bcf347f2a0c6f0cc6aa0c329",
+    "worktree": "57867eac59aed2476c388a93c1d58cb0dde5d3f677409c9d0202749309a4cd6b",
+    "exporter": "Current CRG code_review_graph.exports.export_qihse with GraphStore on the same real indexed database",
+    "freshness": "git-status-diff-index-untracked-v2"
+  },
+  "paired_export": {
+    "path": "/tmp/codegraph-search-measured-s6y5js4s/repo/.code-review-graph/graph.paired.qihse.jsonl",
+    "sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b",
+    "body_sha256": "3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4",
+    "worktree": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+    "worktree_v2": "57867eac59aed2476c388a93c1d58cb0dde5d3f677409c9d0202749309a4cd6b",
+    "exporter": "Current official CRG export_qihse; original indexed GraphStore, validated real source hashes",
+    "purpose": "Both original and candidate must import these byte-identical enriched bytes into separate benchmark states"
+  },
+  "structural_records_identical": true,
+  "whole_export_bytes_identical": false,
+  "comparison_caveat": "Freshness metadata changed through the official current exporter, not hand-editing. Both exports have exactly identical normalized node and edge records and the same source commit. Baseline bytes remain preserved. Candidate import and measurement are separate steps, not yet claimed by this evidence.",
+  "storage_boundary": "Only CRG source/index/export artifacts inspected. QIHSE data retrieval exclusively through authenticated native CLI/socket in isolated benchmark state, no raw live QIHSE storage reads."
+}

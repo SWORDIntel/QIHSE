@@ -393,7 +393,18 @@ test-backup-cli: backup-cli
 	$(CC) $(CFLAGS) -o tests/test_backup_cli tests/test_backup_cli.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_backup_cli
 
-.PHONY: test-kv-restore-durability
+.PHONY: test-kv-durable-batch test-kv-restore-durability
+test-kv-durable-batch: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -Wl,--wrap=fdatasync -Wl,--wrap=fflush -o tests/test_kv_durable_batch \
+	    tests/test_kv_durable_batch.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	@set -e; umask 077; work=$$(mktemp -d ./build/kv-durable-batch-XXXXXX); \
+	  trap 'rm -rf -- "$$work"' EXIT HUP INT TERM; \
+	  QIHSE_KV_DURABLE_BATCH_DIR="$$work" LD_LIBRARY_PATH=. ./tests/test_kv_durable_batch
+
+test-serial: test-kv-durable-batch
+
 test-kv-restore-durability: lib
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -DQIHSE_REPLICA_CRASH_TEST -Wl,--export-dynamic -o tests/test_kv_restore_durability tests/test_kv_restore_durability.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
@@ -1472,6 +1483,26 @@ test-column-tsdb-anchor: lib
 test-event-stream: lib
 	$(CC) $(CFLAGS) -o tests/test_event_stream tests/qihse_event_stream_test.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_event_stream
+
+.PHONY: test-python-event-stream-batch test-python-kv-durable-batch
+test-python-event-stream-batch: lib
+	@mkdir -p build && chmod 0700 build
+	@set -e; umask 077; work=$$(mktemp -d ./build/python-event-stream-XXXXXX); \
+	  trap 'rm -rf -- "$$work"' EXIT HUP INT TERM; \
+	  QIHSE_FIPS_MODE=disabled QIHSE_DATA_DIR="$$work" \
+	  QIHSE_EVENT_STREAM_TEST_DIR="$$work" LD_LIBRARY_PATH=. PYTHONPATH=python \
+	  python3 tests/test_python_event_stream_batch.py
+
+test-serial: test-python-event-stream-batch
+
+test-python-kv-durable-batch: lib
+	@mkdir -p build && chmod 0700 build
+	@set -e; umask 077; work=$$(mktemp -d ./build/python-kv-batch-XXXXXX); \
+	  trap 'rm -rf -- "$$work"' EXIT HUP INT TERM; \
+	  QIHSE_FIPS_MODE=disabled QIHSE_DATA_DIR="$$work" LD_LIBRARY_PATH=. PYTHONPATH=python \
+	  python3 tests/test_python_kv_durable_batch.py
+
+test-serial: test-python-kv-durable-batch
 
 test-routing-persistence: lib
 	$(CC) $(CFLAGS) -o tests/test_routing_persistence tests/qihse_routing_persistence_test.c -L. -lqihse $(LDFLAGS)

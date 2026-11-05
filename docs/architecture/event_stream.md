@@ -1,12 +1,12 @@
 # QIHSE Event Stream — Record-Framed Commit Log
 
-> **Status: implemented** — the record format, durability modes, replay, and
-> torn-tail recovery are verified by `tests/qihse_event_stream_test.c`
-> (`make test-event-stream`).
+> **Status: implemented** — V1 compatibility and authenticated V2 batch append/read,
+> recovery, deduplication, and scope isolation are verified by
+> `tests/qihse_event_stream_test.c` (`make test-event-stream`).
 >
-> **Minor discrepancy:** the testing section below says "16 test cases with 49
-> assertions"; the file contains 14 test functions, and its own harness prints
-> the counts it observed at run time.
+> The focused C test currently reports 17 cases and 50 assertions; the Python
+> ctypes smoke test covers authenticated batch append, retry, cursor paging and
+> stable identities.
 
 ## Overview
 
@@ -18,7 +18,7 @@ boundary.
 
 ## Record Format
 
-Each record is serialized as an 88-byte header followed by a variable-length payload:
+Legacy V1 records are serialized as an 88-byte header followed by a variable-length payload. Authenticated V2 records retain that header layout, use `format_version=2`, and append a 48-byte SHA-384 trailer over the committed header and payload.
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -59,15 +59,19 @@ Three durability modes are supported via `qihse_es_durability_t`:
 | Mode | Behavior |
 | --- | --- |
 | `NONE` | No `fdatasync` — fastest, may lose recent records on crash |
-| `FDATASYNC` | `fdatasync` after writing payload and after flipping commit flag |
+| `FDATASYNC` | V1: `fdatasync` after payload and commit flag; V2: one checked sync before and after the batch commit |
 | `FULL` | `fdatasync` + atomic rename for segment rotation (reserved) |
 
 ### Two-phase commit
+
+V1 appends retain the per-record two-phase sequence below; writes use checked complete-write loops and both durability results are checked.
 
 1. Write uncommitted header (flags=0) + payload
 2. `fdatasync` (if durability >= FDATASYNC)
 3. Flip `flags` to `QIHSE_ES_F_COMMITTED` via 4-byte `pwrite`
 4. `fdatasync` (if durability >= FDATASYNC)
+
+V2 batches write each header/payload/trailer uncommitted under one exclusive topic lock, sync once, set commit flags for the batch, and sync once more. This is a group commit, not an all-or-nothing transaction: a crash may retain a valid committed prefix.
 
 This ensures that a crash during step 1-2 leaves an uncommitted record that
 `truncate_torn_tail()` can detect and remove. A crash during step 3-4 leaves
@@ -83,9 +87,11 @@ uncommitted, corrupt, or truncated record.
 
 ### Torn-tail recovery
 
-`qihse_event_stream_truncate_torn_tail()` scans the topic log and truncates
-any bytes after the last committed record using `ftruncate`. This removes
-partial writes from a crash.
+`qihse_event_stream_truncate_torn_tail()` scans the V1 topic log and truncates
+only a partial header or a well-formed uncommitted tail after the last committed
+record. A malformed or truncated committed record is reported as corruption and
+left untouched. Truncation is acknowledged only after `ftruncate` and
+`fdatasync` both succeed.
 
 ### Corruption detection
 
@@ -123,10 +129,7 @@ QIHSE records to be cross-verified against the hash-chained spool.
 
 ## Duplicate Rejection
 
-`qihse_event_stream_append_record()` scans the topic log for an existing
-record with the same event ID before appending. If found, the append is
-rejected (returns 0). This prevents duplicate events without rewriting
-earlier direct observations.
+V1 append maintains a per-topic committed cursor and event-ID index rebuilt on first open or external file change; duplicate detection and predecessor selection occur after acquiring the exclusive file lock. Its C return value remains the historical physical-offset-plus-one sentinel (zero means failure). V2 batch retries return the original physical byte offset for an identical event ID, schema, and payload digest. Reusing an ID for changed schema or content is a conflict and fails the batch.
 
 ## C API
 
@@ -175,6 +178,12 @@ qihse_event_stream_consume_zero_copy(es, "bgp_updates", offset, socket_fd, count
 qihse_event_stream_destroy(es);
 ```
 
+## Authenticated V2 batch API
+
+V2 is written to an internal filename derived from the active principal's tenant ID plus the logical topic, classification, and SCI compartment. The tenant is never caller-selected. Both append and cursor-read APIs require an active `qihse_user_t*` and apply `qihse_auth_can_access`; context-free V1 read/replay/iteration/zero-copy functions cannot address these files. V2 payload integrity is checked before returning data. Recovery rebuilds the cursor and ID index; an incomplete/uncommitted tail may be removed, but committed corruption fails closed and is never silently truncated.
+
+`qihse_event_stream_append_batch()` accepts up to 1,024 records and 64 MiB of payload per call. `qihse_event_stream_read_batch()` returns a bounded page from a byte cursor and advances only on success. `qihse_event_stream_archive_id()` and `qihse_event_stream_member_id()` bind archive/member identity to scan version and schema version, not batch ordering or physical offset. A false return after an I/O failure does not establish whether the final commit reached storage; callers should retry with the same stable IDs.
+
 ## Python API
 
 ```python
@@ -196,6 +205,13 @@ with qihse.EventStream("/tmp/qihse_events") as es:
     # Replay with callback
     count = es.replay("bgp_updates", callback=lambda r: print(r.payload))
 
+    # Authenticated V2 batch ingestion requires the native qihse_user_t*.
+    scope = qihse.EventScope("firmware", classification=0, sci=0)
+    offsets = es.append_batch(scope, [
+        {"schema_id": 2, "event_id": eid, "payload": b"..."},
+    ], user=native_user)
+    page, cursor = es.read_batch(scope, user=native_user)
+
     # Torn-tail recovery
     es.truncate_torn_tail("bgp_updates")
 
@@ -206,7 +222,7 @@ with qihse.EventStream("/tmp/qihse_events") as es:
 
 ## Testing
 
-16 test cases with 49 assertions cover all 9 promotion gates:
+The test targets cover V1 compatibility and the authenticated V2 batch gates:
 
 ```bash
 gcc -std=c99 -Wall -Wextra -O2 -I./include -D_GNU_SOURCE \
@@ -218,6 +234,7 @@ Or via Makefile:
 
 ```bash
 make test-event-stream
+make test-python-event-stream-batch
 ```
 
 ## Storage Layout

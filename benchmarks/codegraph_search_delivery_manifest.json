@@ -1,0 +1,10 @@
+{
+  "pin": "/tmp/codegraph-delivery-final-n3hc00nf",
+  "sha256": {
+    "libqihse.so": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+    "qihse_codegraph.c": "a50a8493c6c0d1a71a0379c0aae57affb26b157c3e1258e8c70fcbe0aa0406e4",
+    "qihse-codegraph": "072c99019a094fbc2d7fc77bc9ca909d043ca63fd02acf71c75d855d34318feb"
+  },
+  "export_sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b",
+  "source_current_matches": true
+}

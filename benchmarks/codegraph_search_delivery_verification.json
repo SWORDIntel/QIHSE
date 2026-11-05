@@ -1,0 +1,40 @@
+{
+  "native_manifest": "codegraph_search_delivery_manifest.json",
+  "native_source_still_matches_pin": true,
+  "native_contracts": {
+    "current_checkout": "PASS; make qihse-codegraph test-graph test-codegraph",
+    "frozen_library_root_peer_test": "PASS",
+    "gcc_fanalyzer_Werror": "PASS",
+    "valgrind": "PASS; 0 errors, 0 lost bytes"
+  },
+  "crg_checks": {
+    "pytest": "75 passed, 71 optional skips",
+    "ruff": "PASS"
+  },
+  "hax_checks": {
+    "focused_graph_cache": "PASS (4 executables), including final FIFO and connected-malformed-response regressions",
+    "lint": "PASS (exit 0); shared workspace fingerprint changed during lint",
+    "real_integration": "PASS after final connected-response hardening",
+    "latest_full_suite": "252 passed, 2 failures (execution_journal, tool_router), 0 timeouts after final scoped hardening edits",
+    "global_promotion": "DENIED; shared changes, unrelated suite failures, review diff exceeds tool limit"
+  },
+  "hax_scoped_sha256": {
+    "src/store/result_cache.c": "3e500f3ce26d35a9931e2dce335c2165e2e08f131837163cdc95c913e3c424e0",
+    "src/store/result_cache.h": "c8f542103e6b66f0477ed73799f9e2f6022ecc203c275adb2eb47ea8a5de7f41",
+    "src/tools/code_context.c": "95b326003f5783893202b4bace62e462dd0673a24e9b042cf6428419bc65e77f",
+    "src/tools/codegraph_reader.c": "0ea1d4ee6effb169ba3540a15871cacdf3e542d6b59fb548cdae1d522ebefce7",
+    "src/tools/codegraph_reader.h": "0f9c2645e4ab436b885707972edcceb92b3aa50e9456016644064affaf971bc8",
+    "src/tools/graph.c": "0d1ab9d102281543a173ee9b7a9223177b35d327a1550786dc1765b561b7705e",
+    "tests/test_result_cache.c": "faa78bbdedb7d239a401260be1952c1e12f15f480610998dfd59fa1be9196efe",
+    "tests/tools/test_codegraph_reader.c": "bea4b75381d57f510f37d44958226722384b60a51a8bcf2836c54c9a0171b60b",
+    "tests/tools/test_code_context.c": "978e15590fe8de7eebc5e0be0e36f0ed890e8e90d5610245b158af7fdb034db6",
+    "tests/tools/test_graph.c": "03188b0cf37dc260a26c631de872e0861f12674fb53cd57a2ab207d346587120"
+  },
+  "external_sha256": {
+    "/home/john/Documents/code-review-graph/code_review_graph/exports.py": "d515ccd962173017fc8cdcc083ca8894926f42fbd64516988b5599b58344f0e3",
+    "/home/john/Documents/code-review-graph/tests/test_qihse_export.py": "681cdbff2e24825cf9387dfc297e53349f3231f8ee6f06dad20be6783b51ce86",
+    "/opt/QIHSE/tests/test_codegraph_native.py": "364e9bf6a65e8f38d3dd150838977681df0c92a0dd28bd52fb74fdbc4b05d7e2",
+    "/opt/QIHSE/benchmarks/codegraph_search_allocations.py": "3f2261e63543ed29492b066136e43cf0ad5ec5580632ff87342cf567cf2c0e23"
+  },
+  "no_history_changes_or_user_process_restarts": true
+}

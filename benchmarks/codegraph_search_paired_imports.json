@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "export_sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b",
+  "source_commit": "e162ebcd79623e670eab721954eb142842c12e89",
+  "before": {
+    "binary": "/tmp/codegraph-search-original-f0s_5ap6/qihse-codegraph",
+    "binary_sha256": "59bf1b1adf82fe6971d8f7048e556d37487a6db46fe03473225d05af66175854",
+    "state_home": "/tmp/codegraph-search-measured-s6y5js4s/state-paired-before",
+    "returncode": 0,
+    "result": {
+      "status": "published",
+      "snapshot": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-284403.kv",
+      "nodes": 8361,
+      "edges": 76358,
+      "unresolved_edges": 47796,
+      "source_sha256": "3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4"
+    },
+    "stderr": "qihse-kv: hard-ceiling compaction fired at 64 sstable(s); the sweep is not keeping up (cadence or thread failure)\n"
+  },
+  "after": {
+    "binary": "/tmp/codegraph-search-release-7it0uqlh/qihse-codegraph",
+    "binary_sha256": "8060859a4b03b9f1bff6874f823aafc50562aa3a10cb3cd7e9671df38f76b6b5",
+    "state_home": "/tmp/codegraph-search-measured-s6y5js4s/state-paired-after",
+    "returncode": 0,
+    "result": {
+      "status": "published",
+      "snapshot": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-666958.kv",
+      "nodes": 8361,
+      "edges": 76358,
+      "unresolved_edges": 47796,
+      "source_sha256": "3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4"
+    },
+    "stderr": "qihse-kv: hard-ceiling compaction fired at 64 sstable(s); the sweep is not keeping up (cadence or thread failure)\n"
+  },
+  "note": "Setup receipts only, not latency benchmarks. Untouched original and final candidate both imported the exact same enriched dual-digest bytes. Counts and canonical body checksums identical; historical states preserved. No raw QIHSE storage reads."
+}

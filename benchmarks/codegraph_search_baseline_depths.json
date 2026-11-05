@@ -1,0 +1,766 @@
+{
+  "binary": "/tmp/codegraph-search-original-f0s_5ap6/qihse-codegraph",
+  "binary_sha256": "59bf1b1adf82fe6971d8f7048e556d37487a6db46fe03473225d05af66175854",
+  "binary_unchanged": true,
+  "cases": [
+    {
+      "depth": 2,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "batch_valid",
+      "symbols": [
+        "GraphStore",
+        "setup_method"
+      ]
+    },
+    {
+      "depth": 1,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "narrow_depth_1",
+      "symbol": "list_memories"
+    },
+    {
+      "depth": 2,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "narrow_depth_2",
+      "symbol": "list_memories"
+    },
+    {
+      "depth": 5,
+      "limit": 80,
+      "max_tokens": 4000,
+      "name": "narrow_depth_5",
+      "symbol": "list_memories"
+    }
+  ],
+  "completed_at_unix": 1793744874.065572,
+  "export_header": {
+    "format": "qihse-codegraph-v1",
+    "head": "e162ebcd79623e670eab721954eb142842c12e89",
+    "t": "h",
+    "version": 1,
+    "worktree": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  "export_sha256": "b4d976cefb249ae85ce11bf150a64eea6b9d53c78936717bf381cce9f22cf29b",
+  "export_trailer": {
+    "edges": 76358,
+    "nodes": 8361,
+    "sha256": "704e967e65b86645cf821b38be7803b3c224c6a78eaf3158fd7ac4ce773960e1",
+    "t": "end",
+    "unresolved_edges": 47796
+  },
+  "export_unchanged": true,
+  "harness_sha256": "d46b68e110c4af6dcbfb7114af2f3f61e7fb45f9a08a46e637a18bafcbeb90f1",
+  "library_sha256": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+  "library_unchanged": true,
+  "logical_cpus": 40,
+  "measurements": [
+    {
+      "case": "batch_valid",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 95001.42071791925,
+      "raw": [
+        {
+          "cpu_ms": 29730.0,
+          "error": null,
+          "members": [
+            {
+              "cpu_ms": 14809.999999999998,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 294692,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 14803.106658975594
+            },
+            {
+              "cpu_ms": 14920.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 295140,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 14978.174043935724
+            }
+          ],
+          "output_bytes": 23030,
+          "peak_rss_kib": 295140,
+          "wall_ms": 29781.280702911317
+        },
+        {
+          "cpu_ms": 30990.0,
+          "error": null,
+          "members": [
+            {
+              "cpu_ms": 15410.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 294820,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 15415.576148894615
+            },
+            {
+              "cpu_ms": 15580.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 294796,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 15560.014682007022
+            }
+          ],
+          "output_bytes": 23030,
+          "peak_rss_kib": 294820,
+          "wall_ms": 30975.590830901638
+        },
+        {
+          "cpu_ms": 34060.0,
+          "error": null,
+          "members": [
+            {
+              "cpu_ms": 18140.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 13725,
+              "output_sha256": "5d46d4496b0f930f3d84a172147416a7a77f6572e074b6bec460a2b1247fd350",
+              "peak_rss_kib": 295204,
+              "returncode": 0,
+              "semantic_sha256": "bf80ec45a08434f3754e0eb8f8dc1bc42ff076a7aa0c1dc0da4617124d980ca4",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 18236.406752024777
+            },
+            {
+              "cpu_ms": 15920.0,
+              "error": null,
+              "fresh": true,
+              "node_count": 50,
+              "output_bytes": 9305,
+              "output_sha256": "d1ac21d1f96a752f87fe97f830971619f478f69204ee8f8bb270cc15a1175c40",
+              "peak_rss_kib": 294632,
+              "returncode": 0,
+              "semantic_sha256": "baf8f7071f5e4b2bd596fd2067ab24fe8a60882db52b1297bf76768208a5c434",
+              "stderr": "",
+              "truncated": true,
+              "wall_ms": 15995.490689994767
+            }
+          ],
+          "output_bytes": 23030,
+          "peak_rss_kib": 295204,
+          "wall_ms": 34231.897442019545
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 30990.0,
+          "p95": 33753.0,
+          "p99": 33998.6
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 23030.0,
+          "p95": 23030.0,
+          "p99": 23030.0
+        },
+        "peak_rss_kib": {
+          "p50": 295140.0,
+          "p95": 295197.6,
+          "p99": 295202.72
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 30975.590830901638,
+          "p95": 33906.266780907754,
+          "p99": 34166.77130979719
+        }
+      },
+      "throughput_per_second": 0.03157847511467939
+    },
+    {
+      "case": "narrow_depth_1",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 45674.262866028585,
+      "raw": [
+        {
+          "cpu_ms": 15740.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 5,
+          "output_bytes": 2011,
+          "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+          "peak_rss_kib": 294788,
+          "returncode": 0,
+          "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 15901.289968984202
+        },
+        {
+          "cpu_ms": 14770.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 5,
+          "output_bytes": 2011,
+          "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+          "peak_rss_kib": 295220,
+          "returncode": 0,
+          "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14771.780987968668
+        },
+        {
+          "cpu_ms": 14980.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 5,
+          "output_bytes": 2011,
+          "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+          "peak_rss_kib": 295092,
+          "returncode": 0,
+          "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14998.147928039543
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 14980.0,
+          "p95": 15664.0,
+          "p99": 15724.8
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 2011.0,
+          "p95": 2011.0,
+          "p99": 2011.0
+        },
+        "peak_rss_kib": {
+          "p50": 295092.0,
+          "p95": 295207.2,
+          "p99": 295217.44
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 14998.147928039543,
+          "p95": 15810.975764889736,
+          "p99": 15883.227128165308
+        }
+      },
+      "throughput_per_second": 0.06568250502037828
+    },
+    {
+      "case": "narrow_depth_2",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 45284.900121972896,
+      "raw": [
+        {
+          "cpu_ms": 15480.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 6,
+          "output_bytes": 2290,
+          "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+          "peak_rss_kib": 295860,
+          "returncode": 0,
+          "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 15545.288805966265
+        },
+        {
+          "cpu_ms": 14930.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 6,
+          "output_bytes": 2290,
+          "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+          "peak_rss_kib": 295820,
+          "returncode": 0,
+          "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14928.111151908524
+        },
+        {
+          "cpu_ms": 14780.000000000002,
+          "error": null,
+          "fresh": true,
+          "node_count": 6,
+          "output_bytes": 2290,
+          "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+          "peak_rss_kib": 295496,
+          "returncode": 0,
+          "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14808.409797027707
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 14930.0,
+          "p95": 15425.0,
+          "p99": 15469.0
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 2290.0,
+          "p95": 2290.0,
+          "p99": 2290.0
+        },
+        "peak_rss_kib": {
+          "p50": 295820.0,
+          "p95": 295856.0,
+          "p99": 295859.2
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 14928.111151908524,
+          "p95": 15483.571040560491,
+          "p99": 15532.94525288511
+        }
+      },
+      "throughput_per_second": 0.06624724780047281
+    },
+    {
+      "case": "narrow_depth_5",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "cold",
+      "phase_wall_ms": 43678.459492046386,
+      "raw": [
+        {
+          "cpu_ms": 14730.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 16,
+          "output_bytes": 5358,
+          "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+          "peak_rss_kib": 295872,
+          "returncode": 0,
+          "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14777.035363018513
+        },
+        {
+          "cpu_ms": 14300.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 16,
+          "output_bytes": 5358,
+          "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+          "peak_rss_kib": 295764,
+          "returncode": 0,
+          "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14313.444094033912
+        },
+        {
+          "cpu_ms": 14570.0,
+          "error": null,
+          "fresh": true,
+          "node_count": 16,
+          "output_bytes": 5358,
+          "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+          "peak_rss_kib": 294152,
+          "returncode": 0,
+          "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+          "stderr": "",
+          "truncated": false,
+          "wall_ms": 14583.72081501875
+        }
+      ],
+      "summary": {
+        "cpu_ms": {
+          "p50": 14570.0,
+          "p95": 14714.0,
+          "p99": 14726.8
+        },
+        "errors": 0,
+        "output_bytes": {
+          "p50": 5358.0,
+          "p95": 5358.0,
+          "p99": 5358.0
+        },
+        "peak_rss_kib": {
+          "p50": 295764.0,
+          "p95": 295861.2,
+          "p99": 295869.84
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 14583.72081501875,
+          "p95": 14757.703908218537,
+          "p99": 14773.169072058517
+        }
+      },
+      "throughput_per_second": 0.06868374102219159
+    },
+    {
+      "case": "batch_valid",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 310.0,
+      "phase_wall_ms": 807.0758919930086,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 2,
+          "output_bytes": 23138,
+          "output_sha256": "474912f5b04b074caab00217c59c6c04d4db6f03f428bd24d498df2d2ff807a1",
+          "semantic_sha256": "3ae7c80ac734d4a4ac5ee257cd31573fae516aa71704d4deb053bb88d9631a6f",
+          "truncated": false,
+          "wall_ms": 263.949888991192
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 2,
+          "output_bytes": 23138,
+          "output_sha256": "474912f5b04b074caab00217c59c6c04d4db6f03f428bd24d498df2d2ff807a1",
+          "semantic_sha256": "3ae7c80ac734d4a4ac5ee257cd31573fae516aa71704d4deb053bb88d9631a6f",
+          "truncated": false,
+          "wall_ms": 270.4329659463838
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 2,
+          "output_bytes": 23138,
+          "output_sha256": "474912f5b04b074caab00217c59c6c04d4db6f03f428bd24d498df2d2ff807a1",
+          "semantic_sha256": "3ae7c80ac734d4a4ac5ee257cd31573fae516aa71704d4deb053bb88d9631a6f",
+          "truncated": false,
+          "wall_ms": 263.77654902171344
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 14250.0,
+        "peak_rss_kib": 296460,
+        "rss_kib": 296460
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 23138.0,
+          "p95": 23138.0,
+          "p99": 23138.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 263.949888991192,
+          "p95": 269.7846582508646,
+          "p99": 270.30330440727994
+        }
+      },
+      "throughput_per_second": 3.717122552863948,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 2,
+        "output_bytes": 23138,
+        "output_sha256": "474912f5b04b074caab00217c59c6c04d4db6f03f428bd24d498df2d2ff807a1",
+        "semantic_sha256": "3ae7c80ac734d4a4ac5ee257cd31573fae516aa71704d4deb053bb88d9631a6f",
+        "truncated": false,
+        "wall_ms": 262.45615002699196
+      }
+    },
+    {
+      "case": "narrow_depth_1",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 300.0,
+      "phase_wall_ms": 765.7210170291364,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 5,
+          "output_bytes": 2011,
+          "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+          "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+          "truncated": false,
+          "wall_ms": 234.99142099171877
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 5,
+          "output_bytes": 2011,
+          "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+          "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+          "truncated": false,
+          "wall_ms": 268.7757610110566
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 5,
+          "output_bytes": 2011,
+          "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+          "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+          "truncated": false,
+          "wall_ms": 259.29017609450966
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 14650.0,
+        "peak_rss_kib": 296460,
+        "rss_kib": 296460
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 2011.0,
+          "p95": 2011.0,
+          "p99": 2011.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 259.29017609450966,
+          "p95": 267.8272025194019,
+          "p99": 268.58604931272566
+        }
+      },
+      "throughput_per_second": 3.9178760061196636,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 5,
+        "output_bytes": 2011,
+        "output_sha256": "a1c5db4c5894f5632d3f297fb1b0573ed852dbcb02a28f5499f7953f8d812f71",
+        "semantic_sha256": "8fa9eeaf63466de6fdbb0878267d0ed7dccc200e9a1ff18fdef49d3a54b82735",
+        "truncated": false,
+        "wall_ms": 258.93834000453353
+      }
+    },
+    {
+      "case": "narrow_depth_2",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 330.0,
+      "phase_wall_ms": 764.9638730799779,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 6,
+          "output_bytes": 2290,
+          "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+          "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+          "truncated": false,
+          "wall_ms": 264.2910749418661
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 6,
+          "output_bytes": 2290,
+          "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+          "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+          "truncated": false,
+          "wall_ms": 252.50976905226707
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 6,
+          "output_bytes": 2290,
+          "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+          "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+          "truncated": false,
+          "wall_ms": 245.36673992406577
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 15090.0,
+        "peak_rss_kib": 296460,
+        "rss_kib": 296460
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 2290.0,
+          "p95": 2290.0,
+          "p99": 2290.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 252.50976905226707,
+          "p95": 263.1129443529062,
+          "p99": 264.0554488240741
+        }
+      },
+      "throughput_per_second": 3.9217538312248457,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 6,
+        "output_bytes": 2290,
+        "output_sha256": "368ac38dd54132714628cc631ae209e02e97feab14dfa4587e9818654f4bd337",
+        "semantic_sha256": "4898e4058e443e7cb7994fc9b910357e3f379d3d6da8bf184a00a38d30279f4e",
+        "truncated": false,
+        "wall_ms": 284.2821020167321
+      }
+    },
+    {
+      "case": "narrow_depth_5",
+      "concurrency": 1,
+      "effective_concurrency": 1,
+      "mode": "resident",
+      "phase_cpu_ms": 320.0,
+      "phase_wall_ms": 811.2039089901373,
+      "raw": [
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 16,
+          "output_bytes": 5358,
+          "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+          "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+          "truncated": false,
+          "wall_ms": 258.19000601768494
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 16,
+          "output_bytes": 5358,
+          "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+          "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+          "truncated": false,
+          "wall_ms": 281.3661239342764
+        },
+        {
+          "error": null,
+          "fresh": true,
+          "node_count": 16,
+          "output_bytes": 5358,
+          "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+          "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+          "truncated": false,
+          "wall_ms": 267.95886701438576
+        }
+      ],
+      "resident_resources": {
+        "cpu_ms": 15510.0,
+        "peak_rss_kib": 296460,
+        "rss_kib": 296460
+      },
+      "summary": {
+        "errors": 0,
+        "output_bytes": {
+          "p50": 5358.0,
+          "p95": 5358.0,
+          "p99": 5358.0
+        },
+        "samples": 3,
+        "tail_warning": "Descriptive interpolated quantiles; fewer than 100 samples cannot characterize p99.",
+        "wall_ms": {
+          "p50": 267.95886701438576,
+          "p95": 280.02539824228734,
+          "p99": 281.0979787958786
+        }
+      },
+      "throughput_per_second": 3.6982070312440696,
+      "warmup": {
+        "error": null,
+        "fresh": true,
+        "node_count": 16,
+        "output_bytes": 5358,
+        "output_sha256": "454e3be5902b6ff5328edc11416861f661ac2a8412f8cef7d367cc3e69ef477a",
+        "semantic_sha256": "4666d082b71ee7f8247054027ed4719a7461601ae682671a7a0631466a8804b2",
+        "truncated": false,
+        "wall_ms": 246.1860419716686
+      }
+    }
+  ],
+  "methodology": {
+    "batch_cold": "ordered independent CLI calls; sum bytes/time, maximum RSS",
+    "cold": "fresh process; filesystem caches not evicted",
+    "cpu": "cold GNU time user+system; resident SELF ONLY /proc ticks phase delta (excludes Git child CPU)",
+    "cpu_resolution": "cold GNU time 10ms; resident /proc scheduler ticks",
+    "errors": "response error fields, including expected missing-symbol failures",
+    "percentiles": "linear interpolation over recorded raw samples",
+    "resident": "authenticated Unix socket; graph loaded once",
+    "rss": "cold GNU time maximum RSS; resident /proc VmHWM"
+  },
+  "platform": "Linux-7.0.14-25-pve-x86_64-with-glibc2.41",
+  "repo": "/tmp/codegraph-search-measured-s6y5js4s/repo",
+  "resident_final_status": {
+    "backend": "QIHSE native CodeGraph",
+    "edges": 76358,
+    "format": "qihse-codegraph-v1",
+    "fresh": true,
+    "generation": "graph-704e967e65b86645cf821b38be7803b3c224c6a78eaf3158fd7ac4ce773960e1-3460074.kv",
+    "head": "e162ebcd79623e670eab721954eb142842c12e89",
+    "nodes": 8361,
+    "unresolved_edges": 47796
+  },
+  "resident_generation_load_ms": 154.48159305378795,
+  "resident_initial_resources": {
+    "cpu_ms": 13780.0,
+    "peak_rss_kib": 296400,
+    "rss_kib": 296400
+  },
+  "resident_initial_status": {
+    "backend": "QIHSE native CodeGraph",
+    "edges": 76358,
+    "format": "qihse-codegraph-v1",
+    "fresh": true,
+    "generation": "graph-704e967e65b86645cf821b38be7803b3c224c6a78eaf3158fd7ac4ce773960e1-3460074.kv",
+    "head": "e162ebcd79623e670eab721954eb142842c12e89",
+    "nodes": 8361,
+    "unresolved_edges": 47796
+  },
+  "resident_startup_ms": 13816.95711798966,
+  "samples_per_case": 3,
+  "schema_version": 1,
+  "source_commit": "e162ebcd79623e670eab721954eb142842c12e89",
+  "source_git_status": "",
+  "started_at_unix": 1793744624.7623227
+}

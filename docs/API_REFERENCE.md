@@ -69,7 +69,7 @@ above):
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 11 | 11 |
-| `include/qihse_kv_store.h` | 59 | 56 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 60 | 57 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
@@ -642,7 +642,11 @@ Tests: `tests/test_kv_read_integrity.c`, `tests/test_kv_security_regression.c`,
 `tests/test_blob_persistence_regression.c`, `tests/test_incremental_export.c`
 (change sequence and delta export, `make test-incremental-export`),
 `tests/test_kv_compaction.c` (SSTable merge, degraded-index recovery, replica
-compaction; `make test-kv-compaction`).
+compaction; `make test-kv-compaction`), and `tests/test_kv_durable_batch.c`
+(WAL-preserving authenticated durable batch; `make test-kv-durable-batch`, run
+serially because it uses process-global auth/storage state), and
+`tests/test_python_kv_durable_batch.py` (`make test-python-kv-durable-batch`,
+authenticated Python append and reopen).
 
 The KV store is the storage substrate the federation APIs write through. The
 `_user` variants are the authorization-aware forms; the context-free forms are
@@ -654,6 +658,7 @@ intentionally restricted to unclassified data.
 | `void qihse_kv_store_destroy(qihse_kv_store_t* store)` | Destroy a store. | n/a |
 | `bool qihse_kv_set(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment)` | Context-free write, unclassified data only. | `false` |
 | `bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value, uint16_t classification, uint16_t sci_compartment, qihse_user_t* user)` | Classified/SCI-capable write with an explicit authenticated user. | `false` (denied or storage failure) |
+| `bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store, const qihse_kv_batch_set_record_t* records, size_t count, qihse_user_t* user)` | WAL-preserving durable SET batch under one store write lock. Preflights every incoming and existing label, rejects duplicate keys, empty/oversized batches, bulk mode, replica read-only and recovery-pending state. Success performs one checked `fflush` and exactly one checked `fdatasync`, without memtable rotation. It is not transactional: after mutation starts, failure may leave a recoverable WAL prefix and fences all data operations on that handle until authenticated reopen. | `false`; preflight refusal leaves store state unchanged |
 | `char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user)` | Read with authorization. Caller frees the result. | `NULL` |
 | `char* qihse_kv_get(qihse_kv_store_t* store, const char* key)` | Inline wrapper: `qihse_kv_get_user(store, key, NULL)`. | `NULL` |
 | `bool qihse_kv_del_user(...)`, `bool qihse_kv_del(...)` | Delete with/without authorization. | `false` |
@@ -677,6 +682,25 @@ intentionally restricted to unclassified data.
 | `int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq)` | In-memory delta: exactly the mutations strictly greater than `since_seq`, in ascending sequence order, tombstones included, authorization-filtered at the KV layer. The resume point is the highest sequence the principal may see — never the global high-water, so hidden mutations cannot be counted from it. | non-zero |
 | `int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user, uint64_t since_seq, uint64_t* out_resume_seq)` | File form of the same delta stream; `qihse_backup_incremental_user()` ([§2.3](#23-snapshot-backup--includeqihse_backuph)) seals it into a `BACKUP_INCREMENTAL` container. | non-zero |
 | `void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)` | Release a delta record array. | n/a |
+
+### Durable batch SET contract
+
+`qihse_kv_set_batch_durable_user()` accepts 1–4,096 records and at most 64 MiB
+per call. Each `qihse_kv_batch_set_record_t` contains a NUL-terminated `key`,
+NUL-terminated `value`, absolute Unix-millisecond `expire_time_ms` (zero means
+no expiry), `classification`, and `sci_compartment`. The byte bound counts 40
+WAL-header bytes per record plus key/value bytes, excluding their terminators.
+The authenticated principal must be active and authorized for every incoming
+and existing label. Duplicate keys are rejected. This is a durable group, not
+an atomic transaction: success means the complete batch reached the WAL and its
+flush/sync checks passed; a failure after mutation begins can leave a recoverable
+prefix and fences the store until it is reopened.
+
+The Python wrapper exposes the same operation as
+`KVStore(user=native_user).set_batch_durable(records, user=native_user)`, where
+each mapping requires string `key`/`value` fields and may include
+`expire_time_ms`, `classification`, and `sci_compartment`. The explicit
+`user` argument is mandatory; the native pointer must remain valid for the call.
 
 ---
 
@@ -1644,6 +1668,26 @@ Test: `tests/test_vector_db.c`, `tests/test_auth_privilege_boundary.c`.
 
 ---
 
+### 8.13 Event stream — `include/qihse_event_stream.h`
+
+Source: `src/marmalade/qihse_event_stream.c`.
+Tests: `tests/qihse_event_stream_test.c` (`make test-event-stream`),
+`tests/test_python_event_stream_batch.py` (`make test-python-event-stream-batch`).
+
+The legacy V1 record header remains 88 bytes and its append C ABI returns physical
+byte offset + 1 (zero denotes failure). V1 APIs are context-free and must only be
+used for unclassified data. New V2 batch APIs require an active principal; they
+bind the physical topic to the authenticated tenant, logical topic, classification
+and SCI, and fail closed on unauthorized access or committed digest corruption.
+V2 files are not addressable through the legacy topic-name APIs.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `bool qihse_event_stream_append_batch(qihse_event_stream_t*, const qihse_user_t*, const qihse_es_scope_t*, const qihse_es_batch_record_t*, size_t, qihse_es_batch_result_t*)` | Append up to 1,024 authenticated V2 records / 64 MiB payload under one topic lock. Identical ID/schema/payload retries return the original physical offset; ID reuse with changed schema or payload fails. A successful FDATASYNC batch has checked pre-commit and post-commit syncs; it is group commit, not a transaction. | `false`; after ambiguous I/O failure retry with the same stable IDs |
+| `bool qihse_event_stream_read_batch(qihse_event_stream_t*, const qihse_user_t*, const qihse_es_scope_t*, uint64_t*, qihse_es_read_record_t*, size_t, size_t, size_t*)` | Read a bounded authorized page at a byte cursor; cursor advances only on success. Every payload digest is verified before disclosure. | `false` for denied scope, invalid cursor/budget, corruption or I/O failure |
+| `void qihse_event_stream_batch_free(qihse_es_read_record_t*, size_t)` | Free payloads returned by the batch reader. | n/a |
+| `bool qihse_event_stream_archive_id(..., const char* scan_version, uint32_t schema_id, uint8_t out_id[48])` / `bool qihse_event_stream_member_id(...)` | Domain-separated stable identities bind archive/member content, exact member name, scan version and schema version. | `false` |
+
 ## 9. Python SDK — `python/qihse/`
 
 The embedded Python APIs are `ctypes` bindings over `libqihse.so`, not
@@ -1665,10 +1709,10 @@ authentication or row-level authorization.
 | Module | Public names | Notes |
 |---|---|---|
 | `python/qihse/core.py` | `VectorDB`, `VectorQuery`, `VectorResult`, `DistanceMetric`, `QueryMode`, `Container` (`Container` is not re-exported by `python/qihse/__init__.py`) | Vector engine plus the `.qdb` container pack/unpack path |
-| `python/qihse/kv.py` | `KVStore` | `set`/`get`/`delete`/`exists`/`expire`/`keys`/`items`/`iteritems`/`size`/`clear`/`save`/`load`; every method accepts `user=None` and forwards the principal |
+| `python/qihse/kv.py` | `KVStore` | `set`/`get`/`delete`/`exists`/`expire`/`keys`/`items`/`iteritems`/`size`/`clear`/`save`/`load`; `set_batch_durable(records, *, user)` requires an explicit principal; authenticated recovery uses `KVStore(user=user)` |
 | `python/qihse/timeseries.py` | `TimeSeriesDB` | `insert(series_id, timestamp, value, classification=0, sci_compartment=0)`, `average_range`, `flush` |
 | `python/qihse/document.py` | `DocumentStore` | `insert_json(doc_id, payload)` over a `KVStore` |
-| `python/qihse/event_stream.py` | `EventStream`, `EventRecord`, `Durability` | `append`, `append_record`, `read`, `iterate`, `length`, `replay`, `truncate_torn_tail`, `consume_zero_copy`, `has_event_id` |
+| `python/qihse/event_stream.py` | `EventStream`, `EventRecord`, `EventScope`, `Durability` | legacy V1 methods plus authenticated `append_batch`/`read_batch`, `compute_archive_id`/`compute_member_id` |
 | `python/qihse/uwp.py` | `UWPServer` (re-exported), `UWPClient`, `UWPContext`, `UWPError` and subclasses (module-level only) | TLS-first UWP client/server |
 | `python/qihse/fts.py` | `FTSIndex`, `FTSResult` | `add_document(..., semantic_class=...)`, `search`, `get_semantic_class`, `save`, `load` |
 | `python/qihse/fusion.py` | `MultimodalFusion`, `FusionResult` | Hybrid vector + FTS RRF search |
@@ -1692,9 +1736,16 @@ VectorDB.start_pg_wire(port: int = 5432, bind_address: str = "127.0.0.1") -> boo
 
 KVStore.set(key, value, classification=0, sci_compartment=0, user=None) -> bool
 KVStore.get(key, user=None) -> str | None
+KVStore(user=native_user).set_batch_durable(records, *, user=native_user) -> bool
 
 EventStream(log_directory, durability=Durability.FDATASYNC, read_only=False)
 EventStream.append(topic: str, payload: bytes) -> bool
+EventStream.append_record(topic, schema_id, event_id, payload) -> int | None
+EventStream.append_batch(scope: EventScope, records, *, user) -> list[tuple[int, bool]]
+EventStream.read_batch(scope: EventScope, cursor=0, *, user,
+                       capacity=256, max_payload_bytes=4*1024*1024) -> tuple[list[EventRecord], int]
+EventStream.compute_archive_id(archive, scan_version, schema_id) -> bytes
+EventStream.compute_member_id(archive_id, member_name, scan_version, schema_id) -> bytes
 
 UWPServer.start(port, bind_address, kv=None, vdb=None, doc=None, tsdb=None,
                 tls_cert=None, tls_key=None) -> bool

@@ -1,0 +1,57 @@
+{
+  "status": "implemented_deployed_verified",
+  "defaults": {
+    "promotion_hits": 3,
+    "window_seconds": 60,
+    "idle_seconds": 600,
+    "memory_mib": 1024,
+    "budget_mib": 2048
+  },
+  "checks": {
+    "native_full_targets": "PASS final gate, including pool fragmentation, crash release and idle retirement",
+    "native_root": "PASS including cross-UID denial",
+    "gcc_fanalyzer": "PASS -Werror",
+    "focused_hax": "PASS config/result_cache/tools/codegraph_reader/tools/graph/tools/code_context",
+    "lint": "PASS",
+    "installed_real_integration": "PASS threshold, socket reuse, RLIMIT_AS, pool denial and second-repo cold fallback",
+    "full_hax": {
+      "OK": 252,
+      "FAIL": 2
+    },
+    "ruff": "PASS native fixture and integration harness"
+  },
+  "review": "One suggested fragmented-budget bug refuted by direct real POSIX lock probe; regression added and final native suite passed. No remaining introduced finding.",
+  "deployment": {
+    "status": "activated",
+    "backup": "/home/john/.local/state/hax/deployments/codegraph-hot-hghdnfwb",
+    "release": "/home/john/.local/lib/qihse-codegraph/releases/hot-d238494910befd52-e5a0c8fb178c923e",
+    "wrapper_stage": "/home/john/.local/bin/.qihse-codegraph-hot-hbshd6ng",
+    "old_sha256": {
+      "wrapper": "34be3a263b94e9cb6d71a81e8a95e082d939b4c626f3456439f1edc15a2c3ba9",
+      "native": "59bf1b1adf82fe6971d8f7048e556d37487a6db46fe03473225d05af66175854",
+      "library": "a76aa5961fadde41942da9c91e50481a682a39e8eedf4f17bab21194a1913dfe",
+      "hax": "e47ade1e198b9ab0e161ab77203af378c38ef887381f2d985e5f6453b5903649"
+    },
+    "new_sha256": {
+      "native": "d238494910befd5247746400b474589cf51e8bc8212581fadf3e24a14029ca6a",
+      "library": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+      "hax": "8bf1810cec8db92d9a8312f2601208d4a68839e057bb2374d0f96f724ecf81dc",
+      "wrapper": "826d1a87d8efe8ba999d21b53ceaa698216ae7a483cd94195ac030b21cb7d8b1"
+    },
+    "hax_install_target": "/usr/local/bin/arxant",
+    "hax_alias": "arxant",
+    "root_stage": "/usr/local/bin/.arxant-codegraph-hot-60147e803fe547639fdcfcc89e05d7f7",
+    "activated_unix_s": 1793829878,
+    "native_help_verified": true,
+    "hax_version": "hax v0.6.1-358-g963bd77+",
+    "user_sessions_restarted": false
+  },
+  "proof": "codegraph_hot_installed_integration.json",
+  "full_suite_failures": [
+    "execution_journal",
+    "tool_router"
+  ],
+  "unrelated_kv_batch_work": "untouched",
+  "user_sessions_restarted": false,
+  "commits": false
+}

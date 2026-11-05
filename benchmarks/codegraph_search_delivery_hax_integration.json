@@ -1,0 +1,650 @@
+{
+  "schema": "hax.codegraph.integration.v1",
+  "root": "/tmp/codegraph-hax-real-g8mmy5j8",
+  "repo": "/tmp/codegraph-search-measured-s6y5js4s/repo",
+  "qihse_sha256": "072c99019a094fbc2d7fc77bc9ca909d043ca63fd02acf71c75d855d34318feb",
+  "library_sha256": "e5a0c8fb178c923e3065be73de057ea995806483dab808e736e396e427e5be9c",
+  "hax_sha256": "11d8f309200d1603a10202b2509b3f5b55174d92b548e87e5e1bbb0f0d70ea1f",
+  "export_sha256": "2b218a690d52c9f504ab4a45788f6bd9c3822541048ee060daa97112d415de1b",
+  "driver": "mock provider; actual compiled tools, native CLI/socket and source files",
+  "status": "passed",
+  "import": {
+    "status": "published",
+    "snapshot": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-Fd1OW8.kv",
+    "nodes": 8361,
+    "edges": 76358,
+    "unresolved_edges": 47796,
+    "source_sha256": "3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4"
+  },
+  "wall_ms": 16643.354637082666,
+  "session": "/tmp/codegraph-hax-real-g8mmy5j8/home/.local/state/hax/sessions/tmp-codegraph-search-measured-s6y5js4s-repo.9597c1d499dd6788/2026-11-04T19-19-57Z_ad90e5cc-1783-4111-9a91-efb6a41651e3.jsonl",
+  "generation": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-Fd1OW8.kv",
+  "source_example": {
+    "id": "c5c6e85160fc9333fd2a86e41f553b7c7773fff506ae6c67b1dc7c44a930abb1",
+    "file": "code_review_graph/graph.py",
+    "symbol": "get_all_nodes",
+    "kind": "Function",
+    "line_start": 1177,
+    "line_end": 1185,
+    "hop": 0,
+    "is_test": false,
+    "risk_hint": 0.55,
+    "source": "    def get_all_nodes(self, exclude_files: bool = True) -> list[GraphNode]:\n        \"\"\"Return all nodes, optionally excluding File nodes.\"\"\"\n        if exclude_files:\n            rows = self._conn.execute(\n                \"SELECT * FROM nodes WHERE kind != 'File'\"\n            ).fetchall()\n        else:\n            rows = self._conn.execute(\"SELECT * FROM nodes\").fetchall()\n        return [self._row_to_node(r) for r in rows]"
+  },
+  "tools": [
+    {
+      "name": "code_context",
+      "output_bytes": 10772,
+      "result": {
+        "query": "get_all_nodes get_all_edges",
+        "backend": "tgrep+rg",
+        "graph": "partial: native graph context or relationship evidence was truncated or invalid",
+        "truncated": true,
+        "citations": [
+          {
+            "path": "code_review_graph/graph.py",
+            "line": 1177,
+            "start_line": 1177,
+            "end_line": 1185,
+            "sha384": "54163478aaead6bb02b77a6402e835ee35e2f1970e8cf104e9760d39f2b533dfb0cea285c73d5f42b773c9a1eddf3b1c",
+            "text": "    def get_all_nodes(self, exclude_files: bool = True) -> list[GraphNode]:\n        \"\"\"Return all nodes, optionally excluding File nodes.\"\"\"\n        if exclude_files:\n            rows = self._conn.execute(\n                \"SELECT * FROM nodes WHERE kind != 'File'\"\n            ).fetchall()\n        else:\n            rows = self._conn.execute(\"SELECT * FROM nodes\").fetchall()\n        return [self._row_to_node(r) for r in rows]",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/graph.py",
+            "line": 3569,
+            "start_line": 3569,
+            "end_line": 3572,
+            "sha384": "54163478aaead6bb02b77a6402e835ee35e2f1970e8cf104e9760d39f2b533dfb0cea285c73d5f42b773c9a1eddf3b1c",
+            "text": "    def get_all_edges(self) -> list[GraphEdge]:\n        \"\"\"Return all edges in the graph.\"\"\"\n        rows = self._conn.execute(\"SELECT * FROM edges\").fetchall()\n        return [self._row_to_edge(r) for r in rows]",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 14,
+            "start_line": 14,
+            "end_line": 55,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_hub_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:\n    \"\"\"Find the most connected nodes (highest in+out degree), excluding File nodes.\n\n    Returns list of dicts with: name, qualified_name, kind, file,\n    in_degree, out_degree, total_degree, community_id\n    \"\"\"\n    # Build degree counts from all edges\n    edges = store.get_all_edges()\n    in_degree: dict[str, int] = Counter()\n    out_degree: dict[str, int] = Counter()\n    for e in edges:\n        out_degree[e.source_qualified] += 1\n        in_degree[e.target_qualified] += 1\n\n    # Get all non-File nodes\n    nodes = store.get_all_nodes(exclude_files=True)\n    community_map = store.get_all_community_ids()\n\n    scored = []\n    for n in nodes:\n        qn = n.qualified_name\n        ind = in_degree.get(qn, 0)\n        outd = out_degree.get(qn, 0)\n        total = ind + outd\n        if total == 0:\n            continue\n        scored.append({\n            \"name\": _sanitize_name(n.name),\n            \"qualified_name\": n.qualified_name,\n            \"kind\": n.kind,\n            \"file\": n.file_path,\n            \"in_degree\": ind,\n            \"out_degree\": outd,\n            \"total_degree\": total,\n            \"community_id\": community_map.get(qn),\n        })\n\n    scored.sort(\n        key=lambda x: x.get(\"total_degree\", 0),  # type: ignore[arg-type,return-value]\n        reverse=True,\n    )\n    return scored[:top_n]",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 58,
+            "start_line": 58,
+            "end_line": 107,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_bridge_nodes(\n    store: GraphStore, top_n: int = 10\n) -> list[dict]:\n    \"\"\"Find nodes with highest betweenness centrality.\n\n    These are architectural chokepoints that sit on shortest paths\n    between many node pairs. If they break, multiple communities\n    lose connectivity.\n\n    Returns list of dicts with: name, qualified_name, kind, file,\n    betweenness, community_id\n    \"\"\"\n    import networkx as nx\n\n    # Build the graph \u2014 use cached version if available\n    nxg = store._build_networkx_graph()\n\n    # Compute betweenness centrality (approximate for large graphs)\n    n_nodes = nxg.number_of_nodes()\n    if n_nodes > 5000:\n        # Sample-based approximation for large graphs\n        k = min(500, n_nodes)\n        bc = nx.betweenness_centrality(nxg, k=k, normalized=True)\n    elif n_nodes > 0:\n        bc = nx.betweenness_centrality(nxg, normalized=True)\n    else:\n        return []\n\n    community_map = store.get_all_community_ids()\n    node_map = {\n        n.qualified_name: n\n        for n in store.get_all_nodes(exclude_files=True)\n    }\n\n    results = []\n    for qn, score in bc.items():\n        if score <= 0 or qn not in node_map:\n            continue\n        n = node_map[qn]\n        if n.kind == \"File\":\n            continue\n        results.append({\n            \"name\": _sanitize_name(n.name),\n            \"qualified_name\": n.qualified_name,\n            \"kind\": n.kind,\n            \"file\": n.file_path,\n            \"betweenness\": round(score, 6),\n            \"community_id\": community_map.get(qn),\n        })\n",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 115,
+            "start_line": 115,
+            "end_line": 164,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:\n    \"\"\"Identify structural weaknesses in the codebase graph.\n\n    Returns dict with categories:\n    - isolated_nodes: degree <= 1, disconnected from graph\n    - thin_communities: fewer than 3 members\n    - untested_hotspots: high-degree nodes with no TESTED_BY edges\n    - single_file_communities: entire community in one file\n    \"\"\"\n    edges = store.get_all_edges()\n    nodes = store.get_all_nodes(exclude_files=True)\n    community_map = store.get_all_community_ids()\n\n    # Build degree map\n    degree: dict[str, int] = Counter()\n    tested_nodes: set[str] = set()\n    for e in edges:\n        degree[e.source_qualified] += 1\n        degree[e.target_qualified] += 1\n        if e.kind == \"TESTED_BY\":\n            tested_nodes.add(e.source_qualified)\n\n    # 1. Isolated nodes (degree <= 1, not File)\n    isolated = []\n    for n in nodes:\n        d = degree.get(n.qualified_name, 0)\n        if d <= 1:\n            isolated.append({\n                \"name\": _sanitize_name(n.name),\n                \"qualified_name\": n.qualified_name,\n                \"kind\": n.kind,\n                \"file\": n.file_path,\n                \"degree\": d,\n            })\n\n    # 2. Build community sizes and file maps from node data\n    comm_sizes: Counter[int] = Counter()\n    comm_files: dict[int, set[str]] = defaultdict(set)\n    for n in nodes:\n        cid = community_map.get(n.qualified_name)\n        if cid is not None:\n            comm_sizes[cid] += 1\n            comm_files[cid].add(n.file_path)\n\n    # Thin communities (< 3 members)\n    communities = store.get_communities_list()\n    thin = []\n    for c in communities:\n        cid = int(c[\"id\"])\n        size = comm_sizes.get(cid, 0)",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 213,
+            "start_line": 213,
+            "end_line": 262,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_surprising_connections(\n    store: GraphStore, top_n: int = 15\n) -> list[dict]:\n    \"\"\"Find edges with high surprise scores.\n\n    Detects unexpected architectural coupling based on:\n    - Cross-community: source and target in different communities\n    - Cross-language: different file languages\n    - Peripheral-to-hub: low-degree node to high-degree node\n    - Cross-file-type: test calling production or vice versa\n    - Non-standard edge kind for the node types\n    \"\"\"\n    edges = store.get_all_edges()\n    nodes = store.get_all_nodes(exclude_files=True)\n    community_map = store.get_all_community_ids()\n\n    node_map = {n.qualified_name: n for n in nodes}\n\n    # Build degree map\n    degree: dict[str, int] = Counter()\n    for e in edges:\n        degree[e.source_qualified] += 1\n        degree[e.target_qualified] += 1\n\n    # Median degree for peripheral detection\n    degrees = [d for d in degree.values() if d > 0]\n    if not degrees:\n        return []\n    median_deg = sorted(degrees)[len(degrees) // 2]\n    high_deg_threshold = max(median_deg * 3, 10)\n\n    scored_edges = []\n    for e in edges:\n        src = node_map.get(e.source_qualified)\n        tgt = node_map.get(e.target_qualified)\n        if not src or not tgt:\n            continue\n        if src.kind == \"File\" or tgt.kind == \"File\":\n            continue\n\n        score = 0.0\n        reasons = []\n\n        # Cross-community (+0.3)\n        src_cid = community_map.get(e.source_qualified)\n        tgt_cid = community_map.get(e.target_qualified)\n        if (src_cid is not None\n                and tgt_cid is not None\n                and src_cid != tgt_cid):\n            score += 0.3",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 317,
+            "start_line": 317,
+            "end_line": 366,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def generate_suggested_questions(\n    store: GraphStore,\n) -> list[dict]:\n    \"\"\"Auto-generate review questions from graph analysis.\n\n    Categories:\n    - bridge_node: Why does X connect communities A and B?\n    - isolated_node: Is X dead code or dynamically invoked?\n    - low_cohesion: Should community X be split?\n    - hub_risk: Does hub node X have adequate test coverage?\n    - surprising: Why does A call B across community boundary?\n    \"\"\"\n    questions = []\n\n    # Bridge node questions\n    bridges = find_bridge_nodes(store, top_n=3)\n    for b in bridges:\n        questions.append({\n            \"category\": \"bridge_node\",\n            \"question\": (\n                f\"'{b['name']}' is a critical connector \"\n                f\"between multiple code regions. Is it \"\n                f\"adequately tested and documented?\"\n            ),\n            \"target\": b[\"qualified_name\"],\n            \"priority\": \"high\",\n        })\n\n    # Hub risk questions\n    hubs = find_hub_nodes(store, top_n=3)\n    edges = store.get_all_edges()\n    tested = {\n        e.source_qualified\n        for e in edges if e.kind == \"TESTED_BY\"\n    }\n    for h in hubs:\n        if h[\"qualified_name\"] not in tested:\n            questions.append({\n                \"category\": \"hub_risk\",\n                \"question\": (\n                    f\"Hub node '{h['name']}' has \"\n                    f\"{h['total_degree']} connections but no \"\n                    f\"direct test coverage. Should it be \"\n                    f\"tested?\"\n                ),\n                \"target\": h[\"qualified_name\"],\n                \"priority\": \"high\",\n            })\n\n    # Surprising connection questions",
+            "source": "graph"
+          }
+        ],
+        "mode": "trace",
+        "seeds": [
+          "get_all_nodes",
+          "get_all_edges"
+        ]
+      }
+    },
+    {
+      "name": "graph_query",
+      "output_bytes": 3797,
+      "result": {
+        "backend": "QIHSE native CodeGraph",
+        "format": "qihse-codegraph-v1",
+        "nodes": [
+          {
+            "id": "c5c6e85160fc9333fd2a86e41f553b7c7773fff506ae6c67b1dc7c44a930abb1",
+            "file": "code_review_graph/graph.py",
+            "symbol": "get_all_nodes",
+            "kind": "Function",
+            "line_start": 1177,
+            "line_end": 1185,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "ac24bfb9bf103068c427139ef274b2b572eb2863c85932914553ca9cb6a57d1c",
+            "file": "code_review_graph/analysis.py",
+            "symbol": "find_surprising_connections",
+            "kind": "Function",
+            "line_start": 213,
+            "line_end": 314,
+            "hop": 1,
+            "is_test": false,
+            "risk_hint": 0.39999999999999997
+          },
+          {
+            "id": "d5b0480fccadb76f913184f120f301617c4cde86c801d2d9b14e9a68e926d0fc",
+            "file": "code_review_graph/graph_diff.py",
+            "symbol": "take_snapshot",
+            "kind": "Function",
+            "line_start": 15,
+            "line_end": 43,
+            "hop": 1,
+            "is_test": false,
+            "risk_hint": 0.39999999999999997
+          },
+          {
+            "id": "2e77f259cc7d7fadbcb821fbaa211d3e720ab5d61a1120f7cc681d85de819192",
+            "file": "tests/test_php_laravel.py",
+            "symbol": "_graph_snapshot",
+            "kind": "Function",
+            "line_start": 738,
+            "line_end": 761,
+            "hop": 1,
+            "is_test": true,
+            "risk_hint": 0.15000000000000002
+          },
+          {
+            "id": "694e9efd220bf25bdb6136cb37691744cbe77b0d8975e0de3a8f7be258d34271",
+            "file": "code_review_graph/graph.py",
+            "symbol": "GraphStore",
+            "kind": "Class",
+            "line_start": 691,
+            "line_end": 3759,
+            "hop": 1,
+            "is_test": false,
+            "risk_hint": 0.39999999999999997
+          },
+          {
+            "id": "f9d5843df4826df992086397ff8f432d4fff14690119365948f1ea5ad29bb729",
+            "file": "code_review_graph/analysis.py",
+            "symbol": "find_hub_nodes",
+            "kind": "Function",
+            "line_start": 14,
+            "line_end": 55,
+            "hop": 1,
+            "is_test": false,
+            "risk_hint": 0.39999999999999997
+          },
+          {
+            "id": "32e18a389898043191e6806768653aa63e6ae1b0a9db3d7782d22271c973b27a",
+            "file": "tests/test_integration_git.py",
+            "symbol": "node_snapshot",
+            "kind": "Function",
+            "line_start": 1162,
+            "line_end": 1180,
+            "hop": 1,
+            "is_test": true,
+            "risk_hint": 0.15000000000000002
+          },
+          {
+            "id": "340c6c2ecc48977cd1cb6744cd16968e1381117a5ed6ecb2e4dc01cf2a016581",
+            "file": "code_review_graph/embeddings.py",
+            "symbol": "embed_all_nodes",
+            "kind": "Function",
+            "line_start": 1307,
+            "line_end": 1315,
+            "hop": 1,
+            "is_test": false,
+            "risk_hint": 0.39999999999999997
+          }
+        ],
+        "edges": 76358,
+        "unresolved_edges": 47796,
+        "head": "e162ebcd79623e670eab721954eb142842c12e89",
+        "generation": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-Fd1OW8.kv",
+        "fresh": true,
+        "seed_match": "exact",
+        "ambiguous": false,
+        "matched_symbols": 1,
+        "seed_nodes": 1,
+        "shown_nodes": 8,
+        "depth": 1,
+        "truncated": true,
+        "risk_kind": "heuristic review priority; not vulnerability probability",
+        "affected_files": [
+          "code_review_graph/graph.py",
+          "code_review_graph/analysis.py",
+          "code_review_graph/graph_diff.py",
+          "tests/test_php_laravel.py",
+          "tests/test_integration_git.py",
+          "code_review_graph/embeddings.py"
+        ],
+        "candidate_tests": [
+          "tests/test_php_laravel.py",
+          "tests/test_integration_git.py"
+        ],
+        "evidence": [
+          {
+            "relation": "CALLS",
+            "from": "find_surprising_connections",
+            "to": "get_all_nodes",
+            "file": "code_review_graph/analysis.py",
+            "line": 226,
+            "confidence": 1.0
+          },
+          {
+            "relation": "CALLS",
+            "from": "take_snapshot",
+            "to": "get_all_nodes",
+            "file": "code_review_graph/graph_diff.py",
+            "line": 22,
+            "confidence": 1.0
+          },
+          {
+            "relation": "CALLS",
+            "from": "_graph_snapshot",
+            "to": "get_all_nodes",
+            "file": "tests/test_php_laravel.py",
+            "line": 748,
+            "confidence": 1.0
+          },
+          {
+            "relation": "CONTAINS",
+            "from": "GraphStore",
+            "to": "get_all_nodes",
+            "file": "code_review_graph/graph.py",
+            "line": 1177,
+            "confidence": 1.0
+          },
+          {
+            "relation": "CALLS",
+            "from": "find_hub_nodes",
+            "to": "get_all_nodes",
+            "file": "code_review_graph/analysis.py",
+            "line": 29,
+            "confidence": 1.0
+          },
+          {
+            "relation": "CALLS",
+            "from": "node_snapshot",
+            "to": "get_all_nodes",
+            "file": "tests/test_integration_git.py",
+            "line": 1179,
+            "confidence": 1.0
+          },
+          {
+            "relation": "CALLS",
+            "from": "embed_all_nodes",
+            "to": "get_all_nodes",
+            "file": "code_review_graph/embeddings.py",
+            "line": 1314,
+            "confidence": 1.0
+          }
+        ],
+        "test_gap_candidates": [],
+        "uncertainty": "unresolved/low-confidence relations excluded; review not exhaustive"
+      }
+    },
+    {
+      "name": "graph_impact",
+      "output_bytes": 2608,
+      "result": {
+        "backend": "QIHSE native CodeGraph",
+        "format": "qihse-codegraph-v1",
+        "nodes": [
+          {
+            "id": "001e2cbe6b92bda0f6e33d5bed519bfed5d7186d8e356bf4de75d0a06784b447",
+            "file": "code_review_graph/graph.py",
+            "symbol": "get_flow_criticalities_for_node",
+            "kind": "Function",
+            "line_start": 3302,
+            "line_end": 3310,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0119f1f84eae70066567cff8658d8d3e83495d2618dfb6de160fb23c3dd7abae",
+            "file": "code_review_graph/graph.py",
+            "symbol": "_edge_extra_is_unresolved",
+            "kind": "Function",
+            "line_start": 374,
+            "line_end": 387,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "028e85055f958a58c58938397c1d8c3fa4d5e7d141a70e99a8873baf531a3d8b",
+            "file": "code_review_graph/graph.py",
+            "symbol": "_impact_resolution_guard",
+            "kind": "Function",
+            "line_start": 280,
+            "line_end": 293,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "076181a77dafe1aef99b442113d302a683350eb0e9a030257f1d8118d79f2923",
+            "file": "code_review_graph/graph.py",
+            "symbol": "__init__",
+            "kind": "Function",
+            "line_start": 694,
+            "line_end": 775,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0a6abf9c7495532dbc173c0a2c394f1dbc57f8bb69ea0fd54b5c7c292c7222fb",
+            "file": "code_review_graph/graph.py",
+            "symbol": "_is_unreadable_database",
+            "kind": "Function",
+            "line_start": 624,
+            "line_end": 640,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0d2cdc2aca3c5e171b9723cd1faf001057e21d3c40b0e0e94879f3765863ffc8",
+            "file": "code_review_graph/graph.py",
+            "symbol": "CorruptGraphDatabaseError",
+            "kind": "Class",
+            "line_start": 559,
+            "line_end": 591,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0f706cdfa5aa2da817584a2a154526f9408a02f0f55b3f6a637b0da53e5b1ef3",
+            "file": "code_review_graph/graph.py",
+            "symbol": "get_repo_root",
+            "kind": "Function",
+            "line_start": 1112,
+            "line_end": 1130,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "153aa0b1b6421c395d1fd9cd6fefb443b9b0040dbcaafed923b922a74a7524e4",
+            "file": "code_review_graph/graph.py",
+            "symbol": "resolve_bare_call_targets",
+            "kind": "Function",
+            "line_start": 1804,
+            "line_end": 1815,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          }
+        ],
+        "edges": 76358,
+        "unresolved_edges": 47796,
+        "head": "e162ebcd79623e670eab721954eb142842c12e89",
+        "generation": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-Fd1OW8.kv",
+        "fresh": true,
+        "seed_nodes": 131,
+        "shown_nodes": 8,
+        "depth": 1,
+        "truncated": true,
+        "risk_kind": "heuristic review priority; not vulnerability probability",
+        "affected_files": [
+          "code_review_graph/graph.py"
+        ],
+        "candidate_tests": [],
+        "evidence": [],
+        "test_gap_candidates": [],
+        "uncertainty": "unresolved/low-confidence relations excluded; review not exhaustive"
+      }
+    },
+    {
+      "name": "graph_review",
+      "output_bytes": 3589,
+      "result": {
+        "backend": "QIHSE native CodeGraph",
+        "format": "qihse-codegraph-v1",
+        "nodes": [
+          {
+            "id": "001e2cbe6b92bda0f6e33d5bed519bfed5d7186d8e356bf4de75d0a06784b447",
+            "file": "code_review_graph/graph.py",
+            "symbol": "get_flow_criticalities_for_node",
+            "kind": "Function",
+            "line_start": 3302,
+            "line_end": 3310,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0119f1f84eae70066567cff8658d8d3e83495d2618dfb6de160fb23c3dd7abae",
+            "file": "code_review_graph/graph.py",
+            "symbol": "_edge_extra_is_unresolved",
+            "kind": "Function",
+            "line_start": 374,
+            "line_end": 387,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "028e85055f958a58c58938397c1d8c3fa4d5e7d141a70e99a8873baf531a3d8b",
+            "file": "code_review_graph/graph.py",
+            "symbol": "_impact_resolution_guard",
+            "kind": "Function",
+            "line_start": 280,
+            "line_end": 293,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "076181a77dafe1aef99b442113d302a683350eb0e9a030257f1d8118d79f2923",
+            "file": "code_review_graph/graph.py",
+            "symbol": "__init__",
+            "kind": "Function",
+            "line_start": 694,
+            "line_end": 775,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0a6abf9c7495532dbc173c0a2c394f1dbc57f8bb69ea0fd54b5c7c292c7222fb",
+            "file": "code_review_graph/graph.py",
+            "symbol": "_is_unreadable_database",
+            "kind": "Function",
+            "line_start": 624,
+            "line_end": 640,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0d2cdc2aca3c5e171b9723cd1faf001057e21d3c40b0e0e94879f3765863ffc8",
+            "file": "code_review_graph/graph.py",
+            "symbol": "CorruptGraphDatabaseError",
+            "kind": "Class",
+            "line_start": 559,
+            "line_end": 591,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "0f706cdfa5aa2da817584a2a154526f9408a02f0f55b3f6a637b0da53e5b1ef3",
+            "file": "code_review_graph/graph.py",
+            "symbol": "get_repo_root",
+            "kind": "Function",
+            "line_start": 1112,
+            "line_end": 1130,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          },
+          {
+            "id": "153aa0b1b6421c395d1fd9cd6fefb443b9b0040dbcaafed923b922a74a7524e4",
+            "file": "code_review_graph/graph.py",
+            "symbol": "resolve_bare_call_targets",
+            "kind": "Function",
+            "line_start": 1804,
+            "line_end": 1815,
+            "hop": 0,
+            "is_test": false,
+            "risk_hint": 0.55
+          }
+        ],
+        "edges": 76358,
+        "unresolved_edges": 47796,
+        "head": "e162ebcd79623e670eab721954eb142842c12e89",
+        "generation": "graph-3eebd364085143163efa91df50121a629c3a556864f8ed371ed3dc7aa49779c4-Fd1OW8.kv",
+        "fresh": true,
+        "seed_nodes": 131,
+        "shown_nodes": 8,
+        "depth": 1,
+        "truncated": true,
+        "risk_kind": "heuristic review priority; not vulnerability probability",
+        "affected_files": [
+          "code_review_graph/graph.py"
+        ],
+        "candidate_tests": [],
+        "evidence": [],
+        "test_gap_candidates": [
+          {
+            "symbol": "get_flow_criticalities_for_node",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "_edge_extra_is_unresolved",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "_impact_resolution_guard",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "__init__",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "_is_unreadable_database",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "CorruptGraphDatabaseError",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "get_repo_root",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          },
+          {
+            "symbol": "resolve_bare_call_targets",
+            "file": "code_review_graph/graph.py",
+            "kind": "no direct test relation in indexed graph"
+          }
+        ],
+        "uncertainty": "unresolved/low-confidence relations excluded; review not exhaustive"
+      }
+    },
+    {
+      "name": "code_context",
+      "output_bytes": 10772,
+      "result": {
+        "query": "get_all_nodes get_all_edges",
+        "backend": "tgrep+rg",
+        "graph": "partial: native graph context or relationship evidence was truncated or invalid",
+        "truncated": true,
+        "citations": [
+          {
+            "path": "code_review_graph/graph.py",
+            "line": 1177,
+            "start_line": 1177,
+            "end_line": 1185,
+            "sha384": "54163478aaead6bb02b77a6402e835ee35e2f1970e8cf104e9760d39f2b533dfb0cea285c73d5f42b773c9a1eddf3b1c",
+            "text": "    def get_all_nodes(self, exclude_files: bool = True) -> list[GraphNode]:\n        \"\"\"Return all nodes, optionally excluding File nodes.\"\"\"\n        if exclude_files:\n            rows = self._conn.execute(\n                \"SELECT * FROM nodes WHERE kind != 'File'\"\n            ).fetchall()\n        else:\n            rows = self._conn.execute(\"SELECT * FROM nodes\").fetchall()\n        return [self._row_to_node(r) for r in rows]",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/graph.py",
+            "line": 3569,
+            "start_line": 3569,
+            "end_line": 3572,
+            "sha384": "54163478aaead6bb02b77a6402e835ee35e2f1970e8cf104e9760d39f2b533dfb0cea285c73d5f42b773c9a1eddf3b1c",
+            "text": "    def get_all_edges(self) -> list[GraphEdge]:\n        \"\"\"Return all edges in the graph.\"\"\"\n        rows = self._conn.execute(\"SELECT * FROM edges\").fetchall()\n        return [self._row_to_edge(r) for r in rows]",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 14,
+            "start_line": 14,
+            "end_line": 55,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_hub_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:\n    \"\"\"Find the most connected nodes (highest in+out degree), excluding File nodes.\n\n    Returns list of dicts with: name, qualified_name, kind, file,\n    in_degree, out_degree, total_degree, community_id\n    \"\"\"\n    # Build degree counts from all edges\n    edges = store.get_all_edges()\n    in_degree: dict[str, int] = Counter()\n    out_degree: dict[str, int] = Counter()\n    for e in edges:\n        out_degree[e.source_qualified] += 1\n        in_degree[e.target_qualified] += 1\n\n    # Get all non-File nodes\n    nodes = store.get_all_nodes(exclude_files=True)\n    community_map = store.get_all_community_ids()\n\n    scored = []\n    for n in nodes:\n        qn = n.qualified_name\n        ind = in_degree.get(qn, 0)\n        outd = out_degree.get(qn, 0)\n        total = ind + outd\n        if total == 0:\n            continue\n        scored.append({\n            \"name\": _sanitize_name(n.name),\n            \"qualified_name\": n.qualified_name,\n            \"kind\": n.kind,\n            \"file\": n.file_path,\n            \"in_degree\": ind,\n            \"out_degree\": outd,\n            \"total_degree\": total,\n            \"community_id\": community_map.get(qn),\n        })\n\n    scored.sort(\n        key=lambda x: x.get(\"total_degree\", 0),  # type: ignore[arg-type,return-value]\n        reverse=True,\n    )\n    return scored[:top_n]",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 58,
+            "start_line": 58,
+            "end_line": 107,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_bridge_nodes(\n    store: GraphStore, top_n: int = 10\n) -> list[dict]:\n    \"\"\"Find nodes with highest betweenness centrality.\n\n    These are architectural chokepoints that sit on shortest paths\n    between many node pairs. If they break, multiple communities\n    lose connectivity.\n\n    Returns list of dicts with: name, qualified_name, kind, file,\n    betweenness, community_id\n    \"\"\"\n    import networkx as nx\n\n    # Build the graph \u2014 use cached version if available\n    nxg = store._build_networkx_graph()\n\n    # Compute betweenness centrality (approximate for large graphs)\n    n_nodes = nxg.number_of_nodes()\n    if n_nodes > 5000:\n        # Sample-based approximation for large graphs\n        k = min(500, n_nodes)\n        bc = nx.betweenness_centrality(nxg, k=k, normalized=True)\n    elif n_nodes > 0:\n        bc = nx.betweenness_centrality(nxg, normalized=True)\n    else:\n        return []\n\n    community_map = store.get_all_community_ids()\n    node_map = {\n        n.qualified_name: n\n        for n in store.get_all_nodes(exclude_files=True)\n    }\n\n    results = []\n    for qn, score in bc.items():\n        if score <= 0 or qn not in node_map:\n            continue\n        n = node_map[qn]\n        if n.kind == \"File\":\n            continue\n        results.append({\n            \"name\": _sanitize_name(n.name),\n            \"qualified_name\": n.qualified_name,\n            \"kind\": n.kind,\n            \"file\": n.file_path,\n            \"betweenness\": round(score, 6),\n            \"community_id\": community_map.get(qn),\n        })\n",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 115,
+            "start_line": 115,
+            "end_line": 164,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:\n    \"\"\"Identify structural weaknesses in the codebase graph.\n\n    Returns dict with categories:\n    - isolated_nodes: degree <= 1, disconnected from graph\n    - thin_communities: fewer than 3 members\n    - untested_hotspots: high-degree nodes with no TESTED_BY edges\n    - single_file_communities: entire community in one file\n    \"\"\"\n    edges = store.get_all_edges()\n    nodes = store.get_all_nodes(exclude_files=True)\n    community_map = store.get_all_community_ids()\n\n    # Build degree map\n    degree: dict[str, int] = Counter()\n    tested_nodes: set[str] = set()\n    for e in edges:\n        degree[e.source_qualified] += 1\n        degree[e.target_qualified] += 1\n        if e.kind == \"TESTED_BY\":\n            tested_nodes.add(e.source_qualified)\n\n    # 1. Isolated nodes (degree <= 1, not File)\n    isolated = []\n    for n in nodes:\n        d = degree.get(n.qualified_name, 0)\n        if d <= 1:\n            isolated.append({\n                \"name\": _sanitize_name(n.name),\n                \"qualified_name\": n.qualified_name,\n                \"kind\": n.kind,\n                \"file\": n.file_path,\n                \"degree\": d,\n            })\n\n    # 2. Build community sizes and file maps from node data\n    comm_sizes: Counter[int] = Counter()\n    comm_files: dict[int, set[str]] = defaultdict(set)\n    for n in nodes:\n        cid = community_map.get(n.qualified_name)\n        if cid is not None:\n            comm_sizes[cid] += 1\n            comm_files[cid].add(n.file_path)\n\n    # Thin communities (< 3 members)\n    communities = store.get_communities_list()\n    thin = []\n    for c in communities:\n        cid = int(c[\"id\"])\n        size = comm_sizes.get(cid, 0)",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 213,
+            "start_line": 213,
+            "end_line": 262,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def find_surprising_connections(\n    store: GraphStore, top_n: int = 15\n) -> list[dict]:\n    \"\"\"Find edges with high surprise scores.\n\n    Detects unexpected architectural coupling based on:\n    - Cross-community: source and target in different communities\n    - Cross-language: different file languages\n    - Peripheral-to-hub: low-degree node to high-degree node\n    - Cross-file-type: test calling production or vice versa\n    - Non-standard edge kind for the node types\n    \"\"\"\n    edges = store.get_all_edges()\n    nodes = store.get_all_nodes(exclude_files=True)\n    community_map = store.get_all_community_ids()\n\n    node_map = {n.qualified_name: n for n in nodes}\n\n    # Build degree map\n    degree: dict[str, int] = Counter()\n    for e in edges:\n        degree[e.source_qualified] += 1\n        degree[e.target_qualified] += 1\n\n    # Median degree for peripheral detection\n    degrees = [d for d in degree.values() if d > 0]\n    if not degrees:\n        return []\n    median_deg = sorted(degrees)[len(degrees) // 2]\n    high_deg_threshold = max(median_deg * 3, 10)\n\n    scored_edges = []\n    for e in edges:\n        src = node_map.get(e.source_qualified)\n        tgt = node_map.get(e.target_qualified)\n        if not src or not tgt:\n            continue\n        if src.kind == \"File\" or tgt.kind == \"File\":\n            continue\n\n        score = 0.0\n        reasons = []\n\n        # Cross-community (+0.3)\n        src_cid = community_map.get(e.source_qualified)\n        tgt_cid = community_map.get(e.target_qualified)\n        if (src_cid is not None\n                and tgt_cid is not None\n                and src_cid != tgt_cid):\n            score += 0.3",
+            "source": "graph"
+          },
+          {
+            "path": "code_review_graph/analysis.py",
+            "line": 317,
+            "start_line": 317,
+            "end_line": 366,
+            "sha384": "d5f8c4d2e8765c57fae7c296746e29aeeb69db2f5faeff38b152e599bf641b074a75c32ffb1e871c4661a6d9fb1bc7c1",
+            "text": "def generate_suggested_questions(\n    store: GraphStore,\n) -> list[dict]:\n    \"\"\"Auto-generate review questions from graph analysis.\n\n    Categories:\n    - bridge_node: Why does X connect communities A and B?\n    - isolated_node: Is X dead code or dynamically invoked?\n    - low_cohesion: Should community X be split?\n    - hub_risk: Does hub node X have adequate test coverage?\n    - surprising: Why does A call B across community boundary?\n    \"\"\"\n    questions = []\n\n    # Bridge node questions\n    bridges = find_bridge_nodes(store, top_n=3)\n    for b in bridges:\n        questions.append({\n            \"category\": \"bridge_node\",\n            \"question\": (\n                f\"'{b['name']}' is a critical connector \"\n                f\"between multiple code regions. Is it \"\n                f\"adequately tested and documented?\"\n            ),\n            \"target\": b[\"qualified_name\"],\n            \"priority\": \"high\",\n        })\n\n    # Hub risk questions\n    hubs = find_hub_nodes(store, top_n=3)\n    edges = store.get_all_edges()\n    tested = {\n        e.source_qualified\n        for e in edges if e.kind == \"TESTED_BY\"\n    }\n    for h in hubs:\n        if h[\"qualified_name\"] not in tested:\n            questions.append({\n                \"category\": \"hub_risk\",\n                \"question\": (\n                    f\"Hub node '{h['name']}' has \"\n                    f\"{h['total_degree']} connections but no \"\n                    f\"direct test coverage. Should it be \"\n                    f\"tested?\"\n                ),\n                \"target\": h[\"qualified_name\"],\n                \"priority\": \"high\",\n            })\n\n    # Surprising connection questions",
+            "source": "graph"
+          }
+        ],
+        "mode": "trace",
+        "seeds": [
+          "get_all_nodes",
+          "get_all_edges"
+        ]
+      }
+    }
+  ]
+}

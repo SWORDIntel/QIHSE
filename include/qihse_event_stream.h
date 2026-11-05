@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "qihse_auth.h"
 
 /* ── Record framing ─────────────────────────────────────────────────────── */
 
@@ -26,7 +27,7 @@ typedef enum {
     QIHSE_ES_DURABILITY_FULL = 2       /* fdatsync + rename for atomic rotation */
 } qihse_es_durability_t;
 
-/* On-disk record header (64 bytes, fixed-width little-endian). */
+/* V1 on-disk record header (88 bytes). Layout retained for compatibility. */
 typedef struct qihse_es_record_header {
     uint32_t magic;            /* QIHSE_ES_MAGIC */
     uint32_t format_version;   /* QIHSE_ES_FORMAT_VERSION */
@@ -36,7 +37,7 @@ typedef struct qihse_es_record_header {
     uint64_t payload_size;     /* payload length in bytes */
     uint64_t prev_record_offset; /* 0 for first record, else offset of predecessor */
     uint8_t  event_id[QIHSE_ES_EVENT_ID_SIZE]; /* SHA-384 of (topic || payload) */
-    /* — total 64 bytes when packed — */
+    /* — total 88 bytes — */
 } qihse_es_record_header_t;
 
 /* ── Opaque handle ───────────────────────────────────────────────────────── */
@@ -142,5 +143,67 @@ bool qihse_event_stream_consume_zero_copy(
     uint64_t offset,
     int network_socket_fd,
     size_t count);
+
+/* Authenticated V2 logs occupy a separate, non-legacy-addressable namespace.
+ * The tenant is always derived from the active principal, never supplied by a
+ * caller. Classification and SCI are part of the topic identity. */
+#define QIHSE_ES_FORMAT_VERSION_V2 2u
+#define QIHSE_ES_V2_TRAILER_SIZE QIHSE_ES_EVENT_ID_SIZE
+#define QIHSE_ES_BATCH_MAX_RECORDS 1024u
+#define QIHSE_ES_BATCH_MAX_BYTES (64u * 1024u * 1024u)
+
+typedef struct qihse_es_scope {
+    const char* topic;
+    uint16_t classification;
+    uint16_t sci;
+} qihse_es_scope_t;
+
+typedef struct qihse_es_batch_record {
+    uint32_t schema_id;
+    const uint8_t* event_id; /* optional; otherwise hash scoped topic + payload */
+    const uint8_t* payload;
+    size_t payload_size;
+} qihse_es_batch_record_t;
+
+typedef struct qihse_es_batch_result {
+    uint64_t stream_offset; /* actual byte offset, including zero */
+    bool duplicate;         /* existing IDs return their original offset */
+} qihse_es_batch_result_t;
+
+typedef struct qihse_es_read_record {
+    qihse_es_record_header_t header;
+    uint8_t* payload; /* owned by caller; release with batch_free */
+    size_t payload_size;
+} qihse_es_read_record_t;
+
+/* One exclusive topic lock spans recovery, deduplication and all writes.
+ * Durability modes sync once before and once after group commit. A batch is
+ * not a crash-atomic transaction: recovery can retain a committed prefix.
+ * Returns false on errors; results are only valid on success. */
+bool qihse_event_stream_append_batch(qihse_event_stream_t* stream,
+    const qihse_user_t* user, const qihse_es_scope_t* scope,
+    const qihse_es_batch_record_t* records, size_t count,
+    qihse_es_batch_result_t* results);
+
+/* Cursor is a byte offset, initially zero; only record boundaries are accepted.
+ * At most capacity records / max_payload_bytes are returned (bounded by the
+ * constants above). On failure cursor is unchanged and no payload is returned.
+ * An empty successful read is EOF. Too small a budget for the first record
+ * fails rather than masquerading as EOF. Integrity is checked before disclosure. */
+bool qihse_event_stream_read_batch(qihse_event_stream_t* stream,
+    const qihse_user_t* user, const qihse_es_scope_t* scope,
+    uint64_t* cursor, qihse_es_read_record_t* records, size_t capacity,
+    size_t max_payload_bytes, size_t* out_count);
+void qihse_event_stream_batch_free(qihse_es_read_record_t* records, size_t count);
+
+/* Stable, domain-separated content identities. Member IDs bind an archive ID
+ * and exact member name; they do not depend on batch order or stream offset. */
+bool qihse_event_stream_archive_id(const uint8_t* archive, size_t archive_size,
+    const char* scan_version, uint32_t schema_id,
+    uint8_t out_id[QIHSE_ES_EVENT_ID_SIZE]);
+bool qihse_event_stream_member_id(
+    const uint8_t archive_id[QIHSE_ES_EVENT_ID_SIZE], const char* member_name,
+    const char* scan_version, uint32_t schema_id,
+    uint8_t out_id[QIHSE_ES_EVENT_ID_SIZE]);
 
 #endif /* QIHSE_EVENT_STREAM_H */

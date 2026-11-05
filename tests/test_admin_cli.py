@@ -292,6 +292,23 @@ class AdminTests(unittest.TestCase):
             self.admin.session(*self.endpoint, user='ADMIN_LOW', password='wrong')
         self.assertEqual(self.cli('--user', 'ADMIN_LOW', 'PING').returncode, 2)
 
+    def test_redis_server_sweep_interval_argument_validation(self):
+        server = ROOT / 'qihse-redis-server'
+        for value in ('0', '30', '86400'):
+            result = subprocess.run([str(server), '--kv-sweep-interval', value, '--help'],
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'--kv-sweep-interval', result.stderr)
+        for value in ('', '-1', '+1', '1x', '86401'):
+            result = subprocess.run([str(server), '--kv-sweep-interval', value, '--help'],
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 2, (value, result.stdout, result.stderr))
+            self.assertIn(b'integer from 0 to 86400', result.stderr)
+        result = subprocess.run([str(server), '--kv-sweep-interval'],
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b'integer from 0 to 86400', result.stderr)
+
     def test_standalone_qkp_service_principal(self):
         import tempfile
         with tempfile.TemporaryDirectory(dir=ROOT / 'build', prefix='standalone-aimem-test-') as data:
@@ -333,6 +350,11 @@ class AdminTests(unittest.TestCase):
                 with self.admin.session('127.0.0.1', port, self.pin,
                                         user='AIMEM_SERVICE', password='StandaloneAimemTest1!') as session:
                     self.assertEqual(session.execute('AIMEM', 'COUNT-SCOPED', 'global', '', '', ''), 0)
+                    with self.admin.session('127.0.0.1', port, self.pin,
+                                            user='GODMODE_OP', password='StandaloneOperatorTest1!') as operator:
+                        info = operator.execute('INFO')
+                        self.assertIn(b'qihse_kv_sweep_interval:30', info)
+                        self.assertIn(b'qihse_kv_sweeper_running:1', info)
                     hax_dir = os.environ.get('QIHSE_HAX_DIR')
                     if hax_dir:
                         cfg_path = Path(data).parent / (Path(data).name + '-hax-client.env')

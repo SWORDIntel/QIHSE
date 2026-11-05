@@ -31,6 +31,7 @@ typedef struct {
     const char* pubsub_dir;
     uint16_t channel_classification;
     uint16_t channel_sci;
+    uint32_t kv_sweep_interval_seconds;
     bool require_auth;
     /* Parsed bootstrap identity; passed into the RESP service-principal gate
      * when that configuration field is present in the integration branch. */
@@ -374,6 +375,7 @@ static void usage(const char* program) {
             "  --bind ADDR       bind address (default 127.0.0.1)\n"
             "  --dir PATH        persistence directory (default /var/lib/qihse or $QIHSE_DATA_DIR)\n"
             "  --require-auth    require AUTH per connection\n"
+            "  --kv-sweep-interval SECONDS  expiry sweep/compaction cadence (default 30; 0 disables)\n"
             "  Durable principal authority requires --require-auth and QIHSE_AUTH_MODE=standalone.\n"
             "  QIHSE_AUTH_ACTION=provision|recover; required QIHSE_AUTH_ suffixes:\n"
             "    STATE_DIR, BOOTSTRAP_FILE, AUTHORITY_ID, NODE_ID, EPOCH,\n"
@@ -430,6 +432,7 @@ int main(int argc, char** argv) {
     memset(&credentials, 0, sizeof(credentials));
     options.port = 6379;
     options.bind = "127.0.0.1";
+    options.kv_sweep_interval_seconds = 30u;
     options.aimem_service_user_id = UINT32_MAX;
     const char* pqc_identity_dir = NULL;
     const char* pqc_trusted_pub = NULL;
@@ -451,6 +454,34 @@ int main(int argc, char** argv) {
         else if (strcmp(arg, "--channel-classif") == 0 && has_next) options.channel_classification = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--channel-sci") == 0 && has_next) options.channel_sci = (uint16_t)atoi(argv[++i]);
         else if (strcmp(arg, "--require-auth") == 0) options.require_auth = true;
+        else if (strcmp(arg, "--kv-sweep-interval") == 0) {
+            if (!has_next) {
+                fprintf(stderr, "--kv-sweep-interval requires an integer from 0 to 86400\n");
+                standalone_credentials_clear(&credentials);
+                return 2;
+            }
+            const char* value = argv[++i];
+            uint32_t parsed = 0u;
+            bool valid = value && *value;
+            for (const char* p = value; valid && *p; ++p) {
+                if (*p < '0' || *p > '9') {
+                    valid = false;
+                    break;
+                }
+                unsigned digit = (unsigned)(*p - '0');
+                if (parsed > (86400u - digit) / 10u) {
+                    valid = false;
+                    break;
+                }
+                parsed = parsed * 10u + digit;
+            }
+            if (!valid) {
+                fprintf(stderr, "--kv-sweep-interval requires an integer from 0 to 86400\n");
+                standalone_credentials_clear(&credentials);
+                return 2;
+            }
+            options.kv_sweep_interval_seconds = parsed;
+        }
         else if (strcmp(arg, "--pqc-require") == 0) pqc_require = true;
         else if (strcmp(arg, "--pqc-identity-dir") == 0 && has_next) pqc_identity_dir = argv[++i];
         else if (strcmp(arg, "--pqc-trusted-pub") == 0 && has_next) pqc_trusted_pub = argv[++i];
@@ -684,6 +715,7 @@ int main(int argc, char** argv) {
     config.bind_address = options.bind;
     config.advertise_address = options.bind;
     config.auth_required = options.require_auth;
+    config.kv_sweep_interval_seconds = options.kv_sweep_interval_seconds;
     config.aimem_service_user_id = options.aimem_service_user_id;
     if (pqc_require) {
         pqc_trusted[0] = pqc_trusted_pub;

@@ -21,6 +21,8 @@ class _KVRecordMeta(ctypes.Structure):
 
 _lib.qihse_kv_store_create.argtypes = []
 _lib.qihse_kv_store_create.restype = _KVStore_p
+_lib.qihse_kv_store_create_user.argtypes = [ctypes.c_void_p]
+_lib.qihse_kv_store_create_user.restype = _KVStore_p
 _lib.qihse_kv_store_destroy.argtypes = [_KVStore_p]
 _lib.qihse_kv_store_destroy.restype = None
 
@@ -33,6 +35,26 @@ _lib.qihse_kv_set_user.argtypes = [
     ctypes.c_void_p,
 ]
 _lib.qihse_kv_set_user.restype = ctypes.c_bool
+
+_KV_BATCH_MAX_RECORDS = 4096
+_KV_BATCH_MAX_BYTES = 64 * 1024 * 1024
+
+class _KVBatchSetRecord(ctypes.Structure):
+    _fields_ = [
+        ("key", ctypes.c_char_p),
+        ("value", ctypes.c_char_p),
+        ("expire_time_ms", ctypes.c_uint64),
+        ("classification", ctypes.c_uint16),
+        ("sci_compartment", ctypes.c_uint16),
+    ]
+
+_lib.qihse_kv_set_batch_durable_user.argtypes = [
+    _KVStore_p,
+    ctypes.POINTER(_KVBatchSetRecord),
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+]
+_lib.qihse_kv_set_batch_durable_user.restype = ctypes.c_bool
 _lib.qihse_kv_get_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_kv_get_user.restype = ctypes.POINTER(ctypes.c_char)
 _lib.qihse_kv_meta_user.argtypes = [
@@ -90,8 +112,9 @@ _libc.free.restype = None
 
 
 class KVStore:
-    def __init__(self):
-        self._ptr = _lib.qihse_kv_store_create()
+    def __init__(self, *, user=None):
+        self._ptr = (_lib.qihse_kv_store_create_user(user) if user is not None
+                     else _lib.qihse_kv_store_create())
         if not self._ptr:
             raise RuntimeError("Failed to create KVStore")
 
@@ -105,6 +128,58 @@ class KVStore:
 
     def __exit__(self, *args):
         self.close()
+
+    def set_batch_durable(self, records, *, user) -> bool:
+        """Persist a bounded batch of SETs through the authenticated WAL path.
+
+        Each record is a mapping with ``key`` and ``value`` strings, plus
+        optional ``expire_time_ms``, ``classification`` and ``sci_compartment``.
+        The native operation is not an atomic transaction; a false result may
+        leave a recoverable prefix and fences the store until reopen.
+        """
+        if user is None:
+            raise ValueError("durable KV batch requires an authenticated principal")
+        bounded_records = []
+        for record in records:
+            if len(bounded_records) == _KV_BATCH_MAX_RECORDS:
+                raise ValueError("durable KV batch record count exceeds native bound")
+            bounded_records.append(record)
+        records = bounded_records
+        if not records:
+            raise ValueError("durable KV batch must contain at least one record")
+        encoded = []
+        native = (_KVBatchSetRecord * len(records))()
+        total_bytes = 0
+        for i, record in enumerate(records):
+            key = record["key"]
+            value = record["value"]
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise TypeError("durable KV keys and values must be strings")
+            if not key or "\0" in key or "\0" in value:
+                raise ValueError("durable KV keys must be nonempty and keys/values cannot contain NUL")
+            remaining = _KV_BATCH_MAX_BYTES - total_bytes
+            if remaining < 40 or len(key) + len(value) > remaining - 40:
+                raise ValueError("durable KV batch exceeds native byte bound")
+            key_bytes = key.encode("utf-8")
+            value_bytes = value.encode("utf-8")
+            expire = int(record.get("expire_time_ms", 0))
+            classification = int(record.get("classification", 0))
+            sci = int(record.get("sci_compartment", 0))
+            record_bytes = 40 + len(key_bytes) + len(value_bytes)
+            if record_bytes > remaining:
+                raise ValueError("durable KV batch exceeds native byte bound")
+            if not 0 <= expire < 1 << 64:
+                raise ValueError("expire_time_ms is outside uint64 range")
+            if not 0 <= classification < 1 << 16 or not 0 <= sci < 1 << 16:
+                raise ValueError("classification and sci_compartment must fit uint16")
+            total_bytes += 40 + len(key_bytes) + len(value_bytes)
+            encoded.append((key_bytes, value_bytes))
+            native[i] = _KVBatchSetRecord(
+                key_bytes, value_bytes, expire, classification, sci)
+        if total_bytes > _KV_BATCH_MAX_BYTES:
+            raise ValueError("durable KV batch exceeds native byte bound")
+        return bool(_lib.qihse_kv_set_batch_durable_user(
+            self._ptr, native, len(records), user))
 
     def set(
         self,

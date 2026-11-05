@@ -58,7 +58,7 @@ _EXPORT_MODULES = {
         "kv": ("KVStore",),
         "timeseries": ("TimeSeriesDB",),
         "document": ("DocumentStore",),
-        "event_stream": ("EventStream", "EventRecord", "Durability"),
+        "event_stream": ("EventStream", "EventRecord", "EventScope", "Durability"),
         "uwp": ("UWPServer",),
         "neural": ("NeuralClassifier", "KeystoneClass"),
         "anchor": ("AnchorIndex",),
@@ -87,7 +87,7 @@ def __dir__():
 __all__ = [
     "VectorDB", "VectorQuery", "VectorResult", "DistanceMetric", "QueryMode",
     "KVStore", "TimeSeriesDB", "DocumentStore",
-    "EventStream", "EventRecord", "Durability",
+    "EventStream", "EventRecord", "EventScope", "Durability",
     "UWPServer",
     "NeuralClassifier", "KeystoneClass",
     "AnchorIndex",

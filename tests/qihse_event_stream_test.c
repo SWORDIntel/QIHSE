@@ -15,6 +15,7 @@
 #include "qihse_event_stream.h"
 
 #include <stdio.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -22,7 +23,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/file.h>
+#include <pthread.h>
+#include <dirent.h>
 #include <openssl/evp.h>
 
 static int test_count = 0;
@@ -293,6 +297,15 @@ static void test_corruption_detection(void) {
     ASSERT(n == 0, "replay should return 0 for corrupt record, got %lu", n);
     qihse_event_stream_destroy(es);
 
+    struct stat before, after;
+    ASSERT(stat(path, &before) == 0, "stat corrupt log before recovery failed");
+    es = qihse_event_stream_open(dir, QIHSE_ES_DURABILITY_NONE, false);
+    ASSERT(es && !qihse_event_stream_truncate_torn_tail(es, "corrupt"),
+           "recovery must refuse committed corruption");
+    qihse_event_stream_destroy(es);
+    ASSERT(stat(path, &after) == 0 && after.st_size == before.st_size,
+           "committed corruption was truncated");
+
     rm_rf(dir);
     free(dir);
 }
@@ -528,9 +541,181 @@ static void test_restart_recovery(void) {
     free(dir);
 }
 
+typedef struct {
+    const char* logdir;
+    const qihse_user_t* user;
+    qihse_es_scope_t scope;
+    uint8_t event_id[48];
+    bool ok;
+    qihse_es_batch_result_t result;
+} v2_race_arg_t;
+
+static void* v2_race_append(void* opaque) {
+    v2_race_arg_t* arg = opaque;
+    qihse_event_stream_t* stream = qihse_event_stream_create(arg->logdir);
+    if (!stream) return NULL;
+    const uint8_t payload[] = "one stable event";
+    qihse_es_batch_record_t record = {9u, arg->event_id, payload, sizeof(payload)-1u};
+    arg->ok = qihse_event_stream_append_batch(stream, arg->user, &arg->scope,
+                                               &record, 1u, &arg->result);
+    qihse_event_stream_destroy(stream);
+    return NULL;
+}
+
+static void test_scoped_v2_batches_in_child(const char* dir) {
+    assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
+    assert(qihse_auth_init());
+    const char* password = "EventStreamOperator123!";
+    assert(qihse_auth_bootstrap_operator(password));
+    qihse_user_t* op = qihse_auth_authenticate_id(0u, password); assert(op);
+    qihse_user_t* low = qihse_auth_create_user(op, 4201u, QIHSE_ROLE_ANALYST,
+                                                0u, 0u, password, false); assert(low);
+    qihse_user_t* no_sci = qihse_auth_create_user(op, 4202u, QIHSE_ROLE_ANALYST,
+                                                   4u, 0u, password, false); assert(no_sci);
+    qihse_user_t* other_tenant = qihse_auth_create_tenant_user(op, 42u, 4203u,
+        QIHSE_ROLE_OPERATOR, 4u, 2u, password, false); assert(other_tenant);
+    char logdir[1024];
+    assert(snprintf(logdir, sizeof(logdir), "%s/events", dir) > 0);
+    assert(mkdir(logdir, 0700) == 0);
+    qihse_event_stream_t* es = qihse_event_stream_create(logdir); assert(es);
+    qihse_es_scope_t scope = {"firmware", 4u, 2u};
+    uint8_t id1[48] = {1}, id2[48] = {2};
+    const uint8_t p1[] = "archive metadata", p2[] = "member result";
+    qihse_es_batch_record_t records[] = {
+        {7u, id1, p1, sizeof(p1) - 1u}, {7u, id2, p2, sizeof(p2) - 1u}
+    };
+    qihse_es_batch_result_t results[2];
+    ASSERT(qihse_event_stream_append_batch(es, op, &scope, records, 2u, results),
+           "V2 batch append failed");
+    ASSERT(results[0].stream_offset == 0u && !results[0].duplicate &&
+           results[1].stream_offset > results[0].stream_offset && !results[1].duplicate,
+           "V2 offsets/append states incorrect");
+    qihse_event_stream_destroy(es);
+    es = qihse_event_stream_create(logdir); assert(es);
+    qihse_es_batch_record_t retry = {7u, id1, p1, sizeof(p1) - 1u};
+    qihse_es_batch_result_t retry_result;
+    ASSERT(qihse_event_stream_append_batch(es, op, &scope, &retry, 1u, &retry_result) &&
+           retry_result.duplicate && retry_result.stream_offset == 0u,
+           "identical V2 retry was not idempotent");
+    const uint8_t changed[] = "different content";
+    retry.payload = changed; retry.payload_size = sizeof(changed) - 1u;
+    ASSERT(!qihse_event_stream_append_batch(es, op, &scope, &retry, 1u, &retry_result),
+           "reused ID with changed payload was accepted");
+    retry.payload = p1; retry.payload_size = sizeof(p1) - 1u; retry.schema_id++;
+    ASSERT(!qihse_event_stream_append_batch(es, op, &scope, &retry, 1u, &retry_result),
+           "reused ID with changed schema was accepted");
+    qihse_es_batch_record_t conflict_pair[] = {
+        {7u, id2, p2, sizeof(p2)-1u}, {8u, id2, p1, sizeof(p1)-1u}
+    };
+    ASSERT(!qihse_event_stream_append_batch(es, op, &scope, conflict_pair, 2u, results),
+           "same-batch ID conflict was accepted");
+
+    uint64_t cursor = 0; size_t count = 0;
+    qihse_es_read_record_t page[2] = {0};
+    ASSERT(qihse_event_stream_read_batch(es, op, &scope, &cursor, page, 2u, 1024u, &count) &&
+           count == 2u && page[0].payload_size == sizeof(p1) - 1u &&
+           memcmp(page[0].payload, p1, sizeof(p1) - 1u) == 0 &&
+           memcmp(page[1].payload, p2, sizeof(p2) - 1u) == 0,
+           "V2 cursor batch read failed");
+    qihse_event_stream_batch_free(page, count);
+    ASSERT(qihse_event_stream_read_batch(es, op, &scope, &cursor, page, 2u, 1024u, &count) &&
+           count == 0u, "V2 cursor EOF not reported");
+    cursor = 0;
+    ASSERT(!qihse_event_stream_read_batch(es, low, &scope, &cursor, page, 2u, 1024u, &count) &&
+           cursor == 0u && count == 0u, "low-clearance read was not denied");
+    ASSERT(!qihse_event_stream_append_batch(es, low, &scope, &retry, 1u, &retry_result),
+           "low-clearance append was not denied");
+    ASSERT(!qihse_event_stream_read_batch(es, no_sci, &scope, &cursor, page, 2u, 1024u, &count),
+           "out-of-compartment read was not denied");
+    ASSERT(!qihse_event_stream_read_batch(es, other_tenant, &scope, &cursor, page, 2u, 1024u, &count),
+           "cross-tenant read disclosed scoped records");
+
+    qihse_event_stream_destroy(es); es = NULL;
+    v2_race_arg_t race[8] = {0}; pthread_t racers[8];
+    for (size_t i = 0; i < 8u; ++i) {
+        race[i].logdir = logdir; race[i].user = op;
+        race[i].scope = (qihse_es_scope_t){"race", 4u, 2u};
+        memset(race[i].event_id, 0xA5, sizeof(race[i].event_id));
+        assert(pthread_create(&racers[i], NULL, v2_race_append, &race[i]) == 0);
+    }
+    size_t winners = 0, duplicates = 0;
+    for (size_t i = 0; i < 8u; ++i) {
+        assert(pthread_join(racers[i], NULL) == 0 && race[i].ok);
+        winners += !race[i].result.duplicate;
+        duplicates += race[i].result.duplicate && race[i].result.stream_offset == 0u;
+    }
+    ASSERT(winners == 1u && duplicates == 7u,
+           "concurrent V2 duplicate race produced %zu winners and %zu retries", winners, duplicates);
+    es = qihse_event_stream_create(logdir); assert(es);
+
+    uint8_t archive_id1[48], archive_id2[48], member_id1[48], member_id2[48];
+    const uint8_t archive[] = "firmware archive";
+    ASSERT(qihse_event_stream_archive_id(archive, sizeof(archive)-1u, "scanner-1", 7u, archive_id1) &&
+           qihse_event_stream_archive_id(archive, sizeof(archive)-1u, "scanner-2", 7u, archive_id2) &&
+           memcmp(archive_id1, archive_id2, 48) != 0,
+           "archive identity did not bind scan version");
+    ASSERT(qihse_event_stream_member_id(archive_id1, "member.bin", "scanner-1", 7u, member_id1) &&
+           qihse_event_stream_member_id(archive_id1, "member.bin", "scanner-1", 8u, member_id2) &&
+           memcmp(member_id1, member_id2, 48) != 0,
+           "member identity did not bind schema version");
+
+    /* Damage a committed payload/trailer; reopen must fail closed, not truncate it. */
+    DIR* d = opendir(logdir); assert(d);
+    struct dirent* ent; char paths[4][1024]; size_t npaths = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        assert(npaths < 4u);
+        assert(snprintf(paths[npaths], sizeof(paths[npaths]), "%s/%s", logdir, ent->d_name) > 0);
+        npaths++;
+    }
+    assert(closedir(d) == 0 && npaths == 2u);
+    size_t damaged = 0;
+    struct stat before, after;
+    for (size_t i = 0; i < npaths; ++i) {
+        assert(stat(paths[i], &before) == 0);
+        if (before.st_size > 300) damaged = i;
+    }
+    assert(stat(paths[damaged], &before) == 0 && before.st_size > 300);
+    int fd = open(paths[damaged], O_WRONLY | O_APPEND | O_NOFOLLOW); assert(fd >= 0);
+    const uint8_t torn[] = {0x51, 0x45, 0x53, 0x54};
+    assert(write(fd, torn, sizeof(torn)) == (ssize_t)sizeof(torn)); close(fd);
+    uint8_t id3[48] = {3};
+    qihse_es_batch_record_t after_torn = {7u, id3, p1, sizeof(p1) - 1u};
+    assert(qihse_event_stream_append_batch(es, op, &scope, &after_torn, 1u, &retry_result) &&
+           !retry_result.duplicate);
+    assert(stat(paths[damaged], &before) == 0 && before.st_size > 300);
+    qihse_event_stream_destroy(es);
+    fd = open(paths[damaged], O_RDWR | O_NOFOLLOW); assert(fd >= 0);
+    uint8_t byte; assert(pread(fd, &byte, 1u, before.st_size - 1) == 1);
+    byte ^= 0x80u; assert(pwrite(fd, &byte, 1u, before.st_size - 1) == 1); close(fd);
+    assert(stat(paths[damaged], &before) == 0);
+    es = qihse_event_stream_create(logdir); assert(es); cursor = 0;
+    ASSERT(!qihse_event_stream_read_batch(es, op, &scope, &cursor, page, 2u, 1024u, &count),
+           "V2 committed digest corruption was disclosed");
+    assert(stat(paths[damaged], &after) == 0 && after.st_size == before.st_size);
+    qihse_event_stream_destroy(es);
+}
+
+static void test_scoped_v2_batches(void) {
+    TEST("scoped V2 batch: auth, dedup conflict, cursor, identity and digest recovery");
+    char* dir = make_temp_dir();
+    pid_t pid = fork(); assert(pid >= 0);
+    if (pid == 0) {
+        test_scoped_v2_batches_in_child(dir);
+        _exit(0); /* Stop the audit signer before the parent removes its isolated directory. */
+    }
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "scoped V2 child failed with wait status %d", status);
+    rm_rf(dir);
+    free(dir);
+}
+
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("=== QIHSE Event Stream Promotion Gate Tests ===\n\n");
 
     test_record_framing();
@@ -547,6 +732,7 @@ int main(void) {
     test_symlink_rejection();
     test_no_implicit_network();
     test_restart_recovery();
+    test_scoped_v2_batches();
 
     printf("\n=== Results: %d passed, %d failed, %d total ===\n", test_pass, test_fail, test_count);
     return test_fail > 0 ? 1 : 0;

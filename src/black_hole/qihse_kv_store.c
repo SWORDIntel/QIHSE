@@ -301,6 +301,7 @@ struct qihse_kv_store {
     size_t sstable_live_count;
     qihse_quantum_defense_ctx_t* qdd_ctx;
     bool bulk_load_mode;
+    bool durable_batch_mode; /* Keep WAL appends, defer threshold flush/rotation. */
     bool replica_read_only;
     uint32_t replication_principal_id; /* QKP replication service principal id */
     sst_meta_index_t* sst_meta;
@@ -342,7 +343,7 @@ struct qihse_kv_store {
      * out, so no cycle is possible.  Reader-preferring kind so enumeration
      * callbacks may call qihse_kv_get_user re-entrantly (rd-over-rd). */
     pthread_rwlock_t store_lock;
-    bool recovery_pending; /* An ambiguous image publication requires authenticated reopen. */
+    bool recovery_pending; /* Ambiguous publication/batch requires authenticated reopen. */
 };
 
 struct qihse_kv_replica_snapshot {
@@ -1378,7 +1379,7 @@ static bool wal_append(qihse_kv_store_t* store, uint8_t op, const char* key, con
               fwrite_exact(value ? value : "", 1u, val_len, store->wal_fd);
     if (!ok) return false;
     store->wal_unflushed_bytes += sizeof(hdr) + key_len + val_len;
-    if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
+    if (!store->durable_batch_mode && store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
     return true;
 }
 
@@ -1408,7 +1409,7 @@ static bool wal_append_replica(qihse_kv_store_t* store, uint8_t op, const char* 
         !fwrite_exact(key, 1u, key_len, store->wal_fd) ||
         !fwrite_exact(value ? value : "", 1u, val_len, store->wal_fd)) return false;
     store->wal_unflushed_bytes += sizeof(hdr) + key_len + val_len;
-    if (store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
+    if (!store->durable_batch_mode && store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
     return true;
 }
 
@@ -2244,15 +2245,21 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
 }
 
 bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store) {
-    if (!store || !store->trie) return false;
-    __atomic_store_n(&store->replica_read_only, true, __ATOMIC_RELEASE);
-    return true;
+    if (!store) return false;
+    kv_store_wrlock(store);
+    bool ok = store->trie && !store->recovery_pending;
+    if (ok) __atomic_store_n(&store->replica_read_only, true, __ATOMIC_RELEASE);
+    kv_store_unlock(store);
+    return ok;
 }
 
 void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
                                                  uint32_t principal_id) {
-    if (store) __atomic_store_n(&store->replication_principal_id, principal_id,
-                                __ATOMIC_RELEASE);
+    if (!store) return;
+    kv_store_wrlock(store);
+    if (!store->recovery_pending)
+        __atomic_store_n(&store->replication_principal_id, principal_id, __ATOMIC_RELEASE);
+    kv_store_unlock(store);
 }
 
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
@@ -2268,17 +2275,24 @@ void qihse_kv_store_destroy(qihse_kv_store_t* store) {
 }
 
 const char* qihse_kv_store_data_directory(qihse_kv_store_t* store) {
-    if (!store) return NULL;
+    if (!store || __atomic_load_n(&store->recovery_pending, __ATOMIC_ACQUIRE)) return NULL;
     return get_qihse_data_dir();
 }
 
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
-    if (store) store->bulk_load_mode = true;
+    if (!store) return;
+    kv_store_wrlock(store);
+    if (!store->recovery_pending) store->bulk_load_mode = true;
+    kv_store_unlock(store);
 }
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
     if (!store) return;
-    store->bulk_load_mode = false;
-    flush_wal_buffer(store);
+    kv_store_wrlock(store);
+    if (!store->recovery_pending) {
+        store->bulk_load_mode = false;
+        flush_wal_buffer(store);
+    }
+    kv_store_unlock(store);
 }
 
 /* ── Store-internal operation lock (nil-GET fix 2026-10-02) ──────────────
@@ -2299,11 +2313,9 @@ static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_us
 static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
                              qihse_user_t* user, uint64_t* out_change_seq);
 
-static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const char* value,
-                                 uint64_t expire_time_ms, uint16_t classification,
-                                 uint16_t sci_compartment, qihse_user_t* user,
-                                 uint64_t* out_change_seq) {
-    if (out_change_seq) *out_change_seq = 0u;
+static bool set_user_preflight(qihse_kv_store_t* store, const char* key, const char* value,
+                                uint16_t classification, uint16_t sci_compartment,
+                                qihse_user_t* user) {
     if (!store || !store->trie || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
         !key || !value || key[0] == '\0') return false;
     if (strlen(key) > KV_MAX_KEY_LEN || strlen(value) > KV_MAX_VALUE_LEN) return false;
@@ -2338,7 +2350,15 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
         }
         lookup_result_free(&existing);
     }
-    if (key_exists && !qihse_auth_can_access(user, ex_class, ex_comp)) return false;
+    return !key_exists || qihse_auth_can_access(user, ex_class, ex_comp);
+}
+
+static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const char* value,
+                                 uint64_t expire_time_ms, uint16_t classification,
+                                 uint16_t sci_compartment, qihse_user_t* user,
+                                 uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
+    if (!set_user_preflight(store, key, value, classification, sci_compartment, user)) return false;
     /* Authorized mutation: issue the change sequence BEFORE any side effect,
      * so a failure after this point at worst skips a number (monotonicity is
      * what matters, not density) and no unauthorized mutation ever advances
@@ -2348,9 +2368,70 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
     if (!wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms,
                     classification, sci_compartment, 0u, seq)) return false;
     if (!insert_internal(store, key, value, expire_time_ms, classification, sci_compartment, 0u, seq)) return false;
-    if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
+    if (!store->bulk_load_mode && !store->durable_batch_mode &&
+        store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
     if (out_change_seq) *out_change_seq = seq;
     return true;
+}
+
+static int batch_key_compare(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store,
+                                     const qihse_kv_batch_set_record_t* records,
+                                     size_t count, qihse_user_t* user) {
+    if (!store || !records || count == 0u ||
+        count > QIHSE_KV_DURABLE_BATCH_MAX_RECORDS || !user) return false;
+    const char** keys = malloc(count * sizeof(*keys));
+    if (!keys) return false;
+    bool ok = false;
+    kv_store_wrlock(store);
+    if (!store->trie || !store->wal_fd || store->recovery_pending ||
+        store->bulk_load_mode || store->durable_batch_mode ||
+        __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
+        !qihse_auth_user_is_active(user) ||
+        count > UINT64_MAX - __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED)) goto done;
+    size_t bytes = 0u;
+    for (size_t i = 0u; i < count; i++) {
+        const qihse_kv_batch_set_record_t* r = &records[i];
+        if (!r->key || !r->value) goto done;
+        size_t k = strnlen(r->key, KV_MAX_KEY_LEN + 1u);
+        size_t v = strnlen(r->value, KV_MAX_VALUE_LEN + 1u);
+        if (k == 0u || k > KV_MAX_KEY_LEN || v > KV_MAX_VALUE_LEN) goto done;
+        size_t record_bytes = 40u + k + v;
+        if (record_bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES - bytes) goto done;
+        bytes += record_bytes;
+        keys[i] = r->key;
+        if (!set_user_preflight(store, r->key, r->value,
+                                r->classification, r->sci_compartment, user)) goto done;
+    }
+    qsort(keys, count, sizeof(*keys), batch_key_compare);
+    for (size_t i = 1u; i < count; i++) {
+        if (strcmp(keys[i - 1u], keys[i]) == 0) goto done;
+    }
+
+    store->durable_batch_mode = true;
+    for (size_t i = 0u; i < count; i++) {
+        const qihse_kv_batch_set_record_t* r = &records[i];
+        if (!set_user_with_expiry(store, r->key, r->value, r->expire_time_ms,
+                                  r->classification, r->sci_compartment, user, NULL)) goto failed;
+    }
+    if (aimem_durability_test_fail_once("wal-fflush") || fflush(store->wal_fd) != 0) goto failed;
+    if (fdatasync(fileno(store->wal_fd)) != 0) goto failed;
+    store->wal_unflushed_bytes = 0u;
+    store->durable_batch_mode = false;
+    ok = true;
+    goto done;
+failed:
+    /* WAL/memtable may now contain a prefix. Never let a caller observe or
+     * extend this ambiguous state; reopen replays the authoritative WAL. */
+    store->durable_batch_mode = false;
+    __atomic_store_n(&store->recovery_pending, true, __ATOMIC_RELEASE);
+done:
+    kv_store_unlock(store);
+    free(keys);
+    return ok;
 }
 
 bool qihse_kv_set_user(qihse_kv_store_t* store, const char* key, const char* value,
@@ -2512,7 +2593,8 @@ static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
     if (!wal_append(store, KV_WAL_OP_DEL, key, "", 0u, classification, sci,
                     KV_FLAG_TOMBSTONE, seq)) return false;
     if (!insert_internal(store, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE, seq)) return false;
-    if (!store->bulk_load_mode && store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
+    if (!store->bulk_load_mode && !store->durable_batch_mode &&
+        store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
     if (out_change_seq) *out_change_seq = seq;
     return true;
 }
@@ -2954,6 +3036,7 @@ bool qihse_kv_sstable_stats(qihse_kv_store_t* store, qihse_kv_sstable_stats_t* o
     if (!store || !out) return false;
     memset(out, 0, sizeof(*out));
     kv_store_rdlock(store);
+    if (store->recovery_pending) { kv_store_unlock(store); return false; }
     out->live_sstable_files = store->sstable_live_count;
     out->sstable_counter = (size_t)store->sstable_counter;
     out->index_degraded = !store->sst_meta || store->sst_meta->degraded;
@@ -3715,16 +3798,16 @@ int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_
  * them) and then tracks deltas. */
 
 uint64_t qihse_kv_change_seq(qihse_kv_store_t* store) {
-    if (!store) return 0u;
+    if (!store || __atomic_load_n(&store->recovery_pending, __ATOMIC_ACQUIRE)) return 0u;
     return __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED);
 }
 
 uint64_t qihse_kv_instance_id(qihse_kv_store_t* store) {
-    return store ? store->instance_id : 0u;
+    return store && !__atomic_load_n(&store->recovery_pending, __ATOMIC_ACQUIRE) ? store->instance_id : 0u;
 }
 
 uint64_t qihse_kv_projection_epoch(qihse_kv_store_t* store) {
-    if (!store) return 0u;
+    if (!store || __atomic_load_n(&store->recovery_pending, __ATOMIC_ACQUIRE)) return 0u;
     return __atomic_load_n(&store->projection_epoch, __ATOMIC_ACQUIRE);
 }
 
