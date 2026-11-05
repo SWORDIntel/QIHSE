@@ -456,9 +456,15 @@ int fsync(int fd) {
 ''')
         subprocess.run(["cc", "-shared", "-fPIC", str(failure_source), "-o",
                         str(failure_library), "-ldl"], check=True, capture_output=True)
+        # Deduplicated imports do not publish. Use a distinct, valid input for
+        # each injected publication failure so the durability path is exercised.
+        failure_input = root / "publication-failure.jsonl"
         for failure in ("snapshot", "manifest"):
+            records = [json.loads(line) for line in source.read_text().splitlines()]
+            records[0]["publication_failure_fixture"] = failure
+            write_records(failure_input, records)
             failed = subprocess.run(
-                [str(executable), "import", "--repo", str(repo), "--input", str(source)],
+                [str(executable), "import", "--repo", str(repo), "--input", str(failure_input)],
                 env={**env, "LD_PRELOAD": str(failure_library), "CODEGRAPH_TEST_ENOSPC": failure},
                 capture_output=True, text=True, timeout=60, check=False)
             assert failed.returncode == 1, (failure, failed.stdout, failed.stderr)
@@ -467,8 +473,11 @@ int fsync(int fd) {
             assert not list(state.glob("*.tmp-*")), failure
 
         before_sync = invoke("status")["generation"]
+        records = [json.loads(line) for line in source.read_text().splitlines()]
+        records[0]["publication_failure_fixture"] = "manifest-sync"
+        write_records(failure_input, records)
         uncertain = subprocess.run(
-            [str(executable), "import", "--repo", str(repo), "--input", str(source)],
+            [str(executable), "import", "--repo", str(repo), "--input", str(failure_input)],
             env={**env, "LD_PRELOAD": str(failure_library), "CODEGRAPH_TEST_ENOSPC": "manifest-sync"},
             capture_output=True, text=True, timeout=60, check=False)
         assert uncertain.returncode == 1 and "durability" in uncertain.stdout, uncertain
