@@ -136,7 +136,9 @@ def main() -> None:
                         "-o", str(helper)], check=True, capture_output=True)
         helper_data = root / "writer-state"
         helper_data.mkdir(mode=0o700)
-        legacy_path = state / ("graph-" + "1" * 64 + "-legacy.kv")
+        # Historical writers used a decimal PID, not a six-character mkstemps
+        # suffix. Seven-digit PIDs exposed the original migration rejection.
+        legacy_path = state / ("graph-" + "1" * 64 + "-2777935.kv")
         fixture_result = subprocess.run([str(helper), str(source), str(legacy_path)],
                                         env={**env, "QIHSE_DATA_DIR": str(helper_data)},
                                         capture_output=True, timeout=90)
@@ -147,6 +149,16 @@ def main() -> None:
                       sha256=hashlib.sha256(legacy_path.read_bytes()).hexdigest())
         manifest_path.write_text(json.dumps(legacy))
         assert invoke("status")["fresh"]
+
+        unsupported_path = state / ("graph-" + "1" * 64 + "-letters.kv")
+        unsupported_path.write_bytes(legacy_path.read_bytes())
+        unsupported = {**legacy, "snapshot": unsupported_path.name}
+        manifest_path.write_text(json.dumps(unsupported))
+        before_failed_migrate = manifest_path.read_bytes()
+        failed = invoke("migrate", expect=1)
+        assert "unsupported snapshot filename" in failed["error"], failed
+        assert manifest_path.read_bytes() == before_failed_migrate
+        manifest_path.write_text(json.dumps(legacy))
 
         # Migration is physical only: changed source must remain stale.
         clean_source = (repo / "src/a.c").read_text()
@@ -179,6 +191,15 @@ def main() -> None:
         # or files not in the generation namespace.
         obsolete = state / ("graph-" + "2" * 64 + "-unused.kv")
         obsolete.write_bytes(b"obsolete synthetic generation")
+        numeric_obsolete = [state / ("graph-" + "2" * 64 + f"-{suffix}.kv")
+                            for suffix in ("1", "12345", "2777935", "2147483647")]
+        for path in numeric_obsolete:
+            path.write_bytes(b"obsolete synthetic PID generation")
+        malformed_names = [state / ("graph-" + "3" * 64 + f"-{suffix}.kv")
+                           for suffix in ("0", "0123456", "2147483648", "12345678901",
+                                          "letters", "+1234567", "-1234567", "1.kv.extra")]
+        for path in malformed_names:
+            path.write_bytes(b"unmanaged synthetic file")
         unrelated = state / "operator-note.txt"
         unrelated.write_text("retain")
         malformed = state / "graph-unmanaged-fixture.kv"
@@ -198,6 +219,10 @@ def main() -> None:
             invoke("gc")
             assert active.is_dir(), "GC removed a locked runtime"
         assert not obsolete.exists()
+        assert all(not path.exists() for path in numeric_obsolete)
+        assert all(path.is_file() for path in malformed_names)
+        assert unsupported_path.is_file()
+        assert legacy_path.is_file(), "GC removed the legacy PID rollback generation"
         assert not dead.exists()
         assert unmanaged.is_dir() and unrelated.is_file() and malformed.is_file()
         current = manifest()

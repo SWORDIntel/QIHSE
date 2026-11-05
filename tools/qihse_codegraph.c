@@ -258,16 +258,32 @@ static bool storage_lock(cg_state *st, int operation) {
 static struct json_object *read_json_file(const char *path);
 static bool load_snapshot_unlocked(cg_state *st, bool build_graph);
 static bool snapshot_name(const char *name) {
-    if (!name || strlen(name) != 80 || strncmp(name, "graph-", 6) ||
-        name[70] != '-' || strcmp(name + 77, ".kv")) return false;
+    if (!name) return false;
+    size_t length = strlen(name);
+    if (length < 75 || length > 84 || strncmp(name, "graph-", 6) ||
+        name[70] != '-' || strcmp(name + length - 3, ".kv")) return false;
     for (size_t i = 6; i < 70; i++)
         if (!((name[i] >= '0' && name[i] <= '9') ||
               (name[i] >= 'a' && name[i] <= 'f'))) return false;
-    for (size_t i = 71; i < 77; i++)
-        if (!((name[i] >= '0' && name[i] <= '9') ||
-              (name[i] >= 'a' && name[i] <= 'z') ||
-              (name[i] >= 'A' && name[i] <= 'Z'))) return false;
-    return true;
+    size_t suffix_length = length - 74;
+    bool random_suffix = suffix_length == 6;
+    unsigned long pid = 0;
+    bool pid_suffix = name[71] != '0';
+    for (size_t i = 71; i < length - 3; i++) {
+        bool digit = name[i] >= '0' && name[i] <= '9';
+        if (!(digit || (name[i] >= 'a' && name[i] <= 'z') ||
+              (name[i] >= 'A' && name[i] <= 'Z'))) random_suffix = false;
+        if (pid_suffix) {
+            if (!digit) pid_suffix = false;
+            else {
+                unsigned value = (unsigned)(name[i] - '0');
+                if (pid > ((unsigned long)INT_MAX - value) / 10) pid_suffix = false;
+                else pid = pid * 10 + value;
+            }
+        }
+    }
+    /* Original publishers used getpid(); newer ones use mkstemps(). */
+    return random_suffix || pid_suffix;
 }
 /* Keep the ownership lease until every data entry has been removed. A crash
  * during a large cleanup must leave a runtime that later GC can still identify. */
@@ -1129,6 +1145,7 @@ static int migrate_snapshot(cg_state *st) {
     int rc = 1;
     char output[PATH_MAX] = {0}, manifest_path[PATH_MAX];
     bool committed = false;
+    const char *failure = "CodeGraph migration failed while loading the current graph";
     if (!load_snapshot_unlocked(st, true)) goto done;
     if (json_string(st->manifest, "storage_format") &&
         !strcmp(json_string(st->manifest, "storage_format"), "qihse-codegraph-zstd-v1")) {
@@ -1140,20 +1157,27 @@ static int migrate_snapshot(cg_state *st) {
     const char *input_hash = json_string(st->manifest, "input_sha256");
     const char *old_name = json_string(st->manifest, "snapshot");
     char previous[128];
-    if (!hex64(input_hash) || !snapshot_name(old_name)) goto done;
+    failure = "CodeGraph migration failed: invalid input digest in current manifest";
+    if (!hex64(input_hash)) goto done;
+    failure = "CodeGraph migration failed: unsupported snapshot filename in current manifest";
+    if (!snapshot_name(old_name)) goto done;
     snprintf(previous, sizeof(previous), "%s", old_name);
+    failure = "CodeGraph migration failed while creating the compact snapshot";
     if (snprintf(output, sizeof(output), "%s/graph-%s-XXXXXX.kv", st->directory,
                  input_hash) >= (int)sizeof(output)) { output[0] = 0; goto done; }
     int fd = mkstemps(output, 3);
     if (fd < 0) { output[0] = 0; goto done; }
     close(fd);
     char sha[65];
-    if (!cg_storage_save(st->kv, output, st->principal) || !verify_saved(st, output) ||
-        !sha256_file(output, sha, 0)) goto done;
+    failure = "CodeGraph migration failed while writing the compact snapshot";
+    if (!cg_storage_save(st->kv, output, st->principal)) goto done;
+    failure = "CodeGraph migration failed while verifying the compact snapshot";
+    if (!verify_saved(st, output) || !sha256_file(output, sha, 0)) goto done;
     json_text(st->manifest, "snapshot", strrchr(output, '/') + 1);
     json_text(st->manifest, "sha256", sha);
     json_text(st->manifest, "storage_format", "qihse-codegraph-zstd-v1");
     json_text(st->manifest, "previous_snapshot", previous);
+    failure = "CodeGraph migration failed while publishing the manifest; inspect current status before retry";
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory) >=
         (int)sizeof(manifest_path)) goto done;
     if (!atomic_write(manifest_path,
@@ -1165,7 +1189,7 @@ static int migrate_snapshot(cg_state *st) {
 done:
     if (rc && output[0] && !committed) unlink(output);
     storage_lock(st, LOCK_UN);
-    return rc ? error_json("CodeGraph migration failed; inspect current manifest before retry") : 0;
+    return rc ? error_json(failure) : 0;
 }
 static int collect_snapshots(cg_state *st) {
     if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");

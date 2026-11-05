@@ -1981,6 +1981,8 @@ qihse-codegraph: tools/qihse_codegraph.c tools/qihse_codegraph_storage.c tools/q
 test-codegraph: qihse-codegraph test-codegraph-codec
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph
 	python3 tests/test_codegraph_storage.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_reindex.py
+	python3 tests/test_codegraph_reindex_source.py --binary ./qihse-codegraph
 
 # QIHSE Studio: ASP.NET Core 8 + React SPA real-time operations display
 .PHONY: studio install-studio

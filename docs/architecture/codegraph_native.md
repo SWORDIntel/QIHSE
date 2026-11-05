@@ -304,7 +304,8 @@ Migration authenticates legacy loading, writes a compact sibling, reopens it and
 compares every key/value in both directions using canonical record fingerprints before switching `current.json`.
 Source HEAD, freshness digests, counts and unresolved evidence are preserved. A
 stale graph stays stale. The old snapshot is retained as `previous_snapshot` for
-rollback. Conversion is per repository/current generation; historical snapshots
+rollback. Migration and GC recognize both legacy decimal-PID filenames and
+the newer six-character random suffixes. Conversion is per repository/current generation; historical snapshots
 are not all rewritten. A failure before manifest publication leaves the old
 snapshot current. If directory fsync fails after rename, inspect the manifest
 before retrying; the potentially published file is retained.
@@ -400,3 +401,31 @@ logical-size reduction. Level 3 produced 21,209,959 bytes; level 12 produced
 interleaved repetitions at each level round-tripped byte-for-byte. Reproduce with
 `python3 tests/bench_codegraph_compression.py`. This motivates
 the space-focused level-9 default; it does not predict physical ZFS savings.
+
+To rebuild the source index and publish a fresh compact graph with a stage
+progress bar, run from the QIHSE checkout:
+
+```sh
+./tools/qihse-codegraph-reindex --repo ../your-repository
+```
+
+The bar reports three completed stages: rebuild, export, and authenticated
+compact import. On a terminal, an elapsed-time activity indicator runs while each
+stage is working; the bar does not estimate progress within a stage. The wrapper
+uses the exporter's reported path, including custom CRG data directories.
+
+The wrapper checks HEAD, staged entries and tracked/untracked source state before
+the rebuild and after export. If they differ, publication stops. For older CRG
+exporters, it verifies the exported checksum and source identity, adds the required
+v2 freshness fields to a temporary export, and recomputes its checksum. The native
+importer still performs all structural, authorization and freshness checks.
+Failures leave the previous QIHSE generation available.
+
+For conversion alone, with the same progress display:
+
+```sh
+./tools/qihse-codegraph-reindex --migrate-only --repo ../your-repository
+```
+
+This mode preserves the indexed source revision and freshness; it does not rebuild
+the CRG index. An already compact graph returns `unchanged`.
