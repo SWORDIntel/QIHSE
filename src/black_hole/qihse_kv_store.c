@@ -3538,6 +3538,33 @@ static bool parse_snapshot_into_trie(const char* filepath, qihse_user_t* user,
     return true;
 }
 
+typedef struct {
+    qihse_user_t* user;
+    uint64_t now;
+    bool authorized;
+    bool has_live;
+    bool include_dead;
+    uint16_t required_classification;
+    uint16_t required_sci;
+} restore_auth_ctx_t;
+
+static bool restore_auth_cb(const char* key, void* value, size_t value_size, void* ud) {
+    (void)key; (void)value_size;
+    restore_auth_ctx_t* ctx = (restore_auth_ctx_t*)ud;
+    kv_payload_t* p = (kv_payload_t*)value;
+    if (!p) { ctx->authorized = false; return false; }
+    /* Prior authorized deletions/expiry are not live rows being replaced. */
+    if (!ctx->include_dead && payload_is_dead(p, ctx->now)) return true;
+    if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
+        ctx->authorized = false; return false;
+    }
+    if (p->classification > ctx->required_classification)
+        ctx->required_classification = p->classification;
+    ctx->required_sci |= p->sci_compartment;
+    if (!payload_is_dead(p, ctx->now)) ctx->has_live = true;
+    return true;
+}
+
 /* Detached immutable snapshot open. No storage path, WAL, recovery, or SST is
  * touched. Parsing finishes and the principal is rechecked before publication. */
 qihse_kv_store_t* qihse_kv_open_snapshot_user(FILE* stream, qihse_user_t* user,
@@ -3568,36 +3595,15 @@ qihse_kv_store_t* qihse_kv_open_snapshot_user(FILE* stream, qihse_user_t* user,
     }
     if (rc < 0) failure = rc == -2 ? EACCES : rc == -3 ? EFBIG : rc == -4 ? E2BIG : EINVAL;
     if (ferror(stream) && !failure) failure = EIO;
+    if (!failure) {
+        restore_auth_ctx_t auth = { .user = user, .now = current_time_ms(),
+            .authorized = true, .include_dead = true };
+        qihse_trinary_trie_foreach(store->trie, restore_auth_cb, &auth);
+        if (!auth.authorized) failure = EACCES;
+    }
     if (!qihse_auth_user_is_active(user)) failure = EACCES;
     if (failure) { qihse_kv_store_destroy(store); errno = failure; return NULL; }
     return store;
-}
-
-typedef struct {
-    qihse_user_t* user;
-    uint64_t now;
-    bool authorized;
-    bool has_live;
-    bool include_dead;
-    uint16_t required_classification;
-    uint16_t required_sci;
-} restore_auth_ctx_t;
-
-static bool restore_auth_cb(const char* key, void* value, size_t value_size, void* ud) {
-    (void)key; (void)value_size;
-    restore_auth_ctx_t* ctx = (restore_auth_ctx_t*)ud;
-    kv_payload_t* p = (kv_payload_t*)value;
-    if (!p) { ctx->authorized = false; return false; }
-    /* Prior authorized deletions/expiry are not live rows being replaced. */
-    if (!ctx->include_dead && payload_is_dead(p, ctx->now)) return true;
-    if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
-        ctx->authorized = false; return false;
-    }
-    if (p->classification > ctx->required_classification)
-        ctx->required_classification = p->classification;
-    ctx->required_sci |= p->sci_compartment;
-    if (!payload_is_dead(p, ctx->now)) ctx->has_live = true;
-    return true;
 }
 
 static bool replica_snapshot_file_valid(const char* filepath, qihse_user_t* principal,

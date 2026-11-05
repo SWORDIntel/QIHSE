@@ -36,6 +36,17 @@ static void finish(void) { qihse_audit_shutdown(); assert(nftw(runtime, cleanup,
 static void value_is(qihse_kv_store_t *store, qihse_user_t *user, const char *key, const char *want) {
     char *v = qihse_kv_get_user(store, key, user); assert(want ? v && !strcmp(v, want) : !v); free(v);
 }
+typedef struct { qihse_user_t *op; const char *bytes; size_t pos; } downgrade_stream;
+static ssize_t downgrade_read(void *cookie, char *out, size_t n) {
+    downgrade_stream *state = cookie;
+    size_t left = strlen(state->bytes) - state->pos;
+    if (!left) {
+        assert(qihse_auth_modify_user(state->op,75,NULL,NULL,-1,-1,0,0));
+        return 0;
+    }
+    if (n > left) n = left;
+    memcpy(out,state->bytes+state->pos,n); state->pos += n; return (ssize_t)n;
+}
 static FILE *fixture(void) {
     FILE *f = tmpfile(); assert(f);
     /* All versions of metadata: public, protected SCI, expiry, tombstone. */
@@ -86,6 +97,13 @@ int main(int argc, char **argv) {
     assert(qihse_auth_create_user(op, 74, QIHSE_ROLE_ANALYST,4,0,PASSWORD,false));
     qihse_user_t *low=qihse_auth_authenticate_id(73,PASSWORD), *no_sci=qihse_auth_authenticate_id(74,PASSWORD);
     assert(low && no_sci);
+    assert(qihse_auth_create_user(op,75,QIHSE_ROLE_ANALYST,4,2,PASSWORD,false));
+    qihse_user_t *changing=qihse_auth_authenticate_id(75,PASSWORD); assert(changing);
+    downgrade_stream changing_input={op,"9 6 0 4 2 0 1\nprotectedsecret\n",0};
+    cookie_io_functions_t changing_io={.read=downgrade_read};
+    FILE *changing_file=fopencookie(&changing_input,"rb",changing_io); assert(changing_file);
+    assert(!qihse_kv_open_snapshot_user(changing_file,changing,4096,10) && errno==EACCES);
+    fclose(changing_file);
     FILE *f=fixture();
     reject(f,NULL,4096,10,EACCES); reject(f,low,4096,10,EACCES); reject(f,no_sci,4096,10,EACCES);
     reject(f,op,32,10,EFBIG); reject(f,op,4096,1,E2BIG);
