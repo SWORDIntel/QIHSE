@@ -16,6 +16,8 @@
 #include "qihse_audit.h"
 #include "qihse_graph_store.h"
 #include "qihse_kv_store.h"
+#include "qihse_codegraph_storage.h"
+#include <dirent.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -70,6 +72,7 @@ typedef struct {
     size_t nn, capacity, edges, unresolved;
     struct json_object *meta, *manifest;
     bool audit_ready;
+    int lifecycle_fd, lease_fd;
     char directory[PATH_MAX], repository[PATH_MAX];
     char scratch[PATH_MAX];
 } cg_state;
@@ -236,6 +239,36 @@ static bool sha256_file(const char *path, char out[65], double deadline) {
     close(fd);
     return ok;
 }
+/* Locks are stable files, never removed during collection. */
+static int private_lock(const char *path, int operation, bool create) {
+    int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK |
+                        (create ? O_CREAT : 0), 0600);
+    struct stat info;
+    if (fd < 0) return -1;
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
+        (info.st_mode & 077) || info.st_nlink != 1 || flock(fd, operation)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+static bool storage_lock(cg_state *st, int operation) {
+    return st->lifecycle_fd >= 0 && flock(st->lifecycle_fd, operation) == 0;
+}
+static struct json_object *read_json_file(const char *path);
+static bool load_snapshot_unlocked(cg_state *st, bool build_graph);
+static bool snapshot_name(const char *name) {
+    if (!name || strlen(name) != 80 || strncmp(name, "graph-", 6) ||
+        name[70] != '-' || strcmp(name + 77, ".kv")) return false;
+    for (size_t i = 6; i < 70; i++)
+        if (!((name[i] >= '0' && name[i] <= '9') ||
+              (name[i] >= 'a' && name[i] <= 'f'))) return false;
+    for (size_t i = 71; i < 77; i++)
+        if (!((name[i] >= '0' && name[i] <= '9') ||
+              (name[i] >= 'a' && name[i] <= 'z') ||
+              (name[i] >= 'A' && name[i] <= 'Z'))) return false;
+    return true;
+}
 static int delete_scratch_entry(const char *path, const struct stat *st, int flags,
                                 struct FTW *ftw) {
     (void)st;
@@ -267,11 +300,15 @@ static void graph_close(cg_state *st) {
         qihse_audit_flush();
         qihse_audit_shutdown();
     }
-    if (st->scratch[0])
-        nftw(st->scratch, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS);
+    if (st->scratch[0] &&
+        nftw(st->scratch, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS))
+        fprintf(stderr, "CodeGraph scratch cleanup failed: %s\n", strerror(errno));
+    if (st->lease_fd >= 0) close(st->lease_fd);
+    if (st->lifecycle_fd >= 0) close(st->lifecycle_fd);
 }
 static bool graph_open(cg_state *st, const char *repo, bool importing) {
     memset(st, 0, sizeof(*st));
+    st->lifecycle_fd = st->lease_fd = -1;
     if (!realpath(repo, st->repository))
         return false;
     char work_marker[PATH_MAX];
@@ -301,12 +338,21 @@ static bool graph_open(cg_state *st, const char *repo, bool importing) {
         if (stat(st->directory, &state_stat) != 0 || !S_ISDIR(state_stat.st_mode))
             return false;
     }
+    char lock_path[PATH_MAX];
+    if (snprintf(lock_path, sizeof(lock_path), "%s/.storage.lock", st->directory) >=
+        (int)sizeof(lock_path)) return false;
+    st->lifecycle_fd = private_lock(lock_path, LOCK_SH, true);
+    if (st->lifecycle_fd < 0) return false;
     if (snprintf(st->scratch, sizeof(st->scratch), "%s/.runtime-XXXXXX", st->directory) >=
             (int)sizeof(st->scratch) ||
         !mkdtemp(st->scratch)) {
         st->scratch[0] = '\0';
         return false;
     }
+    if (snprintf(lock_path, sizeof(lock_path), "%s/.lease", st->scratch) >=
+        (int)sizeof(lock_path)) return false;
+    st->lease_fd = private_lock(lock_path, LOCK_EX | LOCK_NB, true);
+    if (st->lease_fd < 0 || !storage_lock(st, LOCK_UN)) return false;
     /* Force QIHSE's KV runtime into our private disposable directory,
      * never the host's production /opt/qihse-data. This process is single
      * purpose; QIHSE caches its data dir for the process lifetime. */
@@ -438,7 +484,54 @@ static bool build_native_graph(cg_state *st, size_t expected_nodes, size_t expec
                                size_t expected_unresolved);
 static bool freshness(cg_state *st, const char **reason);
 
-static int import_snapshot(cg_state *st, const char *input) {
+/* Canonical multiset digest: authenticated enumeration, length-delimited records.
+ * Reload the SAME store: separate handles share the process QIHSE_DATA_DIR. */
+typedef struct { unsigned char (*hashes)[32]; size_t n, cap; bool ok; } cg_fingerprint;
+static bool fingerprint_record(const char *key, const char *value, void *arg) {
+    cg_fingerprint *f = arg;
+    if (f->n >= CG_MAX_NODES + CG_MAX_EDGES + 2u) return f->ok = false;
+    if (f->n == f->cap) {
+        size_t cap = f->cap ? f->cap * 2 : 256;
+        void *next = realloc(f->hashes, cap * 32);
+        if (!next) return f->ok = false;
+        f->hashes = next; f->cap = cap;
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    size_t kn = strlen(key), vn = strlen(value);
+    unsigned char lengths[16];
+    for (size_t i = 0; i < 8; ++i) {
+        lengths[i] = (uint64_t)kn >> (56 - 8*i);
+        lengths[8+i] = (uint64_t)vn >> (56 - 8*i);
+    }
+    unsigned int n = 0;
+    f->ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(ctx, lengths, sizeof(lengths)) == 1 &&
+        EVP_DigestUpdate(ctx, key, kn) == 1 && EVP_DigestUpdate(ctx, value, vn) == 1 &&
+        EVP_DigestFinal_ex(ctx, f->hashes[f->n], &n) == 1 && n == 32;
+    EVP_MD_CTX_free(ctx);
+    if (f->ok) f->n++;
+    return f->ok;
+}
+static int compare_hashes(const void *a, const void *b) { return memcmp(a, b, 32); }
+static bool record_fingerprint(cg_state *st, char result[65], size_t *count) {
+    cg_fingerprint f = {NULL, 0, 0, true};
+    bool ok = qihse_kv_foreach_user(st->kv, st->principal, fingerprint_record, &f) && f.ok;
+    if (ok) {
+        if (f.n) qsort(f.hashes, f.n, 32, compare_hashes);
+        ok = sha256_buffer((const char *)f.hashes, f.n * 32, result);
+    }
+    *count = f.n;
+    free(f.hashes);
+    return ok;
+}
+static bool verify_saved(cg_state *st, const char *path) {
+    char before[65], after[65]; size_t n_before, n_after;
+    return record_fingerprint(st, before, &n_before) &&
+           cg_storage_load(st->kv, path, st->principal) &&
+           record_fingerprint(st, after, &n_after) &&
+           n_before == n_after && !strcmp(before, after);
+}
+static int import_snapshot_unlocked(cg_state *st, const char *input) {
     char lock_path[PATH_MAX], manifest_path[PATH_MAX];
     if (snprintf(lock_path, sizeof(lock_path), "%s/.import.lock", st->directory) >=
             (int)sizeof(lock_path) ||
@@ -618,6 +711,53 @@ static int import_snapshot(cg_state *st, const char *input) {
         return error_json("source changed since CRG export; rebuild before import");
     }
 
+    struct json_object *previous = read_json_file(manifest_path);
+    const char *old_name = previous ? json_string(previous, "snapshot") : NULL;
+    const char *old_hash = previous ? json_string(previous, "input_sha256") : NULL;
+    const char *old_sha = previous ? json_string(previous, "sha256") : NULL;
+    char old_path[PATH_MAX], old_actual[65], rollback[128] = {0};
+    struct json_object *old_format_field = NULL;
+    bool old_format_valid = !previous ||
+        !json_object_object_get_ex(previous, "storage_format", &old_format_field) ||
+        (json_object_is_type(old_format_field, json_type_string) &&
+         !strcmp(json_object_get_string(old_format_field), "qihse-codegraph-zstd-v1"));
+    if (snapshot_name(old_name)) {
+        snprintf(rollback, sizeof(rollback), "%s", old_name);
+        if (old_format_valid && old_hash && !strcmp(old_hash, input_hash) && hex64(old_sha) &&
+            snprintf(old_path, sizeof(old_path), "%s/%s", st->directory, old_name) <
+                (int)sizeof(old_path) && sha256_file(old_path, old_actual, 0) &&
+            !strcmp(old_actual, old_sha) &&
+            json_string(previous, "head") &&
+            !strcmp(json_string(previous, "head"), json_string(meta, "head")) &&
+            json_string(previous, "worktree") &&
+            !strcmp(json_string(previous, "worktree"), json_string(meta, "worktree_v2")) &&
+            json_string(previous, "freshness") &&
+            !strcmp(json_string(previous, "freshness"), "git-status-diff-index-untracked-v2") &&
+            json_num(previous, "nodes") == (int64_t)nodes &&
+            json_num(previous, "edges") == (int64_t)edges &&
+            json_num(previous, "unresolved_edges") == (int64_t)unresolved) {
+            if (!verify_saved(st, old_path)) {
+                json_object_put(previous); json_object_put(meta); close(lfd);
+                return error_json("existing snapshot does not match verified import records");
+            }
+            st->manifest = previous;
+            bool still_current = freshness(st, &stale_reason);
+            st->manifest = NULL;
+            if (!still_current) {
+                json_object_put(previous);
+                json_object_put(meta);
+                close(lfd);
+                return error_json("source changed during unchanged snapshot verification");
+            }
+            json_text(previous, "status", "unchanged");
+            print_json(previous);
+            json_object_put(previous);
+            json_object_put(meta);
+            close(lfd);
+            return 0;
+        }
+    }
+    if (previous) json_object_put(previous);
     char name[128], published[PATH_MAX], temporary[PATH_MAX];
     snprintf(name, sizeof(name), "graph-%s-XXXXXX.kv", input_hash);
     if (snprintf(published, sizeof(published), "%s/%s", st->directory, name) >=
@@ -636,7 +776,7 @@ static int import_snapshot(cg_state *st, const char *input) {
     }
     close(reserved);
     snprintf(name, sizeof(name), "%s", strrchr(published, '/') + 1);
-    if (qihse_kv_save_user(st->kv, temporary, st->principal) != 0) {
+    if (!cg_storage_save(st->kv, temporary, st->principal)) {
         unlink(published);
         unlink(temporary);
         json_object_put(meta);
@@ -653,6 +793,8 @@ static int import_snapshot(cg_state *st, const char *input) {
     }
     struct json_object *manifest = json_object_new_object();
     json_text(manifest, "snapshot", name);
+    json_text(manifest, "storage_format", "qihse-codegraph-zstd-v1");
+    if (rollback[0]) json_text(manifest, "previous_snapshot", rollback);
     json_text(manifest, "sha256", binary_hash);
     json_text(manifest, "head", json_string(meta, "head"));
     json_text(manifest, "worktree", json_string(meta, "worktree_v2"));
@@ -877,7 +1019,7 @@ static struct json_object *read_json_file(const char *path) {
     }
     return row;
 }
-static bool load_snapshot(cg_state *st, bool build_graph) {
+static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
     double phase_start = monotonic_ms();
     char manifest_path[PATH_MAX];
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory) >=
@@ -886,6 +1028,10 @@ static bool load_snapshot(cg_state *st, bool build_graph) {
     st->manifest = read_json_file(manifest_path);
     if (!st->manifest)
         return false;
+    const char *format = json_string(st->manifest, "storage_format");
+    struct json_object *format_field;
+    if (json_object_object_get_ex(st->manifest, "storage_format", &format_field) &&
+        (!format || strcmp(format, "qihse-codegraph-zstd-v1"))) return false;
     char *snapshot = json_string(st->manifest, "snapshot");
     char *sha = json_string(st->manifest, "sha256");
     if (!snapshot || strncmp(snapshot, "graph-", 6) != 0 || strlen(snapshot) > 120 ||
@@ -898,7 +1044,7 @@ static bool load_snapshot(cg_state *st, bool build_graph) {
         return false;
     snapshot_verify_ms = monotonic_ms() - phase_start;
     phase_start = monotonic_ms();
-    bool loaded = qihse_kv_load_user(st->kv, snapshot_path, st->principal) == 0;
+    bool loaded = cg_storage_load(st->kv, snapshot_path, st->principal);
     kv_load_ms = monotonic_ms() - phase_start;
     if (!loaded)
         return false;
@@ -931,6 +1077,120 @@ static bool load_snapshot(cg_state *st, bool build_graph) {
                                     (size_t)json_num(st->manifest, "unresolved_edges"));
     graph_build_ms = monotonic_ms() - phase_start;
     return built;
+}
+
+static bool load_snapshot(cg_state *st, bool build_graph) {
+    if (!storage_lock(st, LOCK_SH)) return false;
+    bool ok = load_snapshot_unlocked(st, build_graph);
+    storage_lock(st, LOCK_UN);
+    return ok;
+}
+static int import_snapshot(cg_state *st, const char *input) {
+    if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");
+    int rc = import_snapshot_unlocked(st, input);
+    storage_lock(st, LOCK_UN);
+    return rc;
+}
+
+/* Conversion preserves source freshness and every KV record; no reindexing. */
+static int migrate_snapshot(cg_state *st) {
+    if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");
+    int rc = 1;
+    char output[PATH_MAX] = {0}, manifest_path[PATH_MAX];
+    bool committed = false;
+    if (!load_snapshot_unlocked(st, true)) goto done;
+    if (json_string(st->manifest, "storage_format") &&
+        !strcmp(json_string(st->manifest, "storage_format"), "qihse-codegraph-zstd-v1")) {
+        json_text(st->manifest, "status", "unchanged");
+        print_json(st->manifest);
+        rc = 0;
+        goto done;
+    }
+    const char *input_hash = json_string(st->manifest, "input_sha256");
+    const char *old_name = json_string(st->manifest, "snapshot");
+    char previous[128];
+    if (!hex64(input_hash) || !snapshot_name(old_name)) goto done;
+    snprintf(previous, sizeof(previous), "%s", old_name);
+    if (snprintf(output, sizeof(output), "%s/graph-%s-XXXXXX.kv", st->directory,
+                 input_hash) >= (int)sizeof(output)) { output[0] = 0; goto done; }
+    int fd = mkstemps(output, 3);
+    if (fd < 0) { output[0] = 0; goto done; }
+    close(fd);
+    char sha[65];
+    if (!cg_storage_save(st->kv, output, st->principal) || !verify_saved(st, output) ||
+        !sha256_file(output, sha, 0)) goto done;
+    json_text(st->manifest, "snapshot", strrchr(output, '/') + 1);
+    json_text(st->manifest, "sha256", sha);
+    json_text(st->manifest, "storage_format", "qihse-codegraph-zstd-v1");
+    json_text(st->manifest, "previous_snapshot", previous);
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory) >=
+        (int)sizeof(manifest_path)) goto done;
+    if (!atomic_write(manifest_path,
+                      json_object_to_json_string_ext(st->manifest, JSON_C_TO_STRING_PLAIN),
+                      &committed)) goto done;
+    json_text(st->manifest, "status", "migrated");
+    print_json(st->manifest);
+    rc = 0;
+done:
+    if (rc && output[0] && !committed) unlink(output);
+    storage_lock(st, LOCK_UN);
+    return rc ? error_json("CodeGraph migration failed; inspect current manifest before retry") : 0;
+}
+static int collect_snapshots(cg_state *st) {
+    if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");
+    int rc = 1;
+    size_t removed = 0, runtimes = 0;
+    DIR *dir = NULL;
+    /* Authenticate and validate the retained current graph before removing anything. */
+    if (!load_snapshot_unlocked(st, true)) goto done;
+    const char *current = json_string(st->manifest, "snapshot");
+    const char *previous = json_string(st->manifest, "previous_snapshot");
+    struct json_object *previous_field = NULL;
+    if (!snapshot_name(current) ||
+        (json_object_object_get_ex(st->manifest, "previous_snapshot", &previous_field) &&
+         !snapshot_name(previous))) goto done;
+    dir = opendir(st->directory);
+    if (!dir) goto done;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        const char *name = entry->d_name;
+        char path[PATH_MAX];
+        struct stat info;
+        if (snprintf(path, sizeof(path), "%s/%s", st->directory, name) >=
+                (int)sizeof(path)) goto done;
+        if (lstat(path, &info)) {
+            if (errno == ENOENT) continue;
+            goto done;
+        }
+        if (snapshot_name(name) && S_ISREG(info.st_mode) && info.st_uid == geteuid() &&
+            strcmp(name, current) && (!previous || strcmp(name, previous))) {
+            if (unlink(path)) goto done;
+            removed++;
+        } else if (!strncmp(name, ".runtime-", 9) && S_ISDIR(info.st_mode) &&
+                   info.st_uid == geteuid() && !(info.st_mode & 077)) {
+            char lease[PATH_MAX];
+            if (snprintf(lease, sizeof(lease), "%s/.lease", path) >= (int)sizeof(lease))
+                goto done;
+            int fd = private_lock(lease, LOCK_EX | LOCK_NB, false);
+            if (fd < 0) continue; /* Active or legacy/unmanaged scratch: preserve. */
+            int failure = nftw(path, delete_scratch_entry, 16, FTW_DEPTH | FTW_PHYS);
+            close(fd);
+            if (failure) goto done;
+            runtimes++;
+        }
+    }
+    if (fsync(dirfd(dir))) goto done;
+    rc = 0;
+done:
+    if (dir) closedir(dir);
+    storage_lock(st, LOCK_UN);
+    struct json_object *report = json_object_new_object();
+    json_text(report, "status", rc ? "collection_failed" : "collected");
+    json_int(report, "removed_snapshots", (int64_t)removed);
+    json_int(report, "removed_runtimes", (int64_t)runtimes);
+    print_json(report);
+    json_object_put(report);
+    return rc;
 }
 
 /* Git metadata is compared at request time. A changed HEAD, staged work or
@@ -2687,7 +2947,7 @@ static int memory_option(const char *text, int maximum) {
 }
 
 static const char *usage_text =
-    "usage: qihse-codegraph <import|status|query|impact|review|context|serve> "
+    "usage: qihse-codegraph <import|migrate|gc|status|query|impact|review|context|serve> "
     "[--repo DIR] [--input JSONL] [--symbol NAME] [--file PATH] "
     "[--base GITREF] [--depth 1..5] [--limit 1..256] "
     "[--max-tokens 128..16000] [--socket PATH] [--token-file PATH] "
@@ -2720,7 +2980,8 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         const char *flag = argv[i];
         if (!strcmp(flag, "--help")) {
-            if (!read_action(action) && strcmp(action, "serve") && strcmp(action, "import"))
+            if (!read_action(action) && strcmp(action, "serve") && strcmp(action, "import") &&
+                strcmp(action, "migrate") && strcmp(action, "gc"))
                 return usage();
             fputs(usage_text, stdout);
             return 0;
@@ -2777,7 +3038,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(action, "import") && strcmp(action, "status") && strcmp(action, "query") &&
         strcmp(action, "impact") && strcmp(action, "review") && strcmp(action, "context") &&
-        strcmp(action, "serve"))
+        strcmp(action, "serve") && strcmp(action, "migrate") && strcmp(action, "gc"))
         return usage();
     /* Bare impact/review means "changed since HEAD", never whole-repo
      * pseudo-review with no seeds. Graph context requires an explicit seed. */
@@ -2850,6 +3111,10 @@ int main(int argc, char **argv) {
     int rc;
     if (!strcmp(action, "import")) {
         rc = input ? import_snapshot(&st, input) : usage();
+    } else if (!strcmp(action, "migrate")) {
+        rc = migrate_snapshot(&st);
+    } else if (!strcmp(action, "gc")) {
+        rc = collect_snapshots(&st);
     } else if (!load_snapshot(&st, strcmp(action, "status") != 0)) {
         rc = error_json("no valid QIHSE CodeGraph generation; import a fresh CRG snapshot");
     } else if (!strcmp(action, "serve")) {

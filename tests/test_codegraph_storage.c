@@ -23,7 +23,10 @@ static int clean_test(const char *path, const struct stat *st, int type, struct 
     (void)st; (void)type; (void)walk; return remove(path);
 }
 int main(void) {
-    char root[] = "/tmp/qihse-codegraph-codec-test-XXXXXX";
+    char root[4096];
+    const char *temporary = getenv("TMPDIR");
+    assert(snprintf(root, sizeof(root), "%s/qihse-codegraph-codec-test-XXXXXX",
+                    temporary && *temporary ? temporary : ".") < (int)sizeof(root));
     assert(mkdtemp(root));
     assert(setenv("QIHSE_DATA_DIR", root, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);

@@ -285,3 +285,53 @@ complete-suite or production deployment acceptance; see the performance document
 
 Review output is not a replacement for running tests or inspecting code.
 Do not label uncertain relationships as verified.
+
+## Compact storage and lifecycle maintenance
+
+New imports write `qihse-codegraph-zstd-v1` storage containers (Zstandard; the
+optional CLI now requires libzstd development headers). The logical CRG format
+remains `qihse-codegraph-v1`. Legacy KV snapshots remain readable. Reimporting
+identical validated records reuses the current snapshot instead of appending a
+new generation; a damaged current file is not reused.
+
+To convert the current stored graph without rebuilding CRG:
+
+```sh
+qihse-codegraph migrate --repo .
+```
+
+Migration authenticates legacy loading, writes a compact sibling, reopens it and
+compares every key/value in both directions using canonical record fingerprints before switching `current.json`.
+Source HEAD, freshness digests, counts and unresolved evidence are preserved. A
+stale graph stays stale. The old snapshot is retained as `previous_snapshot` for
+rollback. Conversion is per repository/current generation; historical snapshots
+are not all rewritten. A failure before manifest publication leaves the old
+snapshot current. If directory fsync fails after rename, inspect the manifest
+before retrying; the potentially published file is retained.
+
+To reclaim historical generations after reviewing retention needs:
+
+```sh
+qihse-codegraph gc --repo .
+```
+
+This explicitly deletes historical managed snapshots except the current and
+`previous_snapshot` generations. It is not an archive-preserving operation.
+Imports do not automatically prune history. GC first authenticates and validates
+the current graph. New readers, publishers, converters and GC coordinate through
+a permanent `.storage.lock`; runtime scratch directories hold a `.lease` lock.
+GC skips active scratch and old scratch without a lease. Before migration or the first GC,
+stop any older CodeGraph binaries/readers: those versions do not participate in
+these locks. Do not remove the lock files manually.
+
+The compact container preserves the authorized legacy KV serialization, including
+security labels. Its decoder rejects oversized, corrupt, truncated and trailing
+frames. The existing path-based KV API still requires temporary decompression and
+a private durable restore; compact storage does not yet remove runtime disk
+copies. Temporary codec files are removed on normal completion. Legacy abandoned
+runtime directories require separate reviewed cleanup, since they have no lease.
+
+Allocated ZFS bytes, apparent file sizes and bytes reclaimed after deletion are
+different measurements. Filesystem snapshots can retain deleted blocks. Measure
+both `du -sh` and `du -sh --apparent-size`; do not infer physical savings from the
+compression ratio alone.
