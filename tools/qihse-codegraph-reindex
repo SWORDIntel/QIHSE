@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Reindex and publish a compact QIHSE CodeGraph, or migrate the existing graph."""
+import argparse
+import codecs
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+from qihse_codegraph_reindex_source import prepare_export, source_identity
+
+
+SPINNER = "|/-\\"
+
+
+class StopRequested(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def progress(completed, total, label, elapsed=None, tick=0):
+    """The bar counts finished stages, never estimated work within a stage."""
+    width = 24
+    filled = width * completed // total
+    line = f"[{'#' * filled}{'-' * (width - filled)}] {completed}/{total} stages {label}"
+    if elapsed is not None:
+        line += f" {SPINNER[tick % 4]} elapsed {elapsed:.1f}s"
+    tty = sys.stderr.isatty()
+    print(('\r\033[2K' if tty else '') + line,
+          end='' if tty and elapsed is not None else '\n', file=sys.stderr, flush=True)
+
+
+def clear_progress():
+    if sys.stderr.isatty():
+        print('\r\033[2K', end='', file=sys.stderr, flush=True)
+
+
+def replay(source, destination):
+    source.seek(0)
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    while chunk := source.read(65536):
+        destination.write(decoder.decode(chunk))
+    destination.write(decoder.decode(b'', final=True))
+    destination.flush()
+
+
+def stop_child(proc, signum):
+    """Stop the whole stage, including its helpers, before closing its logs."""
+    for sig, timeout in ((signum, 5), (signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(timeout=timeout)
+            # A stage leader can exit before a helper in the same group.
+            # Escalate to the remaining group instead of leaving it behind.
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+        except subprocess.TimeoutExpired:
+            pass
+    proc.wait()
+
+
+def exported_path(output):
+    output.seek(0)
+    paths = []
+    prefix = 'QIHSE CodeGraph exported: '
+    while line := output.readline(65536):
+        text = line.decode('utf-8', errors='replace').rstrip('\r\n')
+        if text.startswith(prefix):
+            paths.append(Path(text[len(prefix):]))
+            if len(paths) > 1:
+                break
+    if len(paths) != 1 or not paths[0].is_absolute() or paths[0].name != 'graph.qihse.jsonl' or not paths[0].is_file():
+        raise ValueError('Export did not report one existing absolute graph.qihse.jsonl path')
+    return paths[0]
+
+
+def run_stage(command, env, completed, total, label, native, exporting=False):
+    started = time.monotonic()
+    tty = sys.stderr.isatty()
+    progress(completed, total, label, 0 if tty else None)
+    # Capturing avoids interleaving a live bar with child logs or native JSON.
+    # Temporary files bound parent memory even when a stage emits large logs.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        proc = None
+        try:
+            proc = subprocess.Popen(command, env=env, stdout=output, stderr=errors,
+                                    start_new_session=True)
+            tick = 0
+            while True:
+                try:
+                    result = proc.wait(timeout=0.2)
+                    if result:
+                        stop_child(proc, signal.SIGTERM)
+                    return result, exported_path(output) if exporting and result == 0 else None
+                except subprocess.TimeoutExpired:
+                    if tty:
+                        tick += 1
+                        progress(completed, total, label, time.monotonic() - started, tick)
+        except (KeyboardInterrupt, StopRequested) as exc:
+            if proc is not None:
+                stop_child(proc, exc.signum if isinstance(exc, StopRequested) else signal.SIGINT)
+            raise
+        finally:
+            clear_progress()
+            replay(output, sys.stdout if native else sys.stderr)
+            replay(errors, sys.stderr)
+
+
+def preflight(repo, root, migrate_only):
+    repo = repo.resolve(strict=True)
+    if not repo.is_dir() or not (repo / '.git').exists():
+        raise ValueError(f'Not a Git repository root: {repo}')
+    cli = root / 'qihse-codegraph'
+    if not cli.is_file() or not os.access(cli, os.X_OK):
+        raise ValueError(f'Native CodeGraph executable is missing or not executable: {cli}; '
+                         'build it with make qihse-codegraph')
+    crg = None if migrate_only else shutil.which('code-review-graph')
+    if not migrate_only and not crg:
+        raise ValueError('code-review-graph is not executable on PATH')
+    return repo, cli, crg
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', type=Path, default=Path.cwd(), help='Git repository root')
+    parser.add_argument('--migrate-only', action='store_true',
+                        help='Convert the existing graph with native migrate; skip source reindexing')
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    try:
+        repo, cli, crg = preflight(args.repo, root, args.migrate_only)
+    except (OSError, ValueError) as exc:
+        print(f'Preflight failed: {exc}', file=sys.stderr)
+        return 2
+    env = os.environ.copy()
+    previous = env.get('LD_LIBRARY_PATH', '')
+    env['LD_LIBRARY_PATH'] = str(root) + (os.pathsep + previous if previous else '')
+    stages = ([('Migrating existing graph', [str(cli), 'migrate', '--repo', str(repo)], True)]
+              if args.migrate_only else [
+                  ('Rebuilding source index', [crg, 'build', '--repo', str(repo)], False),
+                  ('Exporting graph', [crg, 'visualize', '--format', 'qihse', '--repo', str(repo)], False),
+                  ('Publishing compact graph', [str(cli), 'import', '--repo', str(repo)], True),
+              ])
+
+    def request_stop(signum, _frame):
+        raise StopRequested(signum)
+
+    previous_handler = signal.signal(signal.SIGTERM, request_stop)
+    try:
+        baseline = None
+        if not args.migrate_only:
+            progress(0, len(stages), 'Checking source identity')
+            baseline = source_identity(repo)
+        with tempfile.TemporaryDirectory(prefix='qihse-codegraph-export-') as scratch:
+            snapshot = None
+            for i, (label, command, native) in enumerate(stages):
+                if native and not args.migrate_only:
+                    command = command + ['--input', str(snapshot)]
+                try:
+                    result, exported = run_stage(command, env, i, len(stages), label, native,
+                                                 exporting=not args.migrate_only and i == 1)
+                    if exported is not None:
+                        progress(i, len(stages), 'Checking exported source identity')
+                        if source_identity(repo) != baseline:
+                            raise ValueError('Source changed during reindex/export; refusing publication')
+                        snapshot = Path(scratch) / 'graph.qihse.jsonl'
+                        prepare_export(exported, snapshot, baseline)
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    print(f'Failed during {label}: {exc}', file=sys.stderr)
+                    return 1
+                if result:
+                    print(f'Failed during {label}: exit status {result}', file=sys.stderr)
+                    return result if result > 0 else 128 - result
+        progress(len(stages), len(stages), 'Complete')
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f'Preflight failed while checking source identity: {exc}', file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, StopRequested) as exc:
+        clear_progress()
+        print('Interrupted; no completion reported.', file=sys.stderr)
+        return 128 + (exc.signum if isinstance(exc, StopRequested) else signal.SIGINT)
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
