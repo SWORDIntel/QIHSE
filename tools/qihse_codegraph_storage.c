@@ -82,7 +82,7 @@ bool cg_storage_save(qihse_kv_store_t *store, const char *path, qihse_user_t *us
     unsigned char header[16]; memcpy(header, magic, 8); put64(header + 8, (uint64_t)st.st_size);
     if (fwrite(header, 1, sizeof(header), out) != sizeof(header)) goto done;
     ctx = ZSTD_createCCtx(); buffers = malloc(CG_BLOCK * 2);
-    if (!ctx || !buffers || ZSTD_isError(ZSTD_CCtx_setParameter(ctx, ZSTD_c_compressionLevel, 3)) ||
+    if (!ctx || !buffers || ZSTD_isError(ZSTD_CCtx_setParameter(ctx, ZSTD_c_compressionLevel, 9)) ||
         ZSTD_isError(ZSTD_CCtx_setParameter(ctx, ZSTD_c_windowLog, 23)) ||
         ZSTD_isError(ZSTD_CCtx_setParameter(ctx, ZSTD_c_checksumFlag, 1)) ||
         ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(ctx, (uint64_t)st.st_size))) goto done;

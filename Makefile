@@ -2037,6 +2037,24 @@ test-codegraph-codec: $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
 	  tests/test_codegraph_storage.c tools/qihse_codegraph_storage.c -o tests/test_codegraph_storage \
 	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
-	./tests/test_codegraph_storage
+	LD_LIBRARY_PATH=. ./tests/test_codegraph_storage
 
 test-serial: test-codegraph
+
+.PHONY: test-graph-property-index
+test-graph-property-index:
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -pthread \
+	  tests/test_graph_property_index.c src/broad_oak/qihse_graph_store.c \
+	  src/black_hole/qihse_arena.c -o tests/test_graph_property_index
+	./tests/test_graph_property_index
+
+test-serial: test-graph-property-index
+
+.PHONY: test-codegraph-memory
+test-codegraph-memory: $(LIB_TARGET)
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
+	  tests/test_codegraph_memory.c tools/qihse_codegraph_storage.c -o tests/test_codegraph_memory \
+	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=. ./tests/test_codegraph_memory
+
+test-serial: test-codegraph-memory

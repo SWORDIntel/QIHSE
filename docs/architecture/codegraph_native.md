@@ -288,7 +288,7 @@ Do not label uncertain relationships as verified.
 
 ## Compact storage and lifecycle maintenance
 
-New imports write `qihse-codegraph-zstd-v1` storage containers (Zstandard; the
+New imports write `qihse-codegraph-zstd-v1` storage containers (Zstandard level 9; the
 optional CLI now requires libzstd development headers). The logical CRG format
 remains `qihse-codegraph-v1`. Legacy KV snapshots remain readable. Reimporting
 identical validated records reuses the current snapshot instead of appending a
@@ -326,12 +326,77 @@ these locks. Do not remove the lock files manually.
 
 The compact container preserves the authorized legacy KV serialization, including
 security labels. Its decoder rejects oversized, corrupt, truncated and trailing
-frames. The existing path-based KV API still requires temporary decompression and
-a private durable restore; compact storage does not yet remove runtime disk
-copies. Temporary codec files are removed on normal completion. Legacy abandoned
-runtime directories require separate reviewed cleanup, since they have no lease.
+frames. CodeGraph opens snapshots of at most 64 MiB decoded data and 100,000 records
+through a bounded authenticated stream into an immutable KV handle. This avoids
+expanded temporary files and runtime SST restoration for those reads. Larger
+snapshots retain the disk-backed loader; only byte/record-limit errors trigger
+fallback, never authorization or malformed-input errors. The memory path retains
+record values in RAM, so its limits are deliberate. Exports and large-graph
+fallback still use private temporary files, removed on normal completion. Legacy
+abandoned runtime directories require separate reviewed cleanup because they have
+no lease.
 
 Allocated ZFS bytes, apparent file sizes and bytes reclaimed after deletion are
 different measurements. Filesystem snapshots can retain deleted blocks. Measure
 both `du -sh` and `du -sh --apparent-size`; do not infer physical savings from the
 compression ratio alone.
+
+
+## Query and property-index efficiency
+
+Property indexing hashes the complete composite key, including its NUL-separated
+label, property name and value. Stored key lengths are checked before comparison.
+Previously, C-string hashing used only the label, producing collision chains for
+same-kind nodes and a potential out-of-bounds comparison of unequal-length keys.
+
+Bounded queries encode seed/visited/hop state in one byte per node rather than
+allocating a second distance array and clearing the first array between phases.
+Review aggregation visits the admitted, ID-sorted queue (at most the query limit)
+instead of scanning every node again. Traversal ordering, truncation, evidence,
+authorization and source freshness checks remain unchanged.
+
+`tests/bench_codegraph_query_algorithm.py` compares exact JSON outputs before
+reporting per-case query timings on synthetic graphs. It excludes Git/auth/storage
+work, so its speedups are not end-to-end request speedups.
+`tests/test_graph_property_index.c` measures same-label property insertion and
+lookup while verifying every returned vertex. The optional `--bench FILE
+memory|disk` mode of `tests/test_codegraph_memory` compares snapshot loading with
+fresh isolated runtimes; its `write_bytes` metric is process logical writes, not
+physical ZFS allocation. OS cache is not dropped. These isolated measurements must
+not be treated as predictions for all live repositories.
+
+Measured synthetic results (raw samples and conditions in
+`benchmarks/codegraph_storage_optimization.json`):
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| Build property indexes for 8,000 same-kind vertices | 6,825.6 ms | 36.0 ms |
+| Verify all property lookups on those vertices | 4,064.6 ms | 11.8 ms |
+| Sparse bounded review in a 100,000-node graph | 1.498 ms | 0.0728 ms |
+| Load 50,000 stored KV records | 1,245.8 ms | 308.0 ms |
+| Process logical writes during that load | 109,839,910 bytes | 0 bytes |
+
+The loader retained about 26 MiB more RSS on that fixture; both modes peaked near
+60 MiB. The property index adds one `size_t` per hash bucket for key length.
+High-degree query timings varied between runs, so no improvement is claimed for
+that case. These numbers isolate different operations and must not be multiplied
+into a claimed combined speedup.
+
+For local builds, ensure the test/CLI process selects the newly built library:
+
+```sh
+LD_LIBRARY_PATH="$PWD" ./qihse-codegraph status --repo .
+```
+
+An inherited `LD_LIBRARY_PATH` pointing at a separately installed older library
+can otherwise override the executable's runpath and fail on the new snapshot API.
+
+
+A separate varied synthetic storage fixture (50,000 nodes, 100,000 edges,
+SHA-256 IDs, varied paths and evidence fields) measured 79,662,422 bytes of legacy
+KV records versus 19,056,786 bytes of compact storage at level 9. This is a 76.1%
+logical-size reduction. Level 3 produced 21,209,959 bytes; level 12 produced
+18,426,123 bytes but required over twice level 9's compression CPU. Three
+interleaved repetitions at each level round-tripped byte-for-byte. Reproduce with
+`python3 tests/bench_codegraph_compression.py`. This motivates
+the space-focused level-9 default; it does not predict physical ZFS savings.

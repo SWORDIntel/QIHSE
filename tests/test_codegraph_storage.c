@@ -40,7 +40,7 @@ int main(void) {
     char *large = malloc(1024 * 1024 + 1); assert(large);
     memset(large, 'a', 1024 * 1024); large[1024 * 1024] = 0;
     assert(qihse_kv_set_user(s, "large", large, 0, 0, op));
-    char compact[1024], legacy[1024], denied[1024];
+    char compact[sizeof(root) + 32], legacy[sizeof(root) + 32], denied[sizeof(root) + 32];
     snprintf(compact, sizeof(compact), "%s/graph.kv", root);
     snprintf(legacy, sizeof(legacy), "%s/legacy.kv", root);
     snprintf(denied, sizeof(denied), "%s/denied.kv", root);

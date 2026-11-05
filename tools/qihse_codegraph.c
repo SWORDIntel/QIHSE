@@ -537,10 +537,25 @@ static bool record_fingerprint(cg_state *st, char result[65], size_t *count) {
     free(f.hashes);
     return ok;
 }
+/* Retain bounded snapshots in memory without installing a runtime SST copy.
+ * Large snapshots keep the durable path; auth/corruption never triggers fallback. */
+static bool replace_snapshot_store(cg_state *st, const char *path) {
+    qihse_kv_store_t *loaded = cg_storage_open(path, st->principal,
+                                             UINT64_C(64) << 20, 100000);
+    if (loaded) {
+        if (st->kv) qihse_kv_store_destroy(st->kv);
+        st->kv = loaded;
+        return true;
+    }
+    if (errno != EFBIG && errno != E2BIG) return false;
+    if (st->kv) qihse_kv_store_destroy(st->kv);
+    st->kv = qihse_kv_store_create();
+    return st->kv && cg_storage_load(st->kv, path, st->principal);
+}
 static bool verify_saved(cg_state *st, const char *path) {
     char before[65], after[65]; size_t n_before, n_after;
     return record_fingerprint(st, before, &n_before) &&
-           cg_storage_load(st->kv, path, st->principal) &&
+           replace_snapshot_store(st, path) &&
            record_fingerprint(st, after, &n_after) &&
            n_before == n_after && !strcmp(before, after);
 }
@@ -1060,7 +1075,7 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
         return false;
     snapshot_verify_ms = monotonic_ms() - phase_start;
     phase_start = monotonic_ms();
-    bool loaded = cg_storage_load(st->kv, snapshot_path, st->principal);
+    bool loaded = replace_snapshot_store(st, snapshot_path);
     kv_load_ms = monotonic_ms() - phase_start;
     if (!loaded)
         return false;

@@ -69,7 +69,7 @@ above):
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 11 | 11 |
-| `include/qihse_kv_store.h` | 60 | 57 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 61 | 58 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
