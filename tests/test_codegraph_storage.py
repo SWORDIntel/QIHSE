@@ -51,7 +51,10 @@ int main(int argc, char **argv) {
             assert(json_object_object_get_ex(row, "id", &value));
             snprintf(key, sizeof(key), "%s:%s", type, json_object_get_string(value));
         }
-        assert(qihse_kv_set_user(store, key, line, 0, 0, user));
+        int protected_node = getenv("CODEGRAPH_PROTECTED_FIXTURE") &&
+                             !strncmp(key, "n:", 2);
+        assert(qihse_kv_set_user(store, key, line, protected_node ? 4 : 0,
+                                 protected_node ? 2 : 0, user));
         json_object_put(row);
     }
     assert(!ferror(input)); fclose(input); free(line);
@@ -102,6 +105,13 @@ def main() -> None:
 
         original = manifest()
         assert original["storage_format"] == "qihse-codegraph-zstd-v1", original
+        current_stats = invoke("stats")
+        current_file = state / original["snapshot"]
+        assert current_stats["coverage"] == "authorized_current_generation", current_stats
+        assert current_stats["storage_format"] == "qihse-codegraph-zstd-v1"
+        assert current_stats["encoded_bytes"] == current_file.stat().st_size
+        assert current_stats["allocated_bytes"] == current_file.stat().st_blocks * 512
+        assert current_stats["decoded_bytes"] > current_stats["encoded_bytes"]
         baseline = invoke("context", "--symbol", "caller", "--depth", "2")
         generation_files = set(state.glob("graph-*.kv"))
         duplicate = invoke("import", "--input", str(source))
@@ -149,6 +159,28 @@ def main() -> None:
                       sha256=hashlib.sha256(legacy_path.read_bytes()).hexdigest())
         manifest_path.write_text(json.dumps(legacy))
         assert invoke("status")["fresh"]
+        legacy_stats = invoke("stats")
+        assert legacy_stats["storage_format"] == "qihse-kv-legacy", legacy_stats
+        assert legacy_stats["encoded_bytes"] == legacy_stats["decoded_bytes"] == legacy_path.stat().st_size
+
+        # The CLI reader uses a guest principal. A syntactically valid graph
+        # with one SCI-classified record must not disclose sizes or counts.
+        protected_data = root / "protected-writer-state"
+        protected_data.mkdir(mode=0o700)
+        protected_path = state / ("graph-" + "4" * 64 + "-2777936.kv")
+        protected_result = subprocess.run([str(helper), str(source), str(protected_path)],
+                                          env={**env, "QIHSE_DATA_DIR": str(protected_data),
+                                               "CODEGRAPH_PROTECTED_FIXTURE": "1"},
+                                          capture_output=True, timeout=90)
+        assert protected_result.returncode == 0, (protected_result.stdout, protected_result.stderr)
+        protected = {**legacy, "snapshot": protected_path.name,
+                     "sha256": hashlib.sha256(protected_path.read_bytes()).hexdigest()}
+        manifest_path.write_text(json.dumps(protected))
+        denied_stats = invoke("stats", expect=1)
+        assert set(denied_stats) == {"error"}, denied_stats
+        assert "bytes" not in json.dumps(denied_stats) and "nodes" not in json.dumps(denied_stats)
+        manifest_path.write_text(json.dumps(legacy))
+        assert invoke("stats") == legacy_stats, "unreferenced classified history affected guest statistics"
 
         unsupported_path = state / ("graph-" + "1" * 64 + "-letters.kv")
         unsupported_path.write_bytes(legacy_path.read_bytes())

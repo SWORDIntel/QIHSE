@@ -302,6 +302,20 @@ remains `qihse-codegraph-v1`. Legacy KV snapshots remain readable. Reimporting
 identical validated records reuses the current snapshot instead of appending a
 new generation; a damaged current file is not reused.
 
+For authenticated size accounting of the current generation:
+
+```sh
+qihse-codegraph stats --repo .
+```
+
+The response reports `encoded_bytes` (apparent snapshot size), `allocated_bytes`
+(filesystem blocks assigned to that snapshot), and `decoded_bytes` (the legacy KV
+byte count, or the compact container's declared decoded length after successful
+authenticated loading). `coverage` is `authorized_current_generation`. It does not
+sum rollback generations, historical snapshots, scratch files or filesystem
+snapshots; those may contain records outside the reader's clearance. Do not use
+this response as the total folder size or as a claim of bytes reclaimable by GC.
+
 To convert the current stored graph without rebuilding CRG:
 
 ```sh

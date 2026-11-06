@@ -1540,6 +1540,54 @@ static struct json_object *summary(cg_state *st, bool freshness_verified) {
         json_text(obj, "stale_reason", reason);
     return obj;
 }
+
+/* Account only for the generation the principal has just loaded and authorized.
+ * Historical files may have different labels and cannot be enumerated as data
+ * merely because their names appear in the same directory. */
+static int storage_stats(cg_state *st) {
+    if (!storage_lock(st, LOCK_SH)) return error_json("storage lock failed");
+    int rc = 1;
+    int fd = -1;
+    struct stat info;
+    unsigned char header[16];
+    uint64_t decoded = 0;
+    bool compact = false;
+    if (!load_snapshot_unlocked(st, false) || !principal_active(st)) goto done;
+    const char *name = json_string(st->manifest, "snapshot");
+    char path[PATH_MAX];
+    if (!snapshot_name(name) ||
+        snprintf(path, sizeof(path), "%s/%s", st->directory, name) >= (int)sizeof(path))
+        goto done;
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &info) || !S_ISREG(info.st_mode) ||
+        info.st_uid != geteuid() || info.st_nlink != 1 || info.st_size < 0 ||
+        info.st_blocks < 0 || info.st_blocks > INT64_MAX / 512) goto done;
+    ssize_t n = pread(fd, header, sizeof(header), 0);
+    if (n < 0) goto done;
+    compact = n >= 4 && !memcmp(header, "QCGZ", 4);
+    if (compact) {
+        if (n != (ssize_t)sizeof(header) || memcmp(header, "QCGZ0001", 8)) goto done;
+        for (size_t i = 8; i < sizeof(header); ++i)
+            decoded = (decoded << 8) | header[i];
+        if (decoded > (UINT64_C(64) << 30)) goto done;
+    } else {
+        decoded = (uint64_t)info.st_size;
+    }
+    if (!principal_active(st)) goto done;
+    struct json_object *report = summary(st, false);
+    json_text(report, "storage_format", compact ? "qihse-codegraph-zstd-v1" : "qihse-kv-legacy");
+    json_text(report, "coverage", "authorized_current_generation");
+    json_int(report, "encoded_bytes", (int64_t)info.st_size);
+    json_int(report, "allocated_bytes", (int64_t)info.st_blocks * 512);
+    json_int(report, "decoded_bytes", (int64_t)decoded);
+    print_json(report);
+    json_object_put(report);
+    rc = 0;
+done:
+    if (fd >= 0) close(fd);
+    storage_lock(st, LOCK_UN);
+    return rc ? error_json("current CodeGraph storage accounting unavailable") : 0;
+}
 static bool impact_edge(const char *type, bool incoming) {
     if (!strcmp(type, "TESTED_BY"))
         return !incoming;
@@ -3004,7 +3052,7 @@ static int memory_option(const char *text, int maximum) {
 }
 
 static const char *usage_text =
-    "usage: qihse-codegraph <import|migrate|gc|status|query|impact|review|context|serve> "
+    "usage: qihse-codegraph <import|migrate|gc|status|stats|query|impact|review|context|serve> "
     "[--repo DIR] [--input JSONL] [--symbol NAME] [--file PATH] "
     "[--base GITREF] [--depth 1..5] [--limit 1..256] "
     "[--max-tokens 128..16000] [--socket PATH] [--token-file PATH] "
@@ -3037,7 +3085,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         const char *flag = argv[i];
         if (!strcmp(flag, "--help")) {
-            if (!read_action(action) && strcmp(action, "serve") && strcmp(action, "import") &&
+            if (!read_action(action) && strcmp(action, "stats") && strcmp(action, "serve") && strcmp(action, "import") &&
                 strcmp(action, "migrate") && strcmp(action, "gc"))
                 return usage();
             fputs(usage_text, stdout);
@@ -3093,7 +3141,7 @@ int main(int argc, char **argv) {
         else
             return usage();
     }
-    if (strcmp(action, "import") && strcmp(action, "status") && strcmp(action, "query") &&
+    if (strcmp(action, "import") && strcmp(action, "status") && strcmp(action, "stats") && strcmp(action, "query") &&
         strcmp(action, "impact") && strcmp(action, "review") && strcmp(action, "context") &&
         strcmp(action, "serve") && strcmp(action, "migrate") && strcmp(action, "gc"))
         return usage();
@@ -3104,6 +3152,7 @@ int main(int argc, char **argv) {
     if (tokens < 128 || tokens > 16000 || limit == 0 || limit > 256 || depth < 1 || depth > 5 ||
         idle_seconds < 1 || idle_seconds > 3600 || workers < 1 || workers > CG_WORKERS ||
         (!strcmp(action, "serve") && (!socket_path || !token_path)) ||
+        (!strcmp(action, "stats") && (socket_path || token_path || input)) ||
         (!!socket_path != !!token_path) || !valid_match(match) ||
         (strcmp(fallback, "error") && strcmp(fallback, "oneshot")))
         return usage();
@@ -3172,6 +3221,8 @@ int main(int argc, char **argv) {
         rc = migrate_snapshot(&st);
     } else if (!strcmp(action, "gc")) {
         rc = collect_snapshots(&st);
+    } else if (!strcmp(action, "stats")) {
+        rc = storage_stats(&st);
     } else if (!load_snapshot(&st, strcmp(action, "status") != 0)) {
         rc = error_json("no valid QIHSE CodeGraph generation; import a fresh CRG snapshot");
     } else if (!strcmp(action, "serve")) {
