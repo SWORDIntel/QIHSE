@@ -315,6 +315,10 @@ authenticated loading). `coverage` is `authorized_current_generation`. It does n
 sum rollback generations, historical snapshots, scratch files or filesystem
 snapshots; those may contain records outside the reader's clearance. Do not use
 this response as the total folder size or as a claim of bytes reclaimable by GC.
+The counters come from the descriptor used for authenticated loading. A legacy
+generation too large for the bounded immutable reader returns an accounting
+error: its path-based fallback cannot bind size metadata to that authenticated
+descriptor. Migrating it to compact storage permits accounting.
 
 To convert the current stored graph without rebuilding CRG:
 
@@ -349,7 +353,7 @@ these locks. Do not remove the lock files manually.
 
 The compact container preserves the authorized legacy KV serialization, including
 security labels. Its decoder rejects oversized, corrupt, truncated and trailing
-frames. CodeGraph opens snapshots of at most 64 MiB decoded data and 100,000 records
+frames. CodeGraph opens snapshots of at most 64 MiB decoded data and 150,000 records
 through a bounded authenticated stream into an immutable KV handle. This avoids
 expanded temporary files and runtime SST restoration for those reads. Larger
 snapshots retain the disk-backed loader; only byte/record-limit errors trigger
@@ -358,6 +362,14 @@ record values in RAM, so its limits are deliberate. Exports and large-graph
 fallback still use private temporary files, removed on normal completion. Legacy
 abandoned runtime directories require separate reviewed cleanup because they have
 no lease.
+
+The 150,000-record limit was chosen from three alternating paired runs on the
+selected Angryier graph (8,853 nodes, 114,689 edges; 54,478,835 decoded bytes).
+With exact JSON equality, median one-shot status fell from 11.93 to 8.50 seconds
+and query of `main` from 23.82 to 12.37 seconds. Sampled process writes fell
+from 163,446,624 to 10,061 bytes, while peak RSS rose by roughly 26 MiB for
+status and 50 MiB for query. These are measurements for this graph and host;
+the 64 MiB decoded limit remains unchanged.
 
 Allocated ZFS bytes, apparent file sizes and bytes reclaimed after deletion are
 different measurements. Filesystem snapshots can retain deleted blocks. Measure

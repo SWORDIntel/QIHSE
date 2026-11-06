@@ -129,17 +129,28 @@ int main(int argc, char **argv) {
     assert(snprintf(legacy,sizeof(legacy),"%s/legacy.kv",runtime)<(int)sizeof(legacy));
     assert(cg_storage_save(s,compact,op)); assert(qihse_kv_save_user(s,legacy,op)==0);
     assert(qihse_kv_load_user(s,legacy,op) != 0); /* immutable even for Operator */
-    qihse_kv_store_t *copy=cg_storage_open(compact,op,4096,10); assert(copy); value_is(copy,op,"protected","secret");
+    cg_storage_info_t sizes={0};
+    qihse_kv_store_t *copy=cg_storage_open_info(compact,op,4096,10,&sizes);
+    assert(copy && sizes.valid && sizes.compact && sizes.decoded_bytes>0 && sizes.encoded_bytes>0);
+    struct stat compact_stat; assert(stat(compact,&compact_stat)==0);
+    assert(sizes.encoded_bytes==(uint64_t)compact_stat.st_size &&
+           sizes.allocated_bytes==(uint64_t)compact_stat.st_blocks*512);
+    value_is(copy,op,"protected","secret");
     assert(qihse_kv_meta_user(copy,"protected",op,&m) && m.change_seq==22 && m.classification==4 && m.sci_compartment==2);
     qihse_kv_store_destroy(copy);
-    assert(!cg_storage_open(compact,low,4096,10) && errno==EACCES);
+    sizes.valid=true;
+    assert(!cg_storage_open_info(compact,low,4096,10,&sizes) && errno==EACCES && !sizes.valid);
     assert(!cg_storage_open(compact,op,32,10) && errno==EFBIG);
     assert(!cg_storage_open(compact,op,4096,1) && errno==E2BIG);
     assert(!cg_storage_open(legacy,low,4096,10) && errno==EACCES);
-    copy=cg_storage_open(legacy,op,4096,10); assert(copy); qihse_kv_store_destroy(copy);
+    copy=cg_storage_open_info(legacy,op,4096,10,&sizes);
+    assert(copy && sizes.valid && !sizes.compact && sizes.decoded_bytes==sizes.encoded_bytes);
+    qihse_kv_store_destroy(copy);
     int fd=open(compact,O_RDWR); assert(fd>=0); off_t length=lseek(fd,0,SEEK_END); assert(length>0);
     assert(ftruncate(fd,length-1)==0); close(fd);
-    assert(!cg_storage_open(compact,op,4096,10)); value_is(s,op,"protected","secret");
+    sizes.valid=true;
+    assert(!cg_storage_open_info(compact,op,4096,10,&sizes) && !sizes.valid);
+    value_is(s,op,"protected","secret");
     FILE *bad=tmpfile(); assert(bad); fputs("1 1 0 0 0 0 1\nkv\n1 1 0 0 0 0 2\nkv\n",bad);
     reject(bad,op,4096,10,EINVAL); fclose(bad);
     bad=tmpfile(); assert(bad); fputs("1 100000 0 0 0 0 1\nx",bad); reject(bad,op,4096,10,EFBIG); fclose(bad);

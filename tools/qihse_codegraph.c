@@ -71,6 +71,8 @@ typedef struct {
     cg_node **by_vertex, **by_name, **by_file;
     size_t nn, capacity, edges, unresolved;
     struct json_object *meta, *manifest;
+    cg_storage_info_t storage_info;
+    bool stats_mode;
     bool audit_ready;
     int lifecycle_fd, lease_fd;
     char directory[PATH_MAX], repository[PATH_MAX];
@@ -556,8 +558,11 @@ static bool record_fingerprint(cg_state *st, char result[65], size_t *count) {
 /* Retain bounded snapshots in memory without installing a runtime SST copy.
  * Large snapshots keep the durable path; auth/corruption never triggers fallback. */
 static bool replace_snapshot_store(cg_state *st, const char *path) {
-    qihse_kv_store_t *loaded = cg_storage_open(path, st->principal,
-                                             UINT64_C(64) << 20, 100000);
+    memset(&st->storage_info, 0, sizeof(st->storage_info));
+    qihse_kv_store_t *loaded = st->stats_mode ?
+        cg_storage_open_info(path, st->principal, UINT64_C(64) << 20, 150000,
+                             &st->storage_info) :
+        cg_storage_open(path, st->principal, UINT64_C(64) << 20, 150000);
     if (loaded) {
         if (st->kv) qihse_kv_store_destroy(st->kv);
         st->kv = loaded;
@@ -566,7 +571,9 @@ static bool replace_snapshot_store(cg_state *st, const char *path) {
     if (errno != EFBIG && errno != E2BIG) return false;
     if (st->kv) qihse_kv_store_destroy(st->kv);
     st->kv = qihse_kv_store_create();
-    return st->kv && cg_storage_load(st->kv, path, st->principal);
+    return st->kv && (st->stats_mode ?
+        cg_storage_load_info(st->kv, path, st->principal, &st->storage_info) :
+        cg_storage_load(st->kv, path, st->principal));
 }
 static bool verify_saved(cg_state *st, const char *path) {
     char before[65], after[65]; size_t n_before, n_after;
@@ -1086,14 +1093,17 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
         return false;
     char snapshot_path[PATH_MAX], actual[65];
     if (snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s", st->directory, snapshot) >=
-            (int)sizeof(snapshot_path) ||
-        !sha256_file(snapshot_path, actual, 0) || strcmp(actual, sha))
+            (int)sizeof(snapshot_path))
+        return false;
+    if (!st->stats_mode && (!sha256_file(snapshot_path, actual, 0) || strcmp(actual, sha)))
         return false;
     snapshot_verify_ms = monotonic_ms() - phase_start;
     phase_start = monotonic_ms();
     bool loaded = replace_snapshot_store(st, snapshot_path);
     kv_load_ms = monotonic_ms() - phase_start;
     if (!loaded)
+        return false;
+    if (st->stats_mode && (!st->storage_info.valid || strcmp(st->storage_info.sha256, sha)))
         return false;
     char *header = qihse_kv_get_user(st->kv, "_meta", st->principal);
     char *end = qihse_kv_get_user(st->kv, "_end", st->principal);
@@ -1546,45 +1556,26 @@ static struct json_object *summary(cg_state *st, bool freshness_verified) {
  * merely because their names appear in the same directory. */
 static int storage_stats(cg_state *st) {
     if (!storage_lock(st, LOCK_SH)) return error_json("storage lock failed");
+    st->stats_mode = true;
     int rc = 1;
-    int fd = -1;
-    struct stat info;
-    unsigned char header[16];
-    uint64_t decoded = 0;
-    bool compact = false;
-    if (!load_snapshot_unlocked(st, false) || !principal_active(st)) goto done;
+    if (!load_snapshot_unlocked(st, false) || !st->storage_info.valid ||
+        !principal_active(st)) goto done;
     const char *name = json_string(st->manifest, "snapshot");
-    char path[PATH_MAX];
+    const char *declared_format = json_string(st->manifest, "storage_format");
     if (!snapshot_name(name) ||
-        snprintf(path, sizeof(path), "%s/%s", st->directory, name) >= (int)sizeof(path))
-        goto done;
-    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0 || fstat(fd, &info) || !S_ISREG(info.st_mode) ||
-        info.st_uid != geteuid() || info.st_nlink != 1 || info.st_size < 0 ||
-        info.st_blocks < 0 || info.st_blocks > INT64_MAX / 512) goto done;
-    ssize_t n = pread(fd, header, sizeof(header), 0);
-    if (n < 0) goto done;
-    compact = n >= 4 && !memcmp(header, "QCGZ", 4);
-    if (compact) {
-        if (n != (ssize_t)sizeof(header) || memcmp(header, "QCGZ0001", 8)) goto done;
-        for (size_t i = 8; i < sizeof(header); ++i)
-            decoded = (decoded << 8) | header[i];
-        if (decoded > (UINT64_C(64) << 30)) goto done;
-    } else {
-        decoded = (uint64_t)info.st_size;
-    }
-    if (!principal_active(st)) goto done;
+        (declared_format && strcmp(declared_format, "qihse-codegraph-zstd-v1")) ||
+        (!!declared_format != st->storage_info.compact)) goto done;
     struct json_object *report = summary(st, false);
-    json_text(report, "storage_format", compact ? "qihse-codegraph-zstd-v1" : "qihse-kv-legacy");
+    json_text(report, "storage_format", st->storage_info.compact ?
+        "qihse-codegraph-zstd-v1" : "qihse-kv-legacy");
     json_text(report, "coverage", "authorized_current_generation");
-    json_int(report, "encoded_bytes", (int64_t)info.st_size);
-    json_int(report, "allocated_bytes", (int64_t)info.st_blocks * 512);
-    json_int(report, "decoded_bytes", (int64_t)decoded);
+    json_int(report, "encoded_bytes", (int64_t)st->storage_info.encoded_bytes);
+    json_int(report, "allocated_bytes", (int64_t)st->storage_info.allocated_bytes);
+    json_int(report, "decoded_bytes", (int64_t)st->storage_info.decoded_bytes);
     print_json(report);
     json_object_put(report);
     rc = 0;
 done:
-    if (fd >= 0) close(fd);
     storage_lock(st, LOCK_UN);
     return rc ? error_json("current CodeGraph storage accounting unavailable") : 0;
 }

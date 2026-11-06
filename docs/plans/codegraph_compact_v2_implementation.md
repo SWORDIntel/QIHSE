@@ -53,7 +53,7 @@ Existing implementation and evidence are documented in
 | Area | Current behavior | Remaining opportunity |
 |---|---|---|
 | Persistent snapshots | Versioned Zstandard level-9 container over authorized KV serialization | Repeated textual IDs, keys, paths and record fields still exist before compression |
-| Loading | Authenticated immutable memory load up to 64 MiB decoded / 100,000 records; larger graphs use a disk fallback | Avoid restoring large read-only graphs through mutable KV/SST state |
+| Loading | Authenticated immutable memory load up to 64 MiB decoded / 150,000 records; larger graphs use a disk fallback | Avoid restoring still larger read-only graphs through mutable KV/SST state |
 | Publication | Validated atomic manifest; identical valid imports reuse the current snapshot | Make per-file reuse possible without rewriting the full graph |
 | Migration | Authenticated conversion, logical-record verification and rollback generation | Add a packed format and independently readable blocks |
 | Retention | Explicit GC retains current/previous generations and skips active scratch leases | Account for shared blocks and generation-pinned readers |
@@ -72,6 +72,20 @@ generation. On the selected fresh Angryier generation it reported 7,534,503
 encoded bytes, 7,545,856 allocated bytes and 54,478,835 decoded bytes. These
 figures exclude rollback, historical and scratch storage. Wider folder totals
 remain gated on a deliberate authorization policy for older generations.
+
+The [synthetic P0 method](../../benchmarks/codegraph_p0_method.md) and
+[machine-readable receipt](../../benchmarks/codegraph_p0_reference.json) cover
+800 nodes and 2,400 edges in three alternating pairs. Authenticated legacy KV
+used 1,825,299 apparent bytes; current Zstandard level 9 used 187,976 bytes
+(89.7% less on this fixture). Four query shapes matched exactly, including a
+truncated high-degree context and a separate untruncated caller/target/test
+check. This establishes a reproducible current-format baseline, not a packed-v2
+improvement or a prediction for other graphs. The
+[memory-cap method and receipt](../../benchmarks/codegraph_memory_cap_compare.py)
+record a separate one-graph, three-pair comparison: increasing the bounded
+reader from 100,000 to 150,000 records reduced median status/query time while
+raising peak RSS. Its [results](../../benchmarks/codegraph_memory_cap_angryier_20261106.json)
+are specific to the selected graph and shared host.
 
 ## Invariants
 
@@ -325,9 +339,12 @@ acceptable default storage optimization.
 
 ## Execution checklist
 
-- [~] P0: current-generation authorized accounting implemented; broader accounting
-      and the baseline query corpus remain to complete.
-- [ ] P1: implement and validate lossless packed records.
+- [~] P0: current-generation authorized accounting and a reproducible synthetic
+      baseline/query corpus implemented; broader accounting and selected-graph
+      baseline coverage remain.
+- [~] P1: an isolated bounded digest-key prototype passed round-trip, malformed
+      input and sanitizer checks. Integration awaits an authenticated SDK export
+      of all metadata, a complete preservation oracle and comparative size data.
 - [ ] P2: implement compact adjacency and bounded selective reads.
 - [ ] Migration: support packed-v2 conversion, rollback and measurable progress.
 - [ ] P3: implement per-file incremental generations and shared-block-safe GC.
