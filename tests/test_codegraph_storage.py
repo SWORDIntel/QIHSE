@@ -28,6 +28,7 @@ LEGACY_WRITER = r'''
 #include <json-c/json.h>
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
+#include "qihse_codegraph_storage.h"
 int main(int argc, char **argv) {
     assert(argc == 3);
     const char *password = "CodeGraphLegacyFixture1!";
@@ -58,7 +59,10 @@ int main(int argc, char **argv) {
         json_object_put(row);
     }
     assert(!ferror(input)); fclose(input); free(line);
-    assert(qihse_kv_save_user(store, argv[2], user) == 0);
+    if (getenv("CODEGRAPH_PACKED_FIXTURE"))
+        assert(cg_storage_save_packed(store, argv[2], user));
+    else
+        assert(qihse_kv_save_user(store, argv[2], user) == 0);
     qihse_kv_store_destroy(store);
     return 0;
 }
@@ -140,9 +144,12 @@ def main() -> None:
         helper_source.write_text(LEGACY_WRITER)
         helper = root / "legacy_writer"
         json_flags = shlex.split(subprocess.check_output(
-            ["pkg-config", "--cflags", "--libs", "json-c"], text=True))
+            ["pkg-config", "--cflags", "--libs", "json-c", "libzstd", "openssl"], text=True))
         subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-I" + str(project / "include"),
-                        str(helper_source), "-L" + str(binary.parent), "-lqihse", *json_flags,
+                        "-I" + str(project / "tools"), str(helper_source),
+                        str(project / "tools/qihse_codegraph_storage.c"),
+                        str(project / "tools/qihse_codegraph_packed.c"),
+                        "-L" + str(binary.parent), "-lqihse", *json_flags,
                         "-o", str(helper)], check=True, capture_output=True)
         helper_data = root / "writer-state"
         helper_data.mkdir(mode=0o700)
@@ -219,6 +226,62 @@ def main() -> None:
         invoke("migrate")
         assert manifest_path.read_bytes() == before_second_migrate
 
+        # Explicit packed-v2 conversion retains freshness, complete graph
+        # answers and the previous generation as rollback. The tiny fixture
+        # makes no size claim against the current Zstandard format.
+        invoke("migrate", "--storage-format", "packed-v2")
+        packed = manifest()
+        assert packed["storage_format"] == "qihse-codegraph-packed-v2", packed
+        assert packed["previous_snapshot"] == converted["snapshot"]
+        assert packed["snapshot"] != converted["snapshot"]
+        packed_stats = invoke("stats")
+        packed_file = state / packed["snapshot"]
+        assert packed_stats["storage_format"] == "qihse-codegraph-packed-v2"
+        assert packed_stats["encoded_bytes"] == packed_file.stat().st_size
+        assert packed_stats["decoded_bytes"] > 0
+        for key in ("head", "worktree", "freshness", "input_sha256", "nodes",
+                    "edges", "unresolved_edges"):
+            assert packed[key] == converted[key], (key, packed, converted)
+        assert invoke("context", "--symbol", "caller", "--depth", "2")["evidence"] == baseline["evidence"]
+        before_packed_repeat = manifest_path.read_bytes()
+        invoke("migrate", "--storage-format", "packed-v2")
+        assert manifest_path.read_bytes() == before_packed_repeat
+
+        # A format label cannot redirect the verified packed payload through
+        # the legacy/Zstandard loader.
+        mismatched = {**packed, "storage_format": "qihse-codegraph-zstd-v1"}
+        manifest_path.write_text(json.dumps(mismatched))
+        assert "error" in invoke("stats", expect=1)
+        wrong_magic = {**packed, "snapshot": converted["snapshot"],
+                       "sha256": hashlib.sha256((state / converted["snapshot"]).read_bytes()).hexdigest()}
+        manifest_path.write_text(json.dumps(wrong_magic))
+        assert "error" in invoke("stats", expect=1)
+        assert "error" in invoke("query", "--symbol", "caller", expect=1)
+        manifest_path.write_text(json.dumps(packed))
+
+        # New packed adapter negative: a Guest cannot read a syntactically
+        # valid, Operator-produced graph with one classified/SCI node.
+        protected_packed_path = state / ("graph-" + "5" * 64 + "-2777937.kv")
+        protected_packed_data = root / "protected-packed-writer-state"
+        protected_packed_data.mkdir(mode=0o700)
+        protected_packed_result = subprocess.run(
+            [str(helper), str(source), str(protected_packed_path)],
+            env={**env, "QIHSE_DATA_DIR": str(protected_packed_data),
+                 "CODEGRAPH_PROTECTED_FIXTURE": "1", "CODEGRAPH_PACKED_FIXTURE": "1"},
+            capture_output=True, timeout=90)
+        assert protected_packed_result.returncode == 0, (
+            protected_packed_result.stdout, protected_packed_result.stderr)
+        protected_packed = {**packed, "snapshot": protected_packed_path.name,
+                            "sha256": hashlib.sha256(protected_packed_path.read_bytes()).hexdigest()}
+        manifest_path.write_text(json.dumps(protected_packed))
+        for action in ("status", "stats", "query"):
+            report = invoke(action, *(["--symbol", "caller"] if action == "query" else []),
+                            expect=1)
+            assert set(report) == {"error"}, (action, report)
+            assert "secret" not in json.dumps(report) and "nodes" not in json.dumps(report)
+        manifest_path.write_text(json.dumps(packed))
+        assert invoke("stats") == packed_stats
+
         # GC cannot remove current/previous, active runtime, unmanaged runtime,
         # or files not in the generation namespace.
         obsolete = state / ("graph-" + "2" * 64 + "-unused.kv")
@@ -254,7 +317,8 @@ def main() -> None:
         assert all(not path.exists() for path in numeric_obsolete)
         assert all(path.is_file() for path in malformed_names)
         assert unsupported_path.is_file()
-        assert legacy_path.is_file(), "GC removed the legacy PID rollback generation"
+        assert not legacy_path.exists(), "GC retained an obsolete legacy generation"
+        assert (state / converted["snapshot"]).is_file(), "GC removed packed rollback generation"
         assert not dead.exists()
         assert unmanaged.is_dir() and unrelated.is_file() and malformed.is_file()
         current = manifest()

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "qihse_codegraph_packed.h"
 #include "qihse_auth.h"
 #include "qihse_audit.h"

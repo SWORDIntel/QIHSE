@@ -134,6 +134,8 @@ def main():
     parser.add_argument('--repo', type=Path, default=Path.cwd(), help='Git repository root')
     parser.add_argument('--migrate-only', action='store_true',
                         help='Convert the existing graph with native migrate; skip source reindexing')
+    parser.add_argument('--storage-format', choices=('zstd-v1', 'packed-v2'),
+                        help='Select the published CodeGraph storage format')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     try:
@@ -144,11 +146,14 @@ def main():
     env = os.environ.copy()
     previous = env.get('LD_LIBRARY_PATH', '')
     env['LD_LIBRARY_PATH'] = str(root) + (os.pathsep + previous if previous else '')
-    stages = ([('Migrating existing graph', [str(cli), 'migrate', '--repo', str(repo)], True)]
+    storage_args = ['--storage-format', args.storage_format] if args.storage_format else []
+    stages = ([('Migrating existing graph', [str(cli), 'migrate', '--repo', str(repo),
+                *storage_args], True)]
               if args.migrate_only else [
                   ('Rebuilding source index', [crg, 'build', '--repo', str(repo)], False),
                   ('Exporting graph', [crg, 'visualize', '--format', 'qihse', '--repo', str(repo)], False),
-                  ('Publishing compact graph', [str(cli), 'import', '--repo', str(repo)], True),
+                  ('Publishing compact graph', [str(cli), 'import', '--repo', str(repo),
+                                                *storage_args], True),
               ])
 
     def request_stop(signum, _frame):

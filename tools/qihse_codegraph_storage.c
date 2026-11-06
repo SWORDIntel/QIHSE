@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "qihse_codegraph_storage.h"
+#include "qihse_codegraph_packed.h"
 #include "qihse_auth.h"
 #include <openssl/evp.h>
 #include <zstd.h>
@@ -18,6 +19,7 @@
 #define CG_STORAGE_MAX (UINT64_C(64) << 30)
 #define CG_BLOCK 65536u
 static const unsigned char magic[8] = {'Q','C','G','Z','0','0','0','1'};
+static const unsigned char packed_magic[8] = {'Q','C','G','P','0','0','0','2'};
 static bool active(qihse_user_t *user) {
     if (user && qihse_auth_user_is_active(user)) return true;
     errno = EACCES;
@@ -44,8 +46,64 @@ static uint64_t get64(const unsigned char *p) {
     for (int i = 0; i < 8; ++i) n = (n << 8) | p[i];
     return n;
 }
+/* Bind packed record labels to the manifest before any packed payload decode.
+ * The digest and decoder use the same descriptor; the principal is checked
+ * throughout even though a digest never exposes payload bytes. */
+static bool verify_source_sha(FILE *source, const struct stat *before,
+                              const char *expected, qihse_user_t *user) {
+    if (!expected || strlen(expected) != 64 || !active(user) ||
+        before->st_uid != geteuid() || before->st_nlink != 1 ||
+        before->st_size < 0 || (uint64_t)before->st_size > CG_STORAGE_MAX) {
+        errno = EACCES;
+        return false;
+    }
+    for (size_t i = 0; i < 64; ++i)
+        if (!((expected[i] >= '0' && expected[i] <= '9') ||
+              (expected[i] >= 'a' && expected[i] <= 'f'))) {
+            errno = EINVAL;
+            return false;
+        }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char *buffer = malloc(CG_BLOCK), digest[32];
+    unsigned int digest_len = 0;
+    bool ok = ctx && buffer && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
+    for (off_t offset = 0; ok && offset < before->st_size;) {
+        if (!active(user)) { ok = false; break; }
+        size_t length = (uint64_t)(before->st_size - offset) < CG_BLOCK ?
+            (size_t)(before->st_size - offset) : CG_BLOCK;
+        ssize_t n = pread(fileno(source), buffer, length, offset);
+        if (n <= 0 || EVP_DigestUpdate(ctx, buffer, (size_t)n) != 1) {
+            ok = false; break;
+        }
+        offset += n;
+    }
+    if (ok) ok = EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1 && digest_len == 32;
+    EVP_MD_CTX_free(ctx);
+    free(buffer);
+    struct stat after;
+    if (!ok || !active(user) || fstat(fileno(source), &after) ||
+        after.st_dev != before->st_dev || after.st_ino != before->st_ino ||
+        after.st_size != before->st_size ||
+        after.st_mtime != before->st_mtime ||
+        after.st_mtim.tv_nsec != before->st_mtim.tv_nsec ||
+        after.st_ctime != before->st_ctime ||
+        after.st_ctim.tv_nsec != before->st_ctim.tv_nsec) {
+        errno = EIO;
+        return false;
+    }
+    static const char hex[] = "0123456789abcdef";
+    char actual[65];
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        actual[2 * i] = hex[digest[i] >> 4];
+        actual[2 * i + 1] = hex[digest[i] & 15];
+    }
+    actual[64] = '\0';
+    if (strcmp(actual, expected)) { errno = EINVAL; return false; }
+    return true;
+}
 static void publish_info(cg_storage_info_t *out, FILE *source,
                          const struct stat *before, uint64_t decoded, bool compact,
+                         bool packed,
                          qihse_user_t *user) {
     if (!out || !active(user)) return;
     struct stat after;
@@ -84,7 +142,8 @@ static void publish_info(cg_storage_info_t *out, FILE *source,
         final_info.st_ctim.tv_nsec != after.st_ctim.tv_nsec) return;
     *out = (cg_storage_info_t){.encoded_bytes = (uint64_t)after.st_size,
                                .allocated_bytes = (uint64_t)after.st_blocks * 512,
-                               .decoded_bytes = decoded, .compact = compact, .valid = true};
+                               .decoded_bytes = decoded, .compact = compact,
+                               .packed = packed, .valid = true};
     static const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(digest); ++i) {
         out->sha256[2 * i] = hex[digest[i] >> 4];
@@ -164,8 +223,71 @@ done:
     return ok;
 }
 
-bool cg_storage_load_info(qihse_kv_store_t *store, const char *path,
-                          qihse_user_t *user, cg_storage_info_t *out_info) {
+bool cg_storage_save_packed(qihse_kv_store_t *store, const char *path,
+                            qihse_user_t *user) {
+    if (!store || !path || !active(user)) return false;
+    char raw[PATH_MAX] = {0}, output[PATH_MAX] = {0};
+    int fd = -1;
+    FILE *in = NULL, *out = NULL;
+    bool ok = false;
+    if (!temporary(raw, &fd)) goto done;
+    close(fd); fd = -1;
+    if (qihse_kv_save_user(store, raw, user) != 0) goto done;
+    fd = open(raw, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > CG_STORAGE_MAX) goto done;
+    in = fdopen(fd, "rb"); if (!in) goto done; fd = -1;
+    if (snprintf(output, sizeof(output), "%s.codec-XXXXXX", path) >= (int)sizeof(output)) {
+        output[0] = '\0'; goto done;
+    }
+    fd = mkstemp(output); if (fd < 0) { output[0] = '\0'; goto done; }
+    out = fdopen(fd, "wb"); if (!out) goto done; fd = -1;
+    if (!cg_packed_encode_snapshot(in, out, user, CG_STORAGE_MAX, CG_PACKED_MAX_RECORDS) ||
+        !active(user) || fflush(out) || fsync(fileno(out))) goto done;
+    if (fclose(out)) { out = NULL; goto done; } out = NULL;
+    if (rename(output, path)) goto done;
+    output[0] = '\0';
+    ok = sync_parent(path);
+done:
+    if (fd >= 0) close(fd);
+    if (in) fclose(in);
+    if (out) fclose(out);
+    if (raw[0]) unlink(raw);
+    if (output[0]) unlink(output);
+    return ok;
+}
+
+static bool load_packed_snapshot(qihse_kv_store_t *store, FILE *source,
+                                 const struct stat *source_stat, qihse_user_t *user,
+                                 const char *expected_sha,
+                                 cg_storage_info_t *out_info) {
+    char raw[PATH_MAX] = {0};
+    int fd = -1;
+    FILE *out = NULL;
+    bool ok = false;
+    uint64_t decoded = 0;
+    if (fseek(source, 0, SEEK_SET) || !temporary(raw, &fd)) goto done;
+    out = fdopen(fd, "wb"); if (!out) goto done; fd = -1;
+    if (!cg_packed_decode_snapshot(source, out, user, CG_STORAGE_MAX,
+                                   CG_PACKED_MAX_RECORDS) || fflush(out)) goto done;
+    off_t length = ftello(out);
+    if (length < 0) goto done;
+    decoded = (uint64_t)length;
+    if (fclose(out)) { out = NULL; goto done; } out = NULL;
+    ok = verify_source_sha(source, source_stat, expected_sha, user) &&
+         qihse_kv_load_user(store, raw, user) == 0;
+    if (ok) publish_info(out_info, source, source_stat, decoded, false, true, user);
+done:
+    if (fd >= 0) close(fd);
+    if (out) fclose(out);
+    if (raw[0]) unlink(raw);
+    return ok;
+}
+
+bool cg_storage_load_verified_info(qihse_kv_store_t *store, const char *path,
+                                   qihse_user_t *user, const char *expected_sha,
+                                   cg_storage_info_t *out_info) {
     if (out_info) memset(out_info, 0, sizeof(*out_info));
     if (!store || !path || !active(user)) return false;
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -176,6 +298,17 @@ bool cg_storage_load_info(qihse_kv_store_t *store, const char *path,
     if (!in) { close(fd); return false; }
     unsigned char header[16];
     size_t n = fread(header, 1, sizeof(header), in);
+    if (expected_sha && (n < sizeof(packed_magic) ||
+                         memcmp(header, packed_magic, sizeof(packed_magic)))) {
+        fclose(in); errno = EINVAL; return false;
+    }
+    if (n >= 4 && !memcmp(header, "QCGP", 4)) {
+        bool ok = n >= 8 && !memcmp(header, packed_magic, sizeof(packed_magic)) &&
+                  verify_source_sha(in, &st, expected_sha, user) &&
+                  load_packed_snapshot(store, in, &st, user, expected_sha, out_info);
+        fclose(in);
+        return ok;
+    }
     /* A compact-looking header never falls back to the legacy text parser. */
     if (n < 4 || memcmp(header, "QCGZ", 4)) {
         fclose(in);
@@ -222,12 +355,16 @@ bool cg_storage_load_info(qihse_kv_store_t *store, const char *path,
     ok = qihse_kv_load_user(store, raw, user) == 0;
 done:
     if (fd >= 0) close(fd);
-    if (ok) publish_info(out_info, in, &st, expected, true, user);
+    if (ok) publish_info(out_info, in, &st, expected, true, false, user);
     fclose(in);
     if (out) fclose(out);
     ZSTD_freeDCtx(ctx); free(buffers);
     if (raw[0]) unlink(raw);
     return ok;
+}
+bool cg_storage_load_info(qihse_kv_store_t *store, const char *path,
+                          qihse_user_t *user, cg_storage_info_t *out_info) {
+    return cg_storage_load_verified_info(store, path, user, NULL, out_info);
 }
 bool cg_storage_load(qihse_kv_store_t *store, const char *path, qihse_user_t *user) {
     return cg_storage_load_info(store, path, user, NULL);
@@ -277,9 +414,9 @@ static ssize_t decode_read(void *cookie, char *output, size_t capacity) {
     }
     return (ssize_t)out.pos;
 }
-qihse_kv_store_t *cg_storage_open_info(const char *path, qihse_user_t *user,
-                                      size_t max_bytes, size_t max_records,
-                                      cg_storage_info_t *out_info) {
+qihse_kv_store_t *cg_storage_open_verified_info(const char *path, qihse_user_t *user,
+    size_t max_bytes, size_t max_records, const char *expected_sha,
+    cg_storage_info_t *out_info) {
     if (out_info) memset(out_info, 0, sizeof(*out_info));
     if (!active(user)) return NULL;
     if (!path || !max_bytes || !max_records) { errno = EINVAL; return NULL; }
@@ -297,9 +434,38 @@ qihse_kv_store_t *cg_storage_open_info(const char *path, qihse_user_t *user,
     int error = EINVAL;
     cg_decode_stream *state = NULL;
     FILE *decoded = NULL;
+    char *packed_raw = NULL;
+    size_t packed_raw_size = 0;
     uint64_t decoded_size = (uint64_t)info.st_size;
-    bool compact = false;
+    bool compact = false, packed = false;
     if (ferror(source)) { error = EIO; goto done; }
+    if (expected_sha && (n < sizeof(packed_magic) ||
+                         memcmp(header, packed_magic, sizeof(packed_magic)))) goto done;
+    if (n >= 4 && !memcmp(header, "QCGP", 4)) {
+        if (n < 8 || memcmp(header, packed_magic, sizeof(packed_magic)) ||
+            !verify_source_sha(source, &info, expected_sha, user)) {
+            error = errno; goto done;
+        }
+        packed = true;
+        rewind(source);
+        decoded = open_memstream(&packed_raw, &packed_raw_size);
+        if (!decoded) { error = errno; goto done; }
+        if (!cg_packed_decode_snapshot(source, decoded, user, max_bytes, max_records)) {
+            error = errno; goto done;
+        }
+        if (fclose(decoded)) { decoded = NULL; error = EIO; goto done; }
+        decoded = NULL;
+        decoded_size = packed_raw_size;
+        if (!verify_source_sha(source, &info, expected_sha, user)) {
+            error = errno; goto done;
+        }
+        FILE *reader = fmemopen(packed_raw, packed_raw_size, "rb");
+        if (!reader) { error = errno; goto done; }
+        store = qihse_kv_open_snapshot_user(reader, user, max_bytes, max_records);
+        error = errno;
+        fclose(reader);
+        goto done;
+    }
     if (n < 4 || memcmp(header, "QCGZ", 4)) {
         if ((uint64_t)info.st_size > max_bytes) { error = EFBIG; goto done; }
         rewind(source);
@@ -329,10 +495,17 @@ qihse_kv_store_t *cg_storage_open_info(const char *path, qihse_user_t *user,
 done:
     if (decoded) fclose(decoded);
     if (state) { ZSTD_freeDCtx(state->decoder); free(state); }
-    if (store) publish_info(out_info, source, &info, decoded_size, compact, user);
+    if (store) publish_info(out_info, source, &info, decoded_size, compact, packed, user);
     fclose(source);
+    free(packed_raw);
     if (!store) errno = error;
     return store;
+}
+qihse_kv_store_t *cg_storage_open_info(const char *path, qihse_user_t *user,
+                                      size_t max_bytes, size_t max_records,
+                                      cg_storage_info_t *out_info) {
+    return cg_storage_open_verified_info(path, user, max_bytes, max_records,
+                                         NULL, out_info);
 }
 qihse_kv_store_t *cg_storage_open(const char *path, qihse_user_t *user,
                                  size_t max_bytes, size_t max_records) {

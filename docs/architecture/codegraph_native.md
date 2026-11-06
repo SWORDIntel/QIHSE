@@ -336,6 +336,32 @@ are not all rewritten. A failure before manifest publication leaves the old
 snapshot current. If directory fsync fails after rename, inspect the manifest
 before retrying; the potentially published file is retained.
 
+An opt-in packed-v2 pilot uses `--storage-format packed-v2` on `import` or
+`migrate`. The reindex wrapper accepts the same option. Its versioned frame
+reconstructs the authorized live KV export exactly, including classification,
+SCI, expiry, flags, sequence numbers and opaque JSON values. Before decoding,
+the loader checks the manifest SHA-256 against the same open descriptor and
+checks the reader's clearance against every record label; the decoded stream
+then passes through QIHSE's authenticated KV loader. Migration compares full
+record metadata without depending on export order. The packed codec currently
+accepts at most 64 MiB of decoded KV data; larger graphs keep the default
+Zstandard path. Packed-v2 is not the default because its measured size depends
+on graph shape and can exceed Zstandard on small graphs.
+In the three-pair authenticated 800-node/2,400-edge synthetic comparison,
+packed-v2 used 182,355 apparent bytes versus 187,857 for the current level-9
+Zstandard container (2.93% less); a 16-node fixture was 33 bytes larger.
+The [method](../../benchmarks/codegraph_packed_method.md) and
+[receipts](../../benchmarks/codegraph_packed_literal_reference.json) include
+exact record and native-query parity. They do not predict savings on a live
+repository. [Zstandard tuning](../../benchmarks/codegraph_zstd_tuning_medium_20261106.json)
+also found a 10.2% size reduction at level 19 on that synthetic fixture, with
+roughly 36 times the level-9 encode CPU, so the default remains level 9.
+On the selected fresh Angryier graph, packed-v2 was 7,798,284 bytes against
+the existing 7,534,503-byte Zstandard snapshot (3.50% larger). Four
+authenticated query responses matched apart from generation IDs. The graph
+was migrated back to Zstandard; the newly serialized snapshot was 8,043,696
+bytes. Conversion keeps previous generations until garbage collection.
+
 To reclaim historical generations after reviewing retention needs:
 
 ```sh
@@ -463,3 +489,6 @@ For conversion alone, with the same progress display:
 
 This mode preserves the indexed source revision and freshness; it does not rebuild
 the CRG index. An already compact graph returns `unchanged`.
+For the bounded packed-v2 pilot, append `--storage-format packed-v2`. The
+stage bar still reports completion only after the new generation is verified
+and published; the previous generation remains available as rollback.

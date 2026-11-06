@@ -87,6 +87,23 @@ reader from 100,000 to 150,000 records reduced median status/query time while
 raising peak RSS. Its [results](../../benchmarks/codegraph_memory_cap_angryier_20261106.json)
 are specific to the selected graph and shared host.
 
+An opt-in packed-v2 pilot now transforms the authenticated live KV export,
+preserves its complete record metadata, and binds Guest reads to the current
+manifest digest before decoding. The [packed comparison](../../benchmarks/codegraph_packed_method.md)
+measured 182,355 bytes against current Zstandard's 187,857 bytes on the
+800-node/2,400-edge fixture (2.93% less); the tiny fixture was 33 bytes larger.
+Direct import and conversion returned exact native query results. The pilot
+has a 64 MiB decoded limit and retains Zstandard as default. On the selected
+fresh Angryier graph (8,853 nodes, 114,689 edges), packed-v2 used 7,798,284
+bytes versus the existing 7,534,503-byte Zstandard snapshot (3.50% larger).
+Four authenticated queries had identical results except for generation IDs.
+The graph was migrated back to Zstandard; that new snapshot was 8,043,696
+bytes because reserialization changed record order. The previous generations
+were retained. This live result rules out enabling packed-v2 by default.
+Separate
+[Zstandard parameter measurements](../../benchmarks/codegraph_zstd_tuning_medium_20261106.json)
+showed a larger size cut only with much greater encode CPU.
+
 ## Invariants
 
 1. Every graph read, enumeration, migration, export, mapped-block access and query
@@ -342,11 +359,12 @@ acceptable default storage optimization.
 - [~] P0: current-generation authorized accounting and a reproducible synthetic
       baseline/query corpus implemented; broader accounting and selected-graph
       baseline coverage remain.
-- [~] P1: an isolated bounded digest-key prototype passed round-trip, malformed
-      input and sanitizer checks. Integration awaits an authenticated SDK export
-      of all metadata, a complete preservation oracle and comparative size data.
+- [~] P1: opt-in packed-v2 pilot integrated with authenticated snapshot export,
+      full-metadata migration check, sanitizer/negative tests and synthetic
+      size/query receipts. Live size validation and the 64 MiB cap remain.
 - [ ] P2: implement compact adjacency and bounded selective reads.
-- [ ] Migration: support packed-v2 conversion, rollback and measurable progress.
+- [~] Migration: packed-v2 conversion and rollback generation work through the
+      existing stage bar; within-stage byte/record progress remains.
 - [ ] P3: implement per-file incremental generations and shared-block-safe GC.
 - [ ] P4: define and validate explicit filesystem/overlay source providers.
 - [ ] P5: evaluate optional, explicitly incomplete retrieval views.

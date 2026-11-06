@@ -1973,12 +1973,12 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 # Requires json-c, OpenSSL and libzstd only for this optional executable.
 # This is NOT linked into HAX and adds no mandatory dependency to libqihse.so.
 .PHONY: test-codegraph
-qihse-codegraph: tools/qihse_codegraph.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_storage.h $(LIB_TARGET)
+qihse-codegraph: tools/qihse_codegraph.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_storage.h tools/qihse_codegraph_packed.c tools/qihse_codegraph_packed.h $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core \
-	  $< tools/qihse_codegraph_storage.c -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl libzstd) \
+	  $< tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl libzstd) \
 	  $(LDFLAGS) -Wl,-rpath,'$$ORIGIN'
 
-test-codegraph: qihse-codegraph test-codegraph-codec
+test-codegraph: qihse-codegraph test-codegraph-codec test-codegraph-packed
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph
 	python3 tests/test_codegraph_storage.py --binary ./qihse-codegraph
 	python3 tests/test_codegraph_reindex.py
@@ -2037,11 +2037,18 @@ test-qihse-deps:
 .PHONY: test-codegraph-codec
 test-codegraph-codec: $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
-	  tests/test_codegraph_storage.c tools/qihse_codegraph_storage.c -o tests/test_codegraph_storage \
+	  tests/test_codegraph_storage.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c -o tests/test_codegraph_storage \
 	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
 	LD_LIBRARY_PATH=. ./tests/test_codegraph_storage
 
 test-serial: test-codegraph
+
+.PHONY: test-codegraph-packed
+test-codegraph-packed: $(LIB_TARGET)
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
+	  tests/test_codegraph_packed.c tools/qihse_codegraph_packed.c -o tests/test_codegraph_packed \
+	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd openssl) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=. ./tests/test_codegraph_packed
 
 .PHONY: test-graph-property-index
 test-graph-property-index:
@@ -2055,7 +2062,7 @@ test-serial: test-graph-property-index
 .PHONY: test-codegraph-memory
 test-codegraph-memory: $(LIB_TARGET)
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
-	  tests/test_codegraph_memory.c tools/qihse_codegraph_storage.c -o tests/test_codegraph_memory \
+	  tests/test_codegraph_memory.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c -o tests/test_codegraph_memory \
 	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
 	LD_LIBRARY_PATH=. ./tests/test_codegraph_memory
 

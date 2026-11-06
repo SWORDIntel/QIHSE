@@ -73,6 +73,7 @@ typedef struct {
     struct json_object *meta, *manifest;
     cg_storage_info_t storage_info;
     bool stats_mode;
+    const char *requested_storage_format;
     bool audit_ready;
     int lifecycle_fd, lease_fd;
     char directory[PATH_MAX], repository[PATH_MAX];
@@ -555,13 +556,116 @@ static bool record_fingerprint(cg_state *st, char result[65], size_t *count) {
     free(f.hashes);
     return ok;
 }
+static bool sha256_private_user(cg_state *st, const char *path, char result[65]) {
+    if (!principal_active(st)) return false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    bool ok = fd >= 0;
+    struct stat info;
+    if (ok && (fstat(fd, &info) || !S_ISREG(info.st_mode) ||
+               info.st_uid != geteuid() || info.st_nlink != 1)) ok = false;
+    EVP_MD_CTX *digest = ok ? EVP_MD_CTX_new() : NULL;
+    if (!digest || EVP_DigestInit_ex(digest, EVP_sha256(), NULL) != 1) ok = false;
+    unsigned char chunk[65536], sum[32];
+    unsigned int length = 0;
+    while (ok) {
+        if (!principal_active(st)) { ok = false; break; }
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { ok = false; break; }
+        if (!n) break;
+        ok = EVP_DigestUpdate(digest, chunk, (size_t)n) == 1;
+    }
+    if (ok) ok = principal_active(st) &&
+        EVP_DigestFinal_ex(digest, sum, &length) == 1 && length == 32;
+    if (ok) digest_hex(sum, sizeof(sum), result);
+    EVP_MD_CTX_free(digest);
+    if (fd >= 0) close(fd);
+    return ok;
+}
+/* Compare complete authenticated live-record exports, including labels,
+ * expiry, flags and sequence numbers, when validating packed conversion. */
+static bool export_fingerprint(cg_state *st, char result[65]) {
+    if (!st->kv || !principal_active(st)) return false;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/.export-check-XXXXXX", st->scratch) >=
+        (int)sizeof(path)) return false;
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    close(fd);
+    bool ok = qihse_kv_save_user(st->kv, path, st->principal) == 0 &&
+              principal_active(st);
+    fd = ok ? open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
+    struct stat info;
+    if (fd < 0 || fstat(fd, &info) || !S_ISREG(info.st_mode) ||
+        info.st_uid != geteuid() || info.st_nlink != 1) ok = false;
+    FILE *input = ok ? fdopen(fd, "rb") : NULL;
+    if (!input && fd >= 0) close(fd);
+    if (!input) ok = false;
+    unsigned char *hashes = NULL;
+    size_t count = 0, capacity = 0;
+    unsigned char chunk[65536];
+    while (ok) {
+        if (!principal_active(st)) { ok = false; break; }
+        char header[256];
+        if (!fgets(header, sizeof(header), input)) {
+            ok = feof(input) && !ferror(input);
+            break;
+        }
+        size_t length = strlen(header), key_len = 0, value_len = 0;
+        if (!length || header[length - 1] != '\n' ||
+            sscanf(header, "%zu %zu", &key_len, &value_len) != 2 ||
+            !key_len || key_len > 65535 || value_len > (16u << 20) ||
+            count >= CG_MAX_NODES + CG_MAX_EDGES + 2) { ok = false; break; }
+        if (count == capacity) {
+            size_t next_capacity = capacity ? capacity * 2 : 256;
+            unsigned char *next = realloc(hashes, next_capacity * 32);
+            if (!next) { ok = false; break; }
+            hashes = next;
+            capacity = next_capacity;
+        }
+        EVP_MD_CTX *digest = EVP_MD_CTX_new();
+        ok = digest && EVP_DigestInit_ex(digest, EVP_sha256(), NULL) == 1 &&
+             EVP_DigestUpdate(digest, header, length) == 1;
+        size_t remaining = key_len + value_len + 1;
+        int last = -1;
+        while (ok && remaining) {
+            if (!principal_active(st)) { ok = false; break; }
+            size_t wanted = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+            size_t n = fread(chunk, 1, wanted, input);
+            if (n != wanted || EVP_DigestUpdate(digest, chunk, n) != 1) {
+                ok = false; break;
+            }
+            last = chunk[n - 1];
+            remaining -= n;
+        }
+        unsigned int digest_len = 0;
+        if (ok) ok = last == '\n' &&
+            EVP_DigestFinal_ex(digest, hashes + count * 32, &digest_len) == 1 &&
+            digest_len == 32;
+        EVP_MD_CTX_free(digest);
+        if (ok) ++count;
+    }
+    if (input && fclose(input)) ok = false;
+    if (ok) {
+        if (count) qsort(hashes, count, 32, compare_hashes);
+        ok = sha256_buffer((const char *)hashes, count * 32, result);
+    }
+    free(hashes);
+    unlink(path);
+    return ok;
+}
 /* Retain bounded snapshots in memory without installing a runtime SST copy.
  * Large snapshots keep the durable path; auth/corruption never triggers fallback. */
-static bool replace_snapshot_store(cg_state *st, const char *path) {
+static bool replace_snapshot_store(cg_state *st, const char *path,
+                                   const char *expected_sha) {
     memset(&st->storage_info, 0, sizeof(st->storage_info));
-    qihse_kv_store_t *loaded = st->stats_mode ?
-        cg_storage_open_info(path, st->principal, UINT64_C(64) << 20, 150000,
-                             &st->storage_info) :
+    bool bound_info = st->stats_mode ||
+        (st->manifest && json_string(st->manifest, "storage_format"));
+    qihse_kv_store_t *loaded = expected_sha ?
+        cg_storage_open_verified_info(path, st->principal, UINT64_C(64) << 20,
+                                      150000, expected_sha, &st->storage_info) :
+        bound_info ? cg_storage_open_info(path, st->principal, UINT64_C(64) << 20,
+                                          150000, &st->storage_info) :
         cg_storage_open(path, st->principal, UINT64_C(64) << 20, 150000);
     if (loaded) {
         if (st->kv) qihse_kv_store_destroy(st->kv);
@@ -571,16 +675,25 @@ static bool replace_snapshot_store(cg_state *st, const char *path) {
     if (errno != EFBIG && errno != E2BIG) return false;
     if (st->kv) qihse_kv_store_destroy(st->kv);
     st->kv = qihse_kv_store_create();
-    return st->kv && (st->stats_mode ?
-        cg_storage_load_info(st->kv, path, st->principal, &st->storage_info) :
+    return st->kv && (expected_sha ?
+        cg_storage_load_verified_info(st->kv, path, st->principal, expected_sha,
+                                      &st->storage_info) :
+        bound_info ? cg_storage_load_info(st->kv, path, st->principal,
+                                          &st->storage_info) :
         cg_storage_load(st->kv, path, st->principal));
 }
-static bool verify_saved(cg_state *st, const char *path) {
+static bool verify_saved(cg_state *st, const char *path, const char *expected_sha) {
     char before[65], after[65]; size_t n_before, n_after;
     return record_fingerprint(st, before, &n_before) &&
-           replace_snapshot_store(st, path) &&
+           replace_snapshot_store(st, path, expected_sha) &&
            record_fingerprint(st, after, &n_after) &&
            n_before == n_after && !strcmp(before, after);
+}
+static bool verify_saved_full(cg_state *st, const char *path) {
+    char before[65], after[65], sha[65];
+    return export_fingerprint(st, before) && sha256_private_user(st, path, sha) &&
+           replace_snapshot_store(st, path, sha) &&
+           export_fingerprint(st, after) && !strcmp(before, after);
 }
 static int import_snapshot_unlocked(cg_state *st, const char *input) {
     char lock_path[PATH_MAX], manifest_path[PATH_MAX];
@@ -771,10 +884,17 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     bool old_format_valid = !previous ||
         !json_object_object_get_ex(previous, "storage_format", &old_format_field) ||
         (json_object_is_type(old_format_field, json_type_string) &&
-         !strcmp(json_object_get_string(old_format_field), "qihse-codegraph-zstd-v1"));
+         (!strcmp(json_object_get_string(old_format_field), "qihse-codegraph-zstd-v1") ||
+          !strcmp(json_object_get_string(old_format_field), "qihse-codegraph-packed-v2")));
     if (snapshot_name(old_name)) {
         snprintf(rollback, sizeof(rollback), "%s", old_name);
-        if (old_format_valid && old_hash && !strcmp(old_hash, input_hash) && hex64(old_sha) &&
+        if (old_format_valid &&
+            (!st->requested_storage_format ||
+             (old_format_field &&
+              !strcmp(json_object_get_string(old_format_field),
+                  !strcmp(st->requested_storage_format, "packed-v2") ?
+                  "qihse-codegraph-packed-v2" : "qihse-codegraph-zstd-v1"))) &&
+            old_hash && !strcmp(old_hash, input_hash) && hex64(old_sha) &&
             snprintf(old_path, sizeof(old_path), "%s/%s", st->directory, old_name) <
                 (int)sizeof(old_path) && sha256_file(old_path, old_actual, 0) &&
             !strcmp(old_actual, old_sha) &&
@@ -787,7 +907,10 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
             json_num(previous, "nodes") == (int64_t)nodes &&
             json_num(previous, "edges") == (int64_t)edges &&
             json_num(previous, "unresolved_edges") == (int64_t)unresolved) {
-            if (!verify_saved(st, old_path)) {
+            if (!verify_saved(st, old_path,
+                              old_format_field &&
+                              !strcmp(json_object_get_string(old_format_field),
+                                      "qihse-codegraph-packed-v2") ? old_sha : NULL)) {
                 json_object_put(previous); json_object_put(meta); close(lfd);
                 return error_json("existing snapshot does not match verified import records");
             }
@@ -827,12 +950,22 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     }
     close(reserved);
     snprintf(name, sizeof(name), "%s", strrchr(published, '/') + 1);
-    if (!cg_storage_save(st->kv, temporary, st->principal)) {
+    bool write_packed = st->requested_storage_format &&
+        !strcmp(st->requested_storage_format, "packed-v2");
+    if (!(write_packed ? cg_storage_save_packed(st->kv, temporary, st->principal) :
+                         cg_storage_save(st->kv, temporary, st->principal))) {
         unlink(published);
         unlink(temporary);
         json_object_put(meta);
         close(lfd);
         return error_json("QIHSE KV snapshot serialization failed");
+    }
+    if (write_packed && !verify_saved_full(st, temporary)) {
+        unlink(published);
+        unlink(temporary);
+        json_object_put(meta);
+        close(lfd);
+        return error_json("packed CodeGraph snapshot metadata verification failed");
     }
     char binary_hash[65];
     if (!sha256_file(temporary, binary_hash, 0) || rename(temporary, published) != 0) {
@@ -844,7 +977,8 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     }
     struct json_object *manifest = json_object_new_object();
     json_text(manifest, "snapshot", name);
-    json_text(manifest, "storage_format", "qihse-codegraph-zstd-v1");
+    json_text(manifest, "storage_format", write_packed ?
+        "qihse-codegraph-packed-v2" : "qihse-codegraph-zstd-v1");
     if (rollback[0]) json_text(manifest, "previous_snapshot", rollback);
     json_text(manifest, "sha256", binary_hash);
     json_text(manifest, "head", json_string(meta, "head"));
@@ -1085,7 +1219,8 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
     const char *format = json_string(st->manifest, "storage_format");
     struct json_object *format_field;
     if (json_object_object_get_ex(st->manifest, "storage_format", &format_field) &&
-        (!format || strcmp(format, "qihse-codegraph-zstd-v1"))) return false;
+        (!format || (strcmp(format, "qihse-codegraph-zstd-v1") &&
+                     strcmp(format, "qihse-codegraph-packed-v2")))) return false;
     char *snapshot = json_string(st->manifest, "snapshot");
     char *sha = json_string(st->manifest, "sha256");
     if (!snapshot || strncmp(snapshot, "graph-", 6) != 0 || strlen(snapshot) > 120 ||
@@ -1095,15 +1230,23 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
     if (snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s", st->directory, snapshot) >=
             (int)sizeof(snapshot_path))
         return false;
-    if (!st->stats_mode && (!sha256_file(snapshot_path, actual, 0) || strcmp(actual, sha)))
+    if (!st->stats_mode && !format &&
+        (!sha256_file(snapshot_path, actual, 0) || strcmp(actual, sha)))
         return false;
     snapshot_verify_ms = monotonic_ms() - phase_start;
     phase_start = monotonic_ms();
-    bool loaded = replace_snapshot_store(st, snapshot_path);
+    bool loaded = replace_snapshot_store(st, snapshot_path,
+        format && !strcmp(format, "qihse-codegraph-packed-v2") ? sha : NULL);
     kv_load_ms = monotonic_ms() - phase_start;
     if (!loaded)
         return false;
-    if (st->stats_mode && (!st->storage_info.valid || strcmp(st->storage_info.sha256, sha)))
+    if ((st->stats_mode || format) &&
+        (!st->storage_info.valid || strcmp(st->storage_info.sha256, sha)))
+        return false;
+    if (format && ((!strcmp(format, "qihse-codegraph-zstd-v1") &&
+                   (!st->storage_info.compact || st->storage_info.packed)) ||
+                  (!strcmp(format, "qihse-codegraph-packed-v2") &&
+                   (!st->storage_info.packed || st->storage_info.compact))))
         return false;
     char *header = qihse_kv_get_user(st->kv, "_meta", st->principal);
     char *end = qihse_kv_get_user(st->kv, "_end", st->principal);
@@ -1157,8 +1300,14 @@ static int migrate_snapshot(cg_state *st) {
     bool committed = false;
     const char *failure = "CodeGraph migration failed while loading the current graph";
     if (!load_snapshot_unlocked(st, true)) goto done;
-    if (json_string(st->manifest, "storage_format") &&
-        !strcmp(json_string(st->manifest, "storage_format"), "qihse-codegraph-zstd-v1")) {
+    bool write_packed = st->requested_storage_format &&
+        !strcmp(st->requested_storage_format, "packed-v2");
+    const char *target_format = write_packed ? "qihse-codegraph-packed-v2" :
+        "qihse-codegraph-zstd-v1";
+    const char *current_format = json_string(st->manifest, "storage_format");
+    if (current_format && (!strcmp(current_format, target_format) ||
+        (!st->requested_storage_format &&
+         !strcmp(current_format, "qihse-codegraph-packed-v2")))) {
         json_text(st->manifest, "status", "unchanged");
         print_json(st->manifest);
         rc = 0;
@@ -1180,12 +1329,15 @@ static int migrate_snapshot(cg_state *st) {
     close(fd);
     char sha[65];
     failure = "CodeGraph migration failed while writing the compact snapshot";
-    if (!cg_storage_save(st->kv, output, st->principal)) goto done;
+    if (!(write_packed ? cg_storage_save_packed(st->kv, output, st->principal) :
+                         cg_storage_save(st->kv, output, st->principal))) goto done;
     failure = "CodeGraph migration failed while verifying the compact snapshot";
-    if (!verify_saved(st, output) || !sha256_file(output, sha, 0)) goto done;
+    if (!(write_packed ? verify_saved_full(st, output) :
+                         verify_saved(st, output, NULL)) ||
+        !sha256_file(output, sha, 0)) goto done;
     json_text(st->manifest, "snapshot", strrchr(output, '/') + 1);
     json_text(st->manifest, "sha256", sha);
-    json_text(st->manifest, "storage_format", "qihse-codegraph-zstd-v1");
+    json_text(st->manifest, "storage_format", target_format);
     json_text(st->manifest, "previous_snapshot", previous);
     failure = "CodeGraph migration failed while publishing the manifest; inspect current status before retry";
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory) >=
@@ -1563,10 +1715,16 @@ static int storage_stats(cg_state *st) {
     const char *name = json_string(st->manifest, "snapshot");
     const char *declared_format = json_string(st->manifest, "storage_format");
     if (!snapshot_name(name) ||
-        (declared_format && strcmp(declared_format, "qihse-codegraph-zstd-v1")) ||
-        (!!declared_format != st->storage_info.compact)) goto done;
+        (declared_format && strcmp(declared_format, "qihse-codegraph-zstd-v1") &&
+         strcmp(declared_format, "qihse-codegraph-packed-v2")) ||
+        (declared_format && !strcmp(declared_format, "qihse-codegraph-zstd-v1") &&
+         !st->storage_info.compact) ||
+        (declared_format && !strcmp(declared_format, "qihse-codegraph-packed-v2") &&
+         !st->storage_info.packed) ||
+        (!declared_format && (st->storage_info.compact || st->storage_info.packed))) goto done;
     struct json_object *report = summary(st, false);
-    json_text(report, "storage_format", st->storage_info.compact ?
+    json_text(report, "storage_format", st->storage_info.packed ?
+        "qihse-codegraph-packed-v2" : st->storage_info.compact ?
         "qihse-codegraph-zstd-v1" : "qihse-kv-legacy");
     json_text(report, "coverage", "authorized_current_generation");
     json_int(report, "encoded_bytes", (int64_t)st->storage_info.encoded_bytes);
@@ -3049,6 +3207,7 @@ static const char *usage_text =
     "[--max-tokens 128..16000] [--socket PATH] [--token-file PATH] "
     "[--idle-seconds 1..3600] [--workers 1..4] [--fallback error|oneshot] "
     "[--memory-limit-mib 128..65536] [--pool-file PATH --pool-budget-mib 128..262144] "
+    "[--storage-format zstd-v1|packed-v2 (import/migrate)] "
     "[--match auto|exact|qualified|prefix|substring] [--timings] [--compact]\n";
 static int usage(void) {
     fputs(usage_text, stderr);
@@ -3072,6 +3231,7 @@ int main(int argc, char **argv) {
     const char *pool_path = NULL;
     size_t workers = CG_WORKERS;
     const char *fallback = "error", *match = NULL;
+    const char *requested_storage_format = NULL;
     bool timings = false, compact_output = false;
     for (int i = 2; i < argc; i++) {
         const char *flag = argv[i];
@@ -3129,6 +3289,8 @@ int main(int argc, char **argv) {
             fallback = value;
         else if (!strcmp(flag, "--match"))
             match = value;
+        else if (!strcmp(flag, "--storage-format"))
+            requested_storage_format = value;
         else
             return usage();
     }
@@ -3144,6 +3306,10 @@ int main(int argc, char **argv) {
         idle_seconds < 1 || idle_seconds > 3600 || workers < 1 || workers > CG_WORKERS ||
         (!strcmp(action, "serve") && (!socket_path || !token_path)) ||
         (!strcmp(action, "stats") && (socket_path || token_path || input)) ||
+        (requested_storage_format &&
+         (strcmp(requested_storage_format, "zstd-v1") &&
+          strcmp(requested_storage_format, "packed-v2"))) ||
+        (requested_storage_format && strcmp(action, "import") && strcmp(action, "migrate")) ||
         (!!socket_path != !!token_path) || !valid_match(match) ||
         (strcmp(fallback, "error") && strcmp(fallback, "oneshot")))
         return usage();
@@ -3205,6 +3371,7 @@ int main(int argc, char **argv) {
         json_object_put(request);
         return error_json("CodeGraph repo/runtime not available");
     }
+    st.requested_storage_format = requested_storage_format;
     int rc;
     if (!strcmp(action, "import")) {
         rc = input ? import_snapshot(&st, input) : usage();
