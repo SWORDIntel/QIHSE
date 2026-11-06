@@ -221,11 +221,12 @@ int main(int argc, char **argv) {
     if (!store_fingerprint(store, op, before, &before_count)) return 5;
 
     char raw[PATH_MAX], decoded[PATH_MAX], reexport[PATH_MAX];
-    char protected_path[PATH_MAX], denied[PATH_MAX];
+    char protected_path[PATH_MAX], protected_raw[PATH_MAX], denied[PATH_MAX];
     if (!path_append(raw, sizeof(raw), output, ".raw") ||
         !path_append(decoded, sizeof(decoded), output, ".decoded") ||
         !path_append(reexport, sizeof(reexport), output, ".reexport") ||
         !path_append(protected_path, sizeof(protected_path), output, ".protected") ||
+        !path_append(protected_raw, sizeof(protected_raw), output, ".protected.raw") ||
         !path_append(denied, sizeof(denied), output, ".denied")) return 5;
     double begin = milliseconds();
     if (qihse_kv_save_user(store, raw, op)) return 6;
@@ -271,7 +272,8 @@ int main(int argc, char **argv) {
         qihse_kv_save_user(store, protected_path, op) == 0
         : !strcmp(backend, "zstd") ? cg_storage_save(store, protected_path, op)
 #ifdef CODEGRAPH_PACKED_CODEC
-        : qihse_kv_save_user(store, raw, op) == 0 && packed_encode(raw, protected_path, op);
+        : qihse_kv_save_user(store, protected_raw, op) == 0 &&
+          packed_encode(protected_raw, protected_path, op);
 #else
         : false;
 #endif

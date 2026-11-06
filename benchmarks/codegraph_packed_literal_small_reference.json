@@ -1,0 +1,132 @@
+{
+  "environment": {
+    "binary_sha256": "13a339f6650302c039e3fbf869566b4f7c0698e66fb056b543a2ed8b387c4b98",
+    "compiler": "cc",
+    "library_sha256": "e474b17678bb257892b02e14fe1183924d6f5ea8bb551bfce45dd7a0e16896d3",
+    "packed_source_sha256": "ed86e8ce60b5deb287f0f4de87c7937782070295aba54f937214afc25df6276a",
+    "platform": "Linux-7.0.14-28-pve-x86_64-with-glibc2.41",
+    "python": "3.13.5",
+    "source_sha256": "622db659959377271862f82e61aed1a60bf9637bd1bed854e8c77b402a0e31a9",
+    "storage_source_sha256": "0bcb4c2807f867af5100ffb2c75e61197e1d395c157bfae7c3328285edfa2967"
+  },
+  "fixture": {
+    "edges": 24,
+    "jsonl_bytes": 18656,
+    "jsonl_sha256": "2663317a10244bcf52e61a43774088596af66bbde65e7c59a66a60f03f6211f7",
+    "nodes": 16
+  },
+  "median": {
+    "legacy": {
+      "encode_cpu_ms": 0.34,
+      "encode_ms": 0.341,
+      "load_cpu_ms": 2.047,
+      "load_ms": 2.047,
+      "peak_rss_kib": 22624,
+      "process_wall_ms": 6244.264,
+      "production_equivalent_encode_ms": 0.341,
+      "raw_export_ms": 0.358,
+      "snapshot_allocated_bytes": 24576,
+      "snapshot_apparent_bytes": 22092
+    },
+    "packed": {
+      "encode_cpu_ms": 1.912,
+      "encode_ms": 1.914,
+      "load_cpu_ms": 2.372,
+      "load_ms": 2.372,
+      "peak_rss_kib": 23004,
+      "process_wall_ms": 6258.285,
+      "production_equivalent_encode_ms": 2.282,
+      "raw_export_ms": 0.368,
+      "snapshot_allocated_bytes": 4096,
+      "snapshot_apparent_bytes": 3249
+    },
+    "zstd": {
+      "encode_cpu_ms": 2.119,
+      "encode_ms": 2.12,
+      "load_cpu_ms": 2.448,
+      "load_ms": 2.447,
+      "peak_rss_kib": 22544,
+      "process_wall_ms": 6205.554,
+      "production_equivalent_encode_ms": 2.12,
+      "raw_export_ms": 0.376,
+      "snapshot_allocated_bytes": 4096,
+      "snapshot_apparent_bytes": 3216
+    }
+  },
+  "method": "authenticated synthetic KV; per-backend fresh process; warm OS cache; backend order rotates; raw export measured separately; packed encode reuses exported raw; zstd/legacy save through authenticated SDK; timings may include shared-host contention",
+  "parity": {
+    "all_formats_exact_raw_roundtrip": true,
+    "fingerprint": "36add8a8ef033bfc1e02306edd4eb6111c9773c5061a556f22c1579e035c9ff5",
+    "low_clearance_denial": true,
+    "native_query_parity": "not tested",
+    "raw_export_sha256": "a909d27ec271bb34910a156db16ff11f93fec20039dffaf1f58656e0275f85b8",
+    "record_count": 42
+  },
+  "runs": [
+    {
+      "backend": "legacy",
+      "encode_cpu_ms": 0.34,
+      "encode_ms": 0.341,
+      "fingerprint": "36add8a8ef033bfc1e02306edd4eb6111c9773c5061a556f22c1579e035c9ff5",
+      "load_cpu_ms": 2.047,
+      "load_ms": 2.047,
+      "low_clearance_denied": true,
+      "peak_rss_kib": 22624,
+      "process_wall_ms": 6244.264,
+      "production_equivalent_encode_ms": 0.341,
+      "raw_export_ms": 0.358,
+      "raw_export_sha256": "a909d27ec271bb34910a156db16ff11f93fec20039dffaf1f58656e0275f85b8",
+      "raw_roundtrip": true,
+      "record_count": 42,
+      "repeat": 0,
+      "snapshot_allocated_bytes": 24576,
+      "snapshot_apparent_bytes": 22092
+    },
+    {
+      "backend": "zstd",
+      "encode_cpu_ms": 2.119,
+      "encode_ms": 2.12,
+      "fingerprint": "36add8a8ef033bfc1e02306edd4eb6111c9773c5061a556f22c1579e035c9ff5",
+      "load_cpu_ms": 2.448,
+      "load_ms": 2.447,
+      "low_clearance_denied": true,
+      "peak_rss_kib": 22544,
+      "process_wall_ms": 6205.554,
+      "production_equivalent_encode_ms": 2.12,
+      "raw_export_ms": 0.376,
+      "raw_export_sha256": "a909d27ec271bb34910a156db16ff11f93fec20039dffaf1f58656e0275f85b8",
+      "raw_roundtrip": true,
+      "record_count": 42,
+      "repeat": 0,
+      "snapshot_allocated_bytes": 4096,
+      "snapshot_apparent_bytes": 3216
+    },
+    {
+      "backend": "packed",
+      "encode_cpu_ms": 1.912,
+      "encode_ms": 1.914,
+      "fingerprint": "36add8a8ef033bfc1e02306edd4eb6111c9773c5061a556f22c1579e035c9ff5",
+      "load_cpu_ms": 2.372,
+      "load_ms": 2.372,
+      "low_clearance_denied": true,
+      "packed_frame_sections": {
+        "body_decoded_bytes": 21305,
+        "body_frame_bytes": 3023,
+        "label_header_decoded_bytes": 871,
+        "label_header_frame_bytes": 178,
+        "outer_header_bytes": 48
+      },
+      "peak_rss_kib": 23004,
+      "process_wall_ms": 6258.285,
+      "production_equivalent_encode_ms": 2.282,
+      "raw_export_ms": 0.368,
+      "raw_export_sha256": "a909d27ec271bb34910a156db16ff11f93fec20039dffaf1f58656e0275f85b8",
+      "raw_roundtrip": true,
+      "record_count": 42,
+      "repeat": 0,
+      "snapshot_allocated_bytes": 4096,
+      "snapshot_apparent_bytes": 3249
+    }
+  ],
+  "timing_context": "codec-literal-small"
+}

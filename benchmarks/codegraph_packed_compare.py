@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -28,19 +29,36 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_driver(output: Path, library_dir: Path, packed: bool) -> list[str]:
+def packed_frame_sections(path: Path) -> dict[str, int]:
+    """Read only length metadata from a synthetic packed output, never graph data."""
+    with path.open("rb") as stream:
+        header = stream.read(48)
+    if len(header) != 48 or header[:8] != b"QCGP0002":
+        raise AssertionError("synthetic packed snapshot has no QCGP0002 header")
+    table = int.from_bytes(header[36:40], "big")
+    body = int.from_bytes(header[40:44], "big")
+    if 48 + table + body != path.stat().st_size:
+        raise AssertionError("packed section lengths do not match output size")
+    return {"outer_header_bytes": 48, "label_header_frame_bytes": table,
+            "body_frame_bytes": body,
+            "label_header_decoded_bytes": int.from_bytes(header[16:24], "big"),
+            "body_decoded_bytes": int.from_bytes(header[24:32], "big")}
+
+
+def build_driver(output: Path, library_dir: Path, codec_dir: Path,
+                 packed: bool) -> list[str]:
     flags = subprocess.check_output(
         ["pkg-config", "--cflags", "--libs", "json-c", "openssl", "libzstd"],
         text=True,
     ).split()
     command = [os.environ.get("CC", "cc"), "-std=c11", "-O2", "-Wall", "-Wextra",
                "-Werror", "-I" + str(PROJECT / "include"),
-               "-I" + str(PROJECT / "tools")]
+               "-I" + str(codec_dir / "tools"), "-I" + str(PROJECT / "tools")]
     if packed:
         command.append("-DCODEGRAPH_PACKED_CODEC")
     command += [str(DRIVER), str(PROJECT / "tools/qihse_codegraph_storage.c")]
     if packed:
-        command.append(str(PROJECT / "tools/qihse_codegraph_packed.c"))
+        command.append(str(codec_dir / "tools/qihse_codegraph_packed.c"))
     command += ["-o", str(output), "-L" + str(library_dir), "-lqihse",
                 *flags, "-ldl", "-lm", "-lpthread"]
     subprocess.run(command, check=True, cwd=PROJECT)
@@ -67,7 +85,7 @@ def run_driver(binary: Path, backend: str, fixture: Path, output: Path,
 
 
 def measure(binary: Path, library_dir: Path, nodes: int, edges: int,
-            repeats: int, packed: bool) -> dict:
+            repeats: int, packed: bool, raw_export: Path | None) -> dict:
     with tempfile.TemporaryDirectory(prefix="qihse-codegraph-packed-") as temporary:
         base = Path(temporary)
         repo = base / "repo"
@@ -96,7 +114,11 @@ def measure(binary: Path, library_dir: Path, nodes: int, edges: int,
                 output_dir.mkdir()
                 receipt = run_driver(binary, backend, fixture, output_dir / "snapshot",
                                      library_dir)
+                if raw_export is not None and repeat == 0 and backend == backends[0]:
+                    shutil.copyfile(output_dir / "snapshot.raw", raw_export)
                 receipt["raw_export_sha256"] = sha256(output_dir / "snapshot.raw")
+                if backend == "packed":
+                    receipt["packed_frame_sections"] = packed_frame_sections(output_dir / "snapshot")
                 receipt["production_equivalent_encode_ms"] = round(
                     receipt["encode_ms"] + (receipt["raw_export_ms"] if backend == "packed" else 0), 3)
                 receipt["repeat"] = repeat
@@ -111,7 +133,7 @@ def measure(binary: Path, library_dir: Path, nodes: int, edges: int,
             actual = (receipt["record_count"], receipt["fingerprint"],
                       receipt["raw_export_sha256"])
             if actual != expected:
-                raise AssertionError(f"record parity failed: {receipt['backend']}")
+                raise AssertionError(f"record parity failed: {receipt['backend']}: {actual} != {expected}")
         keys = ["snapshot_apparent_bytes", "snapshot_allocated_bytes", "raw_export_ms",
                 "encode_ms", "encode_cpu_ms", "production_equivalent_encode_ms",
                 "load_ms", "load_cpu_ms",
@@ -133,10 +155,14 @@ def measure(binary: Path, library_dir: Path, nodes: int, edges: int,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library-dir", type=Path, default=PROJECT)
+    parser.add_argument("--codec-dir", type=Path, default=PROJECT)
     parser.add_argument("--nodes", type=int, default=800)
     parser.add_argument("--edges", type=int, default=2400)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--baseline-only", action="store_true")
+    parser.add_argument("--timing-context", default="uncontrolled")
+    parser.add_argument("--raw-export", type=Path,
+                        help="Copy the first authenticated synthetic raw KV export here")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.repeats < 1:
@@ -144,9 +170,10 @@ def main() -> None:
     packed = not args.baseline_only
     with tempfile.TemporaryDirectory(prefix="qihse-codegraph-packed-build-") as temporary:
         binary = Path(temporary) / "codegraph_packed_driver"
-        command = build_driver(binary, args.library_dir.resolve(), packed)
+        command = build_driver(binary, args.library_dir.resolve(),
+                               args.codec_dir.resolve(), packed)
         result = measure(binary, args.library_dir.resolve(), args.nodes,
-                         args.edges, args.repeats, packed)
+                         args.edges, args.repeats, packed, args.raw_export)
         result["environment"] = {"platform": platform.platform(),
                                  "python": platform.python_version(),
                                  "compiler": command[0],
@@ -154,8 +181,9 @@ def main() -> None:
                                  "binary_sha256": sha256(binary),
                                  "library_sha256": sha256(args.library_dir / "libqihse.so"),
                                  "storage_source_sha256": sha256(PROJECT / "tools/qihse_codegraph_storage.c"),
-                                 "packed_source_sha256": sha256(PROJECT / "tools/qihse_codegraph_packed.c") if packed else None}
+                                 "packed_source_sha256": sha256(args.codec_dir / "tools/qihse_codegraph_packed.c") if packed else None}
         result["method"] = "authenticated synthetic KV; per-backend fresh process; warm OS cache; backend order rotates; raw export measured separately; packed encode reuses exported raw; zstd/legacy save through authenticated SDK; timings may include shared-host contention"
+        result["timing_context"] = args.timing_context
         serialized = json.dumps(result, indent=2, sort_keys=True) + "\n"
         if args.output:
             args.output.write_text(serialized)

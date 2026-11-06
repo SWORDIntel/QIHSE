@@ -1,0 +1,45 @@
+{
+  "binary_sha256": "68d292f582273480dd50ae492994d57a832e1210777e908afdb6564015c7c66d",
+  "cases": {
+    "direct_callers_and_test": {
+      "seed_nodes": 1,
+      "shown_nodes": 4,
+      "truncated": false
+    },
+    "high_degree": {
+      "seed_nodes": 1,
+      "shown_nodes": 194,
+      "truncated": true
+    },
+    "missing_symbol": {
+      "seed_nodes": 0,
+      "shown_nodes": 0,
+      "truncated": false
+    },
+    "shared_names": {
+      "seed_nodes": 2,
+      "shown_nodes": 88,
+      "truncated": true
+    }
+  },
+  "edges": 2400,
+  "ground_truth": {
+    "direct_caller_id": "b3efe52d3c70732556ac4da2c0d9ee1b642bd093163532261f1501c61fa29817",
+    "shared_name_ids": [
+      "cac7c6a4c637a234b1c8eca8b8b5b36de5d7a2d21127ee183db984323c0faae1",
+      "66c00edba6f386049e1034d1f5053fdabb1e1729725988dc0a65ff86f2b1b0b8"
+    ],
+    "target_id": "816ccbdbf4d6116d345ab3c2e75e2ebb2af2502565003079a72add9b4b24fedf",
+    "test_id": "8465ec173b446fd2ef695402f739016905b47147b3f9777bf327a4208adca81a"
+  },
+  "input_sha256": "bdcbbbe998b72c39cdb92a95349ab997d53d386256f723cf8a7e8ab83fb2976e",
+  "nodes": 800,
+  "packed_creation": "zstd-v1 import followed by authenticated packed-v2 migrate",
+  "query_parity": true,
+  "scope": "synthetic authenticated native CLI; no live CodeGraph state",
+  "snapshot_apparent_bytes": {
+    "legacy": 1825299,
+    "packed": 184708,
+    "zstd": 187971
+  }
+}
