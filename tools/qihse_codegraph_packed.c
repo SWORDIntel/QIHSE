@@ -92,11 +92,6 @@ static void put32(unsigned char *p, uint32_t n) {
 static void put64(unsigned char *p, uint64_t n) {
     for (size_t i = 0; i < 8; i++) p[i] = (unsigned char)(n >> (56 - i * 8));
 }
-static int hex(unsigned char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
 static unsigned char hexchar(unsigned value) {
     return (unsigned char)(value < 10 ? '0' + value : 'a' + value - 10);
 }
@@ -128,12 +123,6 @@ static bool parse_header(const unsigned char *line, size_t length, record_header
     r->classification = (uint16_t)field[3]; r->sci = (uint16_t)field[4];
     r->flags = (uint8_t)field[5];
     return true;
-}
-static uint8_t key_tag(const unsigned char *key, size_t length) {
-    if (length != 66 || key[1] != ':' || (key[0] != 'n' && key[0] != 'e'))
-        return TAG_LITERAL;
-    for (size_t i = 2; i < 66; i++) if (hex(key[i]) < 0) return TAG_LITERAL;
-    return key[0] == 'n' ? TAG_NODE : TAG_EDGE;
 }
 static bool compress_frame(const buffer *plain, buffer *encoded) {
     ZSTD_CCtx *ctx = ZSTD_createCCtx();
@@ -214,20 +203,15 @@ bool cg_packed_encode_snapshot(FILE *authorized_export, FILE *packed_output,
         }
         if (fread(key, 1, r.key_len, authorized_export) != r.key_len ||
             memchr(key, 0, r.key_len)) { errno = EINVAL; break; }
-        uint8_t tag = key_tag(key, r.key_len);
+        /* Keep digest-shaped keys in text: values repeat their hex IDs, so
+         * Zstd can back-reference the exact key. The decoder still accepts
+         * older digest-tagged QCGP0002 frames. */
+        uint8_t tag = TAG_LITERAL;
         unsigned char length[2]; put16(length, (uint16_t)hlen);
         if (!append(&table, length, 2, max_bytes) ||
             !append(&table, header, hlen, max_bytes) ||
             !append(&table, &tag, 1, max_bytes)) break;
-        if (tag == TAG_LITERAL) {
-            if (!append(&body, key, r.key_len, max_bytes)) break;
-        } else {
-            unsigned char digest_key[32];
-            for (size_t i = 0; i < 32; i++)
-                digest_key[i] = (unsigned char)((hex(key[2+i*2]) << 4) |
-                                                 hex(key[3+i*2]));
-            if (!append(&body, digest_key, 32, max_bytes)) break;
-        }
+        if (!append(&body, key, r.key_len, max_bytes)) break;
         if (!read_append(&body, authorized_export, r.value_len, max_bytes)) break;
         if (fgetc(authorized_export) != '\n') { errno = EINVAL; break; }
         raw_bytes += hlen + r.key_len + r.value_len + 1;
@@ -316,7 +300,6 @@ static bool reconstruct(const buffer *table, const buffer *body,
         keys[i] = (key_span){.off = raw->len, .len = r.key_len};
         if (tag == TAG_LITERAL) {
             if (memchr(body->data + boff, 0, r.key_len) ||
-                key_tag(body->data + boff, r.key_len) != TAG_LITERAL ||
                 !append(raw, body->data + boff, r.key_len, max_bytes)) {
                 errno = EINVAL; ok = false; break;
             }
