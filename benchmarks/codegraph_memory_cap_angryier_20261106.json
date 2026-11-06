@@ -1,0 +1,202 @@
+{
+  "binaries": {
+    "baseline_100000": "source 33eaf7929bd5, 100000 record cap",
+    "candidate_150000": "same source, 150000 record cap"
+  },
+  "contention": "No planned CodeGraph compilations during measured pairs; normal host activity not isolated.",
+  "cpu_count": 40,
+  "exact_json_equal": true,
+  "graph": {
+    "decoded_bytes": 54478835,
+    "edges": 114689,
+    "nodes": 8853,
+    "record_count_approx": 123544,
+    "source": "authenticated CodeGraph stats and published import result"
+  },
+  "io_limit": "sampled procfs values can miss final writes and exclude child processes",
+  "io_source": "wait4 ru_oublock (512-byte output blocks); optional procfs counters sampled every 20ms",
+  "medians": {
+    "query": {
+      "baseline_100000": {
+        "output_blocks_512b": 319231,
+        "peak_rss_kib": 430036,
+        "wall_ms": 23816.82606299728
+      },
+      "candidate_150000": {
+        "output_blocks_512b": 19,
+        "peak_rss_kib": 481088,
+        "wall_ms": 12370.20336400019
+      }
+    },
+    "status": {
+      "baseline_100000": {
+        "output_blocks_512b": 319231,
+        "peak_rss_kib": 429812,
+        "wall_ms": 11929.448593000416
+      },
+      "candidate_150000": {
+        "output_blocks_512b": 19,
+        "peak_rss_kib": 456400,
+        "wall_ms": 8502.09179599915
+      }
+    }
+  },
+  "platform": "Linux-7.0.14-28-pve-x86_64-with-glibc2.41",
+  "purpose": "100000 vs 150000 record cap with unchanged 64MiB decoded cap",
+  "repeats": 3,
+  "repo": "Angryier (local path withheld)",
+  "rss_source": "wait4 ru_maxrss; process only",
+  "runs": {
+    "query": [
+      {
+        "output_blocks_512b": 319231,
+        "pair": 0,
+        "peak_rss_kib": 429532,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 163683190,
+          "write_bytes": 163446624
+        },
+        "variant": "baseline_100000",
+        "wall_ms": 23816.82606299728
+      },
+      {
+        "output_blocks_512b": 19,
+        "pair": 0,
+        "peak_rss_kib": 480252,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 246627,
+          "write_bytes": 10061
+        },
+        "variant": "candidate_150000",
+        "wall_ms": 11828.16528499825
+      },
+      {
+        "output_blocks_512b": 19,
+        "pair": 1,
+        "peak_rss_kib": 481372,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 246627,
+          "write_bytes": 10061
+        },
+        "variant": "candidate_150000",
+        "wall_ms": 12769.178304995876
+      },
+      {
+        "output_blocks_512b": 319231,
+        "pair": 1,
+        "peak_rss_kib": 430036,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 163683190,
+          "write_bytes": 163446624
+        },
+        "variant": "baseline_100000",
+        "wall_ms": 23266.032190003898
+      },
+      {
+        "output_blocks_512b": 319231,
+        "pair": 2,
+        "peak_rss_kib": 430640,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 163683190,
+          "write_bytes": 163446624
+        },
+        "variant": "baseline_100000",
+        "wall_ms": 25464.80268600135
+      },
+      {
+        "output_blocks_512b": 19,
+        "pair": 2,
+        "peak_rss_kib": 481088,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 246627,
+          "write_bytes": 10061
+        },
+        "variant": "candidate_150000",
+        "wall_ms": 12370.20336400019
+      }
+    ],
+    "status": [
+      {
+        "output_blocks_512b": 319231,
+        "pair": 0,
+        "peak_rss_kib": 429396,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 163679094,
+          "write_bytes": 163446624
+        },
+        "variant": "baseline_100000",
+        "wall_ms": 11916.346663005243
+      },
+      {
+        "output_blocks_512b": 19,
+        "pair": 0,
+        "peak_rss_kib": 456356,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 242531,
+          "write_bytes": 10061
+        },
+        "variant": "candidate_150000",
+        "wall_ms": 8458.331829002418
+      },
+      {
+        "output_blocks_512b": 19,
+        "pair": 1,
+        "peak_rss_kib": 456416,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 242531,
+          "write_bytes": 10061
+        },
+        "variant": "candidate_150000",
+        "wall_ms": 8502.09179599915
+      },
+      {
+        "output_blocks_512b": 319231,
+        "pair": 1,
+        "peak_rss_kib": 429816,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 163679094,
+          "write_bytes": 163446624
+        },
+        "variant": "baseline_100000",
+        "wall_ms": 11929.448593000416
+      },
+      {
+        "output_blocks_512b": 319231,
+        "pair": 2,
+        "peak_rss_kib": 429812,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 163679094,
+          "write_bytes": 163446624
+        },
+        "variant": "baseline_100000",
+        "wall_ms": 12374.526382001932
+      },
+      {
+        "output_blocks_512b": 19,
+        "pair": 2,
+        "peak_rss_kib": 456400,
+        "sampled_process_io": {
+          "cancelled_write_bytes": 0,
+          "wchar": 242531,
+          "write_bytes": 10061
+        },
+        "variant": "candidate_150000",
+        "wall_ms": 8892.261455999687
+      }
+    ]
+  },
+  "source_commit": "33eaf7929bd5c6b5c37128a1d993e52f1e05ea47",
+  "symbol": "main",
+  "warm_cache_method": "one untimed run per binary and case, then paired alternating CLI processes; no cache drop"
+}
