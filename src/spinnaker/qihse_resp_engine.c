@@ -7608,6 +7608,7 @@ typedef struct {
     uint32_t tenant_id;
     uint32_t user_id;
     qihse_user_t* principal;
+    uint64_t session_id; /* zero for the embedded, stateless execution API */
     uint64_t expires_at;
     qihse_resp_server_t* server;
     qihse_ai_memory_query_snapshot_t* snapshot;
@@ -7637,6 +7638,20 @@ static void qihse_resp_aimem_query_cursors_clear_server(qihse_resp_server_t* ser
     for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++) {
         qihse_resp_aimem_query_cursor_t* entry = &g_aimem_query_cursors[i];
         if (entry->used && entry->server == server) {
+            qihse_ai_memory_query_end(entry->snapshot);
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+}
+
+static void qihse_resp_aimem_query_cursors_clear_session(
+        qihse_resp_server_t* server, uint64_t session_id) {
+    if (!server || !session_id) return;
+    pthread_mutex_lock(&g_aimem_query_cursor_lock);
+    for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++) {
+        qihse_resp_aimem_query_cursor_t* entry = &g_aimem_query_cursors[i];
+        if (entry->used && entry->server == server && entry->session_id == session_id) {
             qihse_ai_memory_query_end(entry->snapshot);
             memset(entry, 0, sizeof(*entry));
         }
@@ -8000,6 +8015,7 @@ static bool qihse_resp_handle_aimem_query(qihse_resp_session_t* session,
         if (!snapshot) return qihse_resp_error(session, "ERR AIMEM query unavailable or invalid");
         qihse_uuid_t uuid;
         qihse_resp_aimem_query_cursor_t* slot = NULL;
+        char cursor_id[QIHSE_AIMEM_ID_LEN + 1u] = {0};
         uint64_t now = qihse_resp_monotonic_seconds();
         pthread_mutex_lock(&g_aimem_query_cursor_lock);
         qihse_resp_aimem_query_cursor_expire(now);
@@ -8011,16 +8027,30 @@ static bool qihse_resp_handle_aimem_query(qihse_resp_session_t* session,
             slot->tenant_id = qihse_user_get_tenant_id(session->user);
             slot->user_id = qihse_user_get_id(session->user);
             slot->principal = session->user;
+            slot->session_id = session->fd >= 0 ? session->id : 0u;
             slot->expires_at = now + QIHSE_AIMEM_RESP_QUERY_TTL_SEC;
             slot->server = session->server;
             slot->snapshot = snapshot;
+            memcpy(cursor_id, slot->id, sizeof cursor_id);
         }
         pthread_mutex_unlock(&g_aimem_query_cursor_lock);
         if (!ok) {
             qihse_ai_memory_query_end(snapshot);
             return qihse_resp_error(session, "ERR AIMEM query cursor capacity reached");
         }
-        return qihse_resp_bulk_text(session, slot->id);
+        if (qihse_resp_bulk_text(session, cursor_id)) return true;
+        pthread_mutex_lock(&g_aimem_query_cursor_lock);
+        for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++) {
+            qihse_resp_aimem_query_cursor_t* entry = &g_aimem_query_cursors[i];
+            if (entry->used && entry->server == session->server &&
+                strcmp(entry->id, cursor_id) == 0) {
+                qihse_ai_memory_query_end(entry->snapshot);
+                memset(entry, 0, sizeof(*entry));
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_aimem_query_cursor_lock);
+        return false;
     }
     if (qihse_resp_arg_equal(&request->argv[3], "NEXT")) {
         if (request->argc != 6u) return qihse_resp_error(session, "ERR usage: AIMEM QUERY V1 NEXT <cursor> <page-size>");
@@ -8062,6 +8092,7 @@ static bool qihse_resp_handle_aimem_query(qihse_resp_session_t* session,
         char* id = qihse_resp_arg_text(&request->argv[4]);
         if (!id) return qihse_resp_error(session, "ERR invalid cursor");
         pthread_mutex_lock(&g_aimem_query_cursor_lock);
+        qihse_resp_aimem_query_cursor_expire(qihse_resp_monotonic_seconds());
         qihse_resp_aimem_query_cursor_t* slot = NULL;
         for (size_t i = 0; i < QIHSE_AIMEM_RESP_QUERY_CURSORS; i++)
             if (g_aimem_query_cursors[i].used && strcmp(g_aimem_query_cursors[i].id, id) == 0) { slot = &g_aimem_query_cursors[i]; break; }
@@ -8086,6 +8117,32 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
     if (!qihse_resp_aimem_principal(session))
         return qihse_resp_error(session, "NOAUTH AIMEM requires an authenticated active principal");
     if (request->argc < 2u) return qihse_resp_wrong_arity(session, "AIMEM");
+
+    /* This metadata is deliberately fixed and content-free. A caller must
+     * authenticate before discovering even the protocol surface. */
+    if (qihse_resp_arg_equal(&request->argv[1], "VERSION")) {
+        if (request->argc != 2u) return qihse_resp_wrong_arity(session, "AIMEM VERSION");
+        return qihse_resp_bulk_text(session, "1");
+    }
+    if (qihse_resp_arg_equal(&request->argv[1], "CAPABILITIES")) {
+        static const char* const features[] = {
+            "scoped-memory-v1", "scoped-durable-ack-v1",
+            "system-receipts-v1", "events-v1",
+            "project-grants-v1", "handoffs-v1", "knowledge-v1",
+            "query-cursors-v1", "bm25-v1", "semantic-conditional-v1"
+        };
+        if (request->argc > 3u) return qihse_resp_wrong_arity(session, "AIMEM CAPABILITIES");
+        if (request->argc == 3u) {
+            for (size_t i = 0; i < sizeof features / sizeof features[0]; i++)
+                if (qihse_resp_arg_equal(&request->argv[2], features[i]))
+                    return qihse_resp_integer(session, 1);
+            return qihse_resp_error(session, "ERR UNSUPPORTED AIMEM capability");
+        }
+        bool ok = qihse_resp_array(session, sizeof features / sizeof features[0]);
+        for (size_t i = 0; ok && i < sizeof features / sizeof features[0]; i++)
+            ok = qihse_resp_bulk_text(session, features[i]);
+        return ok;
+    }
 
     if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM &&
         !qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED") &&
@@ -16708,6 +16765,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
         used += (size_t)received;
     }
     qihse_resp_artifact_abort(&session);
+    qihse_resp_aimem_query_cursors_clear_session(server, session.id);
     qihse_resp_session_pubsub_cleanup(&session);
     qihse_kv_replica_snapshot_destroy(session.repl_snapshot);
     session.repl_snapshot = NULL;

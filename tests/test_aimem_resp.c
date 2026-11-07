@@ -202,6 +202,33 @@ static bool fd_send3(int fd, const char* a, const char* b, const char* c) {
     return true;
 }
 
+static bool fd_send_args(int fd, size_t count, const char* const* values) {
+    char line[64];
+    int n = snprintf(line, sizeof line, "*%zu\r\n", count);
+    if (n <= 0 || !fd_write_all(fd, line, (size_t)n)) return false;
+    for (size_t i = 0; i < count; i++) {
+        n = snprintf(line, sizeof line, "$%zu\r\n", strlen(values[i]));
+        if (n <= 0 || !fd_write_all(fd, line, (size_t)n) ||
+            !fd_write_all(fd, values[i], strlen(values[i])) ||
+            !fd_write_all(fd, "\r\n", 2u)) return false;
+    }
+    return true;
+}
+
+static char* fd_read_bulk_id(int fd) {
+    char line[64];
+    if (!fd_read_line(fd, line, sizeof line) ||
+        strcmp(line, "$36\r\n") != 0) return NULL;
+    char id[QIHSE_AIMEM_ID_LEN + 3u];
+    for (size_t i = 0; i < sizeof id - 1u; i++)
+        if (read(fd, &id[i], 1u) != 1) return NULL;
+    id[sizeof id - 1u] = '\0';
+    if (id[QIHSE_AIMEM_ID_LEN] != '\r' ||
+        id[QIHSE_AIMEM_ID_LEN + 1u] != '\n') return NULL;
+    id[QIHSE_AIMEM_ID_LEN] = '\0';
+    return strdup(id);
+}
+
 static int network_claim_child(uint16_t port, const char* username,
         const char* password, const char* handoff_id, bool recipient) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -303,6 +330,21 @@ int main(void) {
                                           { (const uint8_t*)unauth[0], strlen(unauth[0]) },
                                           { (const uint8_t*)unauth[1], strlen(unauth[1]) }
                                       }, &unauth_reply, &unauth_len));
+    const char* version[] = { "AIMEM", "VERSION" };
+    assert(!qihse_resp_server_execute(server, NULL, 2u,
+                                      (const qihse_resp_arg_t[]) {
+                                          { (const uint8_t*)version[0], strlen(version[0]) },
+                                          { (const uint8_t*)version[1], strlen(version[1]) }
+                                      }, &unauth_reply, &unauth_len));
+    expect_contains(tenant7, 2u, version, "$1\r\n1\r\n");
+    const char* capabilities[] = { "AIMEM", "CAPABILITIES" };
+    expect_contains(tenant7, 2u, capabilities, "query-cursors-v1");
+    const char* supported[] = { "AIMEM", "CAPABILITIES", "events-v1" };
+    expect_contains(tenant7, 3u, supported, ":1\r\n");
+    const char* unsupported[] = { "AIMEM", "CAPABILITIES", "raw-storage-v1" };
+    expect_contains(tenant7, 3u, unsupported, "ERR UNSUPPORTED AIMEM capability");
+    const char* invalid_version[] = { "AIMEM", "VERSION", "extra" };
+    expect_contains(tenant7, 3u, invalid_version, "wrong number of arguments");
 
     const char* store_public[] = { "AIMEM", "STORE", "1", "public memory", "public-1" };
     uint8_t* reply = NULL;
@@ -323,6 +365,11 @@ int main(void) {
     reply = NULL;
     reply_len = run(op, 5u, store_secret, &reply);
     char* secret_id = extract_bulk_id(reply, reply_len);
+    free(reply);
+    reply = NULL;
+    reply_len = run(tenant7, 2u, capabilities, &reply);
+    assert(!memmem(reply, reply_len, "classified memory", strlen("classified memory")));
+    assert(!memmem(reply, reply_len, secret_id, strlen(secret_id)));
     free(reply);
 
     const char* count[] = { "AIMEM", "COUNT" };
@@ -867,6 +914,43 @@ int main(void) {
     assert(WIFEXITED(recipient_status) && WEXITSTATUS(recipient_status) == 0);
     assert(WIFEXITED(competitor_status) && WEXITSTATUS(competitor_status) == 0);
     free(process_handoff_id);
+
+    /* A network cursor belongs to the connection and is released when that
+     * client disconnects, even if its authenticated principal stays active. */
+    int cursor_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(cursor_fd >= 0);
+    struct sockaddr_in cursor_addr;
+    memset(&cursor_addr, 0, sizeof cursor_addr);
+    cursor_addr.sin_family = AF_INET;
+    cursor_addr.sin_port = htons(listener_port);
+    cursor_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(connect(cursor_fd, (struct sockaddr*)&cursor_addr, sizeof cursor_addr) == 0);
+    assert(fd_send_args(cursor_fd, 2u, version));
+    char auth_line[64];
+    assert(fd_read_line(cursor_fd, auth_line, sizeof auth_line));
+    assert(strstr(auth_line, "NOAUTH") != NULL);
+    assert(fd_send3(cursor_fd, "AUTH", qihse_user_get_username(tenant7_reader),
+                    "Tenant7Reader123!"));
+    assert(fd_read_line(cursor_fd, auth_line, sizeof auth_line));
+    assert(strcmp(auth_line, "+OK\r\n") == 0);
+    assert(fd_send_args(cursor_fd, 18u, query_begin));
+    char* disconnected_cursor = fd_read_bulk_id(cursor_fd);
+    assert(disconnected_cursor);
+    close(cursor_fd);
+    const char* disconnected_next[] = { "AIMEM", "QUERY", "V1", "NEXT",
+                                        disconnected_cursor, "1" };
+    bool cleaned = false;
+    for (size_t attempt = 0; attempt < 100u; attempt++) {
+        uint8_t* next_reply = NULL;
+        size_t next_len = run(tenant7_reader, 6u, disconnected_next, &next_reply);
+        cleaned = next_len > 0u &&
+                  memmem(next_reply, next_len, "cursor expired or unknown", 25u) != NULL;
+        free(next_reply);
+        if (cleaned) break;
+        usleep(10000u);
+    }
+    assert(cleaned);
+    free(disconnected_cursor);
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
     aimem_fixture_cleanup(data_root);

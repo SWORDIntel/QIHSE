@@ -11,6 +11,8 @@ ranking, and record visibility. A missing or revoked principal fails closed.
 ## Commands
 
 ```text
+AIMEM VERSION
+AIMEM CAPABILITIES [feature]
 AIMEM STORE <kind> <text> [idempotency-key]
 AIMEM STORE-DURABLE <kind> <text> [idempotency-key]
 AIMEM STORE-RECEIPT <kind> <text> <idempotency-key>
@@ -44,6 +46,18 @@ AIMEM QUERY V1 BEGIN <project> <worktree> <workstream> <session> <type> <status>
 AIMEM QUERY V1 NEXT <cursor-uuid> <page-size>
 AIMEM QUERY V1 END <cursor-uuid>
 ```
+
+`VERSION` returns the authenticated AIMEM wire contract version as a bulk
+string (`1`). `CAPABILITIES` returns a bounded array of content-free feature
+tokens: `scoped-memory-v1`, `scoped-durable-ack-v1`,
+`system-receipts-v1`, `events-v1`,
+`project-grants-v1`, `handoffs-v1`, `knowledge-v1`, `query-cursors-v1`,
+`bm25-v1`, and `semantic-conditional-v1`. Passing a feature token returns
+integer `1` if it is advertised, or `-ERR UNSUPPORTED AIMEM capability` if
+it is absent. Semantic support is conditional on the configured projection
+provider and index readiness; use the authorized health operation and handle
+an unavailable or stale projection at query time. Both discovery commands
+require an active authenticated principal and disclose no memory content.
 
 `kind` is `1` for episodic or `2` for semantic; `0` selects either kind for
 reads. Recall returns bounded nested arrays containing the UUID, creation time,
@@ -295,20 +309,20 @@ idempotency-map write, a retry locates the original document, verifies its
 content and repairs the missing map. Legacy random UUIDs with existing
 idempotency mappings retain their original IDs; no migration rewrites them.
 
-**Remaining QH-00 work:** this is **recoverable identity**, not atomic
-multi-key commit. Durable ACK still certifies only the local KV fence, not
-remote replication. Complete WAL-phase fault injection (including partial
-I/O errors and fsync faults), receipt/LSN design, idempotency-map migration
-behaviour, and measured P50/P95 fsync overhead remain required before
-declaring QH-00 complete. A failed admission may already have left a primary
-record; the caller must retry with the same key, not invent a new key.
+**QH-00 limit:** this is **recoverable identity**, not atomic
+multi-key commit. Durable ACK certifies only the local KV fence, not
+remote replication. WAL fault injection, receipt stability, legacy
+idempotency-map migration and measured P50/P95 fsync overhead are covered by
+the focused durability suite and benchmark; they do not expand the ACK's
+guarantee. A failed admission may already have left a primary record; the
+caller must retry with the same key, not invent a new key.
 Deterministic identity binds to the authenticated numeric tenant/principal
 IDs, which must be restored consistently across process restarts.
 
 Index rebuild is derived from authoritative KV documents; a durable ACK
 does not certify semantic-index freshness if embedding/indexing fails.
-QH-01 through QH-05 are implemented; QH-06 through QH-08 retain the remaining
-gates tracked in `ROADMAP.md` and `QIHSE_ENGINE_ROADMAP.md`.
+QH-01 through QH-08 are implemented in the native engine; deployment remains
+subject to the separate operational gates in `docs/AIMEM_CURRENT_ISSUES.md`.
 
 ## Native QH-05 through QH-08 contracts
 
@@ -317,7 +331,9 @@ accepts exact scope, type/status/current filters, inclusive ingestion bounds,
 an exclusive changed-since watermark, an optional ingestion-time as-of view,
 ranking mode and a maximum of 4,096 rows. NEXT accepts 1..128 rows. Cursor
 tokens are random UUIDs bound to the active principal and server, expire after
-five minutes, and are removed when the server is destroyed. Cursor lookup
+five minutes, and are removed on network client disconnect or server
+destruction. Embedded stateless callers must explicitly issue `END`; their
+cursors still expire after five minutes. Cursor lookup
 errors do not distinguish an unknown token from a token owned by another
 principal. Results are process-local; restart requires a new query.
 
