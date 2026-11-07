@@ -50,6 +50,14 @@ class MemoryHit:
 
 
 @dataclass(frozen=True)
+class DurableReceipt:
+    operation: str
+    id: str
+    token: str
+    durability: str
+
+
+@dataclass(frozen=True)
 class KnowledgeVersion:
     knowledge_id: str
     version_id: str
@@ -121,6 +129,13 @@ def _hit(reply: Reply) -> MemoryHit:
                      _uint(row[3]), _uint(row[4]), score, _text(row[6]))
 
 
+def _scoped_receipt(reply: Reply) -> DurableReceipt:
+    operation, id, token, durability = (_text(v) for v in _array(reply, 4))
+    if operation != "STORE-SCOPED" or durability != "local-fsync" or not id or not token:
+        raise ReplyShapeError("invalid AIMEM scoped receipt")
+    return DurableReceipt(operation, id, token, durability)
+
+
 def _knowledge(reply: Reply) -> KnowledgeVersion:
     row = _array(reply, 15)
     return KnowledgeVersion(_text(row[0]), _text(row[1]), _text(row[2]),
@@ -186,6 +201,18 @@ class AIMEMClient:
         command = "STORE-SCOPED-DURABLE" if durable else "STORE-SCOPED"
         args = (command, kind, text, *scope.args())
         return _text(self._call(*args, *((key,) if key is not None else ())))
+
+    def store_receipt(self, scope: Scope, kind: int, text: str,
+                      *, key: str) -> DurableReceipt:
+        """Store with a local fsync receipt; retry the same key after lost ACK.
+
+        The receipt does not claim remote replication or quorum. A changed
+        payload or kind at the same key raises the server's conflict error.
+        """
+        if kind not in (1, 2) or not text or not key:
+            raise ControllerUsageError("AIMEM receipt requires kind, text, and retry key")
+        return _scoped_receipt(self._call("STORE-SCOPED-RECEIPT", kind, text,
+                                          *scope.args(), key))
 
     def recall(self, scope: Scope, query: str, *, limit: int = 10,
                mode: RecallMode = "bm25", kind: int = 0) -> list[MemoryHit]:
@@ -288,5 +315,5 @@ class AIMEMClient:
             raise ReplyShapeError("AIMEM QUERY END did not return OK")
 
 
-__all__ = ["AIMEMClient", "Scope", "MemoryHit", "KnowledgeVersion",
+__all__ = ["AIMEMClient", "Scope", "MemoryHit", "DurableReceipt", "KnowledgeVersion",
            "Handoff", "QueryHit", "RecallMode"]

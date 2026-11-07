@@ -96,6 +96,33 @@ class AIMEMSDKTests(unittest.TestCase):
             AIMEMClient(wire).query_begin(SCOPE)
         self.assertEqual(raised.exception.error_class, "ERR")
 
+    def test_scoped_receipt_shape_and_wire(self):
+        wire = Wire(array(bulk("STORE-SCOPED"), bulk("row-id"),
+                          bulk("receipt-id"), bulk("local-fsync")))
+        receipt = AIMEMClient(wire).store_receipt(SCOPE, 1, "capture", key="retry-1")
+        self.assertEqual((receipt.operation, receipt.id, receipt.token,
+                          receipt.durability),
+                         ("STORE-SCOPED", "row-id", "receipt-id", "local-fsync"))
+        self.assertEqual(wire.commands, [
+            ("AIMEM", "STORE-SCOPED-RECEIPT", 1, "capture", *SCOPE.args(),
+             "retry-1")])
+
+    def test_scoped_receipt_denied_and_malformed_fail_closed(self):
+        denied = ControllerServerError("NOPERM", "AIMEM denied")
+        unsupported = ControllerServerError("ERR", "unknown AIMEM operation")
+        wire = Wire(denied, unsupported,
+                    array(bulk("STORE-SCOPED"), bulk("id"), bulk("token"),
+                          bulk("global-quorum")))
+        client = AIMEMClient(wire)
+        with self.assertRaises(ControllerServerError) as raised:
+            client.store_receipt(SCOPE, 1, "capture", key="retry-1")
+        self.assertEqual(raised.exception.error_class, "NOPERM")
+        with self.assertRaises(ControllerServerError) as raised:
+            client.store_receipt(SCOPE, 1, "capture", key="retry-1")
+        self.assertEqual(raised.exception.error_class, "ERR")
+        with self.assertRaises(ReplyShapeError):
+            client.store_receipt(SCOPE, 1, "capture", key="retry-1")
+
     def test_knowledge_and_handoff_shapes(self):
         knowledge = array(bulk("kid"), bulk("vid"), bulk(""), bulk(1), bulk(1),
                           bulk(1), bulk(100), bulk(101), bulk(0), bulk(4),
@@ -172,7 +199,8 @@ int main(int argc, char **argv) {
 
     @classmethod
     def setUpClass(cls):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(os.environ.get("QIHSE_AIMEM_TEST_RUNTIME_ROOT") or
+                    Path(__file__).resolve().parents[1]).resolve()
         if not (root / "libqihse.so").exists():
             raise unittest.SkipTest("build libqihse.so before AIMEM SDK E2E test")
         compiler = shutil.which("cc")
@@ -232,6 +260,13 @@ int main(int argc, char **argv) {
                         username="GODMODE_OP", password="PyAimemOperator1!") as operator:
             high = AIMEMClient(operator)
             high_id = high.store(scope, 2, marker, key="high-capture")
+            first = high.store_receipt(scope, 1, "receipt capture", key="receipt-1")
+            replay = high.store_receipt(scope, 1, "receipt capture", key="receipt-1")
+            self.assertEqual(first, replay)
+            self.assertEqual(first.durability, "local-fsync")
+            with self.assertRaises(ControllerServerError) as conflict:
+                high.store_receipt(scope, 1, "changed capture", key="receipt-1")
+            self.assertIn("CONFLICT", conflict.exception.message)
             knowledge = high.knowledge_create(scope, 1, 1, marker)
             self.assertEqual(high.get(scope, high_id).text, marker)
             self.assertEqual(high.knowledge_get(scope, knowledge.version_id).content,
