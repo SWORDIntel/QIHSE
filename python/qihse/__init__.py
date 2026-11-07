@@ -66,6 +66,7 @@ _EXPORT_MODULES = {
         "fts": ("FTSIndex", "FTSResult"),
         "fusion": ("MultimodalFusion", "FusionResult"),
         "controller": ("Controller", "Reply", "Watch", "ControllerError", "ControllerServerError"),
+        "aimem": ("AIMEMClient", "Scope", "MemoryHit", "KnowledgeVersion", "Handoff", "QueryHit"),
         "thermal": ("get_fleet_telemetry", "collect_local_telemetry", "publish_telemetry"),
     }.items()
     for name in names
@@ -95,6 +96,7 @@ __all__ = [
     "FTSIndex", "FTSResult",
     "MultimodalFusion", "FusionResult",
     "Controller", "Reply", "Watch", "ControllerError", "ControllerServerError",
+    "AIMEMClient", "Scope", "MemoryHit", "KnowledgeVersion", "Handoff", "QueryHit",
     "get_fleet_telemetry", "collect_local_telemetry", "publish_telemetry",
 ]
 __version__ = "0.3.0"
