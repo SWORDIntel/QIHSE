@@ -7600,6 +7600,141 @@ static bool qihse_resp_aimem_emit_knowledge(qihse_resp_session_t* session,
         qihse_resp_bulk_text(session, value->content);
 }
 
+static bool qihse_resp_aimem_u32(const qihse_resp_arg_t* arg, uint32_t* out);
+static bool qihse_resp_aimem_idem_valid(const qihse_resp_arg_t* arg);
+static bool qihse_resp_aimem_scope_parse(const qihse_resp_request_t* request,
+                                         size_t first,
+                                         qihse_ai_memory_scope_t* scope);
+
+typedef struct {
+    qihse_ai_memory_knowledge_provenance_t value;
+    char* retry_key;
+    const char** source_ids;
+    qihse_ai_memory_relation_t* relations;
+} qihse_resp_aimem_knowledge_input_t;
+
+static void qihse_resp_aimem_knowledge_input_free(
+        qihse_resp_aimem_knowledge_input_t* input) {
+    if (!input) return;
+    if (input->source_ids)
+        for (size_t i = 0; i < input->value.source_event_count; i++)
+            free((void*)input->source_ids[i]);
+    free(input->source_ids);
+    free(input->relations);
+    free(input->retry_key);
+    memset(input, 0, sizeof(*input));
+}
+
+/* Extended verbs use explicit counts, so a source UUID can never be confused
+ * with relation fields. The C API repeats evidence visibility checks under
+ * the authenticated principal before it writes anything. */
+static bool qihse_resp_aimem_knowledge_input_parse(
+        const qihse_resp_request_t* request, size_t first,
+        qihse_resp_aimem_knowledge_input_t* input) {
+    memset(input, 0, sizeof(*input));
+    uint32_t confidence = 0u, source_count = 0u, relation_count = 0u;
+    if (request->argc < first + 4u ||
+        !qihse_resp_aimem_u32(&request->argv[first], &confidence) ||
+        confidence > QIHSE_AIMEM_CONFIDENCE_MAX ||
+        !qihse_resp_aimem_idem_valid(&request->argv[first + 1u]) ||
+        !qihse_resp_aimem_u32(&request->argv[first + 2u], &source_count) ||
+        source_count > QIHSE_AIMEM_KNOWLEDGE_MAX_SOURCES)
+        return false;
+    size_t at = first + 3u;
+    if (request->argc < at + source_count + 1u) return false;
+    input->value.confidence_ppm = confidence;
+    input->retry_key = qihse_resp_arg_text(&request->argv[first + 1u]);
+    input->value.idempotency_key = input->retry_key;
+    input->value.source_event_count = source_count;
+    if (source_count) input->source_ids = calloc(source_count, sizeof(*input->source_ids));
+    if (!input->retry_key || (source_count && !input->source_ids)) goto invalid;
+    for (size_t i = 0; i < source_count; i++) {
+        qihse_uuid_t parsed;
+        if (request->argv[at + i].len != QIHSE_AIMEM_ID_LEN ||
+            memchr(request->argv[at + i].data, '\0', QIHSE_AIMEM_ID_LEN)) goto invalid;
+        input->source_ids[i] = qihse_resp_arg_text(&request->argv[at + i]);
+        if (!input->source_ids[i] ||
+            !qihse_uuid_parse(input->source_ids[i], &parsed)) goto invalid;
+    }
+    input->value.source_event_ids = input->source_ids;
+    at += source_count;
+    if (!qihse_resp_aimem_u32(&request->argv[at++], &relation_count) ||
+        relation_count > QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS ||
+        request->argc != at + (size_t)relation_count * 6u) goto invalid;
+    input->value.relation_count = relation_count;
+    if (relation_count) input->relations = calloc(relation_count, sizeof(*input->relations));
+    if (relation_count && !input->relations) goto invalid;
+    for (size_t i = 0; i < relation_count; i++, at += 6u) {
+        qihse_ai_memory_relation_t* relation = &input->relations[i];
+        if (request->argv[at + 1u].len != QIHSE_AIMEM_ID_LEN ||
+            memchr(request->argv[at + 1u].data, '\0', QIHSE_AIMEM_ID_LEN)) goto invalid;
+        char* target = qihse_resp_arg_text(&request->argv[at + 1u]);
+        qihse_uuid_t parsed;
+        bool valid = qihse_resp_aimem_u32(&request->argv[at], &relation->type) &&
+            relation->type >= QIHSE_AIMEM_RELATION_FIXES &&
+            relation->type <= QIHSE_AIMEM_RELATION_CONTRADICTS &&
+            target && qihse_uuid_parse(target, &parsed) &&
+            qihse_resp_aimem_scope_parse(request, at + 2u, &relation->target_scope);
+        if (valid) memcpy(relation->target_version_id, target, QIHSE_AIMEM_ID_LEN + 1u);
+        free(target);
+        if (!valid) goto invalid;
+    }
+    input->value.relations = input->relations;
+    return true;
+invalid:
+    qihse_resp_aimem_knowledge_input_free(input);
+    return false;
+}
+
+static bool qihse_resp_aimem_emit_knowledge_ex(qihse_resp_session_t* session,
+        const qihse_ai_memory_knowledge_version_t* value) {
+    char generated[16], reviewed[16], confidence[16], relation_type[16];
+    const char* visible_sources[QIHSE_AIMEM_KNOWLEDGE_MAX_SOURCES];
+    const qihse_ai_memory_relation_t* visible_relations[QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS];
+    size_t source_count = 0u, relation_count = 0u;
+    for (size_t i = 0; i < value->source_event_count &&
+                       i < QIHSE_AIMEM_KNOWLEDGE_MAX_SOURCES; i++) {
+        qihse_ai_memory_hit_t event = {0};
+        if (qihse_ai_memory_event_get(session->server, session->user,
+                value->source_event_ids[i], &value->scope, &event))
+            visible_sources[source_count++] = value->source_event_ids[i];
+        free(event.text);
+    }
+    for (size_t i = 0; i < value->relation_count &&
+                       i < QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS; i++) {
+        const qihse_ai_memory_relation_t* relation = &value->relations[i];
+        qihse_ai_memory_knowledge_version_t target = {0};
+        if (qihse_ai_memory_knowledge_get(session->server, session->user,
+                relation->target_version_id, &relation->target_scope, &target))
+            visible_relations[relation_count++] = relation;
+        qihse_ai_memory_knowledge_free(&target);
+    }
+    snprintf(generated, sizeof generated, "%u", value->generated_by);
+    snprintf(reviewed, sizeof reviewed, "%u", value->reviewed_by);
+    snprintf(confidence, sizeof confidence, "%u", value->confidence_ppm);
+    bool ok = qihse_resp_array(session, 6u) &&
+        qihse_resp_aimem_emit_knowledge(session, value) &&
+        qihse_resp_bulk_text(session, generated) &&
+        qihse_resp_bulk_text(session, reviewed) &&
+        qihse_resp_bulk_text(session, confidence) &&
+        qihse_resp_array(session, source_count);
+    for (size_t i = 0; ok && i < source_count; i++)
+        ok = qihse_resp_bulk_text(session, visible_sources[i]);
+    ok = ok && qihse_resp_array(session, relation_count);
+    for (size_t i = 0; ok && i < relation_count; i++) {
+        const qihse_ai_memory_relation_t* relation = visible_relations[i];
+        snprintf(relation_type, sizeof relation_type, "%u", relation->type);
+        ok = qihse_resp_array(session, 6u) &&
+             qihse_resp_bulk_text(session, relation_type) &&
+             qihse_resp_bulk_text(session, relation->target_version_id) &&
+             qihse_resp_bulk_text(session, relation->target_scope.project) &&
+             qihse_resp_bulk_text(session, relation->target_scope.worktree) &&
+             qihse_resp_bulk_text(session, relation->target_scope.workstream) &&
+             qihse_resp_bulk_text(session, relation->target_scope.session);
+    }
+    return ok;
+}
+
 #define QIHSE_AIMEM_RESP_QUERY_CURSORS 128u
 #define QIHSE_AIMEM_RESP_QUERY_TTL_SEC 300u
 typedef struct {
@@ -8139,6 +8274,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             "scoped-local-fsync-receipts-v1",
             "system-receipts-v1", "events-v1",
             "project-grants-v1", "handoffs-v1", "knowledge-v1",
+            "knowledge-provenance-v1",
             "query-cursors-v1", "bm25-v1", "semantic-conditional-v1"
         };
         if (request->argc > 3u) return qihse_resp_wrong_arity(session, "AIMEM CAPABILITIES");
@@ -8396,9 +8532,11 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         if (!store) return qihse_resp_error(session, "ERR AIMEM store unavailable");
         qihse_ai_memory_knowledge_version_t value;
         memset(&value, 0, sizeof value);
-        if (qihse_resp_arg_equal(&request->argv[2], "CREATE")) {
-            if (request->argc != 10u)
-                return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE CREATE <type> <status> <content> <project> <worktree> <workstream> <session>");
+        bool create_ex = qihse_resp_arg_equal(&request->argv[2], "CREATE-EX");
+        if (qihse_resp_arg_equal(&request->argv[2], "CREATE") || create_ex) {
+            if ((!create_ex && request->argc != 10u) ||
+                (create_ex && request->argc < 14u))
+                return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE CREATE[-EX] <type> <status> <content> <project> <worktree> <workstream> <session> [<confidence-ppm> <retry-key> <source-count> <source-uuid>... <relation-count> <relation-six-fields>...]");
             uint32_t type = 0u, status = 0u;
             qihse_ai_memory_scope_t scope;
             if (!qihse_resp_aimem_u32(&request->argv[3], &type) ||
@@ -8407,23 +8545,41 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                 request->argv[5].len == 0u || request->argv[5].len > QIHSE_AIMEM_RESP_MAX_TEXT ||
                 memchr(request->argv[5].data, '\0', request->argv[5].len))
                 return qihse_resp_error(session, "ERR invalid AIMEM knowledge fields");
+            qihse_resp_aimem_knowledge_input_t input = {0};
+            if (create_ex && !qihse_resp_aimem_knowledge_input_parse(request, 10u, &input))
+                return qihse_resp_error(session, "ERR invalid AIMEM knowledge provenance fields");
             char* content = qihse_resp_arg_text(&request->argv[5]);
             pthread_rwlock_wrlock(&session->server->kv_lock);
-            qihse_ai_memory_write_result_t result = content ? qihse_ai_memory_knowledge_create(
-                session->server, session->user, &scope, type, status, content, &value)
+            qihse_ai_memory_write_result_t result = content ? (create_ex
+                ? qihse_ai_memory_knowledge_create_ex(session->server, session->user,
+                    &scope, type, status, content, &input.value, &value)
+                : qihse_ai_memory_knowledge_create(
+                    session->server, session->user, &scope, type, status, content, &value))
                 : QIHSE_AIMEM_WRITE_FAILED;
-            bool durable = result == QIHSE_AIMEM_WRITE_NEW && qihse_kv_sync_store(store);
+            bool admitted = result == QIHSE_AIMEM_WRITE_NEW ||
+                (create_ex && result == QIHSE_AIMEM_WRITE_REPLAY);
+            bool durable = admitted && qihse_kv_sync_store(store);
             pthread_rwlock_unlock(&session->server->kv_lock);
+            qihse_resp_aimem_knowledge_input_free(&input);
             free(content);
-            if (result != QIHSE_AIMEM_WRITE_NEW)
+            if (result == QIHSE_AIMEM_WRITE_CONFLICT) {
+                qihse_ai_memory_knowledge_free(&value);
+                return qihse_resp_error(session, "ERR CONFLICT AIMEM knowledge retry identity changed");
+            }
+            if (!admitted) {
+                qihse_ai_memory_knowledge_free(&value);
                 return qihse_resp_error(session, "NOPERM AIMEM knowledge creation denied");
+            }
             if (!durable) { qihse_ai_memory_knowledge_free(&value); return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM knowledge create not confirmed durable"); }
-            bool emitted = qihse_resp_aimem_emit_knowledge(session, &value);
+            bool emitted = create_ex ? qihse_resp_aimem_emit_knowledge_ex(session, &value) :
+                qihse_resp_aimem_emit_knowledge(session, &value);
             qihse_ai_memory_knowledge_free(&value); return emitted;
         }
-        if (qihse_resp_arg_equal(&request->argv[2], "REVISE")) {
-            if (request->argc != 8u)
-                return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE REVISE <knowledge-id> <expected-version-id> <expected-revision> <status> <content>");
+        bool revise_ex = qihse_resp_arg_equal(&request->argv[2], "REVISE-EX");
+        if (qihse_resp_arg_equal(&request->argv[2], "REVISE") || revise_ex) {
+            if ((!revise_ex && request->argc != 8u) ||
+                (revise_ex && request->argc < 12u))
+                return qihse_resp_error(session, "ERR usage: AIMEM KNOWLEDGE REVISE[-EX] <knowledge-id> <expected-version-id> <expected-revision> <status> <content> [<confidence-ppm> <retry-key> <source-count> <source-uuid>... <relation-count> <relation-six-fields>...]");
             char* knowledge = qihse_resp_arg_text(&request->argv[3]);
             char* expected = qihse_resp_arg_text(&request->argv[4]);
             uint64_t revision = 0u; uint32_t status = 0u;
@@ -8432,19 +8588,35 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
                 request->argv[7].len <= QIHSE_AIMEM_RESP_MAX_TEXT &&
                 !memchr(request->argv[7].data, '\0', request->argv[7].len);
             char* content = valid ? qihse_resp_arg_text(&request->argv[7]) : NULL;
+            qihse_resp_aimem_knowledge_input_t input = {0};
+            if (revise_ex && !qihse_resp_aimem_knowledge_input_parse(request, 8u, &input)) {
+                free(knowledge); free(expected); free(content);
+                return qihse_resp_error(session, "ERR invalid AIMEM knowledge provenance fields");
+            }
             pthread_rwlock_wrlock(&session->server->kv_lock);
-            qihse_ai_memory_write_result_t result = content ? qihse_ai_memory_knowledge_revise(
-                session->server, session->user, knowledge, expected, revision, status, content, &value)
+            qihse_ai_memory_write_result_t result = content ? (revise_ex
+                ? qihse_ai_memory_knowledge_revise_ex(session->server, session->user,
+                    knowledge, expected, revision, status, content, &input.value, &value)
+                : qihse_ai_memory_knowledge_revise(
+                    session->server, session->user, knowledge, expected, revision, status, content, &value))
                 : QIHSE_AIMEM_WRITE_FAILED;
-            bool durable = result == QIHSE_AIMEM_WRITE_NEW && qihse_kv_sync_store(store);
+            bool admitted = result == QIHSE_AIMEM_WRITE_NEW ||
+                (revise_ex && result == QIHSE_AIMEM_WRITE_REPLAY);
+            bool durable = admitted && qihse_kv_sync_store(store);
             pthread_rwlock_unlock(&session->server->kv_lock);
+            qihse_resp_aimem_knowledge_input_free(&input);
             free(knowledge); free(expected); free(content);
-            if (result == QIHSE_AIMEM_WRITE_CONFLICT)
+            if (result == QIHSE_AIMEM_WRITE_CONFLICT) {
+                qihse_ai_memory_knowledge_free(&value);
                 return qihse_resp_error(session, "ERR CONFLICT AIMEM knowledge revision changed");
-            if (result != QIHSE_AIMEM_WRITE_NEW)
+            }
+            if (!admitted) {
+                qihse_ai_memory_knowledge_free(&value);
                 return qihse_resp_error(session, "NOPERM AIMEM knowledge revision denied");
+            }
             if (!durable) { qihse_ai_memory_knowledge_free(&value); return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM knowledge revision not confirmed durable"); }
-            bool emitted = qihse_resp_aimem_emit_knowledge(session, &value);
+            bool emitted = revise_ex ? qihse_resp_aimem_emit_knowledge_ex(session, &value) :
+                qihse_resp_aimem_emit_knowledge(session, &value);
             qihse_ai_memory_knowledge_free(&value); return emitted;
         }
         qihse_ai_memory_scope_t scope;
