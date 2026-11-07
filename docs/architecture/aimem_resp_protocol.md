@@ -23,6 +23,7 @@ AIMEM FORGET-DURABLE <uuid>
 AIMEM FORGET-RECEIPT <uuid>
 AIMEM COUNT [kind]
 AIMEM STORE-SCOPED[-DURABLE] <kind> <text> <project> <worktree> <workstream> <session> [idempotency-key]
+AIMEM STORE-SCOPED-RECEIPT <kind> <text> <project> <worktree> <workstream> <session> <idempotency-key>
 AIMEM RECALL-SCOPED <query> <limit> [bm25|semantic|hybrid] <kind> <project> <worktree> <workstream> <session>
 AIMEM GET-SCOPED <uuid> <project> <worktree> <workstream> <session>
 AIMEM FORGET-SCOPED[-DURABLE] <uuid> <project> <worktree> <workstream> <session>
@@ -50,6 +51,7 @@ AIMEM QUERY V1 END <cursor-uuid>
 `VERSION` returns the authenticated AIMEM wire contract version as a bulk
 string (`1`). `CAPABILITIES` returns a bounded array of content-free feature
 tokens: `scoped-memory-v1`, `scoped-durable-ack-v1`,
+`scoped-local-fsync-receipts-v1`,
 `system-receipts-v1`, `events-v1`,
 `project-grants-v1`, `handoffs-v1`, `knowledge-v1`, `query-cursors-v1`,
 `bm25-v1`, and `semantic-conditional-v1`. Passing a feature token returns
@@ -86,6 +88,17 @@ persist their mutation sequence while legacy frames remain readable.
 `make test-aimem-idem-migration` covers old-map recovery, and
 `make bench-aimem-durability ARGS="100 256"` compares ordinary and fsync-fenced
 store/delete pairs on the selected data filesystem.
+
+`STORE-SCOPED-RECEIPT` requires an explicit scope and idempotency key. It
+returns `[STORE-SCOPED, uuid, receipt, local-fsync]` after the native scoped
+row and its retry identity pass the local fsync fence. An exact retry returns
+the original UUID and receipt, including after a lost reply; a changed
+payload or kind returns `ERR CONFLICT`. The receipt binds the authenticated
+tenant, principal, scope, UUID and canonical row sequence without exposing
+that sequence. It does not certify remote replication or quorum. A failed
+fence returns `ERR NOT_DURABLE`; retry the same key and payload to determine
+whether the row survived. Other principals cannot retrieve the receipt by
+reusing the key because retry identity includes the principal.
 
 `EVENT APPEND` accepts the registered kinds `session_start`, `session_end`,
 `task_started`, `task_completed`, `observation`, `decision`, `blocker`, and

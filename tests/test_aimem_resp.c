@@ -341,6 +341,9 @@ int main(void) {
     expect_contains(tenant7, 2u, capabilities, "query-cursors-v1");
     const char* supported[] = { "AIMEM", "CAPABILITIES", "events-v1" };
     expect_contains(tenant7, 3u, supported, ":1\r\n");
+    const char* scoped_receipt_feature[] = { "AIMEM", "CAPABILITIES",
+        "scoped-local-fsync-receipts-v1" };
+    expect_contains(tenant7, 3u, scoped_receipt_feature, ":1\r\n");
     const char* unsupported[] = { "AIMEM", "CAPABILITIES", "raw-storage-v1" };
     expect_contains(tenant7, 3u, unsupported, "ERR UNSUPPORTED AIMEM capability");
     const char* invalid_version[] = { "AIMEM", "VERSION", "extra" };
@@ -558,6 +561,55 @@ int main(void) {
     const char* high_recall[] = { "AIMEM", "RECALL-SCOPED", "QH01_HIGH_SCOPE_MARKER",
         "8", "bm25", "0", "project-high", "", "", "" };
     expect_contains(guest, 10u, high_recall, "*0\r\n");
+
+    /* QH-HAX scoped receipt: discard the first durable reply, then recover
+     * the same principal-bound UUID and receipt by exact retry. */
+    const char* receipt_store[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "2",
+        "QHHAX_HIGH_RECEIPT_MARKER", "project-receipt", "", "", "", "receipt-key-1" };
+    const char* receipt_missing_key[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "2",
+        "QHHAX_HIGH_RECEIPT_MARKER", "project-receipt", "", "", "" };
+    expect_contains(op, 8u, receipt_missing_key, "requires an idempotency-key");
+    reply = NULL;
+    reply_len = run(op, 9u, receipt_store, &reply);
+    assert(reply_len > 0u && reply[0] == '*');
+    free(reply); /* simulated lost reply after the durable write */
+    reply = NULL;
+    reply_len = run(op, 9u, receipt_store, &reply);
+    char* receipt_operation = extract_array_bulk(reply, reply_len, 0u);
+    char* receipt_id = extract_array_bulk(reply, reply_len, 1u);
+    char* receipt_token = extract_array_bulk(reply, reply_len, 2u);
+    char* receipt_durability = extract_array_bulk(reply, reply_len, 3u);
+    assert(strcmp(receipt_operation, "STORE-SCOPED") == 0);
+    assert(strcmp(receipt_durability, "local-fsync") == 0);
+    assert(strlen(receipt_id) == QIHSE_AIMEM_ID_LEN &&
+           strlen(receipt_token) == QIHSE_AIMEM_ID_LEN);
+    free(receipt_operation); free(receipt_durability); free(reply);
+    reply = NULL;
+    reply_len = run(op, 9u, receipt_store, &reply);
+    char* receipt_retry_id = extract_array_bulk(reply, reply_len, 1u);
+    char* receipt_retry_token = extract_array_bulk(reply, reply_len, 2u);
+    assert(strcmp(receipt_id, receipt_retry_id) == 0 &&
+           strcmp(receipt_token, receipt_retry_token) == 0);
+    free(receipt_retry_id); free(receipt_retry_token); free(reply);
+    const char* receipt_conflict[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "2",
+        "changed protected bytes", "project-receipt", "", "", "", "receipt-key-1" };
+    expect_contains(op, 9u, receipt_conflict, "ERR CONFLICT");
+    const char* receipt_high_get[] = { "AIMEM", "GET-SCOPED", "placeholder",
+        "project-receipt", "", "", "" };
+    receipt_high_get[2] = receipt_id;
+    expect_contains(guest, 7u, receipt_high_get, "$-1\r\n");
+    const char* low_same_receipt_key[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "1",
+        "low receipt row", "project-receipt", "", "", "", "receipt-key-1" };
+    reply = NULL;
+    reply_len = run(guest, 9u, low_same_receipt_key, &reply);
+    char* low_receipt_id = extract_array_bulk(reply, reply_len, 1u);
+    char* low_receipt_token = extract_array_bulk(reply, reply_len, 2u);
+    assert(strcmp(receipt_id, low_receipt_id) != 0 &&
+           strcmp(receipt_token, low_receipt_token) != 0);
+    assert(!memmem(reply, reply_len, receipt_id, strlen(receipt_id)));
+    assert(!memmem(reply, reply_len, "QHHAX_HIGH_RECEIPT_MARKER", 25u));
+    free(low_receipt_id); free(low_receipt_token); free(reply);
+    free(receipt_id); free(receipt_token);
     const char* high_forget[] = { "AIMEM", "FORGET-SCOPED", "placeholder",
         "project-high", "", "", "" };
     high_forget[2] = high_scoped_id;

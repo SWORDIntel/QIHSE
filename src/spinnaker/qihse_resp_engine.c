@@ -7977,6 +7977,15 @@ static bool qihse_resp_aimem_emit_receipt(qihse_resp_session_t* session,
            qihse_resp_bulk_text(session, "local-fsync");
 }
 
+static bool qihse_resp_aimem_emit_scoped_receipt(qihse_resp_session_t* session,
+        const char* id, const char* receipt) {
+    return qihse_resp_array(session, 4u) &&
+           qihse_resp_bulk_text(session, "STORE-SCOPED") &&
+           qihse_resp_bulk_text(session, id) &&
+           qihse_resp_bulk_text(session, receipt) &&
+           qihse_resp_bulk_text(session, "local-fsync");
+}
+
 static bool qihse_resp_handle_aimem_query(qihse_resp_session_t* session,
         const qihse_resp_request_t* request) {
     if (request->argc < 4u || !qihse_resp_arg_equal(&request->argv[2], "V1"))
@@ -8127,6 +8136,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
     if (qihse_resp_arg_equal(&request->argv[1], "CAPABILITIES")) {
         static const char* const features[] = {
             "scoped-memory-v1", "scoped-durable-ack-v1",
+            "scoped-local-fsync-receipts-v1",
             "system-receipts-v1", "events-v1",
             "project-grants-v1", "handoffs-v1", "knowledge-v1",
             "query-cursors-v1", "bm25-v1", "semantic-conditional-v1"
@@ -8147,6 +8157,7 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
     if (qihse_user_get_tenant_id(session->user) != QIHSE_TENANT_SYSTEM &&
         !qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED") &&
         !qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED-DURABLE") &&
+        !qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED-RECEIPT") &&
         !qihse_resp_arg_equal(&request->argv[1], "RECALL-SCOPED") &&
         !qihse_resp_arg_equal(&request->argv[1], "GET-SCOPED") &&
         !qihse_resp_arg_equal(&request->argv[1], "FORGET-SCOPED") &&
@@ -8662,9 +8673,13 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
     }
 
     bool scoped_durable = qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED-DURABLE");
-    if (qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED") || scoped_durable) {
+    bool scoped_receipt = qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED-RECEIPT");
+    if (qihse_resp_arg_equal(&request->argv[1], "STORE-SCOPED") ||
+        scoped_durable || scoped_receipt) {
         if (request->argc != 8u && request->argc != 9u)
-            return qihse_resp_error(session, "ERR usage: AIMEM STORE-SCOPED[-DURABLE] <kind> <text> <project> <worktree> <workstream> <session> [idempotency-key]");
+            return qihse_resp_error(session, "ERR usage: AIMEM STORE-SCOPED[-DURABLE|-RECEIPT] <kind> <text> <project> <worktree> <workstream> <session> [idempotency-key]");
+        if (scoped_receipt && request->argc != 9u)
+            return qihse_resp_error(session, "ERR STORE-SCOPED-RECEIPT requires an idempotency-key");
         if (request->argv[3].len == 0u || request->argv[3].len > QIHSE_AIMEM_RESP_MAX_TEXT ||
             memchr(request->argv[3].data, '\0', request->argv[3].len))
             return qihse_resp_error(session, "ERR AIMEM invalid or oversized text");
@@ -8685,14 +8700,28 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             idem = qihse_resp_arg_text(&request->argv[8]);
         }
         char id[QIHSE_AIMEM_ID_LEN + 1u];
-        qihse_aimem_admit_result_t result = qihse_resp_aimem_store_one(
-            session, kind, text, idem, scoped_durable, &scope, id, NULL);
+        char receipt[QIHSE_AIMEM_ID_LEN + 1u];
+        qihse_aimem_admit_result_t result;
+        if (scoped_receipt) {
+            qihse_ai_memory_write_result_t write = qihse_ai_memory_store_scoped_durable(
+                session->server, session->user, text, kind, &scope, idem, id, receipt);
+            result = write == QIHSE_AIMEM_WRITE_NEW || write == QIHSE_AIMEM_WRITE_REPLAY
+                ? QIHSE_AIMEM_ADMIT_OK
+                : write == QIHSE_AIMEM_WRITE_CONFLICT ? QIHSE_AIMEM_ADMIT_CONFLICT
+                : write == QIHSE_AIMEM_WRITE_NOT_DURABLE ? QIHSE_AIMEM_ADMIT_NOT_DURABLE
+                : QIHSE_AIMEM_ADMIT_FAILED;
+        } else {
+            result = qihse_resp_aimem_store_one(
+                session, kind, text, idem, scoped_durable, &scope, id, NULL);
+        }
         free(text); free(idem);
         if (result == QIHSE_AIMEM_ADMIT_CONFLICT)
             return qihse_resp_error(session, "ERR CONFLICT AIMEM idempotency key mismatch");
         if (result == QIHSE_AIMEM_ADMIT_NOT_DURABLE)
             return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM admission not confirmed durable");
-        return result == QIHSE_AIMEM_ADMIT_OK ? qihse_resp_bulk_text(session, id)
+        return result == QIHSE_AIMEM_ADMIT_OK ?
+                   (scoped_receipt ? qihse_resp_aimem_emit_scoped_receipt(session, id, receipt)
+                                   : qihse_resp_bulk_text(session, id))
                                                : qihse_resp_error(session, "ERR AIMEM store failed");
     }
 
