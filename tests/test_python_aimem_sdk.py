@@ -9,7 +9,8 @@ import time
 import unittest
 from pathlib import Path
 
-from qihse.aimem import AIMEMClient, Scope
+from qihse.aimem import (AIMEMClient, KnowledgeProvenance, KnowledgeRelation,
+                         Scope)
 from qihse.controller import (Controller, ControllerServerError, ControllerUsageError,
                               Reply, ReplyShapeError)
 
@@ -136,6 +137,52 @@ class AIMEMSDKTests(unittest.TestCase):
         self.assertEqual(client.knowledge_latest(SCOPE, "kid").content, "rule")
         self.assertEqual(client.handoff_get("hid").evidence_ids, ("evidence",))
         self.assertEqual(client.handoff_accept("hid", 1), "ACCEPTED")
+
+    def test_extended_knowledge_wire_and_reply(self):
+        knowledge = array(bulk("kid"), bulk("vid"), bulk(""), bulk(5), bulk(1),
+                          bulk(1), bulk(100), bulk(101), bulk(0), bulk(4),
+                          *(bulk(v) for v in SCOPE.args()), bulk("candidate"))
+        relation = array(bulk(1), bulk("target-version"),
+                         *(bulk(v) for v in SCOPE.args()))
+        extended = array(knowledge, bulk(4), bulk(0), bulk(750_000),
+                         array(bulk("event-uuid")), array(relation))
+        wire = Wire(extended, extended)
+        client = AIMEMClient(wire)
+        provenance = KnowledgeProvenance(750_000, "retry-1", ("event-uuid",),
+                                        (KnowledgeRelation(1, "target-version", SCOPE),))
+        created = client.knowledge_create_ex(SCOPE, 5, 1, "candidate", provenance)
+        self.assertEqual(created.source_event_ids, ("event-uuid",))
+        self.assertEqual(created.relations[0].target_scope, SCOPE)
+        self.assertEqual(created.confidence_ppm, 750_000)
+        client.knowledge_revise_ex("kid", "vid", 1, 1, "candidate", provenance)
+        suffix = (750_000, "retry-1", 1, "event-uuid", 1, 1,
+                  "target-version", *SCOPE.args())
+        self.assertEqual(wire.commands, [
+            ("AIMEM", "KNOWLEDGE", "CREATE-EX", 5, 1, "candidate",
+             *SCOPE.args(), *suffix),
+            ("AIMEM", "KNOWLEDGE", "REVISE-EX", "kid", "vid", 1, 1,
+             "candidate", *suffix),
+        ])
+
+    def test_extended_knowledge_invalid_and_denied(self):
+        with self.assertRaises(ControllerUsageError):
+            KnowledgeProvenance(1_000_001, "retry")
+        with self.assertRaises(ControllerUsageError):
+            KnowledgeProvenance(100, "retry", relations=(
+                KnowledgeRelation(4, "target", SCOPE),))
+        denied = ControllerServerError("NOPERM", "AIMEM evidence unavailable")
+        unsupported = ControllerServerError("ERR", "UNSUPPORTED AIMEM capability")
+        wire = Wire(denied, unsupported, array())
+        client = AIMEMClient(wire)
+        provenance = KnowledgeProvenance(100, "retry")
+        with self.assertRaises(ControllerServerError) as raised:
+            client.knowledge_create_ex(SCOPE, 5, 1, "candidate", provenance)
+        self.assertEqual(raised.exception.error_class, "NOPERM")
+        with self.assertRaises(ControllerServerError) as raised:
+            client.knowledge_create_ex(SCOPE, 5, 1, "candidate", provenance)
+        self.assertEqual(raised.exception.error_class, "ERR")
+        with self.assertRaises(ReplyShapeError):
+            client.knowledge_create_ex(SCOPE, 5, 1, "candidate", provenance)
 
     def test_query_cursor_lifecycle_and_shape(self):
         knowledge = array(bulk("kid"), bulk("vid"), bulk(""), bulk(1), bulk(1),
@@ -268,6 +315,18 @@ int main(int argc, char **argv) {
                 high.store_receipt(scope, 1, "changed capture", key="receipt-1")
             self.assertIn("CONFLICT", conflict.exception.message)
             knowledge = high.knowledge_create(scope, 1, 1, marker)
+            high_event_id = high.event_append(scope, "hax", "high-event-1",
+                                              "observation", 1_000, marker)
+            provenance = KnowledgeProvenance(500_000, "high-knowledge-1",
+                                             (high_event_id,))
+            extended = high.knowledge_create_ex(scope, 5, 1, marker, provenance)
+            self.assertEqual(high.knowledge_create_ex(scope, 5, 1, marker,
+                                                       provenance), extended)
+            with self.assertRaises(ControllerServerError) as conflict:
+                high.knowledge_create_ex(scope, 5, 1, "changed candidate",
+                                         provenance)
+            self.assertIn("CONFLICT", conflict.exception.message)
+            self.assertEqual(extended.source_event_ids, (high_event_id,))
             self.assertEqual(high.get(scope, high_id).text, marker)
             self.assertEqual(high.knowledge_get(scope, knowledge.version_id).content,
                              marker)
@@ -281,6 +340,20 @@ int main(int argc, char **argv) {
             self.assertEqual(low.recall(scope, marker, mode="bm25"), [])
             self.assertEqual(low.count(scope), 0)
             self.assertIsNone(low.knowledge_get(scope, knowledge.version_id))
+            self.assertIsNone(low.knowledge_get(scope, extended.version.version_id))
+            low.store(scope, 1, "low-owned project note", key="low-owner-1")
+            with self.assertRaises(ControllerServerError) as denied:
+                low.knowledge_create_ex(scope, 5, 1, "low candidate",
+                                        KnowledgeProvenance(100, "low-knowledge-1",
+                                                            (high_event_id,)))
+            self.assertNotIn(marker, str(denied.exception))
+            with self.assertRaises(ControllerServerError) as denied:
+                low.knowledge_revise_ex(extended.version.knowledge_id,
+                                        extended.version.version_id,
+                                        extended.version.revision, 1,
+                                        "low takeover", KnowledgeProvenance(
+                                            100, "low-revise-1"))
+            self.assertNotIn(marker, str(denied.exception))
 
 
 if __name__ == "__main__":

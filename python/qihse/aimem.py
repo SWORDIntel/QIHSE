@@ -74,6 +74,48 @@ class KnowledgeVersion:
 
 
 @dataclass(frozen=True)
+class KnowledgeRelation:
+    type: int
+    target_version_id: str
+    target_scope: Scope
+
+
+@dataclass(frozen=True)
+class KnowledgeProvenance:
+    confidence_ppm: int
+    retry_key: str
+    source_event_ids: tuple[str, ...] = ()
+    relations: tuple[KnowledgeRelation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.confidence_ppm <= 1_000_000 or not self.retry_key:
+            raise ControllerUsageError("invalid AIMEM confidence or retry key")
+        if len(self.source_event_ids) > 32 or len(self.relations) > 32:
+            raise ControllerUsageError("AIMEM provenance count exceeds 32")
+        if any(relation.type not in (1, 2, 3) for relation in self.relations):
+            raise ControllerUsageError("invalid AIMEM relation type")
+
+    def args(self) -> tuple:
+        result: list = [self.confidence_ppm, self.retry_key,
+                        len(self.source_event_ids), *self.source_event_ids,
+                        len(self.relations)]
+        for relation in self.relations:
+            result.extend((relation.type, relation.target_version_id,
+                           *relation.target_scope.args()))
+        return tuple(result)
+
+
+@dataclass(frozen=True)
+class ExtendedKnowledgeVersion:
+    version: KnowledgeVersion
+    generated_by: int
+    reviewed_by: int
+    confidence_ppm: int
+    source_event_ids: tuple[str, ...]
+    relations: tuple[KnowledgeRelation, ...]
+
+
+@dataclass(frozen=True)
 class Handoff:
     id: str
     owner_id: int
@@ -143,6 +185,27 @@ def _knowledge(reply: Reply) -> KnowledgeVersion:
                             _uint(row[6]), _uint(row[7]), _uint(row[8]),
                             _uint(row[9]), Scope(*(_text(v) for v in row[10:14])),
                             _text(row[14]))
+
+
+def _extended_knowledge(reply: Reply) -> ExtendedKnowledgeVersion:
+    row = _array(reply, 6)
+    confidence = _uint(row[3])
+    if confidence > 1_000_000:
+        raise ReplyShapeError("invalid AIMEM confidence")
+    relations = []
+    for item in _array(row[5]):
+        fields = _array(item, 6)
+        relation_type = _uint(fields[0])
+        if relation_type not in (1, 2, 3, 4):
+            raise ReplyShapeError("invalid AIMEM relation type")
+        relations.append(KnowledgeRelation(relation_type, _text(fields[1]),
+                                           Scope(*(_text(v) for v in fields[2:6]))))
+    sources = tuple(_text(v) for v in _array(row[4]))
+    if len(sources) > 32 or len(relations) > 32:
+        raise ReplyShapeError("AIMEM provenance reply exceeds bound")
+    return ExtendedKnowledgeVersion(_knowledge(row[0]), _uint(row[1]),
+                                    _uint(row[2]), confidence, sources,
+                                    tuple(relations))
 
 
 def _handoff(reply: Reply) -> Handoff:
@@ -253,12 +316,28 @@ class AIMEMClient:
         return _knowledge(self._call("KNOWLEDGE", "CREATE", type, status,
                                      content, *scope.args()))
 
+    def knowledge_create_ex(self, scope: Scope, type: int, status: int,
+                            content: str, provenance: KnowledgeProvenance
+                            ) -> ExtendedKnowledgeVersion:
+        return _extended_knowledge(self._call("KNOWLEDGE", "CREATE-EX", type,
+                                              status, content, *scope.args(),
+                                              *provenance.args()))
+
     def knowledge_revise(self, knowledge_id: str, expected_version_id: str,
                          expected_revision: int, status: int,
                          content: str) -> KnowledgeVersion:
         return _knowledge(self._call("KNOWLEDGE", "REVISE", knowledge_id,
                                      expected_version_id, expected_revision,
                                      status, content))
+
+    def knowledge_revise_ex(self, knowledge_id: str, expected_version_id: str,
+                            expected_revision: int, status: int, content: str,
+                            provenance: KnowledgeProvenance
+                            ) -> ExtendedKnowledgeVersion:
+        return _extended_knowledge(self._call("KNOWLEDGE", "REVISE-EX",
+                                              knowledge_id, expected_version_id,
+                                              expected_revision, status, content,
+                                              *provenance.args()))
 
     def knowledge_get(self, scope: Scope, version_id: str) -> KnowledgeVersion | None:
         reply = self._call("KNOWLEDGE", "GET", version_id, *scope.args())
@@ -316,4 +395,5 @@ class AIMEMClient:
 
 
 __all__ = ["AIMEMClient", "Scope", "MemoryHit", "DurableReceipt", "KnowledgeVersion",
+           "KnowledgeRelation", "KnowledgeProvenance", "ExtendedKnowledgeVersion",
            "Handoff", "QueryHit", "RecallMode"]
