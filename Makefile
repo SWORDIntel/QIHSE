@@ -1010,6 +1010,22 @@ test-aimem-idem-migration: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_idem_migration tests/test_aimem_idem_migration.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_idem_migration
 
+test-hax-recall-fixture: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_aimem_hax_recall_fixture tests/test_aimem_hax_recall_fixture.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_hax_recall_fixture
+
+.PHONY: bench-hax-recall
+bench-hax-recall: lib
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_aimem_hax_recall_fixture tests/test_aimem_hax_recall_fixture.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_hax_recall_fixture --benchmark
+else
+	@echo 'Semantic/hybrid benchmark requires QIHSE_ENABLE_AIMEM_KEYSTONE=1 and a configured provider' >&2
+	@false
+endif
+
 test-python-aimem-sdk: lib
 	PYTHONPATH=python LD_LIBRARY_PATH=. python3 tests/test_python_aimem_sdk.py -v
 
@@ -1133,6 +1149,7 @@ test-serial: test-auth-privilege-boundary test-object-acl test-aggregate-hardene
 
 test-serial: test-build-verification test-aimem-scope-index test-aimem-knowledge test-aimem-idem-migration
 test-serial: test-python-aimem-sdk
+test-serial: test-hax-recall-fixture
 test-serial: test-aimem-qh08 test-aimem-qh08-resp
 test-serial: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
 test-serial: test-wal-durability

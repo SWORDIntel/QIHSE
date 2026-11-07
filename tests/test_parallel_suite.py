@@ -28,6 +28,7 @@ class ParallelSuiteTests(unittest.TestCase):
         self.assertIn("test-aimem-knowledge", serial)
         self.assertIn("test-aimem-idem-migration", serial)
         self.assertIn("test-python-aimem-sdk", serial)
+        self.assertIn("test-hax-recall-fixture", serial)
 
     def test_admin_cli_builds_standalone_service(self):
         makefile = (ROOT / "Makefile").read_text()
