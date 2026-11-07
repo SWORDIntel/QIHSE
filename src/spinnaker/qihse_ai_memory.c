@@ -56,6 +56,7 @@ static pthread_mutex_t g_aimem_knowledge_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_migration_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_archive_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_aimem_scope_index_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_aimem_scoped_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Defined with the embedding block below; reset() needs it earlier. */
 static void aimem_vecs_clear(void);
@@ -681,6 +682,13 @@ static qihse_ai_memory_write_result_t aimem_store_uuid(
         return QIHSE_AIMEM_WRITE_REPLAY;
     }
 
+    /* A durable delete retains a tombstone at this canonical key. The
+     * deterministic retry ID must never resurrect a forgotten memory. */
+    uint64_t prior_seq = 0u;
+    bool tombstone = false;
+    if (qihse_kv_change_seq_user(store, key, user, &prior_seq, &tombstone) &&
+        tombstone) return QIHSE_AIMEM_WRITE_CONFLICT;
+
     /* A verified fabric clearance-0 job runs with a live local executor
      * handle, but its output must retain the remote token's zero label.
      * The fabric entry point below admits only system Operators, and all
@@ -830,6 +838,18 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
         uint32_t kind, const qihse_ai_memory_scope_t* scope,
         const char* idempotency_key,
         char out_id[QIHSE_AIMEM_ID_LEN + 1u]) {
+    return qihse_ai_memory_store_scoped_idempotent_with_seq(server, user, text,
+        kind, scope, idempotency_key, out_id, NULL);
+}
+
+/* Caller holds g_aimem_scoped_write_lock. Serializing the read/insert/fence
+ * sequence keeps native same-key contenders on one canonical row sequence. */
+static qihse_ai_memory_write_result_t aimem_store_scoped_idempotent_locked(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+        uint32_t kind, const qihse_ai_memory_scope_t* scope,
+        const char* idempotency_key,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
     if (!aimem_scope_valid(scope) ||
         (kind != QIHSE_AIMEM_EPISODIC && kind != QIHSE_AIMEM_SEMANTIC) ||
         !user || !qihse_auth_user_is_active(user) ||
@@ -851,8 +871,61 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
     qihse_uuid_t uuid;
     if (!qihse_uuid_from_seed(seed, (size_t)n, &uuid))
         return QIHSE_AIMEM_WRITE_FAILED;
-    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id, NULL,
+    return aimem_store_uuid(server, user, text, kind, scope, &uuid, out_id,
+                            out_change_seq,
                             false);
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent_with_seq(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+        uint32_t kind, const qihse_ai_memory_scope_t* scope,
+        const char* idempotency_key,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq) {
+    pthread_mutex_lock(&g_aimem_scoped_write_lock);
+    qihse_ai_memory_write_result_t result = aimem_store_scoped_idempotent_locked(
+        server, user, text, kind, scope, idempotency_key, out_id, out_change_seq);
+    pthread_mutex_unlock(&g_aimem_scoped_write_lock);
+    return result;
+}
+
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_durable(
+        qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+        uint32_t kind, const qihse_ai_memory_scope_t* scope,
+        const char* idempotency_key,
+        char out_id[QIHSE_AIMEM_ID_LEN + 1u],
+        char out_receipt[QIHSE_AIMEM_ID_LEN + 1u]) {
+    if (out_id) out_id[0] = '\0';
+    if (out_receipt) out_receipt[0] = '\0';
+    if (!out_id || !out_receipt) return QIHSE_AIMEM_WRITE_FAILED;
+    pthread_mutex_lock(&g_aimem_scoped_write_lock);
+    uint64_t seq = 0u;
+    qihse_ai_memory_write_result_t result = aimem_store_scoped_idempotent_locked(
+        server, user, text, kind, scope, idempotency_key, out_id, &seq);
+    if (result != QIHSE_AIMEM_WRITE_NEW && result != QIHSE_AIMEM_WRITE_REPLAY)
+        goto done;
+    qihse_kv_store_t* store = qihse_resp_server_store(server);
+    if (!seq || !store || !qihse_kv_sync_store(store)) {
+        result = QIHSE_AIMEM_WRITE_NOT_DURABLE;
+        goto done;
+    }
+    char seed[640];
+    int n = snprintf(seed, sizeof seed,
+        "QH-HAX:scoped-receipt:v1:%u:%u:%s:%s:%s:%s:%s:%llu",
+        (unsigned)qihse_user_get_tenant_id(user),
+        (unsigned)qihse_user_get_id(user), scope->project, scope->worktree,
+        scope->workstream, scope->session, out_id, (unsigned long long)seq);
+    qihse_uuid_t token;
+    if (n <= 0 || (size_t)n >= sizeof seed ||
+        !qihse_uuid_from_seed(seed, (size_t)n, &token) ||
+        !qihse_uuid_format(&token, out_receipt))
+        result = QIHSE_AIMEM_WRITE_FAILED;
+done:
+    if (result != QIHSE_AIMEM_WRITE_NEW && result != QIHSE_AIMEM_WRITE_REPLAY) {
+        out_id[0] = '\0';
+        out_receipt[0] = '\0';
+    }
+    pthread_mutex_unlock(&g_aimem_scoped_write_lock);
+    return result;
 }
 
 bool qihse_ai_memory_change_seq(qihse_resp_server_t* server,

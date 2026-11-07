@@ -248,7 +248,8 @@ typedef enum {
     QIHSE_AIMEM_WRITE_FAILED = 0,
     QIHSE_AIMEM_WRITE_NEW = 1,
     QIHSE_AIMEM_WRITE_REPLAY = 2,
-    QIHSE_AIMEM_WRITE_CONFLICT = 3
+    QIHSE_AIMEM_WRITE_CONFLICT = 3,
+    QIHSE_AIMEM_WRITE_NOT_DURABLE = 4
 } qihse_ai_memory_write_result_t;
 
 /* Append a registered, immutable lifecycle event. Event identity is
@@ -557,6 +558,25 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
     uint32_t kind, const qihse_ai_memory_scope_t* scope,
     const char* idempotency_key,
     char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+/* The scoped canonical row's stable local mutation sequence. A replay returns
+ * its original sequence. This does not itself fence the write to durable media. */
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent_with_seq(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const qihse_ai_memory_scope_t* scope,
+    const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq);
+/* Durable, retry-safe scoped admission for trusted native clients. NEW and
+ * REPLAY mean the local WAL/SSTable/directory fsync fence succeeded. The
+ * opaque receipt is stable for identical retries, bound to principal, scope,
+ * canonical ID and local row sequence; it is not a replication/quorum ACK.
+ * A failed fence returns NOT_DURABLE and no receipt: retry the same key and
+ * payload to resolve whether the row survived. */
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_durable(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const qihse_ai_memory_scope_t* scope,
+    const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u],
+    char out_receipt[QIHSE_AIMEM_ID_LEN + 1u]);
 size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
                                      qihse_user_t* user, const char* query,
                                      size_t limit, qihse_ai_memory_mode_t mode,
