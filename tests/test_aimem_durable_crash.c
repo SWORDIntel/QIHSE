@@ -9,6 +9,7 @@
 #include "qihse_resp_wire.h"
 
 #include <assert.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +30,8 @@
 #define HANDOFF_COMPETITOR_ID 9203u
 #define AIMEM_SERVICE_ID 9204u
 #define MIGRATION_TEXT "QH01-LEGACY-MIGRATION-FIXTURE"
+#define SCOPED_TEXT "QH-HAX-SCOPED-DURABLE-SECRET"
+#define SCOPED_IDEM "qh-hax-scoped-durable-01"
 
 static qihse_resp_server_t* server;
 static qihse_kv_store_t* store;
@@ -414,6 +417,92 @@ static void verify_event_fence_retry(void) {
     qihse_kv_store_destroy(store);
 }
 
+static qihse_ai_memory_scope_t scoped_fixture(void) {
+    qihse_ai_memory_scope_t scope = {0};
+    strcpy(scope.project, "hax-capture");
+    strcpy(scope.worktree, "tree");
+    strcpy(scope.workstream, "stream");
+    strcpy(scope.session, "session");
+    return scope;
+}
+
+static void scoped_durable_then_kill(int pipe_fd) {
+    open_instance();
+    qihse_ai_memory_scope_t scope = scoped_fixture();
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    char receipt[QIHSE_AIMEM_ID_LEN + 1u];
+    assert(qihse_ai_memory_store_scoped_durable(server, aimem_service_user,
+        SCOPED_TEXT, QIHSE_AIMEM_SEMANTIC, &scope, SCOPED_IDEM, id, receipt)
+        == QIHSE_AIMEM_WRITE_NEW);
+    assert(strlen(id) == QIHSE_AIMEM_ID_LEN);
+    assert(strlen(receipt) == QIHSE_AIMEM_ID_LEN);
+    qihse_audit_flush();
+    write_exact(pipe_fd, id, sizeof id);
+    write_exact(pipe_fd, receipt, sizeof receipt);
+    kill(getpid(), SIGKILL);
+    _exit(100);
+}
+
+typedef struct {
+    qihse_ai_memory_scope_t scope;
+    char id[QIHSE_AIMEM_ID_LEN + 1u];
+    char receipt[QIHSE_AIMEM_ID_LEN + 1u];
+    qihse_ai_memory_write_result_t result;
+} scoped_replay_result_t;
+
+static void* scoped_replay_thread(void* data) {
+    scoped_replay_result_t* item = data;
+    item->result = qihse_ai_memory_store_scoped_durable(server,
+        aimem_service_user, SCOPED_TEXT, QIHSE_AIMEM_SEMANTIC,
+        &item->scope, SCOPED_IDEM, item->id, item->receipt);
+    return NULL;
+}
+
+static void verify_scoped_durable_replay(const char* id, const char* receipt) {
+    open_instance();
+    qihse_ai_memory_scope_t scope = scoped_fixture();
+    char replay_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char replay_receipt[QIHSE_AIMEM_ID_LEN + 1u];
+    assert(qihse_ai_memory_store_scoped_durable(server, aimem_service_user,
+        SCOPED_TEXT, QIHSE_AIMEM_SEMANTIC, &scope, SCOPED_IDEM,
+        replay_id, replay_receipt) == QIHSE_AIMEM_WRITE_REPLAY);
+    assert(strcmp(id, replay_id) == 0);
+    assert(strcmp(receipt, replay_receipt) == 0);
+    pthread_t workers[8];
+    scoped_replay_result_t results[8] = {0};
+    for (size_t i = 0; i < 8u; i++) {
+        results[i].scope = scope;
+        assert(pthread_create(&workers[i], NULL, scoped_replay_thread,
+                              &results[i]) == 0);
+    }
+    for (size_t i = 0; i < 8u; i++) {
+        assert(pthread_join(workers[i], NULL) == 0);
+        assert(results[i].result == QIHSE_AIMEM_WRITE_REPLAY);
+        assert(strcmp(results[i].id, id) == 0);
+        assert(strcmp(results[i].receipt, receipt) == 0);
+    }
+    assert(qihse_ai_memory_store_scoped_durable(server, aimem_service_user,
+        "changed payload", QIHSE_AIMEM_SEMANTIC, &scope, SCOPED_IDEM,
+        replay_id, replay_receipt) == QIHSE_AIMEM_WRITE_CONFLICT);
+    assert(replay_id[0] == '\0' && replay_receipt[0] == '\0');
+    qihse_user_t* low = qihse_auth_create_tenant_user(operator_user, 77u,
+        AIMEM_SERVICE_ID + 1u, QIHSE_ROLE_GUEST, 0u, 0u,
+        "LowClearancePass123!", false);
+    assert(low);
+    qihse_ai_memory_hit_t hit = {0};
+    assert(!qihse_ai_memory_get_scoped(server, low, id, &scope, &hit));
+    assert(hit.text == NULL);
+    assert(qihse_ai_memory_forget_scoped(server, aimem_service_user,
+                                        id, &scope));
+    assert(qihse_ai_memory_store_scoped_durable(server, aimem_service_user,
+        SCOPED_TEXT, QIHSE_AIMEM_SEMANTIC, &scope, SCOPED_IDEM,
+        replay_id, replay_receipt) == QIHSE_AIMEM_WRITE_CONFLICT);
+    assert(replay_id[0] == '\0' && replay_receipt[0] == '\0');
+    qihse_audit_flush();
+    qihse_resp_server_destroy(server);
+    qihse_kv_store_destroy(store);
+}
+
 static void expect_killed(pid_t pid) {
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
@@ -461,6 +550,30 @@ int main(void) {
         _exit(0);
     }
     int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* Native scoped durable receipt survives a lost reply and SIGKILL. */
+    assert(pipe(fd) == 0);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(fd[0]);
+        scoped_durable_then_kill(fd[1]);
+    }
+    close(fd[1]);
+    char scoped_id[QIHSE_AIMEM_ID_LEN + 1u];
+    char scoped_receipt[QIHSE_AIMEM_ID_LEN + 1u];
+    read_exact(fd[0], scoped_id, sizeof scoped_id);
+    read_exact(fd[0], scoped_receipt, sizeof scoped_receipt);
+    close(fd[0]);
+    expect_killed(pid);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        verify_scoped_durable_replay(scoped_id, scoped_receipt);
+        _exit(0);
+    }
+    status = 0;
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
