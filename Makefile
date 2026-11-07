@@ -1010,6 +1010,9 @@ test-aimem-idem-migration: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_idem_migration tests/test_aimem_idem_migration.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_idem_migration
 
+test-python-aimem-sdk: lib
+	PYTHONPATH=python LD_LIBRARY_PATH=. python3 tests/test_python_aimem_sdk.py -v
+
 bench-aimem-durability: lib
 	$(CC) $(CFLAGS) -o benchmarks/qihse_aimem_durability_bench benchmarks/qihse_aimem_durability_bench.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./benchmarks/qihse_aimem_durability_bench $(ARGS)
@@ -1128,7 +1131,8 @@ test-edge-persistence: lib
 
 test-serial: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-qkp-access-negative test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-consensus-wire test-consensus-snapshot-stage test-consensus-channel test-consensus-mesh test-consensus-blob-channel test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-aimem-resp test-aimem-durable-crash test-aimem-replay-recovery test-aimem-qh05-08 test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-table-store-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
 
-test-serial: test-build-verification test-aimem-scope-index
+test-serial: test-build-verification test-aimem-scope-index test-aimem-knowledge test-aimem-idem-migration
+test-serial: test-python-aimem-sdk
 test-serial: test-aimem-qh08 test-aimem-qh08-resp
 test-serial: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
 test-serial: test-wal-durability

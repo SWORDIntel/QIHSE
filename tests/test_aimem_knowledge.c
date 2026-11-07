@@ -76,7 +76,12 @@ int main(void) {
         QIHSE_ROLE_GUEST, 0u, 0u, "KnowledgeLowReader123!", false);
     qihse_user_t* tenant_operator = qihse_auth_create_tenant_user(op, 7u, 9206u,
         QIHSE_ROLE_OPERATOR, 5u, 0u, "KnowledgeTenantOp123!", false);
-    assert(op && owner && reader && foreign && high && low_reader && tenant_operator);
+    qihse_user_t* sci_owner = qihse_auth_create_tenant_user(op, 7u, 9207u,
+        QIHSE_ROLE_GUEST, 5u, 1u, "KnowledgeSciOwner123!", false);
+    qihse_user_t* missing_sci_reader = qihse_auth_create_tenant_user(op, 7u, 9208u,
+        QIHSE_ROLE_GUEST, 5u, 0u, "KnowledgeMissingSci123!", false);
+    assert(op && owner && reader && foreign && high && low_reader &&
+           tenant_operator && sci_owner && missing_sci_reader);
 
     qihse_kv_store_t* store = qihse_kv_store_create();
     assert(store);
@@ -256,11 +261,29 @@ int main(void) {
         "QH04_HIGH_CLASSIFIED_MARKER", &secret) == QIHSE_AIMEM_WRITE_NEW);
     assert(!qihse_ai_memory_knowledge_get(server, low_reader, secret.version_id, &high_scope, &temporal));
     assert(!qihse_ai_memory_knowledge_latest(server, low_reader, secret.knowledge_id, &high_scope, &temporal));
+    /* Equal classification and valid project membership isolate the SCI gate. */
+    assert(qihse_ai_memory_project_grant(server, owner, high_scope.project, 9208u));
+    assert(qihse_ai_memory_store_scoped(server, sci_owner, "SCI ownership seed",
+        QIHSE_AIMEM_EPISODIC, &high_scope, seed));
+    qihse_ai_memory_knowledge_version_t sci_secret;
+    assert(qihse_ai_memory_knowledge_create(server, sci_owner, &high_scope,
+        QIHSE_AIMEM_KNOWLEDGE_GOTCHA, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+        "QH04_SCI_CLASSIFIED_MARKER", &sci_secret) == QIHSE_AIMEM_WRITE_NEW);
+    assert(qihse_ai_memory_knowledge_get(server, sci_owner,
+        sci_secret.version_id, &high_scope, &temporal));
+    qihse_ai_memory_knowledge_free(&temporal);
+    assert(!qihse_ai_memory_knowledge_get(server, missing_sci_reader,
+        sci_secret.version_id, &high_scope, &temporal));
+    assert(temporal.content == NULL);
+    assert(!qihse_ai_memory_knowledge_latest(server, missing_sci_reader,
+        sci_secret.knowledge_id, &high_scope, &temporal));
+    assert(temporal.content == NULL);
     assert(qihse_kv_sync_store(store));
     qihse_audit_flush();
     char audit_path[512];
     assert(snprintf(audit_path, sizeof audit_path, "%s/qihse_audit.log", data_root) > 0);
     assert(!file_contains(audit_path, "QH04_HIGH_CLASSIFIED_MARKER"));
+    assert(!file_contains(audit_path, "QH04_SCI_CLASSIFIED_MARKER"));
     assert(!file_contains(audit_path, "reviewed durable lineage"));
 
     /* A durable restart must preserve retry identity and return the original
@@ -282,6 +305,7 @@ int main(void) {
     qihse_ai_memory_knowledge_free(&approved);
     qihse_ai_memory_knowledge_free(&retracted);
     qihse_ai_memory_knowledge_free(&secret);
+    qihse_ai_memory_knowledge_free(&sci_secret);
     qihse_ai_memory_knowledge_free(&related);
     for (size_t i = 0; i < 2u; i++) qihse_ai_memory_knowledge_free(&workers[i].value);
     qihse_resp_server_destroy(server);
