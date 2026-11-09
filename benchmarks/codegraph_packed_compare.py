@@ -45,6 +45,17 @@ def packed_frame_sections(path: Path) -> dict[str, int]:
             "body_decoded_bytes": int.from_bytes(header[24:32], "big")}
 
 
+def checksum_sources(project: Path) -> list[str]:
+    source = project / "tools/qihse_codegraph_checksum.c"
+    if not source.exists():
+        return []
+    module = PROJECT / "tools/codegraph_xxh3"
+    library = module / "build/libqihse_xxh3.a"
+    if not library.exists():
+        subprocess.run(["make", "-C", str(module), "build/libqihse_xxh3.a"], check=True)
+    return [str(source), str(library)]
+
+
 def build_driver(output: Path, library_dir: Path, codec_dir: Path,
                  packed: bool) -> list[str]:
     flags = subprocess.check_output(
@@ -56,9 +67,10 @@ def build_driver(output: Path, library_dir: Path, codec_dir: Path,
                "-I" + str(codec_dir / "tools"), "-I" + str(PROJECT / "tools")]
     if packed:
         command.append("-DCODEGRAPH_PACKED_CODEC")
-    command += [str(DRIVER), str(PROJECT / "tools/qihse_codegraph_storage.c")]
-    if packed:
-        command.append(str(codec_dir / "tools/qihse_codegraph_packed.c"))
+    command += [str(DRIVER), str(PROJECT / "tools/qihse_codegraph_storage.c"), str(PROJECT / "tools/qihse_codegraph_dictionary.c")]
+    packed_source = codec_dir / "tools/qihse_codegraph_packed.c"
+    command.append(str(packed_source if packed_source.exists() else PROJECT / "tools/qihse_codegraph_packed.c"))
+    command += checksum_sources(PROJECT)
     command += ["-o", str(output), "-L" + str(library_dir), "-lqihse",
                 *flags, "-ldl", "-lm", "-lpthread"]
     subprocess.run(command, check=True, cwd=PROJECT)

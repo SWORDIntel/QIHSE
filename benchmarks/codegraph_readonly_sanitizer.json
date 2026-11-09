@@ -1,0 +1,60 @@
+{
+  "fixture": {
+    "nodes": 800,
+    "edges": 2400
+  },
+  "conditions": "Synthetic shared snapshot, same libqihse and compiler; current RSS after one context query, concurrent host workloads, page cache not dropped",
+  "pairs": [
+    {
+      "before": {
+        "Rss_KiB": 72764,
+        "Pss_KiB": 62724,
+        "Private_Clean_KiB": 368,
+        "Private_Dirty_KiB": 61632
+      },
+      "after": {
+        "Rss_KiB": 147992,
+        "Pss_KiB": 138023,
+        "Private_Clean_KiB": 1668,
+        "Private_Dirty_KiB": 135616
+      }
+    }
+  ],
+  "binary_sha256": {
+    "before": "6b9ee0a96307f208f8bcab8f9ec23a48a4c827346dcf9dadfce2a2671b365903",
+    "after": "b6647910fe211ddf336ff927f07bf6ccd696324c59427811577d3db8a465d8fc"
+  },
+  "source_sha256": {},
+  "shared_library_sha256": "8ead12e45e4fc434dbf1e1b4d4e2787b0210603fe4b3cb05b84d3c78ba9e4841",
+  "measurement_order": "All RSS pairs use the same immutable snapshot; refresh and authorization checks follow.",
+  "import": {
+    "wall_ms": 4314.286,
+    "cpu_ms": 4312.493,
+    "peak_rss_kib": 76992,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 9305382
+  },
+  "storage_format": "qihse-codegraph-packed-v2",
+  "cold_before": {
+    "wall_ms": 6420.003,
+    "cpu_ms": 6422.788,
+    "peak_rss_kib": 72024,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "cold_after": {
+    "wall_ms": 6879.255,
+    "cpu_ms": 6889.877,
+    "peak_rss_kib": 146220,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "refresh_invalidation_and_revocation": "passed",
+  "median_rss_KiB": {
+    "before": 72764,
+    "after": 147992
+  },
+  "cold_query_parity": true,
+  "validation_scope": "CLI and codec sources compiled with -fsanitize=address,undefined -fno-omit-frame-pointer -O1; shared libqihse not instrumented; ASAN_OPTIONS=detect_leaks=0:abort_on_error=1; UBSAN_OPTIONS=halt_on_error=1",
+  "memory_comparison": "Do not compare sanitizer-process RSS with the normal baseline. Use codegraph_readonly_reference.json for performance measurements."
+}

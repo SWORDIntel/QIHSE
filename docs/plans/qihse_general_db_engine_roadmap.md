@@ -1,5 +1,7 @@
 # QIHSE General-Purpose Database Engine Replacement Roadmap
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status: partial.** A phase-by-phase roadmap for the database-replacement
 > program. Several phases describe work whose test files do not exist (see the
 > status lines for SQL, transactions, secondary indexes and replication in
@@ -190,7 +192,7 @@ Goal: Beyond SQL -- domain-specific query surfaces.
 | 8.4 Full-text SQL extensions | MATCH(), RANK(), highlight snippets in SELECT | qihse_fts_index.c, qihse_sql_parser.c |
 | 8.5 QQL v2 | Unified QQL with first-class spatial, temporal, vector, graph, and FTS predicates | qihse_qql_parser.c |
 
-### Phase 10 -- Federation Data Plane 🚧 IN PROGRESS (F0–F8 landed)
+### Phase 10 -- Federation Data Plane (historical F0–F8 implementation record; current CT gaps in master)
 
 Goal: upgrade QIHSE from a database-centric sharded cluster into a **partition-aware, security-first federation data plane** of sovereign nodes — suitable for backing a multi-host hypervisor control system and the Citadel build/supply-chain fabric — without coupling ordinary local operation to whole-cluster quorum.
 

@@ -1,5 +1,7 @@
 # W12 — TurboQuant derived vector index (research and implementation plan)
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 **Status:** W12.0 in progress (2026-10-22). The [first substrate audit and synthetic FP32 kernel baseline](qihse_w12_baseline_audit.md) exist. A [standalone experimental W12.1 scalar reference](qihse_w12_scalar_reference.md) is under validation; no engine integration, optimization, promotion or completed stage gate is claimed.
 **Master:** [QIHSE ROADMAP.md, W12](../../ROADMAP.md#w12--turboquant-vector-candidate-index-planned).
 **Scope:** QIHSE-native vector retrieval and optional AIMEM semantic retrieval, not HAX, NAT, or model KV-cache integration.

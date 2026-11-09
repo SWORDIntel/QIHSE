@@ -391,6 +391,9 @@ static int backup_seal_container(const char* output_path, backup_type_t type,
      * damages the previous backup that was there. */
     if (!backup_finish_file(out_f)) { out_f = NULL; goto done; }
     out_f = NULL;
+    if (!qihse_auth_user_is_active(user)) {
+        result = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
+    }
     if (rename(tmp_path, output_path) != 0) goto done;
     tmp_pending = false;
 
@@ -575,6 +578,139 @@ done:
     if (f) fclose(f);
     free(chunk);
     return result;
+}
+
+/* A verified detached view; never opens a configured storage directory. */
+static qihse_kv_store_t* backup_merge_open(qihse_user_t* user, const char* path,
+    size_t max_bytes, size_t max_records, int* result) {
+    FILE* in = backup_open_read(path);
+    FILE* raw = NULL;
+    uint8_t* chunk = NULL;
+    qihse_kv_store_t* view = NULL;
+    uint8_t encoded[BACKUP_HEADER_BYTES];
+    backup_header_t h;
+    struct stat st;
+    *result = QIHSE_BACKUP_EXPORT_ERR;
+    if (!in) goto done;
+    if (fread(encoded, 1, sizeof(encoded), in) != sizeof(encoded) ||
+        !backup_decode_header(encoded, &h) || h.type != BACKUP_FULL ||
+        h.data_length > max_bytes || fstat(fileno(in), &st) || st.st_size < 0 ||
+        (uint64_t)st.st_size != BACKUP_HEADER_BYTES + h.data_length) goto done;
+    *result = backup_container_gate(user, &h);
+    if (*result != QIHSE_BACKUP_EXPORT_OK) goto done;
+    *result = QIHSE_BACKUP_EXPORT_ERR;
+    raw = tmpfile();
+    chunk = malloc(BACKUP_COPY_CHUNK);
+    if (!raw || !chunk) goto done;
+    uint64_t hash = backup_hash_update(backup_hash_init(), encoded,
+                                       BACKUP_HASHED_HEADER_BYTES), moved = 0;
+    if (backup_move_section(in, h.data_length, raw, &hash, chunk,
+            BACKUP_COPY_CHUNK, &moved) || hash != h.checksum ||
+        fflush(raw) || fseeko(raw, 0, SEEK_SET)) goto done;
+    view = qihse_kv_open_snapshot_user(raw, user, max_bytes, max_records);
+    if (view) *result = QIHSE_BACKUP_EXPORT_OK;
+    else if (errno == EACCES) *result = QIHSE_BACKUP_EXPORT_DENIED;
+done:
+    if (in) fclose(in);
+    if (raw) fclose(raw);
+    free(chunk);
+    return view;
+}
+
+typedef struct {
+    qihse_kv_store_t *base, *incoming;
+    qihse_user_t* user;
+    FILE* out;
+    qihse_backup_merge_stats_t stats;
+    size_t max_bytes;
+    bool ok;
+} backup_merge_context;
+
+static bool backup_merge_row(const char* key, const char* value,
+    uint16_t classification, uint16_t sci, void* opaque) {
+    backup_merge_context* c = opaque;
+    qihse_kv_record_meta_t m, old;
+    if (!qihse_kv_meta_user(c->incoming, key, c->user, &m)) {
+        /* Expiry may have elapsed since enumeration. Never resurrect it. */
+        return true;
+    }
+    char* existing = qihse_kv_get_user(c->base, key, c->user);
+    if (existing) {
+        bool same = qihse_kv_meta_user(c->base, key, c->user, &old) &&
+            !strcmp(existing, value) && old.classification == classification &&
+            old.sci_compartment == sci && old.expire_time_ms == m.expire_time_ms &&
+            old.flags == m.flags;
+        free(existing);
+        if (same) c->stats.identical++;
+        else c->stats.conflicts++;
+        return true;
+    }
+    c->stats.added++;
+    if (fprintf(c->out, "%zu %zu %llu %u %u %u %llu\n", strlen(key), strlen(value),
+            (unsigned long long)m.expire_time_ms, (unsigned)classification,
+            (unsigned)sci, (unsigned)m.flags, (unsigned long long)m.change_seq) < 0 ||
+        fwrite(key, 1, strlen(key), c->out) != strlen(key) ||
+        fwrite(value, 1, strlen(value), c->out) != strlen(value) ||
+        fputc('\n', c->out) == EOF) c->ok = false;
+    off_t bytes = ftello(c->out);
+    if (bytes < 0 || (uint64_t)bytes > c->max_bytes) c->ok = false;
+    return c->ok;
+}
+
+int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
+    const char* incoming_path, const char* output_path, size_t max_bytes,
+    size_t max_records, qihse_backup_merge_stats_t* stats) {
+    if (stats) memset(stats, 0, sizeof(*stats));
+    int rc = backup_principal_gate(user);
+    if (rc) return rc;
+    if (!base_path || !incoming_path || !output_path || !*output_path ||
+        !max_bytes || max_bytes > ((size_t)1 << 30) || !max_records ||
+        max_records > 2000000u || !strcmp(base_path, output_path) ||
+        !strcmp(incoming_path, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
+    /* Reject aliases as well as identical spellings. */
+    struct stat a, b, out;
+    if (stat(base_path, &a) || stat(incoming_path, &b)) return QIHSE_BACKUP_EXPORT_ERR;
+    if (!lstat(output_path, &out) &&
+        ((a.st_dev == out.st_dev && a.st_ino == out.st_ino) ||
+         (b.st_dev == out.st_dev && b.st_ino == out.st_ino) || S_ISLNK(out.st_mode)))
+        return QIHSE_BACKUP_EXPORT_ERR;
+    qihse_kv_store_t *base = NULL, *incoming = NULL, *union_view = NULL;
+    FILE* merged = NULL;
+    char path[BACKUP_PATH_MAX] = {0};
+    bool pending = false;
+    backup_merge_context c = {.user = user, .max_bytes = max_bytes, .ok = true};
+    base = backup_merge_open(user, base_path, max_bytes, max_records, &rc);
+    if (!base) goto done;
+    incoming = backup_merge_open(user, incoming_path, max_bytes, max_records, &rc);
+    if (!incoming) goto done;
+    rc = QIHSE_BACKUP_EXPORT_ERR;
+    if (!backup_sibling_path(output_path, ".merge", path, sizeof(path)) ||
+        qihse_kv_save_user(base, path, user)) goto done;
+    pending = true;
+    merged = fopen(path, "a+");
+    if (!merged) goto done;
+    if (fseeko(merged, 0, SEEK_END) || ftello(merged) < 0 ||
+        (uint64_t)ftello(merged) > max_bytes) goto done;
+    c.base = base; c.incoming = incoming; c.out = merged;
+    if (!qihse_kv_foreach_meta_user(incoming, user, backup_merge_row, &c) || !c.ok)
+        goto done;
+    if (backup_principal_gate(user)) { rc = QIHSE_BACKUP_EXPORT_DENIED; goto done; }
+    if (c.stats.conflicts) { rc = QIHSE_BACKUP_EXPORT_CONFLICT; goto done; }
+    if (fflush(merged) || fseeko(merged, 0, SEEK_SET)) goto done;
+    union_view = qihse_kv_open_snapshot_user(merged, user, max_bytes, max_records);
+    if (!union_view) goto done;
+    fclose(merged); merged = NULL;
+    rc = backup_seal_container(output_path, BACKUP_FULL, 0, 0, path, user, NULL);
+    pending = false;
+done:
+    if (merged) fclose(merged);
+    if (pending) unlink(path);
+    if (union_view) qihse_kv_store_destroy(union_view);
+    if (incoming) qihse_kv_store_destroy(incoming);
+    if (base) qihse_kv_store_destroy(base);
+    if (stats && (rc == QIHSE_BACKUP_EXPORT_OK || rc == QIHSE_BACKUP_EXPORT_CONFLICT))
+        *stats = c.stats;
+    return rc;
 }
 
 int qihse_backup_verify_user(qihse_user_t* user, const char* backup_path) {

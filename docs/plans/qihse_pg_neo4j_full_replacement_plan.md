@@ -1,5 +1,7 @@
 # QIHSE Full PostgreSQL & Neo4j Replacement Plan
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status: partial — the test results reported here are contradicted by the
 > repository.** The header claims "Phase A & B COMPLETE" with 62/62 passing
 > tests.

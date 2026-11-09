@@ -1,5 +1,7 @@
 # QIHSE Key Vault — Password-Bound Unlock-Key Storage with Fleet Sync
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status: PLANNED — design only, not yet implemented.** No vault code exists
 > in this tree as of this writing; every section below is a proposal. Existing
 > primitives named in §2 were verified in-tree and are the intended reuse

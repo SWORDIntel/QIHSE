@@ -1,5 +1,7 @@
 # Scoped AIMEM hybrid indexing through KEYSTONE
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 Status: in progress. KEYSTONE has a sealed, filtered, dimension-aware
 candidate-only vector primitive with a versioned shared-library ABI gate.
 QIHSE can now bind the built-in embedder to a

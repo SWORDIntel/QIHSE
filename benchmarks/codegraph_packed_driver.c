@@ -19,6 +19,7 @@
 #include "qihse_codegraph_storage.h"
 #ifdef CODEGRAPH_PACKED_CODEC
 #include "qihse_codegraph_packed.h"
+#include "qihse_codegraph_dictionary.h"
 #endif
 
 #define PASSWORD "CodeGraphPackedBenchmark1!"
@@ -130,7 +131,7 @@ static bool populate(qihse_kv_store_t *store, qihse_user_t *user, const char *in
                 break;
             }
             const char *id = json_object_get_string(field);
-            if (!id || strlen(id) != 64 ||
+            if (!id || (strlen(id) != 64 && strlen(id) != 32) ||
                 snprintf(key, sizeof(key), "%s:%s", type, id) >= (int)sizeof(key)) {
                 json_object_put(row);
                 ok = false;
@@ -188,6 +189,26 @@ static bool packed_encode(const char *raw, const char *output, qihse_user_t *use
     return ok;
 }
 
+static bool dictionary_decode(const char *path, const char *raw, qihse_user_t *user) {
+    FILE *input = fopen(path, "rb"), *out = fopen(raw, "wb+");
+    if (!input || !out) { if(input) fclose(input); if(out) fclose(out); return false; }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char block[4096], digest[32]; unsigned length = 0; size_t n;
+    bool ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
+    while (ok && (n = fread(block, 1, sizeof(block), input)))
+        ok = EVP_DigestUpdate(ctx, block, n) == 1;
+    ok = ok && !ferror(input) && EVP_DigestFinal_ex(ctx, digest, &length) == 1 && length == 32;
+    EVP_MD_CTX_free(ctx); rewind(input);
+    char expected[65];
+    if (ok) {
+        for (size_t i=0;i<32;i++) snprintf(expected+2*i,3,"%02x",digest[i]);
+        ok = cg_dictionary_decode_snapshot(input,out,user,expected,LIMIT_BYTES,LIMIT_RECORDS);
+    }
+    if (fclose(input)) ok=false;
+    if (fclose(out)) ok=false;
+    return ok;
+}
+
 static bool packed_decode(const char *input, const char *raw, qihse_user_t *user) {
     FILE *source = fopen(input, "rb"), *dest = fopen(raw, "wb+");
     if (!source || !dest) {
@@ -205,9 +226,10 @@ static bool packed_decode(const char *input, const char *raw, qihse_user_t *user
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     const char *backend = argv[1], *input = argv[2], *output = argv[3];
-    if (strcmp(backend, "legacy") && strcmp(backend, "zstd") && strcmp(backend, "packed")) return 2;
+    if (strcmp(backend, "legacy") && strcmp(backend, "zstd") &&
+        strcmp(backend, "packed") && strcmp(backend, "dictionary") && strcmp(backend, "auto")) return 2;
 #ifndef CODEGRAPH_PACKED_CODEC
-    if (!strcmp(backend, "packed")) return 2;
+    if (!strcmp(backend, "packed") || !strcmp(backend, "auto")) return 2;
 #endif
     if (setenv("QIHSE_FIPS_MODE", "disabled", 1) || !qihse_auth_init() ||
         !qihse_auth_bootstrap_operator(PASSWORD)) return 3;
@@ -233,9 +255,13 @@ int main(int argc, char **argv) {
     double raw_export_ms = milliseconds() - begin;
     begin = milliseconds();
     double cpu_begin = cpu_milliseconds();
-    bool saved = !strcmp(backend, "legacy") ? qihse_kv_save_user(store, output, op) == 0
+    bool automatic = !strcmp(backend, "auto");
+    cg_storage_format selected_format = CG_STORAGE_ZSTD;
+    bool saved = automatic ? cg_storage_save_auto_format(store, output, op, &selected_format)
+                 : !strcmp(backend, "legacy") ? qihse_kv_save_user(store, output, op) == 0
                  : !strcmp(backend, "zstd") ? cg_storage_save(store, output, op)
 #ifdef CODEGRAPH_PACKED_CODEC
+                 : !strcmp(backend, "dictionary") ? cg_storage_save_dictionary(store, output, op)
                  : packed_encode(raw, output, op);
 #else
                  : false;
@@ -243,6 +269,8 @@ int main(int argc, char **argv) {
     double encode_ms = milliseconds() - begin;
     double encode_cpu_ms = cpu_milliseconds() - cpu_begin;
     if (!saved) return 7;
+    if (automatic) backend = selected_format == CG_STORAGE_DICTIONARY ? "dictionary" :
+                             selected_format == CG_STORAGE_PACKED ? "packed" : "zstd";
     struct stat snapshot;
     if (stat(output, &snapshot)) return 8;
     qihse_kv_store_t *loaded = qihse_kv_store_create_user(op);
@@ -252,14 +280,15 @@ int main(int argc, char **argv) {
     bool decoded_ok = !strcmp(backend, "legacy") ? qihse_kv_load_user(loaded, output, op) == 0
                       : !strcmp(backend, "zstd") ? cg_storage_load(loaded, output, op)
 #ifdef CODEGRAPH_PACKED_CODEC
-                      : packed_decode(output, decoded, op) &&
+                      : (!strcmp(backend, "dictionary") ? dictionary_decode(output, decoded, op) :
+                         packed_decode(output, decoded, op)) &&
                         qihse_kv_load_user(loaded, decoded, op) == 0;
 #else
                       : false;
 #endif
     double load_ms = milliseconds() - begin;
     double load_cpu_ms = cpu_milliseconds() - cpu_begin;
-    if (!decoded_ok || (!strcmp(backend, "packed") && !same_bytes(raw, decoded)) ||
+    if (!decoded_ok || ((!strcmp(backend, "packed") || !strcmp(backend, "dictionary")) && !same_bytes(raw, decoded)) ||
         qihse_kv_save_user(loaded, reexport, op) != 0 || !same_bytes(raw, reexport) ||
         !store_fingerprint(loaded, op, after, &after_count) ||
         strcmp(before, after) || before_count != after_count) return 9;
@@ -272,6 +301,7 @@ int main(int argc, char **argv) {
         qihse_kv_save_user(store, protected_path, op) == 0
         : !strcmp(backend, "zstd") ? cg_storage_save(store, protected_path, op)
 #ifdef CODEGRAPH_PACKED_CODEC
+        : !strcmp(backend, "dictionary") ? cg_storage_save_dictionary(store, protected_path, op)
         : qihse_kv_save_user(store, protected_raw, op) == 0 &&
           packed_encode(protected_raw, protected_path, op);
 #else
@@ -284,13 +314,14 @@ int main(int argc, char **argv) {
         qihse_kv_load_user(low_store, protected_path, low) != 0
         : !strcmp(backend, "zstd") ? !cg_storage_load(low_store, protected_path, low)
 #ifdef CODEGRAPH_PACKED_CODEC
+        : !strcmp(backend, "dictionary") ? !dictionary_decode(protected_path, denied, low)
         : !packed_decode(protected_path, denied, low);
 #else
         : false;
 #endif
     if (!denied_ok) return 11;
 #ifdef CODEGRAPH_PACKED_CODEC
-    if (!strcmp(backend, "packed")) {
+    if (!strcmp(backend, "packed") || !strcmp(backend, "dictionary")) {
         struct stat info;
         if (stat(denied, &info) || info.st_size != 0) return 11;
     }
@@ -300,13 +331,13 @@ int main(int argc, char **argv) {
     qihse_kv_store_destroy(low_store);
     qihse_kv_store_destroy(loaded);
     qihse_kv_store_destroy(store);
-    printf("{\"backend\":\"%s\",\"record_count\":%zu,\"fingerprint\":\"%s\","
+    printf("{\"backend\":\"%s\",\"selected_format\":\"%s\",\"record_count\":%zu,\"fingerprint\":\"%s\","
            "\"raw_export_ms\":%.3f,\"encode_ms\":%.3f,\"encode_cpu_ms\":%.3f,"
            "\"load_ms\":%.3f,\"load_cpu_ms\":%.3f,"
            "\"snapshot_apparent_bytes\":%jd,\"snapshot_allocated_bytes\":%jd,"
            "\"peak_rss_kib\":%ld,\"low_clearance_denied\":true,"
            "\"raw_roundtrip\":%s}\n",
-           backend, after_count, after, raw_export_ms, encode_ms, encode_cpu_ms,
+           automatic ? "auto" : backend, backend, after_count, after, raw_export_ms, encode_ms, encode_cpu_ms,
            load_ms, load_cpu_ms,
            (intmax_t)snapshot.st_size, (intmax_t)snapshot.st_blocks * 512,
            usage.ru_maxrss, "true");

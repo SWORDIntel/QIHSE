@@ -11,6 +11,10 @@ struct qihse_cluster_topology {
     uint16_t slot_peer[QIHSE_CLUSTER_SLOT_COUNT] __attribute__((aligned(64)));
     uint8_t slot_state[QIHSE_CLUSTER_SLOT_COUNT] __attribute__((aligned(64)));
     uint64_t current_epoch __attribute__((aligned(64)));
+    /* Published conservatively around mutations: remove before clearing
+     * slots, add only after assigning them. A reader cannot observe full
+     * coverage while an unassignment is in progress. */
+    uint32_t assigned_slot_count __attribute__((aligned(64)));
     uint16_t local_node;
     qihse_cluster_node_t nodes[QIHSE_CLUSTER_MAX_NODES];
     /* Tombstones for pruned nodes. Indices are never reused (slot ownership
@@ -272,11 +276,16 @@ bool qihse_cluster_topology_assign_range(qihse_cluster_topology_t* topology, uin
         errno = ENOENT;
         return false;
     }
+    uint32_t added = 0;
     for (uint32_t slot = start; slot <= end; slot++) {
+        added += __atomic_load_n(&topology->slot_to_node[slot], __ATOMIC_ACQUIRE) == QIHSE_CLUSTER_NODE_NONE;
         __atomic_store_n(&topology->slot_peer[slot], QIHSE_CLUSTER_NODE_NONE, __ATOMIC_RELAXED);
         __atomic_store_n(&topology->slot_state[slot], QIHSE_CLUSTER_SLOT_STABLE, __ATOMIC_RELAXED);
         __atomic_store_n(&topology->slot_to_node[slot], owner_index, __ATOMIC_RELEASE);
     }
+    __atomic_store_n(&topology->assigned_slot_count,
+                     __atomic_load_n(&topology->assigned_slot_count, __ATOMIC_RELAXED) + added,
+                     __ATOMIC_RELEASE);
     topology->nodes[owner_index].config_epoch = qihse_cluster_next_epoch(topology);
     pthread_mutex_unlock(&topology->metadata_lock);
     return true;
@@ -299,11 +308,16 @@ bool qihse_cluster_topology_adopt_range(qihse_cluster_topology_t* topology,
         errno = ENOENT;
         return false;
     }
+    uint32_t added = 0;
     for (uint32_t slot = start; slot <= end; slot++) {
+        added += __atomic_load_n(&topology->slot_to_node[slot], __ATOMIC_ACQUIRE) == QIHSE_CLUSTER_NODE_NONE;
         __atomic_store_n(&topology->slot_peer[slot], QIHSE_CLUSTER_NODE_NONE, __ATOMIC_RELAXED);
         __atomic_store_n(&topology->slot_state[slot], QIHSE_CLUSTER_SLOT_STABLE, __ATOMIC_RELAXED);
         __atomic_store_n(&topology->slot_to_node[slot], owner_index, __ATOMIC_RELEASE);
     }
+    __atomic_store_n(&topology->assigned_slot_count,
+                     __atomic_load_n(&topology->assigned_slot_count, __ATOMIC_RELAXED) + added,
+                     __ATOMIC_RELEASE);
     topology->nodes[owner_index].config_epoch = config_epoch;
     uint64_t cur = __atomic_load_n(&topology->current_epoch, __ATOMIC_ACQUIRE);
     while (cur < config_epoch &&
@@ -322,6 +336,12 @@ bool qihse_cluster_topology_unassign_range(qihse_cluster_topology_t* topology, u
         return false;
     }
     pthread_mutex_lock(&topology->metadata_lock);
+    uint32_t removed = 0;
+    for (uint32_t slot = start; slot <= end; slot++)
+        removed += __atomic_load_n(&topology->slot_to_node[slot], __ATOMIC_ACQUIRE) != QIHSE_CLUSTER_NODE_NONE;
+    __atomic_store_n(&topology->assigned_slot_count,
+                     __atomic_load_n(&topology->assigned_slot_count, __ATOMIC_RELAXED) - removed,
+                     __ATOMIC_RELEASE);
     for (uint32_t slot = start; slot <= end; slot++) {
         __atomic_store_n(&topology->slot_peer[slot], QIHSE_CLUSTER_NODE_NONE, __ATOMIC_RELAXED);
         __atomic_store_n(&topology->slot_state[slot], QIHSE_CLUSTER_SLOT_STABLE, __ATOMIC_RELAXED);
@@ -343,9 +363,14 @@ static bool qihse_cluster_topology_set_transition(qihse_cluster_topology_t* topo
         errno = ENOENT;
         return false;
     }
+    bool newly_assigned = __atomic_load_n(&topology->slot_to_node[slot], __ATOMIC_ACQUIRE) == QIHSE_CLUSTER_NODE_NONE;
     __atomic_store_n(&topology->slot_to_node[slot], source_index, __ATOMIC_RELAXED);
     __atomic_store_n(&topology->slot_peer[slot], target_index, __ATOMIC_RELAXED);
     __atomic_store_n(&topology->slot_state[slot], (uint8_t)state, __ATOMIC_RELEASE);
+    if (newly_assigned)
+        __atomic_store_n(&topology->assigned_slot_count,
+                         __atomic_load_n(&topology->assigned_slot_count, __ATOMIC_RELAXED) + 1u,
+                         __ATOMIC_RELEASE);
     qihse_cluster_next_epoch(topology);
     pthread_mutex_unlock(&topology->metadata_lock);
     return true;
@@ -462,11 +487,7 @@ size_t qihse_cluster_topology_ranges(const qihse_cluster_topology_t* topology, q
 
 size_t qihse_cluster_topology_assigned_slots(const qihse_cluster_topology_t* topology) {
     if (!topology) return 0;
-    size_t count = 0;
-    for (size_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
-        if (__atomic_load_n(&topology->slot_to_node[slot], __ATOMIC_ACQUIRE) != QIHSE_CLUSTER_NODE_NONE) count++;
-    }
-    return count;
+    return __atomic_load_n(&topology->assigned_slot_count, __ATOMIC_ACQUIRE);
 }
 
 size_t qihse_cluster_topology_slot_owner_snapshot(const qihse_cluster_topology_t* topology,

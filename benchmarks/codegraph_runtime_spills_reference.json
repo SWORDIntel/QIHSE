@@ -1,0 +1,70 @@
+{
+  "baseline_commit": "e716899d5b30a96e4a0fda5f7f1a27b38266179c",
+  "lifecycle_commits": [
+    "0417cf55bd8844fa48f7810845585733b25d232e",
+    "01df099dfad097dbf8a1a8b863d9f2e01aaca4ce"
+  ],
+  "scope": "disposable authenticated synthetic CodeGraph fixtures only; no live data reads",
+  "comparison": {
+    "fixture_source_bytes": 105047610,
+    "nodes": 6,
+    "edges": 150010,
+    "import_seconds": 23.618900095985737,
+    "measurements": {
+      "baseline": {
+        "logical_bytes": 118287991,
+        "allocated_bytes": 118292480,
+        "files": 3
+      },
+      "candidate": {
+        "logical_bytes": 0,
+        "allocated_bytes": 0,
+        "files": 0
+      }
+    },
+    "query_parity": true,
+    "active_audit_and_lease_preserved": true
+  },
+  "final_lock_fix_and_resident_refresh": {
+    "fixture_source_bytes": 105047610,
+    "nodes": 6,
+    "edges": 150010,
+    "import_seconds": 42.10624450200703,
+    "measurements": {
+      "candidate": {
+        "logical_bytes": 0,
+        "allocated_bytes": 0,
+        "files": 0
+      }
+    },
+    "query_parity": false,
+    "active_audit_and_lease_preserved": true,
+    "resident_refresh_passed": true
+  },
+  "validation": {
+    "native_build": "cc -std=c11 -O2 -Wall -Wextra -Werror",
+    "snapshot_xxh3_regression": "passed",
+    "accounting_normal": "passed",
+    "accounting_asan_ubsan": "passed; shared QIHSE library uninstrumented; leak detection disabled",
+    "accounting_categories": 8,
+    "authorization_negatives": [
+      "NULL principal",
+      "high-data current snapshot",
+      "high-data historical snapshot",
+      "protected-parent derived sidecar excluded"
+    ],
+    "filesystem_guards": [
+      "no symlink following",
+      "private-owner mode checks",
+      "hardlinks excluded",
+      "audit/lease/lookalike/nested sentinels retained"
+    ],
+    "full_qihse_suite": "not run at user request"
+  },
+  "remaining_limits": [
+    "Historical accounting opens are bounded to128MiB decoded and300000records; unauthorized/malformed/over-limit files are excluded and coverage marked incomplete.",
+    "Filesystem accounting is best effort for concurrently changing active runtimes.",
+    "Codec-internal section breakdown is not implemented in this CLI increment; top-level encoded/allocated/decoded and filesystem category totals are exposed.",
+    "Only known KV leaves are reclaimed; audit files and leases remain until normal runtime shutdown."
+  ]
+}

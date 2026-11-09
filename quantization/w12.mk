@@ -11,6 +11,10 @@ test-w12-turboquant: build/w12/test_turboquant build/w12/test_turboquant_tables
 	./build/w12/test_turboquant_tables
 	./build/w12/test_turboquant
 
+.PHONY: test-w12-turboquant-profile-max
+test-w12-turboquant-profile-max: build/w12/test_turboquant
+	./build/w12/test_turboquant --profile-max
+
 build/w12/test_turboquant: tests/test_turboquant.c $(TQ_SOURCES) $(TQ_HEADERS)
 	mkdir -p build/w12
 	$(TQ_CC) $(TQ_FLAGS) $< $(TQ_SOURCES) -lm -o $@

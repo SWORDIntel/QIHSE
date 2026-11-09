@@ -2,14 +2,14 @@
  * test_brain_rebalance.c — Brain R5 (rebalance on join) and R6 (stale prune).
  *
  *   A. largest owner + healthy slotless joiner
- *      -> a proportional tail range is handed to the joiner (REBALANCE)
+ *      -> a proportional tail handoff is refused until an all-writer fence
+ *         exists (REBALANCE records the refusal without moving data)
  *   B. node unhealthy past the prune timeout, owns no slots
  *      -> pruned from the topology (PRUNE), and it disappears from
  *         qihse_cluster_topology_nodes()
  *   C. node unhealthy past the prune timeout and still owning slots
- *      -> direct removal refused (EBUSY); the brain claims the orphaned
- *         range for the local node (rehome-orphan) and the now-slotless
- *         node is pruned
+ *      -> direct removal refused (EBUSY); the brain records a refusal and
+ *         retains both the owner and its range without an all-writer fence
  *
  * Loopback only; journal dirs are relative.
  */
@@ -144,7 +144,7 @@ static void add_node(qihse_cluster_topology_t* topo, const char* seed, const cha
     if (idx_out) *idx_out = idx;
 }
 
-static bool journal_has(const char* dir, const char* kind) {
+static bool journal_has_detail(const char* dir, const char* kind, const char* detail) {
     qihse_event_stream_t* journal = qihse_event_stream_open(dir, QIHSE_ES_DURABILITY_NONE, true);
     assert(journal);
     uint64_t cursor = 0;
@@ -160,13 +160,17 @@ static bool journal_has(const char* dir, const char* kind) {
             char text[2048];
             memcpy(text, payload, payload_size);
             text[payload_size] = '\0';
-            if (strstr(text, needle)) found = true;
+            if (strstr(text, needle) && (!detail || strstr(text, detail))) found = true;
         }
         free(payload);
         payload = NULL;
     }
     qihse_event_stream_destroy(journal);
     return found;
+}
+
+static bool journal_has(const char* dir, const char* kind) {
+    return journal_has_detail(dir, kind, NULL);
 }
 
 static size_t seed_keys_in_range(qihse_kv_store_t* store, qihse_user_t* user, uint16_t first,
@@ -181,6 +185,22 @@ static size_t seed_keys_in_range(qihse_kv_store_t* store, qihse_user_t* user, ui
         found++;
     }
     return found;
+}
+
+static void assert_seed_keys_preserved(qihse_kv_store_t* store, qihse_user_t* user,
+                                       uint16_t first, uint16_t last, size_t expected) {
+    size_t found = 0;
+    for (size_t i = 0; found < expected && i < 20000u; i++) {
+        char key[64];
+        snprintf(key, sizeof key, "reb:key%zu", i);
+        uint16_t slot = qihse_cluster_key_slot(key, strlen(key));
+        if (slot < first || slot > last) continue;
+        char* value = qihse_kv_get_user(store, key, user);
+        assert(value && strcmp(value, "payload") == 0);
+        free(value);
+        found++;
+    }
+    assert(found == expected);
 }
 
 int main(void) {
@@ -285,17 +305,24 @@ int main(void) {
     sleep_ms(3500);
     qihse_cluster_brain_stop();
 
-    /* A — the joiner received the tail half of the local range. */
-    assert(journal_has(dir_a, "REBALANCE"));
+    /* A — the brain records a refused handoff while all slots and values
+     * remain local. The target receives no SET and no owner journal exists. */
+    assert(journal_has_detail(dir_a, "REBALANCE", "all-writer fence"));
+    assert(journal_has_detail(dir_a, "REBALANCE", "\"ok\":false"));
     uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_slot_state_t state;
     uint16_t peer_index = QIHSE_CLUSTER_NODE_NONE;
     assert(qihse_cluster_topology_get_slot(topo, 8192u, &owner, &state, &peer_index));
-    assert(owner == joiner);
+    assert(owner == local);
     assert(qihse_cluster_topology_get_slot(topo, 8191u, &owner, &state, &peer_index));
-    assert(owner == local); /* only the tail moved */
-    assert(__atomic_load_n(&peer.set_count, __ATOMIC_RELAXED) >= 3);
-    printf("PASS slotless joiner received a proportional range (REBALANCE)\n");
+    assert(owner == local);
+    assert_seed_keys_preserved(store, system_user, 8192u, 16383u, 3u);
+    assert(__atomic_load_n(&peer.set_count, __ATOMIC_RELAXED) == 0);
+    char owner_journal[600];
+    snprintf(owner_journal, sizeof(owner_journal), "%s/slot-ownership.journal", data_root);
+    errno = 0;
+    assert(access(owner_journal, F_OK) == -1 && errno == ENOENT);
+    printf("PASS slotless joiner handoff refused without changing ownership or data\n");
 
     /* B — a slotless node unhealthy past the prune timeout is pruned. */
     uint16_t stale = QIHSE_CLUSTER_NODE_NONE;
@@ -311,13 +338,9 @@ int main(void) {
     assert(!qihse_cluster_topology_get_node(topo, stale, &gone));
     printf("PASS stale slotless node pruned from the topology\n");
 
-    /* C — an unhealthy node that still owns slots: the direct API refuses to
-     * remove it while any slot points at it (EBUSY), and the brain claims
-     * the orphaned range for the local node first (R1 rehome-orphan: the
-     * owner is dark past the bus timeout and the range carries no local
-     * keys, so streaming would move nothing). Once the range is claimed the
-     * node owns nothing and the prune takes it — the invariant "ranges must
-     * be re-homed before the owner goes" still holds, just automatically. */
+    /* C — an unhealthy owner cannot be pruned while its range is assigned.
+     * The bounded local probe cannot prove the range empty, so the brain
+     * records a refusal and leaves ownership unchanged. */
     uint16_t busy = QIHSE_CLUSTER_NODE_NONE;
     add_node(topo, "brain-reb-busy", "127.0.0.1", 7097u, 17095u, false, &busy);
     assert(qihse_cluster_topology_assign_range(topo, 4096u, 8191u, busy));
@@ -328,12 +351,16 @@ int main(void) {
     assert(qihse_cluster_brain_start(&bcfg));
     sleep_ms(4000);
     qihse_cluster_brain_stop();
-    assert(journal_has(dir_c, "REHOME_ORPHAN"));
+    assert(journal_has_detail(dir_c, "REHOME_SKIP", "transfer-unavailable-no-writer-fence"));
+    assert(!journal_has(dir_c, "REHOME_ORPHAN"));
     assert(qihse_cluster_topology_get_slot(topo, 4096u, &owner, &state, &peer_index));
-    assert(owner == local); /* claimed by the local node */
-    qihse_cluster_node_t gone_busy;
-    assert(!qihse_cluster_topology_get_node(topo, busy, &gone_busy));
-    printf("PASS orphaned range claimed, then slotless owner pruned\n");
+    assert(owner == busy);
+    qihse_cluster_node_t retained_busy;
+    assert(qihse_cluster_topology_get_node(topo, busy, &retained_busy));
+    errno = 0;
+    assert(!qihse_cluster_topology_remove_node(topo, busy) && errno == EBUSY);
+    assert(access(owner_journal, F_OK) == -1 && errno == ENOENT);
+    printf("PASS orphaned range and owner retained without an all-writer fence\n");
 
     peer.stop = true;
     pthread_join(peer.thread, NULL);

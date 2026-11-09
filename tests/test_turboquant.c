@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -927,8 +928,154 @@ static void test_seed_role_separation_regressions(void)
     puts("formerly identical/shifted seed-family regression smoke: passed");
 }
 
-int main(void)
+static void test_profile_serialization(void)
 {
+    unsigned variant;
+    for (variant = 0; variant <= 1; ++variant) {
+        qihse_tq_config config = config_for(7, 2, (qihse_tq_variant)variant);
+        qihse_tq_profile *profile = create_profile(&config), *loaded = NULL;
+        qihse_tq_query *query = NULL;
+        float vector[7] = {0.5f, -1.0f, 2.0f, 0.25f, -0.75f, 1.5f, 0.125f};
+        size_t bytes = 0, code_bytes = 0, i;
+        uint8_t *serialized, *mutant, *code, *other_code;
+        double decoded[7], score;
+        uint32_t state = 0x9e3779b9u;
+        CHECK(qihse_tq_profile_serialized_size(profile, &bytes) == 0);
+        CHECK(bytes == QIHSE_TQ_PROFILE_HEADER_BYTES +
+              (7u*7u*(1u+variant)+4u)*sizeof(double));
+        serialized = allocate(bytes+1);
+        mutant = allocate(bytes+1);
+        memset(serialized, 0xa5, bytes+1);
+        CHECK(qihse_tq_profile_serialize(profile, serialized, bytes-1) != 0);
+        for (i = 0; i < bytes+1; ++i) CHECK(serialized[i] == 0xa5);
+        CHECK(qihse_tq_profile_serialize(profile, serialized, bytes) == 0);
+        CHECK(serialized[bytes] == 0xa5);
+        CHECK(memcmp(serialized, "QTQP", 4) == 0);
+        CHECK(get_u32(serialized+4) == QIHSE_TQ_PROFILE_VERSION);
+        CHECK(get_u32(serialized+48) == bytes-QIHSE_TQ_PROFILE_HEADER_BYTES);
+        CHECK(get_u32(serialized+60) == independent_crc32(serialized, bytes));
+        CHECK(qihse_tq_profile_deserialize(serialized, bytes, &loaded) == 0);
+        CHECK(loaded != NULL);
+        CHECK(qihse_tq_profile_serialize(loaded, mutant, bytes) == 0);
+        CHECK(memcmp(mutant, serialized, bytes) == 0);
+        CHECK(qihse_tq_profile_matrix_bytes(loaded) ==
+              qihse_tq_profile_matrix_bytes(profile));
+        CHECK(qihse_tq_code_size(&config, &code_bytes) == 0);
+        code = allocate(code_bytes);
+        other_code = allocate(code_bytes);
+        CHECK(qihse_tq_encode(profile, vector, 7, code, code_bytes) == 0);
+        CHECK(qihse_tq_encode(loaded, vector, 7, other_code, code_bytes) == 0);
+        CHECK(memcmp(code, other_code, code_bytes) == 0);
+        CHECK(qihse_tq_decode(loaded, code, code_bytes, decoded, 7) == 0);
+        CHECK(qihse_tq_prepare_query(loaded, vector, 7, &query) == 0);
+        CHECK(qihse_tq_score(loaded, query, code, code_bytes, QIHSE_TQ_DOT, &score) == 0);
+        CHECK(isfinite(score));
+        qihse_tq_query_destroy(query);
+        qihse_tq_profile_destroy(loaded);
+        loaded = NULL;
+
+        CHECK(qihse_tq_profile_deserialize(serialized, bytes-1, &loaded) != 0 && !loaded);
+        CHECK(qihse_tq_profile_deserialize(serialized, bytes+1, &loaded) != 0 && !loaded);
+        for (i = 0; i < 512; ++i) {
+            size_t pos;
+            memcpy(mutant, serialized, bytes);
+            state = state*1664525u+1013904223u;
+            pos = state % bytes;
+            mutant[pos] ^= (uint8_t)(1u << ((state >> 16) & 7u));
+            if ((i & 1u) && pos >= 60u && pos < 64u) mutant[64] ^= 1u;
+            if (i & 1u) reseal(mutant, bytes);
+            CHECK(qihse_tq_profile_deserialize(mutant, bytes, &loaded) != 0 && !loaded);
+        }
+        memcpy(mutant, serialized, bytes);
+        put_u64(mutant+QIHSE_TQ_PROFILE_HEADER_BYTES, UINT64_C(0x7ff8000000000000));
+        reseal(mutant, bytes);
+        CHECK(qihse_tq_profile_deserialize(mutant, bytes, &loaded) != 0 && !loaded);
+        memcpy(mutant, serialized, bytes);
+        put_u64(mutant+QIHSE_TQ_PROFILE_HEADER_BYTES, 0);
+        reseal(mutant, bytes);
+        CHECK(qihse_tq_profile_deserialize(mutant, bytes, &loaded) != 0 && !loaded);
+        memcpy(mutant, serialized, bytes);
+        put_u64(mutant+QIHSE_TQ_PROFILE_HEADER_BYTES+
+                7u*7u*(1u+variant)*sizeof(double), UINT64_C(0x3feccccccccccccd));
+        reseal(mutant, bytes);
+        CHECK(qihse_tq_profile_deserialize(mutant, bytes, &loaded) != 0 && !loaded);
+        if (variant) {
+            memcpy(mutant, serialized, bytes);
+            put_u64(mutant+QIHSE_TQ_PROFILE_HEADER_BYTES+7u*7u*sizeof(double),
+                    UINT64_C(0x7ff8000000000000));
+            reseal(mutant, bytes);
+            CHECK(qihse_tq_profile_deserialize(mutant, bytes, &loaded) != 0 && !loaded);
+        }
+        free(serialized); free(mutant); free(code); free(other_code);
+        qihse_tq_profile_destroy(profile);
+    }
+    puts("versioned exact-profile reopen and bounded mutation rejection: passed");
+}
+
+static void test_wide_profile_reopen(void)
+{
+    enum { DIM = 128 };
+    qihse_tq_config config = config_for(DIM, 3, QIHSE_TQ_PRODUCT);
+    qihse_tq_profile *profile = create_profile(&config), *loaded = NULL;
+    size_t bytes = 0;
+    uint8_t *serialized;
+    CHECK(qihse_tq_profile_serialized_size(profile, &bytes) == 0);
+    serialized = allocate(bytes);
+    CHECK(qihse_tq_profile_serialize(profile, serialized, bytes) == 0);
+    CHECK(qihse_tq_profile_deserialize(serialized, bytes, &loaded) == 0);
+    CHECK(loaded != NULL);
+    CHECK(qihse_tq_profile_serialize(loaded, serialized, bytes) == 0);
+    qihse_tq_profile_destroy(loaded);
+    qihse_tq_profile_destroy(profile);
+    free(serialized);
+    puts("128-dimensional PRODUCT exact-profile reopen: passed");
+}
+
+static void test_max_profile_validation_cost(void)
+{
+    const size_t d = QIHSE_TQ_MAX_DIMENSIONS;
+    const size_t bytes = QIHSE_TQ_PROFILE_HEADER_BYTES + (2u*d*d+4u)*sizeof(double);
+    const double centroids[4] = {-0.75, -0.25, 0.25, 0.75};
+    qihse_tq_profile *loaded = NULL;
+    uint8_t *data = calloc(bytes, 1);
+    clock_t started;
+    size_t i;
+    CHECK(data != NULL);
+    memcpy(data, "QTQP", 4);
+    put_u32(data+4, QIHSE_TQ_PROFILE_VERSION);
+    put_u32(data+8, (uint32_t)d);
+    put_u32(data+12, 2);
+    put_u32(data+16, QIHSE_TQ_PRODUCT);
+    put_u32(data+20, QIHSE_TQ_TABLES_VERSION);
+    put_u64(data+24, 1);
+    put_u64(data+32, 2);
+    put_u32(data+48, (uint32_t)(bytes-QIHSE_TQ_PROFILE_HEADER_BYTES));
+    put_u32(data+52, 4);
+    for (i = 0; i < d; ++i)
+        put_u64(data+QIHSE_TQ_PROFILE_HEADER_BYTES+(i*d+i)*sizeof(double),
+                UINT64_C(0x3ff0000000000000));
+    for (i = 0; i < 4; ++i) {
+        uint64_t bits;
+        memcpy(&bits, &centroids[i], sizeof(bits));
+        put_u64(data+QIHSE_TQ_PROFILE_HEADER_BYTES+2u*d*d*sizeof(double)+
+                i*sizeof(double), bits);
+    }
+    reseal(data, bytes);
+    started = clock();
+    CHECK(qihse_tq_profile_deserialize(data, bytes, &loaded) != 0 && !loaded);
+    printf("1536D checksum-valid forged profile rejected in %.3f CPU seconds\n",
+           (double)(clock()-started)/CLOCKS_PER_SEC);
+    CHECK(qihse_tq_profile_deserialize(data, bytes+1, &loaded) != 0 && !loaded);
+    free(data);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--profile-max") == 0) {
+        test_max_profile_validation_cost();
+        return EXIT_SUCCESS;
+    }
+    CHECK(argc == 1);
     CHECK(sizeof(float) == 4 && sizeof(double) == 8 && FLT_RADIX == 2);
     CHECK(FLT_MANT_DIG == 24 && DBL_MANT_DIG == 53);
     test_chacha20_known_answer();
@@ -940,6 +1087,8 @@ int main(void)
     test_haar_spherical_moments();
     test_conditional_qjl_statistics();
     test_seed_role_separation_regressions();
+    test_profile_serialization();
+    test_wide_profile_reopen();
     puts("All standalone TurboQuant reference tests passed.");
     return EXIT_SUCCESS;
 }

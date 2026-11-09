@@ -126,7 +126,8 @@ static uint64_t fingerprint(const qihse_tq_profile *p) {
     }
     return h;
 }
-/* Standard reflected CRC-32/ISO-HDLC polynomial, excluding checksum field. */
+/* Standard reflected CRC-32/ISO-HDLC polynomial; both 64-byte envelopes
+ * reserve bytes 60..63 for this checksum. */
 static uint32_t code_crc(const uint8_t *code, size_t bytes) {
     uint32_t crc = UINT32_MAX; size_t i; unsigned j;
     for (i = 0; i < bytes; ++i) {
@@ -263,6 +264,144 @@ size_t qihse_tq_profile_matrix_bytes(const qihse_tq_profile *p) {
     if (!p) return 0;
     n = p->config.dimensions;
     return n*n*sizeof(double)*(p->projection ? 2u : 1u);
+}
+int qihse_tq_profile_serialized_size(const qihse_tq_profile *p, size_t *out) {
+    size_t n, count;
+    if (!p || !out || !valid_config(&p->config)) return EINVAL;
+    n = p->config.dimensions;
+    count = n*n*(p->projection ? 2u : 1u) + ((size_t)1 << p->config.scalar_bits);
+    *out = QIHSE_TQ_PROFILE_HEADER_BYTES + count*sizeof(double);
+    return 0;
+}
+int qihse_tq_profile_serialize(const qihse_tq_profile *p, uint8_t *out, size_t bytes) {
+    size_t expected, n, i, offset;
+    int rc = qihse_tq_profile_serialized_size(p, &expected);
+    if (rc) return rc;
+    if (!out || bytes != expected || fingerprint(p) != p->fingerprint) return EINVAL;
+    n = p->config.dimensions;
+    memset(out, 0, bytes);
+    memcpy(out, "QTQP", 4);
+    put_u32(out+4, QIHSE_TQ_PROFILE_VERSION);
+    put_u32(out+8, p->config.dimensions);
+    put_u32(out+12, p->config.scalar_bits);
+    put_u32(out+16, p->config.variant);
+    put_u32(out+20, QIHSE_TQ_TABLES_VERSION);
+    put_u64(out+24, p->config.rotation_seed);
+    put_u64(out+32, p->config.projection_seed);
+    put_u64(out+40, p->fingerprint);
+    put_u32(out+48, (uint32_t)(bytes-QIHSE_TQ_PROFILE_HEADER_BYTES));
+    put_u32(out+52, (uint32_t)((size_t)1 << p->config.scalar_bits));
+    offset = QIHSE_TQ_PROFILE_HEADER_BYTES;
+    for (i = 0; i < n*n; ++i, offset += 8) put_double(out+offset, p->rotation[i]);
+    if (p->projection) for (i = 0; i < n*n; ++i, offset += 8)
+        put_double(out+offset, p->projection[i]);
+    for (i = 0; i < ((size_t)1 << p->config.scalar_bits); ++i, offset += 8)
+        put_double(out+offset, p->centroids[i]);
+    put_u32(out+60, code_crc(out, bytes));
+    return 0;
+}
+static int valid_profile_values(const qihse_tq_profile *p) {
+    size_t i, j, trial, n = p->config.dimensions;
+    size_t levels = (size_t)1 << p->config.scalar_bits;
+    double *probe = NULL, *rotated = NULL, *column_norms = NULL;
+    double scale = 1.0/sqrt((double)n);
+    uint32_t state = UINT32_C(0x9e3779b9);
+    int rc = EBADMSG;
+    for (i = 0; i < levels; ++i) {
+        double value = p->centroids[i];
+        if (!isfinite(value) || !(value > -1.0 && value < 1.0) ||
+            (i && !(value > p->centroids[i-1]))) return EBADMSG;
+        if (fabs(value+p->centroids[levels-1-i]) > 1e-10) return EBADMSG;
+    }
+    for (i = 0; i < n*n; ++i)
+        if (!isfinite(p->rotation[i]) ||
+            (p->projection && !isfinite(p->projection[i]))) return EBADMSG;
+    probe = (double *)calloc(3u*n, sizeof(double));
+    if (!probe) return ENOMEM;
+    rotated = probe+n;
+    column_norms = rotated+n;
+    for (i = 0; i < n; ++i) {
+        double row_norm = 0;
+        for (j = 0; j < n; ++j) {
+            double square = p->rotation[i*n+j]*p->rotation[i*n+j];
+            row_norm += square;
+            column_norms[j] += square;
+        }
+        if (fabs(row_norm-1.0) > 1e-8) goto done;
+    }
+    for (i = 0; i < n; ++i)
+        if (fabs(column_norms[i]-1.0) > 1e-8) goto done;
+    /* Nine fixed matrix-vector probes bound validation to O(d^2). This detects
+     * ordinary corruption; a nonauthenticated envelope cannot prove its seed
+     * generated a Haar matrix or resist a deliberately forged profile. */
+    for (trial = 0; trial < 9u; ++trial) {
+        for (i = 0; i < n; ++i) {
+            if (trial < 3u) {
+                size_t basis = trial == 0u ? 0u : trial == 1u ? n/2u : n-1u;
+                probe[i] = i == basis ? 1.0 : 0.0;
+            } else {
+                state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+                probe[i] = (state & 1u ? 1.0 : -1.0)*scale;
+            }
+        }
+        for (i = 0; i < n; ++i) {
+            double dot = 0;
+            for (j = 0; j < n; ++j) dot += p->rotation[i*n+j]*probe[j];
+            rotated[i] = dot;
+        }
+        for (i = 0; i < n; ++i) {
+            double dot = 0;
+            for (j = 0; j < n; ++j) dot += p->rotation[j*n+i]*rotated[j];
+            if (fabs(dot-probe[i]) > 1e-7) goto done;
+        }
+    }
+    rc = 0;
+done:
+    free(probe);
+    return rc;
+}
+int qihse_tq_profile_deserialize(const uint8_t *data, size_t bytes, qihse_tq_profile **out) {
+    qihse_tq_config config;
+    qihse_tq_profile *p = NULL;
+    size_t expected, n, i, offset;
+    int rc;
+    if (!out) return EINVAL;
+    *out = NULL;
+    if (!data || bytes < QIHSE_TQ_PROFILE_HEADER_BYTES ||
+        bytes > QIHSE_TQ_PROFILE_HEADER_BYTES +
+            (2u*QIHSE_TQ_MAX_DIMENSIONS*QIHSE_TQ_MAX_DIMENSIONS+16u)*sizeof(double) ||
+        memcmp(data, "QTQP", 4) ||
+        get_u32(data+4) != QIHSE_TQ_PROFILE_VERSION ||
+        get_u32(data+20) != QIHSE_TQ_TABLES_VERSION || get_u32(data+56) != 0) return EBADMSG;
+    config.dimensions = get_u32(data+8);
+    config.scalar_bits = get_u32(data+12);
+    config.variant = (qihse_tq_variant)get_u32(data+16);
+    config.rotation_seed = get_u64(data+24);
+    config.projection_seed = get_u64(data+32);
+    if (!valid_config(&config)) return EBADMSG;
+    n = config.dimensions;
+    expected = QIHSE_TQ_PROFILE_HEADER_BYTES +
+        (n*n*(config.variant == QIHSE_TQ_PRODUCT ? 2u : 1u) +
+         ((size_t)1 << config.scalar_bits))*sizeof(double);
+    if (bytes != expected || get_u32(data+48) != bytes-QIHSE_TQ_PROFILE_HEADER_BYTES ||
+        get_u32(data+52) != ((size_t)1 << config.scalar_bits) ||
+        get_u32(data+60) != code_crc(data, bytes)) return EBADMSG;
+    rc = allocate_profile(&config, &p);
+    if (rc) return rc;
+    offset = QIHSE_TQ_PROFILE_HEADER_BYTES;
+    for (i = 0; i < n*n; ++i, offset += 8) p->rotation[i] = get_double(data+offset);
+    if (p->projection) for (i = 0; i < n*n; ++i, offset += 8)
+        p->projection[i] = get_double(data+offset);
+    for (i = 0; i < ((size_t)1 << config.scalar_bits); ++i, offset += 8)
+        p->centroids[i] = get_double(data+offset);
+    rc = valid_profile_values(p);
+    if (rc) goto done;
+    p->fingerprint = fingerprint(p);
+    if (p->fingerprint != get_u64(data+40)) { rc = EBADMSG; goto done; }
+    *out = p; p = NULL; rc = 0;
+done:
+    qihse_tq_profile_destroy(p);
+    return rc;
 }
 static int vector_norm(const float *v, size_t n, double *out) {
     size_t i; double sum = 0;

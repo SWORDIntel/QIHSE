@@ -3,6 +3,7 @@
 #include "qihse_cluster_migrate.h"
 #include "qihse_crc16.h"
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -27,6 +28,25 @@ static qihse_cluster_node_t make_node(const char* seed, const char* host, uint16
     node.primary_index = QIHSE_CLUSTER_NODE_NONE;
     node.healthy = true;
     return node;
+}
+
+typedef struct {
+    qihse_cluster_topology_t* topology;
+    uint16_t owner;
+    unsigned phase;
+} coverage_race_t;
+
+static void* toggle_coverage(void* argument) {
+    coverage_race_t* race = argument;
+    for (unsigned i = 0; i < 2000u; i++) {
+        __atomic_store_n(&race->phase, 4u*i + 1u, __ATOMIC_RELEASE);
+        assert(qihse_cluster_topology_unassign_range(race->topology, 777u, 777u));
+        __atomic_store_n(&race->phase, 4u*i + 2u, __ATOMIC_RELEASE);
+        __atomic_store_n(&race->phase, 4u*i + 3u, __ATOMIC_RELEASE);
+        assert(qihse_cluster_topology_assign_range(race->topology, 777u, 777u, race->owner));
+        __atomic_store_n(&race->phase, 4u*i + 4u, __ATOMIC_RELEASE);
+    }
+    return NULL;
 }
 
 int main(void) {
@@ -57,6 +77,7 @@ int main(void) {
 
     qihse_cluster_topology_t* topology = qihse_cluster_topology_create();
     assert(topology != NULL);
+    assert(qihse_cluster_topology_assigned_slots(topology) == 0u);
     qihse_cluster_node_t first = make_node("first", "127.0.0.1", 7000);
     qihse_cluster_node_t second = make_node("second", "127.0.0.1", 7001);
     uint16_t first_index;
@@ -65,7 +86,41 @@ int main(void) {
     assert(qihse_cluster_topology_upsert_node(topology, &second, &second_index));
     assert(qihse_cluster_topology_set_local_node(topology, first_index));
     assert(qihse_cluster_topology_assign_range(topology, 0, 8191, first_index));
+    assert(qihse_cluster_topology_assigned_slots(topology) == 8192u);
     assert(qihse_cluster_topology_assign_range(topology, 8192, 16383, second_index));
+    assert(qihse_cluster_topology_is_covered(topology));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT);
+    assert(qihse_cluster_topology_assign_range(topology, 8192, 16383, second_index));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT);
+    assert(qihse_cluster_topology_unassign_range(topology, 200u, 200u));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT - 1u);
+    assert(!qihse_cluster_topology_is_covered(topology));
+    assert(qihse_cluster_topology_unassign_range(topology, 200u, 200u));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT - 1u);
+    assert(qihse_cluster_topology_adopt_range(topology, 200u, 200u, first_index, 42u));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT);
+    assert(qihse_cluster_topology_adopt_range(topology, 200u, 200u, first_index, 42u));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT);
+    assert(qihse_cluster_topology_unassign_range(topology, 201u, 201u));
+    assert(qihse_cluster_topology_set_importing(topology, 201u, first_index, second_index));
+    assert(qihse_cluster_topology_assigned_slots(topology) == QIHSE_CLUSTER_SLOT_COUNT);
+
+    coverage_race_t race = { .topology = topology, .owner = first_index, .phase = 0u };
+    pthread_t coverage_writer;
+    assert(pthread_create(&coverage_writer, NULL, toggle_coverage, &race) == 0);
+    for (;;) {
+        unsigned before = __atomic_load_n(&race.phase, __ATOMIC_ACQUIRE);
+        size_t count = qihse_cluster_topology_assigned_slots(topology);
+        bool covered = qihse_cluster_topology_is_covered(topology);
+        unsigned after = __atomic_load_n(&race.phase, __ATOMIC_ACQUIRE);
+        if (before == after && (before & 1u) == 0u) {
+            size_t expected = (before & 3u) == 2u ? QIHSE_CLUSTER_SLOT_COUNT - 1u : QIHSE_CLUSTER_SLOT_COUNT;
+            assert(count == expected);
+            assert(covered == (expected == QIHSE_CLUSTER_SLOT_COUNT));
+        }
+        if (after == 8000u) break;
+    }
+    assert(pthread_join(coverage_writer, NULL) == 0);
     assert(qihse_cluster_topology_is_covered(topology));
 
     qihse_cluster_route_t route = qihse_cluster_topology_route(topology, 100, false, false);

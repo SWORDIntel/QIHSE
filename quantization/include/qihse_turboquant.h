@@ -13,6 +13,8 @@ extern "C" {
 
 #define QIHSE_TQ_REFERENCE_VERSION 1u
 #define QIHSE_TQ_CODE_HEADER_BYTES 64u
+#define QIHSE_TQ_PROFILE_VERSION 1u
+#define QIHSE_TQ_PROFILE_HEADER_BYTES 64u
 #define QIHSE_TQ_MAX_DIMENSIONS 1536u
 
 typedef enum { QIHSE_TQ_MSE = 0, QIHSE_TQ_PRODUCT = 1 } qihse_tq_variant;
@@ -50,6 +52,14 @@ int qihse_tq_profile_copy_rotation(const qihse_tq_profile *profile,
                                   double *out, size_t count);
 int qihse_tq_code_size(const qihse_tq_config *config, size_t *out);
 size_t qihse_tq_profile_matrix_bytes(const qihse_tq_profile *profile);
+
+/* Standalone exact numerical profile envelope. This is neither an authenticated
+ * database sidecar nor a stable engine ABI. The caller owns the exact-size
+ * buffer; deserialization returns a new immutable profile or NULL on failure.
+ * CRC and fingerprint detect accidental corruption, not hostile forgery. */
+int qihse_tq_profile_serialized_size(const qihse_tq_profile *profile, size_t *out);
+int qihse_tq_profile_serialize(const qihse_tq_profile *profile, uint8_t *out, size_t bytes);
+int qihse_tq_profile_deserialize(const uint8_t *data, size_t bytes, qihse_tq_profile **out);
 
 /* Encoding uses finite IEEE binary32 inputs and binary64 intermediate math.
  * Exact output length is required, including the 64-byte reference envelope.

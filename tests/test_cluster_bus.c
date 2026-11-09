@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +38,7 @@ static void make_node(qihse_cluster_node_t* node, const char* id_seed, const cha
     node->healthy = true;
 }
 
-/* Test 1: Build a datagram manually and inject it; verify topology update. */
+/* Test 1: A same-owner announcement is observed without changing topology. */
 static void test_slot_update_inject(void) {
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
     assert(topo);
@@ -46,6 +47,7 @@ static void test_slot_update_inject(void) {
     make_node(&node_a, "nodeA", "127.0.0.1", 7000, 17000);
     uint16_t idx_a;
     assert(qihse_cluster_topology_upsert_node(topo, &node_a, &idx_a));
+    assert(qihse_cluster_topology_assign_range(topo, 100, 200, idx_a));
 
     qihse_cluster_bus_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -75,7 +77,7 @@ static void test_slot_update_inject(void) {
 
     assert(qihse_cluster_bus_inject(bus, datagram, 16 + sizeof(upd), "127.0.0.1", 17000));
 
-    /* Verify slots 100-200 are now owned by idx_a */
+    /* Verify the pre-existing ownership remains unchanged. */
     uint16_t owner;
     qihse_cluster_slot_state_t state;
     assert(qihse_cluster_topology_get_slot(topo, 100, &owner, &state, NULL));
@@ -93,9 +95,81 @@ static void test_slot_update_inject(void) {
     assert(stats.received == 1);
     assert(stats.slot_updates_received == 1);
 
+    /* A wire ID without an in-field NUL must be discarded before the
+     * topology's string lookup can read beyond the fixed payload field. */
+    memset(upd.owner_id, 'X', sizeof(upd.owner_id));
+    memcpy(datagram + 16, &upd, sizeof(upd));
+    assert(qihse_cluster_bus_inject(bus, datagram, 16 + sizeof(upd), "127.0.0.1", 17000));
+    assert(qihse_cluster_topology_get_slot(topo, 150, &owner, &state, NULL));
+    assert(owner == idx_a);
+    qihse_cluster_bus_stats(bus, &stats);
+    assert(stats.slot_updates_received == 1);
+
     qihse_cluster_bus_destroy(bus);
     qihse_cluster_topology_destroy(topo);
-    printf("PASS slot update inject\n");
+    printf("PASS same-owner slot announcement inject\n");
+}
+
+typedef struct { volatile int calls; pthread_t worker; } ct_callback_state_t;
+static void on_ct_slot_update(qihse_cluster_bus_t* bus,
+        const qihse_cluster_bus_ct_slot_update_t* update, void* opaque) {
+    (void)bus;
+    ct_callback_state_t* state = opaque;
+    assert(update && update->magic == QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC);
+    state->worker = pthread_self();
+    __atomic_add_fetch(&state->calls, 1, __ATOMIC_RELEASE);
+}
+
+static void test_ct_slot_update_queued_off_rx_thread(void) {
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo);
+    qihse_cluster_node_t source, target;
+    make_node(&source, "ct-source", "127.0.0.1", 7000, 17487);
+    make_node(&target, "ct-target", "127.0.0.1", 7001, 17488);
+    uint16_t source_idx, target_idx;
+    assert(qihse_cluster_topology_upsert_node(topo, &source, &source_idx));
+    assert(qihse_cluster_topology_upsert_node(topo, &target, &target_idx));
+    assert(qihse_cluster_topology_assign_range(topo, 100, 110, source_idx));
+    qihse_cluster_bus_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = topo; cfg.local_node_index = source_idx;
+    cfg.bus_port = 17489; cfg.bind_address = "127.0.0.1";
+    ct_callback_state_t state = {0};
+    cfg.on_ct_slot_update = on_ct_slot_update;
+    cfg.on_ct_slot_update_user_data = &state;
+    qihse_cluster_bus_t* bus = qihse_cluster_bus_create(&cfg);
+    assert(bus && qihse_cluster_bus_start(bus));
+
+    qihse_cluster_bus_ct_slot_update_t update;
+    memset(&update, 0, sizeof(update));
+    update.magic = QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC;
+    update.start = 100; update.end = 110; update.config_epoch = 9;
+    /* Source and target use independent durable cursor domains. */
+    update.source_lsn = 1000; update.target_lsn = 1;
+    strcpy(update.transfer_id, "ct2-queued-test");
+    strcpy(update.source_id, source.id); strcpy(update.target_id, target.id);
+    strcpy(update.source_qkp_id, "source-pin"); strcpy(update.target_qkp_id, "target-pin");
+    strcpy(update.generation, "gen-1"); strcpy(update.owner_id, target.id);
+    update.checksum[0] = 1;
+    uint8_t datagram[QIHSE_CLUSTER_BUS_HEADER_SIZE + sizeof(update)];
+    uint32_t header[4] = {QIHSE_CLUSTER_BUS_MAGIC, QIHSE_BUS_MSG_SLOT_UPDATE,
+                          source_idx, sizeof(update)};
+    memcpy(datagram, header, sizeof(header));
+    memcpy(datagram + QIHSE_CLUSTER_BUS_HEADER_SIZE, &update, sizeof(update));
+    pthread_t receiver_thread = pthread_self();
+    assert(qihse_cluster_bus_inject(bus, datagram, sizeof(datagram), "127.0.0.1", 17487));
+    for (unsigned i = 0; i < 100 && !__atomic_load_n(&state.calls, __ATOMIC_ACQUIRE); ++i)
+        sleep_ms(5);
+    assert(__atomic_load_n(&state.calls, __ATOMIC_ACQUIRE) == 1);
+    assert(!pthread_equal(receiver_thread, state.worker));
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    assert(qihse_cluster_topology_get_slot(topo, 105, &owner, NULL, NULL));
+    assert(owner == source_idx); /* a claim is never adopted by the bus thread */
+
+    qihse_cluster_bus_stop(bus);
+    qihse_cluster_bus_destroy(bus);
+    qihse_cluster_topology_destroy(topo);
+    printf("PASS CT slot update is queued to off-receive proof worker\n");
 }
 
 /* Test 2: Inject a MEET message and verify the node is added to topology. */
@@ -257,7 +331,8 @@ static void test_live_udp_roundtrip(void) {
     assert(stats_a.pings_sent > 0);
     assert(stats_a.received > 0);
 
-    /* Test slot update broadcast from bus_a to bus_b */
+    /* An update from bus A cannot publish ownership on B without a durable
+     * migration/failover proof, even when the datagram reaches B. */
     assert(qihse_cluster_bus_broadcast_slot_update(bus_a, 0, 99, idx_a));
 
     /* Wait for the actual asynchronous UDP update, not a fixed delay that
@@ -267,18 +342,19 @@ static void test_live_udp_roundtrip(void) {
     uint16_t idx_a_in_b;
     assert(qihse_cluster_topology_find_node(topo_b, node_a.id, &idx_a_in_b));
     qihse_cluster_bus_stats_t stats_b;
-    bool delivered = false;
+    bool refused = false;
     for (unsigned attempt = 0; attempt < 50; ++attempt) {
         qihse_cluster_bus_stats(bus_b, &stats_b);
-        if (stats_b.slot_updates_received > 0 &&
+        if (stats_b.received > 0 &&
             qihse_cluster_topology_get_slot(topo_b, 50, &owner, &state, NULL) &&
-            owner == idx_a_in_b) {
-            delivered = true;
+            owner == QIHSE_CLUSTER_NODE_NONE) {
+            refused = true;
             break;
         }
         sleep_ms(100);
     }
-    assert(delivered);
+    assert(refused);
+    assert(stats_b.slot_updates_received == 0);
 
     qihse_cluster_bus_stop(bus_a);
     qihse_cluster_bus_stop(bus_b);
@@ -384,6 +460,7 @@ static void test_veiled_framing(void) {
     make_node(&node_a, "nodeA", "127.0.0.1", 7000, 17000);
     uint16_t idx_a;
     assert(qihse_cluster_topology_upsert_node(topo, &node_a, &idx_a));
+    assert(qihse_cluster_topology_assign_range(topo, 300, 400, idx_a));
 
     qihse_cluster_bus_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -398,7 +475,7 @@ static void test_veiled_framing(void) {
     size_t frame_len = make_slot_update_frame(idx_a, node_a.id, 300, 400, frame, sizeof(frame));
     uint8_t wrapped[8 + 1 + 64 + sizeof(frame)];
 
-    /* Correct key: datagram must be unwrapped and applied. */
+    /* Correct key: datagram is unwrapped as a same-owner announcement. */
     size_t wrapped_len = veil_wrap_test(cfg.veil_key, nonce, 17u, frame, frame_len,
                                         wrapped, sizeof(wrapped));
     assert(wrapped_len > 0);
@@ -583,7 +660,9 @@ static void test_maintenance_defers_slot_update(void) {
     assert(qihse_cluster_maintenance_release_trusted(gate, generation, token));
     assert(qihse_cluster_bus_inject(bus, frame, len, "127.0.0.1", 17000));
     assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
-    assert(owner == idx);
+    assert(owner == QIHSE_CLUSTER_NODE_NONE);
+    qihse_cluster_bus_stats(bus, &stats);
+    assert(stats.slot_updates_received == 0u);
     qihse_cluster_bus_destroy(bus);
     qihse_cluster_topology_destroy(topo);
     qihse_cluster_maintenance_destroy(gate);
@@ -597,6 +676,7 @@ int main(void) {
     if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
 }
     test_slot_update_inject();
+    test_ct_slot_update_queued_off_rx_thread();
     test_meet_inject();
     test_fail_inject();
     test_bad_magic();

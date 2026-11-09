@@ -1,5 +1,7 @@
 # QIHSE Redis-Compatible Sharded Cluster Engine — Native Hardware-Aware Implementation Plan
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status: partial.** The engine it plans exists and has tests
 > (`tests/test_resp_cluster.c`, `tests/test_cluster_slot.c`,
 > `tests/test_cluster_scatter.c`, `tests/test_cluster_failover.c`), but the

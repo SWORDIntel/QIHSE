@@ -67,6 +67,24 @@ typedef enum {
 #define QIHSE_AIMEM_KNOWLEDGE_MAX_RELATIONS 32u
 #define QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN 64u
 #define QIHSE_AIMEM_CONFIDENCE_MAX 1000000u
+#define QIHSE_AIMEM_SOURCE_SYSTEM_MAX 32u
+#define QIHSE_AIMEM_SOURCE_ID_MAX 256u
+#define QIHSE_AIMEM_SOURCE_REVISION_MAX 128u
+#define QIHSE_AIMEM_URL_SOURCE_SYSTEM "https-url"
+#define QIHSE_AIMEM_URL_CITATION_MAX_BYTES (8u * 1024u * 1024u)
+
+/* External source identity is caller supplied and opaque to QIHSE. A source
+ * provider must authenticate the exact revision/range before citation use. */
+typedef struct {
+    char system[QIHSE_AIMEM_SOURCE_SYSTEM_MAX + 1u];
+    char id[QIHSE_AIMEM_SOURCE_ID_MAX + 1u];
+    char revision[QIHSE_AIMEM_SOURCE_REVISION_MAX + 1u];
+    uint32_t line_start; /* 1-based, inclusive */
+    uint32_t line_end;   /* 1-based, inclusive */
+} qihse_ai_memory_source_ref_t;
+
+bool qihse_ai_memory_url_source_ref_valid(
+    const qihse_ai_memory_source_ref_t* source);
 
 typedef enum {
     QIHSE_AIMEM_RELATION_FIXES = 1u,
@@ -91,6 +109,7 @@ typedef struct {
     const qihse_ai_memory_relation_t* relations;
     size_t relation_count;
     uint32_t confidence_ppm;
+    const qihse_ai_memory_source_ref_t* source_ref; /* optional exact source */
 } qihse_ai_memory_knowledge_provenance_t;
 
 /* Immutable QH-04 version metadata. `content` and all IDs are owned by the
@@ -110,6 +129,7 @@ typedef struct {
     uint32_t generated_by;
     uint32_t reviewed_by;
     uint32_t confidence_ppm;
+    qihse_ai_memory_source_ref_t source_ref;
     char content_sha256[QIHSE_AIMEM_CONTENT_SHA256_HEX_LEN + 1u];
     char (*source_event_ids)[QIHSE_AIMEM_ID_LEN + 1u];
     size_t source_event_count;
@@ -122,6 +142,16 @@ bool qihse_ai_memory_knowledge_get(qihse_resp_server_t* server,
     qihse_user_t* user, const char* version_id,
     const qihse_ai_memory_scope_t* scope,
     qihse_ai_memory_knowledge_version_t* out);
+/* A trusted HTTPS source provider supplies the current response body plus
+ * its deterministic UTF-8 text extraction. The revision hashes body bytes;
+ * line coordinates count LF-delimited extracted-text lines. QIHSE does not
+ * fetch URLs, check MIME, or attest that supplied bytes are current. */
+bool qihse_ai_memory_knowledge_url_citation_valid(
+    qihse_resp_server_t* server, qihse_user_t* user,
+    const char* version_id, const qihse_ai_memory_scope_t* scope,
+    const qihse_ai_memory_source_ref_t* expected_source,
+    const void* body, size_t body_len,
+    const char* rendered_text, size_t rendered_len);
 void qihse_ai_memory_knowledge_free(qihse_ai_memory_knowledge_version_t* value);
 
 #define QIHSE_AIMEM_EVENT_MAX_SUMMARY (16u * 1024u)
@@ -248,7 +278,8 @@ typedef enum {
     QIHSE_AIMEM_WRITE_FAILED = 0,
     QIHSE_AIMEM_WRITE_NEW = 1,
     QIHSE_AIMEM_WRITE_REPLAY = 2,
-    QIHSE_AIMEM_WRITE_CONFLICT = 3
+    QIHSE_AIMEM_WRITE_CONFLICT = 3,
+    QIHSE_AIMEM_WRITE_NOT_DURABLE = 4
 } qihse_ai_memory_write_result_t;
 
 /* Append a registered, immutable lifecycle event. Event identity is
@@ -273,6 +304,8 @@ bool qihse_ai_memory_project_revoke(qihse_resp_server_t* server,
     qihse_user_t* grantor, const char* project, uint32_t reader_id);
 bool qihse_ai_memory_project_reader_allowed(qihse_resp_server_t* server,
     qihse_user_t* reader, const char* project);
+bool qihse_ai_memory_project_reader_allowed_for_owner(qihse_resp_server_t* server,
+    qihse_user_t* reader, uint32_t owner_id, const char* project);
 bool qihse_ai_memory_project_owner_allowed(qihse_resp_server_t* server,
     qihse_user_t* owner, const char* project);
 
@@ -364,6 +397,8 @@ typedef struct {
     uint64_t changed_since_ms; /* exclusive incremental sync watermark */
     uint64_t as_of_ingest_ms; /* 0 = list versions; otherwise one version per lineage */
     const char* text;      /* optional case-insensitive substring */
+    const char* source_event_id; /* optional exact, currently readable event UUID */
+    const qihse_ai_memory_source_ref_t* source_ref; /* optional exact external source */
     qihse_ai_memory_mode_t mode; /* BM25, semantic, or RRF hybrid */
     size_t max_rows;       /* 1..QIHSE_AIMEM_QUERY_MAX_ROWS */
 } qihse_ai_memory_query_v1_t;
@@ -389,6 +424,41 @@ size_t qihse_ai_memory_query_next(qihse_ai_memory_query_snapshot_t* snapshot,
 void qihse_ai_memory_query_hits_free(qihse_ai_memory_query_hit_t* hits,
     size_t count);
 void qihse_ai_memory_query_end(qihse_ai_memory_query_snapshot_t* snapshot);
+
+/* A bounded, authorized walk of existing typed outbound knowledge relations.
+ * The caller owns each returned version and must call walk_hits_free(). */
+#define QIHSE_AIMEM_WALK_MAX_DEPTH 4u
+#define QIHSE_AIMEM_WALK_MAX_NODES 64u
+#define QIHSE_AIMEM_WALK_IN_MAX_SCANNED_VERSIONS 4096u
+typedef struct {
+    qihse_ai_memory_knowledge_version_t version;
+    uint32_t depth;
+    /* Set for a non-root WALK-IN or WALK-V2 hit. For WALK-V2 the returned
+     * version is the target and traversed_from_version_id names its source;
+     * for WALK-IN the returned version itself is the source. */
+    bool has_traversed_relation;
+    char traversed_from_version_id[QIHSE_AIMEM_ID_LEN + 1u];
+    qihse_ai_memory_relation_t traversed_relation;
+} qihse_ai_memory_walk_hit_t;
+size_t qihse_ai_memory_knowledge_walk(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* start_version_id,
+    const qihse_ai_memory_scope_t* scope, uint32_t max_depth,
+    size_t max_nodes, qihse_ai_memory_walk_hit_t* out);
+/* Outbound walk with a final authorization and edge-presence recheck before
+ * returning exact per-hop source and relation metadata. */
+size_t qihse_ai_memory_knowledge_walk_v2(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* start_version_id,
+    const qihse_ai_memory_scope_t* scope, uint32_t max_depth,
+    size_t max_nodes, qihse_ai_memory_walk_hit_t* out);
+/* Incoming companion: follows source versions whose typed relation targets
+ * a visited version. If the authorized scan bound is exceeded, returns 0 and
+ * discloses no partial result. */
+size_t qihse_ai_memory_knowledge_walk_in(qihse_resp_server_t* server,
+    qihse_user_t* user, const char* start_version_id,
+    const qihse_ai_memory_scope_t* scope, uint32_t max_depth,
+    size_t max_nodes, qihse_ai_memory_walk_hit_t* out);
+void qihse_ai_memory_walk_hits_free(qihse_ai_memory_walk_hit_t* hits,
+    size_t count);
 
 /* QH-06: durable single-lineage maintenance only. PLAN carries one source
  * version, typed operation, source/replacement hashes, target retention tier,
@@ -526,6 +596,41 @@ typedef struct {
 } qihse_ai_memory_health_t;
 bool qihse_ai_memory_index_rebuild(qihse_resp_server_t* server,
     qihse_user_t* user, const qihse_ai_memory_scope_t* scope);
+
+/* Optional process-local control for one synchronous rebuild. The durable
+ * BUILDING/READY/FAILED generation remains authoritative after a crash.
+ * Only the initiating active, fully cleared Operator may read progress or
+ * request cancellation. The initiating handle may destroy the control after
+ * revocation, but cannot read its status. A cancellation before cutover leaves the candidate
+ * unpublished and records FAILED; it does not roll back source records.
+ * The caller must join the rebuild and any status/cancel users before
+ * destroying the control. */
+typedef struct qihse_ai_memory_index_control qihse_ai_memory_index_control_t;
+typedef enum {
+    QIHSE_AIMEM_REBUILD_IDLE = 0u,
+    QIHSE_AIMEM_REBUILD_SCANNING = 1u,
+    QIHSE_AIMEM_REBUILD_PUBLISHING = 2u,
+    QIHSE_AIMEM_REBUILD_COMPLETE = 3u,
+    QIHSE_AIMEM_REBUILD_CANCELLED = 4u,
+    QIHSE_AIMEM_REBUILD_FAILED = 5u,
+    /* Private READY committed, but public readiness publication failed. */
+    QIHSE_AIMEM_REBUILD_COMMITTED_UNAVAILABLE = 6u
+} qihse_ai_memory_rebuild_phase_t;
+typedef struct {
+    qihse_ai_memory_rebuild_phase_t phase;
+    uint64_t processed_records;
+    uint64_t record_limit; /* upper bound, not an estimated total */
+} qihse_ai_memory_rebuild_progress_t;
+qihse_ai_memory_index_control_t* qihse_ai_memory_index_control_create(qihse_user_t* user);
+bool qihse_ai_memory_index_control_status(qihse_ai_memory_index_control_t* control,
+    qihse_user_t* user, qihse_ai_memory_rebuild_progress_t* out);
+bool qihse_ai_memory_index_control_cancel(qihse_ai_memory_index_control_t* control,
+    qihse_user_t* user);
+bool qihse_ai_memory_index_control_destroy(qihse_ai_memory_index_control_t* control,
+    qihse_user_t* user);
+bool qihse_ai_memory_index_rebuild_controlled(qihse_resp_server_t* server,
+    qihse_user_t* user, const qihse_ai_memory_scope_t* scope,
+    qihse_ai_memory_index_control_t* control);
 bool qihse_ai_memory_index_recover(qihse_resp_server_t* server,
     qihse_user_t* user, const qihse_ai_memory_scope_t* scope);
 bool qihse_ai_memory_health(qihse_resp_server_t* server, qihse_user_t* user,
@@ -557,6 +662,25 @@ qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent(
     uint32_t kind, const qihse_ai_memory_scope_t* scope,
     const char* idempotency_key,
     char out_id[QIHSE_AIMEM_ID_LEN + 1u]);
+/* The scoped canonical row's stable local mutation sequence. A replay returns
+ * its original sequence. This does not itself fence the write to durable media. */
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_idempotent_with_seq(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const qihse_ai_memory_scope_t* scope,
+    const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u], uint64_t* out_change_seq);
+/* Durable, retry-safe scoped admission for trusted native clients. NEW and
+ * REPLAY mean the local WAL/SSTable/directory fsync fence succeeded. The
+ * opaque receipt is stable for identical retries, bound to principal, scope,
+ * canonical ID and local row sequence; it is not a replication/quorum ACK.
+ * A failed fence returns NOT_DURABLE and no receipt: retry the same key and
+ * payload to resolve whether the row survived. */
+qihse_ai_memory_write_result_t qihse_ai_memory_store_scoped_durable(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* text,
+    uint32_t kind, const qihse_ai_memory_scope_t* scope,
+    const char* idempotency_key,
+    char out_id[QIHSE_AIMEM_ID_LEN + 1u],
+    char out_receipt[QIHSE_AIMEM_ID_LEN + 1u]);
 size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
                                      qihse_user_t* user, const char* query,
                                      size_t limit, qihse_ai_memory_mode_t mode,
@@ -571,6 +695,21 @@ bool qihse_ai_memory_get_scoped(qihse_resp_server_t* server,
 bool qihse_ai_memory_forget_scoped(qihse_resp_server_t* server,
                                    qihse_user_t* user, const char* id,
                                    const qihse_ai_memory_scope_t* scope);
+
+typedef enum {
+    QIHSE_AIMEM_FORGET_RECEIPT_DONE = 0,
+    QIHSE_AIMEM_FORGET_RECEIPT_UNAVAILABLE,
+    QIHSE_AIMEM_FORGET_RECEIPT_CONFLICT,
+    QIHSE_AIMEM_FORGET_RECEIPT_NOT_DURABLE,
+    QIHSE_AIMEM_FORGET_RECEIPT_UNRESOLVED
+} qihse_ai_memory_forget_receipt_result_t;
+
+/* Exact-scope, owner-authorized delete with a principal-bound durable retry
+ * ledger. Caller serializes this operation with the server KV write lock. */
+qihse_ai_memory_forget_receipt_result_t qihse_ai_memory_forget_scoped_receipt(
+    qihse_resp_server_t* server, qihse_user_t* user, const char* id,
+    const qihse_ai_memory_scope_t* scope, const char* retry_key,
+    char out_receipt[QIHSE_AIMEM_ID_LEN + 1u]);
 size_t qihse_ai_memory_count_scoped(qihse_resp_server_t* server,
                                     qihse_user_t* user, uint32_t kind,
                                     const qihse_ai_memory_scope_t* scope);

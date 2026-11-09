@@ -1,7 +1,9 @@
 # CodeGraph compact v2 implementation plan
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 Date: 2026-11-06  
-Status: P0 in progress; later phases remain proposals.  
+Status: supporting phased design. Delivery status is maintained only in [ROADMAP.md](../../ROADMAP.md#codegraph).
 Scope: QIHSE CodeGraph storage, indexing, querying, migration and progress reporting.
 
 ## Objective
@@ -56,7 +58,7 @@ Existing implementation and evidence are documented in
 | Loading | Authenticated immutable memory load up to 64 MiB decoded / 150,000 records; larger graphs use a disk fallback | Avoid restoring still larger read-only graphs through mutable KV/SST state |
 | Publication | Validated atomic manifest; identical valid imports reuse the current snapshot | Make per-file reuse possible without rewriting the full graph |
 | Migration | Authenticated conversion, logical-record verification and rollback generation | Add a packed format and independently readable blocks |
-| Retention | Explicit GC retains current/previous generations and skips active scratch leases | Account for shared blocks and generation-pinned readers |
+| Retention | Successful import/migrate and explicit GC retain current/previous generations and clean abandoned leased runtimes | Account for shared blocks if a future format shares data between generations |
 | Queries | Indexed properties, bounded traversal and bounded review output | Store compact adjacency and decode only required evidence |
 | Reindex workflow | Rebuild → export → compact import; stage bar and terminal elapsed indicator | Incremental updates and measurable within-stage progress |
 | Source freshness | Git-backed identity including staged state and untracked contents; safe compatibility bridge for old exporters | Explicit non-Git and editor-overlay identity modes |
@@ -93,7 +95,9 @@ manifest digest before decoding. The [packed comparison](../../benchmarks/codegr
 measured 182,355 bytes against current Zstandard's 187,857 bytes on the
 800-node/2,400-edge fixture (2.93% less); the tiny fixture was 33 bytes larger.
 Direct import and conversion returned exact native query results. The pilot
-has a 64 MiB decoded limit and retains Zstandard as default. On the selected
+has a 64 MiB decoded limit. The original pilot retained Zstandard as default;
+automatic selection now chooses the smaller candidate and uses Zstandard above
+the packed limit. On the selected
 fresh Angryier graph (8,853 nodes, 114,689 edges), packed-v2 used 7,798,284
 bytes versus the existing 7,534,503-byte Zstandard snapshot (3.50% larger).
 Four authenticated queries had identical results except for generation IDs.
@@ -351,26 +355,10 @@ and inspect equivalent queries before expanding migration coverage.
 Embeddings, node2vec, learned indexes, Bloom filters, spectral sparsification,
 cross-repository linking and general graph query languages are not initial work.
 They add storage or complexity and need evidence of a specific retrieval bottleneck.
-Neither fingerprint truncation nor silently dropping authoritative edges is an
-acceptable default storage optimization.
+Silently dropping authoritative edges remains unacceptable. The later approved 128-bit public-ID format uses full-preimage collision handling and is documented in [the XXH3 identity report](codegraph_xxh3_tuned.md); it supersedes the original blanket fingerprint-width restriction.
 
-## Execution checklist
+## Implementation tracking
 
-- [~] P0: current-generation authorized accounting and a reproducible synthetic
-      baseline/query corpus implemented; broader accounting and selected-graph
-      baseline coverage remain.
-- [~] P1: opt-in packed-v2 pilot integrated with authenticated snapshot export,
-      full-metadata migration check, sanitizer/negative tests and synthetic
-      size/query receipts. Live size validation and the 64 MiB cap remain.
-- [ ] P2: implement compact adjacency and bounded selective reads.
-- [~] Migration: packed-v2 conversion and rollback generation work through the
-      existing stage bar; within-stage byte/record progress remains.
-- [ ] P3: implement per-file incremental generations and shared-block-safe GC.
-- [ ] P4: define and validate explicit filesystem/overlay source providers.
-- [ ] P5: evaluate optional, explicitly incomplete retrieval views.
-- [ ] Complete fault/security/performance validation and the full test suite.
-- [ ] Validate a selected small graph, then a larger graph, before wider conversion.
+Current completed increments CG.1–CG.9 and remaining optimization work CG.10–CG.17 are maintained only in [the authoritative roadmap](../../ROADMAP.md#codegraph). The phased specification above is a design record, not a claim that entire P0–P5 gates are complete. In-memory CSR is shipped; persisted/selective CSR, chunking and incrementality remain separate work.
 
-This checklist describes future work. Existing compact-v1 conversion and the
-stage-progress wrapper are already implemented; they are the baseline, not new
-deliverables claimed complete by this plan.
+The original live-graph conversion sequence is inapplicable because those graphs no longer exist. The newer focused validation and user-stopped full-suite boundary are recorded in the master roadmap; no complete-suite pass is implied.

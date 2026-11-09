@@ -1,4 +1,7 @@
 #include "qihse_kv_store.h"
+#include "qihse_cluster_slot.h"
+#include "qihse_cluster_reclaim.h"
+#include "qihse_ct_codec.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -6,6 +9,8 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/random.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -41,6 +47,8 @@
 #define KV_WAL_MAGIC "QKV2"
 #define KV_WAL_MAGIC_REPLICA "QKV3"
 #define KV_WAL_MAGIC_LOCAL_SEQ "QKV4"
+#define KV_WAL_MAGIC_DELETE_RECEIPT "QKV5"
+#define KV_WAL_MAGIC_CT "QKV6"
 #define KV_REPLICA_CURSOR_MAGIC "QRC1"
 #define KV_REPLICA_CURSOR_MAX_ITEMS 4096u
 #define KV_REPLICA_CURSOR_MAX_ID 128u
@@ -57,10 +65,11 @@ static void replica_install_test_crash_point(const char* point) {
 #endif
 #ifdef QIHSE_AIMEM_DURABILITY_TEST
 static bool aimem_durability_test_fail_once(const char* point) {
-    static bool fired;
+    static char fired_point[128];
     const char* selected = getenv("QIHSE_AIMEM_FAIL_AT");
-    if (!fired && selected && point && strcmp(selected, point) == 0) {
-        fired = true;
+    if (selected && point && strcmp(selected, point) == 0 &&
+        strcmp(fired_point, point) != 0) {
+        snprintf(fired_point, sizeof(fired_point), "%s", point);
         errno = EIO;
         return true;
     }
@@ -305,6 +314,40 @@ struct qihse_kv_store {
     bool replica_read_only;
     bool memory_snapshot; /* Immutable detached snapshot: never writes configured storage. */
     uint32_t replication_principal_id; /* QKP replication service principal id */
+    bool ct_enabled;
+    bool ct_admitted; /* runtime-only: reopened source requires QKP reconcile */
+    uint8_t ct_mode; /* 1 source, 2 receiver */
+    char ct_source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char ct_target_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char ct_successor_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char ct_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    unsigned char ct_owner_token[QIHSE_KV_CT_TOKEN_BYTES];
+    uint32_t ct_tenant_id;
+    qihse_user_t* ct_system_principal; /* borrowed authenticated open context */
+    qihse_kv_ct_tenant_policy_t ct_tenant_policy;
+    uint64_t ct_baseline_lsn;
+    unsigned char ct_baseline_digest[32];
+    bool ct_baseline_sealed;
+    uint64_t ct_durable_lsn;
+    uint64_t ct_ack_lsn;
+    uint64_t ct_retained_bytes;
+    uint64_t ct_limit_bytes;
+    unsigned char ct_last_group_digest[32];
+    uint8_t ct_fence_state; /* 0 none, 1 transfer in progress, 2 moved */
+    uint16_t ct_fence_first, ct_fence_last;
+    uint64_t ct_fence_cut_position;
+    unsigned char ct_moved_slots[QIHSE_CLUSTER_SLOT_COUNT / 8u];
+    char ct_transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    uint8_t ct_transfer_phase; /* 0 none, 1 staged, 2 applied awaiting ACK/seal */
+    char ct_transfer_source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char ct_transfer_source_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t ct_transfer_source_cut;
+    uint64_t ct_transfer_target_position;
+    unsigned char ct_transfer_image_digest[32];
+    unsigned char ct_transfer_group_digest[32];
+    unsigned char ct_transfer_range_digest[32];
+    pthread_mutex_t ct_ack_lock;
+    pthread_cond_t ct_ack_changed;
     sst_meta_index_t* sst_meta;
     /* Store-global monotonic change sequence: the LAST sequence issued to an
      * authorized mutation (the high-water).  Advanced once per authorized
@@ -350,6 +393,11 @@ struct qihse_kv_store {
 struct qihse_kv_replica_snapshot {
     int fd;
     uint64_t size;
+    qihse_user_t* principal;
+    uint32_t principal_id;
+    uint32_t tenant_id;
+    uint16_t classification;
+    uint16_t sci;
 };
 
 typedef struct kv_replica_cursor {
@@ -364,6 +412,9 @@ static void kv_store_rdlock(qihse_kv_store_t* store);
 static void kv_store_wrlock(qihse_kv_store_t* store);
 static void kv_store_unlock(qihse_kv_store_t* store);
 static bool kv_sync_store_locked(qihse_kv_store_t* store);
+static void kv_store_rdlock(qihse_kv_store_t* store);
+static void kv_store_wrlock(qihse_kv_store_t* store);
+static void kv_store_unlock(qihse_kv_store_t* store);
 bool qihse_kv_sync_store(qihse_kv_store_t* store);
 static bool compact_sstables_stream(qihse_kv_store_t* store);
 
@@ -453,6 +504,9 @@ typedef struct {
     uint8_t flags;
     uint64_t change_seq;
 } kv_lookup_result_t;
+static kv_lookup_state_t logical_lookup(qihse_kv_store_t* store,
+                                        const char* key, kv_lookup_result_t* out);
+static void lookup_result_free(kv_lookup_result_t* result);
 
 static uint64_t current_time_ms(void) {
     struct timeval tv;
@@ -595,6 +649,360 @@ static uint64_t fnv1a64_update(uint64_t h, const void* data, size_t len) {
     const unsigned char* p = (const unsigned char*)data;
     for (size_t i = 0; i < len; i++) { h ^= (uint64_t)p[i]; h *= 1099511628211ULL; }
     return h;
+}
+
+typedef struct {
+    char magic[8];
+    uint8_t mode;
+    uint8_t fence_state;
+    uint16_t fence_first, fence_last;
+    uint32_t tenant_id;
+    uint32_t tenant_policy;
+    uint64_t baseline_lsn, durable_lsn, ack_lsn, retained_bytes, limit_bytes;
+    unsigned char baseline_digest[32];
+    uint8_t baseline_sealed;
+    uint64_t fence_cut_position;
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char successor_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    uint8_t transfer_phase;
+    char transfer_source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char transfer_source_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t transfer_source_cut;
+    uint64_t transfer_target_position;
+    unsigned char transfer_image_digest[32];
+    unsigned char transfer_group_digest[32];
+    unsigned char transfer_range_digest[32];
+    unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES];
+    unsigned char last_group_digest[32];
+    unsigned char moved_slots[QIHSE_CLUSTER_SLOT_COUNT / 8u];
+    uint64_t checksum;
+} kv_ct_disk_t;
+
+struct qihse_kv_ct_writer_scope {
+    qihse_kv_store_t* store;
+    qihse_user_t* principal;
+    struct qihse_kv_ct_writer_scope* previous;
+    uint64_t last_seq;
+};
+struct qihse_kv_ct_proof {
+    uint32_t kind; /* 1 promotion, 2 source range seal, 3 target range seal */
+    uint64_t store_instance_id;
+    qihse_user_t* data_principal;
+    uint64_t data_generation;
+    uint32_t data_principal_id, data_tenant_id;
+    uint16_t data_classification, data_sci;
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint16_t first_slot, last_slot;
+    uint64_t source_lsn, target_lsn;
+    unsigned char checksum[32];
+    unsigned char mac[32];
+};
+static _Thread_local qihse_kv_ct_writer_scope_t* kv_ct_scope;
+static _Thread_local qihse_kv_store_t* kv_ct_baseline_import_store;
+static _Thread_local qihse_user_t* kv_ct_baseline_import_principal;
+
+static bool ct_id_valid(const char* id) {
+    if (!id) return false;
+    size_t n = strnlen(id, QIHSE_KV_CT_ID_MAX + 1u);
+    if (!n || n > QIHSE_KV_CT_ID_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+              c == '.' || c == ':')) return false;
+    }
+    return true;
+}
+
+static bool ct_admin(qihse_user_t* user) {
+    return user && qihse_auth_user_is_active(user) &&
+           qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR;
+}
+
+static bool ct_replication_principal(qihse_kv_store_t* store,
+                                     qihse_user_t* user) {
+    return store && user && qihse_auth_user_is_active(user) &&
+        (qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR ||
+         (store->replication_principal_id != 0u &&
+          qihse_user_get_id(user) == store->replication_principal_id));
+}
+
+static bool ct_state_write(qihse_kv_store_t* store) {
+    if (!store || store->memory_snapshot) return false;
+    if (aimem_durability_test_fail_once("ct-state-before-publish")) {
+        errno = EIO;
+        return false;
+    }
+    kv_ct_disk_t disk;
+    memset(&disk, 0, sizeof(disk));
+    memcpy(disk.magic, "QCTST002", 8u);
+    disk.mode = store->ct_mode;
+    disk.fence_state = store->ct_fence_state;
+    disk.fence_first = store->ct_fence_first;
+    disk.fence_last = store->ct_fence_last;
+    disk.tenant_id = store->ct_tenant_id;
+    disk.tenant_policy = (uint32_t)store->ct_tenant_policy;
+    disk.baseline_lsn = store->ct_baseline_lsn;
+    memcpy(disk.baseline_digest, store->ct_baseline_digest,
+           sizeof(disk.baseline_digest));
+    disk.baseline_sealed = store->ct_baseline_sealed ? 1u : 0u;
+    disk.durable_lsn = store->ct_durable_lsn;
+    disk.ack_lsn = store->ct_ack_lsn;
+    disk.retained_bytes = store->ct_retained_bytes;
+    disk.limit_bytes = store->ct_limit_bytes;
+    disk.fence_cut_position = store->ct_fence_cut_position;
+    memcpy(disk.source_id, store->ct_source_id, sizeof(disk.source_id));
+    memcpy(disk.target_id, store->ct_target_id, sizeof(disk.target_id));
+    memcpy(disk.successor_id, store->ct_successor_id, sizeof(disk.successor_id));
+    memcpy(disk.generation, store->ct_generation, sizeof(disk.generation));
+    memcpy(disk.transfer_id, store->ct_transfer_id, sizeof(disk.transfer_id));
+    disk.transfer_phase = store->ct_transfer_phase;
+    memcpy(disk.transfer_source_id, store->ct_transfer_source_id,
+           sizeof(disk.transfer_source_id));
+    memcpy(disk.transfer_source_generation,
+           store->ct_transfer_source_generation,
+           sizeof(disk.transfer_source_generation));
+    disk.transfer_source_cut = store->ct_transfer_source_cut;
+    disk.transfer_target_position = store->ct_transfer_target_position;
+    memcpy(disk.transfer_image_digest, store->ct_transfer_image_digest, 32u);
+    memcpy(disk.transfer_group_digest, store->ct_transfer_group_digest, 32u);
+    memcpy(disk.transfer_range_digest, store->ct_transfer_range_digest, 32u);
+    memcpy(disk.owner_token, store->ct_owner_token, sizeof(disk.owner_token));
+    memcpy(disk.last_group_digest, store->ct_last_group_digest,
+           sizeof(disk.last_group_digest));
+    memcpy(disk.moved_slots, store->ct_moved_slots, sizeof(disk.moved_slots));
+    disk.checksum = fnv1a64_update(14695981039346656037ULL, &disk,
+                                  offsetof(kv_ct_disk_t, checksum));
+    char path[4096], temp[8192]; FILE* f = NULL;
+    if (!build_data_path(path, sizeof(path), "ct-state.bin") ||
+        !atomic_file_begin(path, temp, sizeof(temp), &f)) return false;
+    if (!fwrite_exact(&disk, 1u, sizeof(disk), f)) { fclose(f); unlink(temp); return false; }
+    return atomic_file_commit(f, temp, path) && fsync_dir_path(get_qihse_data_dir());
+}
+
+static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
+                          bool legacy_bootstrap) {
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "ct-state.bin")) return false;
+    int fd = open_secure_read(path);
+    if (fd < 0) return errno == ENOENT;
+    if (legacy_bootstrap || !ct_admin(user)) {
+        close(fd); errno = EACCES; return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_uid != geteuid() ||
+        (st.st_mode & 077) || st.st_nlink != 1) { close(fd); errno = EACCES; return false; }
+    kv_ct_disk_t disk;
+    bool ok = read(fd, &disk, sizeof(disk)) == (ssize_t)sizeof(disk);
+    char extra;
+    if (ok) ok = read(fd, &extra, 1u) == 0;
+    close(fd);
+    ok = ok && memcmp(disk.magic, "QCTST002", 8u) == 0 &&
+        (disk.mode == 1u || disk.mode == 2u) &&
+        disk.fence_state <= 4u && disk.fence_first <= disk.fence_last &&
+        disk.baseline_sealed <= 1u &&
+        disk.fence_last < QIHSE_CLUSTER_SLOT_COUNT &&
+        disk.source_id[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.target_id[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.successor_id[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.generation[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.transfer_id[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.transfer_source_id[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.transfer_source_generation[QIHSE_KV_CT_ID_MAX] == '\0' &&
+        disk.transfer_phase <= 2u &&
+        ct_id_valid(disk.source_id) && ct_id_valid(disk.generation) &&
+        (disk.mode != 1u || ct_id_valid(disk.successor_id)) &&
+        (disk.mode != 2u || ct_id_valid(disk.target_id)) &&
+        (disk.mode != 2u || (disk.tenant_policy == QIHSE_KV_CT_TENANT_EXACT ||
+                             disk.tenant_policy == QIHSE_KV_CT_TENANT_SYSTEM_ALL)) &&
+        (!disk.fence_state || ct_id_valid(disk.transfer_id)) &&
+        (!disk.transfer_phase ||
+         (disk.mode == 1u && disk.fence_state == 1u &&
+          ct_id_valid(disk.transfer_source_id) &&
+          ct_id_valid(disk.transfer_source_generation))) &&
+        disk.checksum == fnv1a64_update(14695981039346656037ULL, &disk,
+                                       offsetof(kv_ct_disk_t, checksum));
+    if (!ok) { errno = EINVAL; return false; }
+    store->ct_enabled = true;
+    store->ct_system_principal = user;
+    store->ct_mode = disk.mode;
+    store->ct_fence_state = disk.fence_state;
+    store->ct_fence_first = disk.fence_first;
+    store->ct_fence_last = disk.fence_last;
+    store->ct_tenant_id = disk.tenant_id;
+    store->ct_tenant_policy = (qihse_kv_ct_tenant_policy_t)disk.tenant_policy;
+    store->ct_baseline_lsn = disk.baseline_lsn;
+    memcpy(store->ct_baseline_digest, disk.baseline_digest,
+           sizeof(disk.baseline_digest));
+    store->ct_baseline_sealed = disk.baseline_sealed != 0u;
+    store->ct_durable_lsn = disk.durable_lsn;
+    store->ct_ack_lsn = disk.ack_lsn;
+    store->ct_retained_bytes = disk.retained_bytes;
+    store->ct_limit_bytes = disk.limit_bytes;
+    store->ct_fence_cut_position = disk.fence_cut_position;
+    memcpy(store->ct_source_id, disk.source_id, sizeof(disk.source_id));
+    memcpy(store->ct_target_id, disk.target_id, sizeof(disk.target_id));
+    memcpy(store->ct_successor_id, disk.successor_id, sizeof(disk.successor_id));
+    memcpy(store->ct_generation, disk.generation, sizeof(disk.generation));
+    memcpy(store->ct_transfer_id, disk.transfer_id, sizeof(disk.transfer_id));
+    store->ct_transfer_phase = disk.transfer_phase;
+    memcpy(store->ct_transfer_source_id, disk.transfer_source_id,
+           sizeof(disk.transfer_source_id));
+    memcpy(store->ct_transfer_source_generation,
+           disk.transfer_source_generation,
+           sizeof(disk.transfer_source_generation));
+    store->ct_transfer_source_cut = disk.transfer_source_cut;
+    store->ct_transfer_target_position = disk.transfer_target_position;
+    memcpy(store->ct_transfer_image_digest, disk.transfer_image_digest, 32u);
+    memcpy(store->ct_transfer_group_digest, disk.transfer_group_digest, 32u);
+    memcpy(store->ct_transfer_range_digest, disk.transfer_range_digest, 32u);
+    memcpy(store->ct_owner_token, disk.owner_token, sizeof(disk.owner_token));
+    memcpy(store->ct_last_group_digest, disk.last_group_digest,
+           sizeof(disk.last_group_digest));
+    memcpy(store->ct_moved_slots, disk.moved_slots, sizeof(disk.moved_slots));
+    return true;
+}
+
+static bool ct_write_allowed(qihse_kv_store_t* store, qihse_user_t* user,
+                             const char* key) {
+    if (!store->ct_enabled) return true;
+    if (store->ct_transfer_phase == 1u) { errno = EBUSY; return false; }
+    if (!user || !qihse_auth_user_is_active(user) ||
+        !kv_ct_scope || kv_ct_scope->store != store ||
+        kv_ct_scope->principal != user) { errno = EACCES; return false; }
+    if (key && !qihse_cluster_key_is_node_local(key)) {
+        uint16_t slot = qihse_cluster_key_slot(key, strlen(key));
+        if ((store->ct_moved_slots[slot / 8u] & (1u << (slot % 8u))) ||
+            (store->ct_fence_state == 1u &&
+             slot >= store->ct_fence_first && slot <= store->ct_fence_last)) {
+            errno = EBUSY; return false;
+        }
+    }
+    return true;
+}
+
+/* Ordinary readers never materialize a primary value that the successor has
+ * not durably acknowledged. A CT receiver serves reads only after a durable
+ * promotion transition changes its mode to source and it reconciles. */
+static bool ct_read_ready(qihse_kv_store_t* store) {
+    if (!store->ct_enabled) return true;
+    if (store->ct_mode != 1u || !store->ct_admitted ||
+        store->ct_durable_lsn > store->ct_ack_lsn) {
+        errno = EAGAIN;
+        return false;
+    }
+    return true;
+}
+
+static bool ct_key_owned_for_read(qihse_kv_store_t* store, const char* key) {
+    if (!store->ct_enabled || !key || qihse_cluster_key_is_node_local(key)) return true;
+    uint16_t slot = qihse_cluster_key_slot(key, strlen(key));
+    return !(store->ct_moved_slots[slot / 8u] & (1u << (slot % 8u))) &&
+        !(store->ct_fence_state == 1u &&
+          store->ct_transfer_source_id[0] != '\0' &&
+          slot >= store->ct_fence_first && slot <= store->ct_fence_last);
+}
+
+static bool ct_key_read_ready(qihse_kv_store_t* store, const char* key) {
+    if (!store->ct_enabled) return true;
+    if (store->ct_mode != 1u || !store->ct_admitted ||
+        store->ct_durable_lsn > store->ct_ack_lsn) {
+        errno = EAGAIN; return false;
+    }
+    if (!ct_key_owned_for_read(store, key)) {
+        errno = EAGAIN;
+        return false;
+    }
+    return true;
+}
+
+static bool ct_token_matches(qihse_kv_store_t* store,
+    const unsigned char token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !token || !store->ct_enabled) return false;
+    unsigned difference = 0u;
+    for (size_t i = 0; i < QIHSE_KV_CT_TOKEN_BYTES; i++)
+        difference |= token[i] ^ store->ct_owner_token[i];
+    return difference == 0u;
+}
+
+static void ct_scope_note_seq(qihse_kv_store_t* store, uint64_t seq) {
+    if (store->ct_enabled && store->ct_mode == 1u && kv_ct_scope &&
+        kv_ct_scope->store == store && seq > kv_ct_scope->last_seq)
+        kv_ct_scope->last_seq = seq;
+}
+
+bool qihse_kv_ct_owner_token_get(qihse_kv_store_t* store,
+    qihse_user_t* principal, unsigned char out[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !out || !ct_admin(principal)) return false;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && !store->recovery_pending;
+    if (ok) memcpy(out, store->ct_owner_token, QIHSE_KV_CT_TOKEN_BYTES);
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_writer_scope_enter(qihse_kv_store_t* store,
+    qihse_user_t* principal, const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    qihse_kv_ct_writer_scope_t** out_scope) {
+    if (out_scope) *out_scope = NULL;
+    if (!store || !principal || !owner_token || !out_scope || kv_ct_scope ||
+        !qihse_auth_user_is_active(principal)) return false;
+    kv_store_rdlock(store);
+    unsigned mismatch = 0u;
+    for (size_t i = 0; i < QIHSE_KV_CT_TOKEN_BYTES; i++)
+        mismatch |= owner_token[i] ^ store->ct_owner_token[i];
+    bool ok = store->ct_enabled && !store->recovery_pending && mismatch == 0u;
+    if (ok && store->ct_mode == 1u && !store->ct_admitted) ok = false;
+    kv_store_unlock(store);
+    if (!ok) { errno = EACCES; return false; }
+    qihse_kv_ct_writer_scope_t* scope = calloc(1u, sizeof(*scope));
+    if (!scope) return false;
+    scope->store = store;
+    scope->principal = principal;
+    kv_ct_scope = scope;
+    *out_scope = scope;
+    return true;
+}
+
+void qihse_kv_ct_writer_scope_leave(qihse_kv_ct_writer_scope_t* scope) {
+    if (!scope || kv_ct_scope != scope) return;
+    kv_ct_scope = scope->previous;
+    free(scope);
+}
+
+bool qihse_kv_ct_writer_scope_finish(qihse_kv_ct_writer_scope_t* scope,
+    uint32_t timeout_ms, uint64_t* out_last_seq) {
+    if (out_last_seq) *out_last_seq = 0u;
+    if (!scope || kv_ct_scope != scope || timeout_ms > 60000u) return false;
+    qihse_kv_store_t* store = scope->store;
+    uint64_t seq = scope->last_seq;
+    if (out_last_seq) *out_last_seq = seq;
+    kv_ct_scope = scope->previous;
+    free(scope);
+    if (seq == 0u) return true;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return false;
+    deadline.tv_sec += timeout_ms / 1000u;
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    if (pthread_mutex_lock(&store->ct_ack_lock) != 0) return false;
+    int rc = 0;
+    while (__atomic_load_n(&store->ct_ack_lsn, __ATOMIC_ACQUIRE) < seq && rc == 0)
+        rc = pthread_cond_timedwait(&store->ct_ack_changed, &store->ct_ack_lock, &deadline);
+    bool ok = __atomic_load_n(&store->ct_ack_lsn, __ATOMIC_ACQUIRE) >= seq;
+    pthread_mutex_unlock(&store->ct_ack_lock);
+    if (!ok) {
+        kv_store_wrlock(store);
+        store->ct_admitted = false;
+        kv_store_unlock(store);
+    }
+    return ok;
 }
 
 /* The image can be empty (or older than this store's mutation history).
@@ -832,18 +1240,21 @@ static bool copy_file_atomic_hash(const char* source, const char* destination,
     if (!in) { close(fd); return false; }
     char tmp[8192]; FILE* out = NULL;
     if (!atomic_file_begin(destination, tmp, sizeof(tmp), &out)) { fclose(in); return false; }
-    uint8_t buffer[65536]; uint64_t hash = 14695981039346656037ULL; bool ok = true;
+    uint8_t* buffer = malloc(65536u);
+    if (!buffer) { fclose(in); fclose(out); unlink(tmp); return false; }
+    uint64_t hash = 14695981039346656037ULL; bool ok = true;
     for (;;) {
-        size_t n = fread(buffer, 1u, sizeof(buffer), in);
+        size_t n = fread(buffer, 1u, 65536u, in);
         if (n) {
             hash = fnv1a64_update(hash, buffer, n);
             if (!fwrite_exact(buffer, 1u, n, out)) { ok = false; break; }
         }
-        if (n < sizeof(buffer)) {
+        if (n < 65536u) {
             if (ferror(in)) ok = false;
             break;
         }
     }
+    free(buffer);
     fclose(in);
     if (!ok) { fclose(out); unlink(tmp); return false; }
     if (!atomic_file_commit(out, tmp, destination)) return false;
@@ -1084,6 +1495,21 @@ static uint64_t wal_replica_record_crc(uint8_t op, uint8_t flags, uint16_t key_l
     return fnv1a64_update(h, &change_seq, sizeof(change_seq));
 }
 
+/* QKV5 is one independently checksummed frame. A torn frame is discarded by
+ * recovery before either member is materialized. The receipt is a normal SET
+ * after replay, so SST flush, replication deltas and compaction need no new
+ * record type. Header bytes 44..47 are reserved and must be zero. */
+static uint64_t wal_delete_receipt_crc(const unsigned char hdr[48],
+                                       const char* source_key, size_t source_len,
+                                       const char* receipt_key, size_t receipt_len,
+                                       const char* receipt, size_t receipt_len_bytes) {
+    uint64_t h = fnv1a64_update(14695981039346656037ULL, hdr, 36u);
+    h = fnv1a64_update(h, hdr + 44u, 4u);
+    h = fnv1a64_update(h, source_key, source_len);
+    h = fnv1a64_update(h, receipt_key, receipt_len);
+    return fnv1a64_update(h, receipt, receipt_len_bytes);
+}
+
 static bool payload_is_dead(const kv_payload_t* p, uint64_t now) {
     return !p || (p->flags & KV_FLAG_TOMBSTONE) != 0u ||
            (p->expire_time_ms != 0u && p->expire_time_ms <= now);
@@ -1299,6 +1725,8 @@ static int kv_save_memtable_only(qihse_kv_store_t* store, const char* filepath, 
     return 0;
 }
 
+static bool fsync_dir_path(const char* dir);
+
 static bool rotate_wal_empty(qihse_kv_store_t* store) {
     if (!store) return false;
     char wal_path[4096], tmp_path[8192];
@@ -1323,6 +1751,10 @@ static bool flush_memtable_to_sstable(qihse_kv_store_t* store) {
     int n = snprintf(sst_path, sizeof(sst_path), "%ssstable_%d.db", dir, store->sstable_counter);
     if (n < 0 || (size_t)n >= sizeof(sst_path)) return false;
     if (kv_save_memtable_only(store, sst_path, store->sstable_counter) != 0) return false;
+    /* The SST name must be durable BEFORE rotating away a WAL that may
+     * contain a completed delete+receipt pair. Otherwise a power loss could
+     * preserve the empty WAL rename but lose the SST rename. */
+    if (!fsync_dir_path(dir)) return false;
     qihse_trinary_trie_t* replacement = qihse_trinary_trie_create();
     if (!replacement) { unlink(sst_path); return false; }
     qihse_trinary_trie_t* old = store->trie;
@@ -1331,7 +1763,7 @@ static bool flush_memtable_to_sstable(qihse_kv_store_t* store) {
     store->sstable_counter++;
     store->sstable_live_count++;
     qihse_trinary_trie_destroy(old);
-    (void)rotate_wal_empty(store);
+    if (!store->ct_enabled) (void)rotate_wal_empty(store);
     if (store->sstable_live_count >= KV_SSTABLE_HARD_CEILING) {
         int32_t before = store->sstable_counter;
         if (compact_sstables_stream(store) && before > 1) {
@@ -1423,6 +1855,221 @@ static bool wal_append_replica(qihse_kv_store_t* store, uint8_t op, const char* 
     store->wal_unflushed_bytes += sizeof(hdr) + key_len + val_len;
     if (!store->durable_batch_mode && store->wal_unflushed_bytes >= WAL_BUFFER_FLUSH_THRESHOLD) flush_wal_buffer(store);
     return true;
+}
+
+/* QKV6 is the canonical WAL frame in CT mode. Each group is persisted before
+ * any contained row is exposed in the memtable; replay reconstructs both
+ * rows and the dense stream cursor from the same complete frame. */
+static bool ct_append_group_locked(qihse_kv_store_t* store,
+                                   qihse_user_t* principal,
+                                   qihse_kv_ct_group_t* group) {
+    if (!store || !store->ct_enabled || !store->wal_fd || !group ||
+        group->count == 0u || group->count > QIHSE_KV_CT_MAX_GROUP_RECORDS ||
+        store->recovery_pending) return false;
+    qihse_kv_ct_tenant_policy_t policy = store->ct_tenant_policy;
+    uint32_t tenant = store->ct_tenant_id;
+    qihse_user_t* codec_principal = principal;
+    if (store->ct_mode == 1u) {
+        /* A source stream may contain multiple resource tenants. Keep one
+         * canonical policy for every frame so replay and export cannot
+         * disagree with capture. The mutator has already passed its own
+         * label and key authorization checks before this call. */
+        codec_principal = store->ct_system_principal;
+        if (!ct_admin(codec_principal)) return false;
+        policy = QIHSE_KV_CT_TENANT_SYSTEM_ALL;
+        tenant = 0u;
+    }
+    size_t frame_bytes = 0u;
+    unsigned char digest[32];
+    if (!qihse_ct_codec_encoded_size(codec_principal, policy, tenant, store->ct_mode,
+                                     group, (size_t)store->ct_limit_bytes, &frame_bytes) ||
+        !qihse_ct_codec_group_digest(codec_principal, policy, tenant, group, digest) ||
+        frame_bytes > store->ct_limit_bytes ||
+        store->ct_retained_bytes > store->ct_limit_bytes - frame_bytes) {
+        errno = ENOSPC; return false;
+    }
+    size_t written = 0u;
+    uint8_t mode = store->ct_mode;
+    if (!qihse_ct_codec_write(store->wal_fd, codec_principal, policy, tenant,
+                              mode, group, (size_t)store->ct_limit_bytes, &written) ||
+        written != frame_bytes || fflush(store->wal_fd) != 0 ||
+        fdatasync(fileno(store->wal_fd)) != 0) {
+        store->recovery_pending = true;
+        return false;
+    }
+    uint64_t old_position = store->ct_durable_lsn;
+    uint64_t old_bytes = store->ct_retained_bytes;
+    unsigned char old_digest[32];
+    memcpy(old_digest, store->ct_last_group_digest, sizeof(old_digest));
+    store->ct_durable_lsn = group->stream_position;
+    store->ct_retained_bytes += frame_bytes;
+    memcpy(store->ct_last_group_digest, digest, sizeof(digest));
+    if (aimem_durability_test_fail_once("ct-after-group-fsync") ||
+        !ct_state_write(store)) {
+        store->ct_durable_lsn = old_position;
+        store->ct_retained_bytes = old_bytes;
+        memcpy(store->ct_last_group_digest, old_digest, sizeof(old_digest));
+        store->recovery_pending = true;
+        return false;
+    }
+    store->wal_unflushed_bytes = 0u;
+    return true;
+}
+
+static bool ct_resource_tenant(const char* key, uint32_t actor_tenant,
+                               uint32_t* out) {
+    if (!key || !out) return false;
+    if (key[0] == 't' && key[1] == ':') {
+        const char* p = key + 2;
+        uint64_t value = 0u;
+        if (*p < '0' || *p > '9') return false;
+        while (*p >= '0' && *p <= '9') {
+            value = value * 10u + (unsigned)(*p++ - '0');
+            if (value > UINT32_MAX) return false;
+        }
+        if (*p != '/' || value == 0u) return false;
+        if (actor_tenant != 0u && actor_tenant != value) return false;
+        *out = (uint32_t)value;
+        return true;
+    }
+    if (actor_tenant != 0u && strncmp(key, "commons/", 8u) != 0) return false;
+    *out = 0u;
+    return true;
+}
+
+static bool ct_source_record(qihse_kv_store_t* store, qihse_user_t* user,
+                             const char* key, const char* value, uint64_t seq,
+                             uint64_t expiry, uint16_t classification,
+                             uint16_t sci, bool tombstone, bool dry_run,
+                             qihse_kv_ct_actor_t actor_kind) {
+    bool system_expiry = store && actor_kind == QIHSE_KV_CT_ACTOR_EXPIRY &&
+        user == store->ct_system_principal && ct_admin(user);
+    if (!store || !user || !key || !store->ct_enabled || store->ct_mode != 1u ||
+        !store->ct_admitted ||
+        (!system_expiry && !ct_write_allowed(store, user, key)) ||
+        store->ct_durable_lsn == UINT64_MAX) return false;
+    if (system_expiry) {
+        uint16_t slot = qihse_cluster_key_slot(key, strlen(key));
+        if ((store->ct_moved_slots[slot / 8u] & (1u << (slot % 8u))) ||
+            (store->ct_fence_state == 1u &&
+             slot >= store->ct_fence_first && slot <= store->ct_fence_last))
+            return false;
+    }
+    uint32_t tenant = 0u;
+    uint32_t actor_tenant = qihse_user_get_tenant_id(user);
+    if (!ct_resource_tenant(key, actor_tenant, &tenant)) return false;
+    qihse_kv_ct_record_t record = {
+        .key = (char*)key, .value = tombstone ? NULL : (char*)value,
+        .change_seq = seq, .expire_time_ms = expiry,
+        .actor_id = qihse_user_get_id(user),
+        .actor_tenant_id = actor_tenant, .resource_tenant_id = tenant,
+        .classification = classification, .sci_compartment = sci,
+        .actor_kind = actor_kind, .tombstone = tombstone
+    };
+    qihse_kv_ct_group_t group = {0};
+    snprintf(group.source_id, sizeof(group.source_id), "%s", store->ct_source_id);
+    snprintf(group.generation, sizeof(group.generation), "%s", store->ct_generation);
+    group.stream_position = store->ct_durable_lsn + 1u;
+    group.first_seq = group.last_seq = seq;
+    group.records = &record;
+    group.count = 1u;
+    if (dry_run) {
+        size_t bytes = 0u;
+        return ct_admin(store->ct_system_principal) &&
+            qihse_ct_codec_encoded_size(store->ct_system_principal,
+                                         QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+                                         1u, &group,
+                                         (size_t)store->ct_limit_bytes, &bytes) &&
+            bytes <= store->ct_limit_bytes &&
+            store->ct_retained_bytes <= store->ct_limit_bytes - bytes;
+    }
+    if (!ct_append_group_locked(store, user, &group)) return false;
+    ct_scope_note_seq(store, group.stream_position);
+    return true;
+}
+
+bool qihse_kv_ct_receiver_apply(qihse_kv_store_t* store, qihse_user_t* principal,
+    const qihse_kv_ct_group_t* group, uint64_t* out_durable_cursor) {
+    if (out_durable_cursor) *out_durable_cursor = 0u;
+    if (!store || !group || !out_durable_cursor ||
+        !ct_replication_principal(store, principal) ||
+        !group->records || group->count == 0u ||
+        group->count > QIHSE_KV_CT_MAX_GROUP_RECORDS) return false;
+    kv_store_wrlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 2u &&
+        store->ct_baseline_sealed && !store->recovery_pending &&
+        !store->memory_snapshot &&
+        strcmp(group->source_id, store->ct_source_id) == 0 &&
+        strcmp(group->generation, store->ct_generation) == 0 &&
+        group->stream_position != 0u &&
+        group->first_seq == group->records[0].change_seq &&
+        group->last_seq == group->records[group->count - 1u].change_seq;
+    if (!ok) goto done;
+    ok = false;
+    unsigned char digest[32];
+    if (!qihse_ct_codec_group_digest(principal, store->ct_tenant_policy,
+                                     store->ct_tenant_id, group, digest)) goto done;
+    if (group->stream_position == store->ct_durable_lsn) {
+        unsigned difference = 0u;
+        for (size_t i = 0; i < sizeof(digest); i++)
+            difference |= digest[i] ^ store->ct_last_group_digest[i];
+        ok = difference == 0u;
+        if (ok) *out_durable_cursor = store->ct_durable_lsn;
+        goto done;
+    }
+    if (group->stream_position != store->ct_durable_lsn + 1u) goto done;
+    uint64_t previous_seq = 0u;
+    for (size_t i = 0; i < group->count; i++) {
+        const qihse_kv_ct_record_t* row = &group->records[i];
+        if (!row->key || !row->change_seq || row->change_seq <= previous_seq ||
+            (row->tombstone ? (row->value != NULL || row->expire_time_ms != 0u) :
+                              row->value == NULL) ||
+            !qihse_auth_can_access(principal, row->classification,
+                                   row->sci_compartment) ||
+            (store->ct_tenant_policy == QIHSE_KV_CT_TENANT_EXACT &&
+             row->resource_tenant_id != store->ct_tenant_id)) goto done;
+        uint32_t from_key = 0u;
+        if (!ct_resource_tenant(row->key, row->actor_tenant_id, &from_key) ||
+            from_key != row->resource_tenant_id) goto done;
+        if (store->ct_fence_state == 1u ||
+            store->ct_moved_slots[qihse_cluster_key_slot(row->key, strlen(row->key)) / 8u]) {
+            uint16_t slot = qihse_cluster_key_slot(row->key, strlen(row->key));
+            if ((store->ct_moved_slots[slot / 8u] & (1u << (slot % 8u))) ||
+                (store->ct_fence_state == 1u &&
+                 slot >= store->ct_fence_first && slot <= store->ct_fence_last)) goto done;
+        }
+        kv_lookup_result_t old;
+        kv_lookup_state_t state = logical_lookup(store, row->key, &old);
+        if (state == KV_LOOKUP_ERROR) goto done;
+        if (state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) {
+            bool allowed = qihse_auth_can_access(principal, old.classification,
+                                                  old.sci_compartment) &&
+                row->classification >= old.classification &&
+                (row->sci_compartment & old.sci_compartment) == old.sci_compartment &&
+                old.change_seq < row->change_seq;
+            lookup_result_free(&old);
+            if (!allowed) goto done;
+        } else lookup_result_free(&old);
+        previous_seq = row->change_seq;
+    }
+    if (!ct_append_group_locked(store, principal, (qihse_kv_ct_group_t*)group)) goto done;
+    for (size_t i = 0; i < group->count; i++) {
+        const qihse_kv_ct_record_t* row = &group->records[i];
+        if (!insert_internal(store, row->key, row->tombstone ? "" : row->value,
+                             row->expire_time_ms, row->classification,
+                             row->sci_compartment,
+                             row->tombstone ? KV_FLAG_TOMBSTONE : 0u,
+                             row->change_seq)) {
+            store->recovery_pending = true;
+            goto done;
+        }
+        kv_change_seq_floor(store, row->change_seq);
+    }
+    *out_durable_cursor = group->stream_position;
+    ok = true;
+done:
+    kv_store_unlock(store);
+    return ok;
 }
 
 /* Close every cached SSTable fd.  Called whenever SSTable files are deleted
@@ -1847,6 +2494,12 @@ static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud
 
 static bool compact_sstables_stream(qihse_kv_store_t* store) {
     if (!store || !store->trie) return false;
+    /* Streaming compaction drops expired physical rows. A CT2 source range
+     * must remain byte-identical from its fence cut through every retry. */
+    if (store->ct_enabled && store->ct_fence_state == 1u) {
+        errno = EBUSY;
+        return false;
+    }
     if (store->sstable_counter == 0) return true;
     const char* dir = get_qihse_data_dir();
     if (!dir) return false;
@@ -1952,6 +2605,85 @@ static int wal_replay_new_record(qihse_kv_store_t* store, FILE* f, bool has_sour
     free(key); free(val); return ok;
 }
 
+static int wal_replay_delete_receipt(qihse_kv_store_t* store, FILE* f,
+                                     const kv_read_context_t* context) {
+    unsigned char hdr[48] = {0};
+    memcpy(hdr, KV_WAL_MAGIC_DELETE_RECEIPT, 4u);
+    if (fread(hdr + 4u, 1u, sizeof(hdr) - 4u, f) != sizeof(hdr) - 4u) return 0;
+    uint16_t source_len, receipt_key_len, source_class, source_sci, receipt_class, receipt_sci;
+    uint32_t value_len;
+    uint64_t delete_seq, receipt_seq, crc;
+    memcpy(&source_len, hdr + 4u, 2u); memcpy(&receipt_key_len, hdr + 6u, 2u);
+    memcpy(&value_len, hdr + 8u, 4u);
+    memcpy(&source_class, hdr + 12u, 2u); memcpy(&source_sci, hdr + 14u, 2u);
+    memcpy(&receipt_class, hdr + 16u, 2u); memcpy(&receipt_sci, hdr + 18u, 2u);
+    memcpy(&delete_seq, hdr + 20u, 8u); memcpy(&receipt_seq, hdr + 28u, 8u);
+    memcpy(&crc, hdr + 36u, 8u);
+    if (!source_len || !receipt_key_len || value_len > QIHSE_KV_DELETE_RECEIPT_MAX_VALUE ||
+        !delete_seq || receipt_seq != delete_seq + 1u || receipt_seq == 0u ||
+        hdr[44] || hdr[45] || hdr[46] || hdr[47]) return 0;
+    if (!kv_read_allowed(context, source_class, source_sci) ||
+        !kv_read_allowed(context, receipt_class, receipt_sci)) return -2;
+    char* source = malloc((size_t)source_len + 1u);
+    char* receipt_key = malloc((size_t)receipt_key_len + 1u);
+    char* value = malloc((size_t)value_len + 1u);
+    if (!source || !receipt_key || !value) {
+        free(source); free(receipt_key); free(value); return -1;
+    }
+    bool ok = fread(source, 1u, source_len, f) == source_len &&
+              fread(receipt_key, 1u, receipt_key_len, f) == receipt_key_len &&
+              fread(value, 1u, value_len, f) == value_len;
+    if (ok) {
+        ok = !memchr(source, 0, source_len) && !memchr(receipt_key, 0, receipt_key_len) &&
+             !memchr(value, 0, value_len) &&
+             wal_delete_receipt_crc(hdr, source, source_len, receipt_key,
+                                    receipt_key_len, value, value_len) == crc;
+    }
+    if (ok) {
+        source[source_len] = '\0'; receipt_key[receipt_key_len] = '\0'; value[value_len] = '\0';
+        ok = strcmp(source, receipt_key) != 0;
+    }
+    bool fatal = false;
+    if (ok) {
+        kv_lookup_result_t old;
+        kv_lookup_state_t state = logical_lookup(store, source, &old);
+        fatal = state == KV_LOOKUP_ERROR;
+        ok = !fatal;
+        if (ok && state != KV_LOOKUP_MISS && old.change_seq == delete_seq) {
+            ok = state == KV_LOOKUP_DEAD && (old.flags & KV_FLAG_TOMBSTONE) &&
+                 old.classification == source_class && old.sci_compartment == source_sci;
+            if (!ok) fatal = true;
+        }
+        if (ok && (state == KV_LOOKUP_MISS || old.change_seq < delete_seq)) {
+            ok = insert_internal(store, source, "", 0u, source_class, source_sci,
+                                 KV_FLAG_TOMBSTONE, delete_seq);
+            if (!ok) fatal = true;
+        }
+        lookup_result_free(&old);
+    }
+    if (ok) {
+        kv_lookup_result_t old;
+        kv_lookup_state_t state = logical_lookup(store, receipt_key, &old);
+        fatal = state == KV_LOOKUP_ERROR;
+        ok = !fatal;
+        if (ok && state != KV_LOOKUP_MISS && old.change_seq == receipt_seq) {
+            ok = state == KV_LOOKUP_LIVE && old.value &&
+                 strcmp(old.value, value) == 0 &&
+                 old.classification == receipt_class && old.sci_compartment == receipt_sci;
+            if (!ok) fatal = true;
+        }
+        if (ok && (state == KV_LOOKUP_MISS || old.change_seq < receipt_seq)) {
+            ok = insert_internal(store, receipt_key, value, 0u, receipt_class,
+                                 receipt_sci, 0u, receipt_seq);
+            if (!ok) fatal = true;
+        }
+        lookup_result_free(&old);
+    }
+    if (ok) kv_change_seq_floor(store, receipt_seq);
+    free(source); free(receipt_key); free(value);
+    return ok ? 1 : fatal ? -1 : 0;
+}
+
 /* Text WAL labels trail the payload. Inspect only the final label tokens,
  * then rewind before the legacy parser materializes the key/value. */
 static bool wal_text_read_allowed(FILE* f, const kv_read_context_t* context) {
@@ -1987,6 +2719,77 @@ static bool wal_text_read_allowed(FILE* f, const kv_read_context_t* context) {
     return kv_read_allowed(context, (uint16_t)last[0], (uint16_t)last[1]);
 }
 
+static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
+                           const kv_read_context_t* context,
+                           uint64_t* last_seen_position) {
+    if (!store->ct_enabled || !context || !context->user ||
+        fseeko(f, -4, SEEK_CUR) != 0) return -1;
+    qihse_kv_ct_group_t group = {0};
+    uint8_t mode = 0u;
+    size_t frame_bytes = 0u;
+    int rc = qihse_ct_codec_read(f, context->user,
+        store->ct_mode == 2u ? store->ct_tenant_policy : QIHSE_KV_CT_TENANT_SYSTEM_ALL,
+        store->ct_mode == 2u ? store->ct_tenant_id : 0u,
+        QIHSE_KV_DURABLE_BATCH_MAX_BYTES, &group, &mode, &frame_bytes);
+    if (rc != 1) return rc == -2 ? -2 : (feof(f) && !ferror(f) ? 0 : -1);
+    bool ok = mode == store->ct_mode &&
+        strcmp(group.source_id, store->ct_source_id) == 0 &&
+        strcmp(group.generation, store->ct_generation) == 0 &&
+        group.stream_position != 0u &&
+        (*last_seen_position ? group.stream_position == *last_seen_position + 1u :
+         (store->ct_mode == 2u ? group.stream_position == 1u :
+          group.stream_position <= store->ct_ack_lsn + 1u));
+    if (ok) {
+        for (size_t i = 0; i < group.count; i++) {
+            qihse_kv_ct_record_t* r = &group.records[i];
+            kv_lookup_result_t old;
+            kv_lookup_state_t state = logical_lookup(store, r->key, &old);
+            if (state == KV_LOOKUP_ERROR) { ok = false; break; }
+            if (state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) {
+                if (old.change_seq > r->change_seq) {
+                    lookup_result_free(&old);
+                    continue;
+                }
+                if (old.change_seq == r->change_seq) {
+                    bool same = old.classification == r->classification &&
+                        old.sci_compartment == r->sci_compartment &&
+                        old.expire_time_ms == r->expire_time_ms &&
+                        (((old.flags & KV_FLAG_TOMBSTONE) != 0u) == r->tombstone) &&
+                        (r->tombstone || (old.value && r->value &&
+                                          strcmp(old.value, r->value) == 0));
+                    lookup_result_free(&old);
+                    if (!same) { ok = false; break; }
+                    continue;
+                }
+            }
+            lookup_result_free(&old);
+            if (!insert_internal(store, r->key, r->tombstone ? "" : r->value,
+                                 r->expire_time_ms, r->classification,
+                                 r->sci_compartment,
+                                 r->tombstone ? KV_FLAG_TOMBSTONE : 0u,
+                                 r->change_seq)) { ok = false; break; }
+            kv_change_seq_floor(store, r->change_seq);
+        }
+    }
+    if (ok) {
+        unsigned char recovered_digest[32];
+        if (!qihse_ct_codec_group_digest(context->user,
+                store->ct_mode == 2u ? store->ct_tenant_policy :
+                                       QIHSE_KV_CT_TENANT_SYSTEM_ALL,
+                store->ct_mode == 2u ? store->ct_tenant_id : 0u,
+                &group, recovered_digest)) ok = false;
+        if (ok) memcpy(store->ct_last_group_digest, recovered_digest,
+                       sizeof(recovered_digest));
+    }
+    if (ok) {
+        *last_seen_position = group.stream_position;
+        if (group.stream_position > store->ct_durable_lsn)
+            store->ct_durable_lsn = group.stream_position;
+    }
+    qihse_ct_codec_clear(&group);
+    return ok ? 1 : -1;
+}
+
 static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* context) {
     if (!store) return false;
     char wal_path[4096];
@@ -1996,12 +2799,36 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
     FILE* f = fdopen(fd, "rb");
     if (!f) { close(fd); return false; }
     off_t last_good = 0;
+    uint64_t ct_last_seen_position = 0u;
     for (;;) {
         int c = fgetc(f);
         if (c == EOF) break;
         if (c == 'Q') {
             char magic[4] = { 'Q', 0, 0, 0 };
             if (fread(magic + 1, 1u, 3u, f) != 3u) break;
+            /* Once the CT state is published, every logical mutation must
+             * carry a QKV6 group and cursor. Legacy WAL frames are a bypass,
+             * even if a previous transition should have rotated them away. */
+            if (store->ct_enabled && memcmp(magic, KV_WAL_MAGIC_CT, 4u) != 0) {
+                fclose(f); errno = EINVAL; return false;
+            }
+            if (memcmp(magic, KV_WAL_MAGIC_DELETE_RECEIPT, 4u) == 0) {
+                int replay = wal_replay_delete_receipt(store, f, context);
+                if (replay == -2) goto denied;
+                if (replay == -1) { fclose(f); return false; }
+                if (!replay) break;
+                last_good = ftello(f);
+                continue;
+            }
+            if (memcmp(magic, KV_WAL_MAGIC_CT, 4u) == 0) {
+                int replay = ct_replay_group(store, f, context,
+                                              &ct_last_seen_position);
+                if (replay == -2) goto denied;
+                if (replay < 0) { fclose(f); return false; }
+                if (!replay) break;
+                last_good = ftello(f);
+                continue;
+            }
             bool sequenced = memcmp(magic, KV_WAL_MAGIC_REPLICA, 4u) == 0 ||
                              memcmp(magic, KV_WAL_MAGIC_LOCAL_SEQ, 4u) == 0;
             if (!sequenced && memcmp(magic, KV_WAL_MAGIC, 4u) != 0) break;
@@ -2011,6 +2838,7 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
             last_good = ftello(f);
             continue;
         }
+        if (store->ct_enabled) { fclose(f); errno = EINVAL; return false; }
         if (c == 'S') {
             char tag[4] = { 'S', 0, 0, 0 };
             if (fread(tag + 1, 1u, 3u, f) != 3u) break;
@@ -2125,6 +2953,12 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
             close(repair_fd);
         }
     }
+    if (store->ct_enabled &&
+        ((store->ct_mode == 1u && store->ct_durable_lsn > store->ct_ack_lsn &&
+          ct_last_seen_position < store->ct_durable_lsn) ||
+         (store->ct_mode == 2u && store->ct_durable_lsn > 0u &&
+          ct_last_seen_position < store->ct_durable_lsn))) return false;
+    if (store->ct_enabled) store->ct_retained_bytes = (uint64_t)last_good;
     return true;
 denied:
     /* Authorization failure is not a torn tail: never repair/truncate it. */
@@ -2192,6 +3026,17 @@ static qihse_kv_store_t* kv_store_allocate(void) {
         pthread_mutex_destroy(&store->sst_fd_lock);
         qihse_trinary_trie_destroy(store->trie); free(store); return NULL;
     }
+    if (pthread_mutex_init(&store->ct_ack_lock, NULL) != 0) {
+        pthread_rwlock_destroy(&store->store_lock);
+        pthread_mutex_destroy(&store->sst_fd_lock);
+        qihse_trinary_trie_destroy(store->trie); free(store); return NULL;
+    }
+    if (pthread_cond_init(&store->ct_ack_changed, NULL) != 0) {
+        pthread_mutex_destroy(&store->ct_ack_lock);
+        pthread_rwlock_destroy(&store->store_lock);
+        pthread_mutex_destroy(&store->sst_fd_lock);
+        qihse_trinary_trie_destroy(store->trie); free(store); return NULL;
+    }
     store->sst_meta = sst_meta_index_create();
     if (!store->sst_meta) { qihse_kv_store_destroy(store); return NULL; }
     return store;
@@ -2206,6 +3051,9 @@ static qihse_kv_store_t* kv_store_create_internal(const kv_read_context_t* conte
     if (!store) return NULL;
     const char* dir = get_qihse_data_dir();
     if (!dir) { qihse_kv_store_destroy(store); return NULL; }
+    if (!ct_state_read(store, user, context->legacy_bootstrap)) {
+        qihse_kv_store_destroy(store); return NULL;
+    }
     if (!replica_install_recover_image(dir, user)) { qihse_kv_store_destroy(store); return NULL; }
     DIR* d = opendir(dir);
     if (d) {
@@ -2283,12 +3131,1392 @@ void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
     kv_store_unlock(store);
 }
 
+static bool ct_make_token(unsigned char out[QIHSE_KV_CT_TOKEN_BYTES],
+                          const unsigned char supplied[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (supplied) { memcpy(out, supplied, QIHSE_KV_CT_TOKEN_BYTES); return true; }
+    size_t done = 0u;
+    while (done < QIHSE_KV_CT_TOKEN_BYTES) {
+        ssize_t n = getrandom(out + done, QIHSE_KV_CT_TOKEN_BYTES - done, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
+bool qihse_kv_ct_source_enable(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* source_id, const char* successor_id, const char* generation,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t max_retained_bytes) {
+    if (!store || !ct_admin(principal) || !ct_id_valid(source_id) ||
+        !ct_id_valid(successor_id) || !ct_id_valid(generation) ||
+        max_retained_bytes < (uint64_t)QIHSE_KV_DURABLE_BATCH_MAX_BYTES + 4096u ||
+        store->memory_snapshot) return false;
+    kv_store_wrlock(store);
+    bool ok = !store->ct_enabled && !store->recovery_pending &&
+        !store->bulk_load_mode && !store->durable_batch_mode &&
+        !store->replica_read_only && kv_sync_store_locked(store) &&
+        rotate_wal_empty(store) && fsync_dir_path(get_qihse_data_dir());
+    if (ok) {
+        store->ct_enabled = true;
+        store->ct_admitted = false;
+        store->ct_mode = 1u;
+        store->ct_system_principal = principal;
+        snprintf(store->ct_source_id, sizeof(store->ct_source_id), "%s", source_id);
+        snprintf(store->ct_successor_id, sizeof(store->ct_successor_id), "%s", successor_id);
+        snprintf(store->ct_generation, sizeof(store->ct_generation), "%s", generation);
+        store->ct_baseline_lsn = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
+        store->ct_baseline_sealed = false;
+        store->ct_durable_lsn = 0u;
+        store->ct_ack_lsn = 0u;
+        store->ct_retained_bytes = 0u;
+        store->ct_limit_bytes = max_retained_bytes;
+        ok = ct_make_token(store->ct_owner_token, owner_token) && ct_state_write(store);
+        if (!ok) {
+            store->ct_enabled = false;
+            store->ct_mode = 0u;
+        }
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_source_status(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_ct_source_status_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!store || !out || !ct_replication_principal(store, principal)) return false;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 1u && !store->recovery_pending;
+    if (ok) {
+        snprintf(out->source_id, sizeof(out->source_id), "%s", store->ct_source_id);
+        snprintf(out->successor_id, sizeof(out->successor_id), "%s", store->ct_successor_id);
+        snprintf(out->generation, sizeof(out->generation), "%s", store->ct_generation);
+        out->durable_lsn = store->ct_durable_lsn;
+        out->oldest_lsn = store->ct_ack_lsn + 1u;
+        out->acknowledged_lsn = store->ct_ack_lsn;
+        out->retained_bytes = store->ct_retained_bytes;
+        out->limit_bytes = store->ct_limit_bytes;
+        out->baseline_row_seq = store->ct_baseline_lsn;
+        out->admitted = store->ct_admitted;
+        memcpy(out->baseline_digest, store->ct_baseline_digest,
+               sizeof(out->baseline_digest));
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+static bool ct_fd_sha256(int fd, unsigned char out[32]) {
+    if (fd < 0 || !out) return false;
+    EVP_MD_CTX* digest = EVP_MD_CTX_new();
+    if (!digest) return false;
+    bool ok = EVP_DigestInit_ex(digest, EVP_sha256(), NULL) == 1;
+    unsigned char chunk[8192];
+    off_t offset = 0;
+    while (ok) {
+        ssize_t n = pread(fd, chunk, sizeof(chunk), offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { ok = false; break; }
+        if (n == 0) break;
+        ok = EVP_DigestUpdate(digest, chunk, (size_t)n) == 1;
+        offset += n;
+    }
+    unsigned int len = 0u;
+    if (ok) ok = EVP_DigestFinal_ex(digest, out, &len) == 1 && len == 32u;
+    EVP_MD_CTX_free(digest);
+    return ok;
+}
+
+typedef struct {
+    kv_disk_record_t* rows;
+    size_t count, capacity, bytes;
+} ct_range_image_t;
+
+static void ct_range_image_free(ct_range_image_t* image);
+static bool ct_range_import_existing_locked(qihse_kv_store_t* store,
+    qihse_user_t* principal, uint16_t first_slot, uint16_t last_slot,
+    ct_range_image_t* out);
+
+static bool ct_hash_u64(EVP_MD_CTX* md, uint64_t value) {
+    unsigned char encoded[8];
+    for (unsigned i = 0u; i < 8u; i++)
+        encoded[i] = (unsigned char)(value >> (56u - i * 8u));
+    return EVP_DigestUpdate(md, encoded, sizeof(encoded)) == 1;
+}
+
+/* Proofs hash only the frozen range under the explicit data principal,
+ * including local preimage rows during transfer-back. Generic snapshots
+ * filter moved slots and cannot provide this internal seal. */
+static bool ct_range_digest(qihse_kv_store_t* store, qihse_user_t* data_principal,
+    uint16_t first_slot, uint16_t last_slot, unsigned char out[32]) {
+    if (!store || !data_principal ||
+        !qihse_auth_user_is_active(data_principal) || !out) return false;
+    ct_range_image_t image = {0};
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && !store->recovery_pending &&
+        ct_range_import_existing_locked(store, data_principal, first_slot,
+                                        last_slot, &image);
+    kv_store_unlock(store);
+    if (!ok) return false;
+    for (size_t i = 0u; i < image.count; i++) {
+        if (!qihse_auth_user_is_active(data_principal) ||
+            !qihse_auth_can_access(data_principal,
+                image.rows[i].classification, image.rows[i].sci_compartment)) {
+            ct_range_image_free(&image);
+            errno = EACCES;
+            return false;
+        }
+    }
+    size_t live_count = 0u;
+    for (size_t i = 0u; i < image.count; i++)
+        if ((image.rows[i].flags & KV_FLAG_TOMBSTONE) == 0u) live_count++;
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    unsigned int digest_len = 0u;
+    ok = md && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(md, "QCT-RANGE-V1", 12u) == 1 &&
+        ct_hash_u64(md, first_slot) && ct_hash_u64(md, last_slot) &&
+        ct_hash_u64(md, live_count);
+    for (size_t i = 0u; ok && i < image.count; i++) {
+        const kv_disk_record_t* row = &image.rows[i];
+        if ((row->flags & KV_FLAG_TOMBSTONE) != 0u) continue;
+        size_t key_len = strlen(row->key), value_len = strlen(row->val);
+        EVP_MD_CTX* row_md = EVP_MD_CTX_new();
+        unsigned char row_digest[32];
+        unsigned int row_len = 0u;
+        bool hashed = row_md && EVP_DigestInit_ex(row_md, EVP_sha256(), NULL) == 1 &&
+            ct_hash_u64(row_md, key_len) &&
+            EVP_DigestUpdate(row_md, row->key, key_len) == 1 &&
+            ct_hash_u64(row_md, value_len) &&
+            EVP_DigestUpdate(row_md, row->val, value_len) == 1 &&
+            ct_hash_u64(row_md, row->expire_time_ms) &&
+            ct_hash_u64(row_md, row->classification) &&
+            ct_hash_u64(row_md, row->sci_compartment) &&
+            ct_hash_u64(row_md, row->flags) &&
+            EVP_DigestFinal_ex(row_md, row_digest, &row_len) == 1 &&
+            row_len == 32u;
+        EVP_MD_CTX_free(row_md);
+        ok = hashed && (i == 0u ||
+            strcmp(image.rows[i - 1u].key, row->key) != 0) &&
+            ct_hash_u64(md, key_len) &&
+            EVP_DigestUpdate(md, row->key, key_len) == 1 &&
+            EVP_DigestUpdate(md, row_digest, 32u) == 1;
+    }
+    if (ok) ok = EVP_DigestFinal_ex(md, out, &digest_len) == 1 &&
+                 digest_len == 32u;
+    EVP_MD_CTX_free(md);
+    ct_range_image_free(&image);
+    return ok && qihse_auth_user_is_active(data_principal);
+}
+
+static void ct_range_image_free(ct_range_image_t* image) {
+    if (!image) return;
+    for (size_t i = 0u; i < image->count; i++)
+        disk_record_free(&image->rows[i]);
+    free(image->rows);
+    memset(image, 0, sizeof(*image));
+}
+
+static int ct_image_row_cmp(const void* lhs, const void* rhs) {
+    const kv_disk_record_t* a = lhs;
+    const kv_disk_record_t* b = rhs;
+    return strcmp(a->key, b->key);
+}
+
+static bool ct_range_image_read(FILE* input, qihse_user_t* principal,
+    uint16_t first_slot, uint16_t last_slot, bool exact_range,
+    ct_range_image_t* out) {
+    if (!input || !principal || !out) return false;
+    memset(out, 0, sizeof(*out));
+    const kv_read_context_t context = { .user = principal };
+    bool ok = true;
+    for (;;) {
+        kv_disk_record_t row;
+        int rc = disk_record_read_context(input, &row, &context);
+        if (rc == 0) break;
+        if (rc != 1) { ok = false; break; }
+        uint16_t slot = qihse_cluster_key_slot(row.key, strlen(row.key));
+        if (qihse_cluster_key_is_node_local(row.key) ||
+            slot < first_slot || slot > last_slot) {
+            disk_record_free(&row);
+            if (exact_range) { ok = false; break; }
+            continue;
+        }
+        size_t bytes = strlen(row.key) + strlen(row.val) + 64u;
+        if ((row.flags & ~KV_FLAG_TOMBSTONE) != 0u ||
+            ((row.flags & KV_FLAG_TOMBSTONE) != 0u &&
+             (row.val[0] != '\0' || row.expire_time_ms != 0u)) ||
+            out->count >= QIHSE_KV_CT_MAX_GROUP_RECORDS ||
+            bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES - out->bytes) {
+            disk_record_free(&row); ok = false; errno = E2BIG; break;
+        }
+        if (out->count == out->capacity) {
+            size_t next = out->capacity ? out->capacity * 2u : 128u;
+            kv_disk_record_t* grown = realloc(out->rows, next * sizeof(*grown));
+            if (!grown) { disk_record_free(&row); ok = false; break; }
+            out->rows = grown; out->capacity = next;
+        }
+        out->rows[out->count++] = row;
+        out->bytes += bytes;
+    }
+    if (ok) {
+        qsort(out->rows, out->count, sizeof(*out->rows), ct_image_row_cmp);
+        for (size_t i = 1u; i < out->count; i++)
+            if (strcmp(out->rows[i - 1u].key, out->rows[i].key) == 0) ok = false;
+    }
+    if (!ok || !qihse_auth_user_is_active(principal)) {
+        ct_range_image_free(out);
+        return false;
+    }
+    return true;
+}
+
+static bool ct_range_stage_copy(const char* source_path,
+    const unsigned char expected_digest[32], char stage_path[4096]) {
+    if (!build_data_path(stage_path, 4096u, "ct-transfer-stage.qfs")) return false;
+    int source_fd = open_secure_read(source_path);
+    if (source_fd < 0) return false;
+    struct stat st;
+    bool ok = fstat(source_fd, &st) == 0 && st.st_size >= 0 &&
+        (uint64_t)st.st_size <= QIHSE_KV_DURABLE_BATCH_MAX_BYTES;
+    char* temp = malloc(8192u);
+    FILE* output = NULL;
+    if (ok) ok = temp && atomic_file_begin(stage_path, temp, 8192u, &output);
+    unsigned char buffer[4096];
+    while (ok) {
+        ssize_t n = read(source_fd, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { ok = false; break; }
+        if (n == 0) break;
+        if (fwrite(buffer, 1u, (size_t)n, output) != (size_t)n) ok = false;
+    }
+    close(source_fd);
+    if (output) {
+        if (ok) ok = atomic_file_commit(output, temp, stage_path) &&
+                     fsync_dir_path(get_qihse_data_dir());
+        else { fclose(output); unlink(temp); }
+    }
+    free(temp);
+    if (ok) {
+        int stage_fd = open_secure_read(stage_path);
+        unsigned char actual[32];
+        ok = stage_fd >= 0 && ct_fd_sha256(stage_fd, actual) &&
+             memcmp(actual, expected_digest, 32u) == 0;
+        if (stage_fd >= 0) close(stage_fd);
+    }
+    if (!ok) (void)unlink(stage_path);
+    return ok;
+}
+
+static bool ct_range_image_from_path(const char* path, qihse_user_t* principal,
+    uint16_t first_slot, uint16_t last_slot, bool exact_range,
+    ct_range_image_t* out) {
+    int fd = open_secure_read(path);
+    if (fd < 0) return false;
+    FILE* input = fdopen(fd, "rb");
+    if (!input) { close(fd); return false; }
+    bool ok = ct_range_image_read(input, principal, first_slot, last_slot,
+                                  exact_range, out);
+    if (fclose(input) != 0) ok = false;
+    if (!ok) ct_range_image_free(out);
+    return ok;
+}
+
+static bool ct_range_merge_group(qihse_kv_store_t* store,
+    qihse_user_t* principal, const ct_range_image_t* incoming,
+    const ct_range_image_t* existing, qihse_kv_ct_group_t* group) {
+    if (!store || !principal || !incoming || !existing || !group) return false;
+    memset(group, 0, sizeof(*group));
+    qihse_kv_ct_record_t* rows = calloc(QIHSE_KV_CT_MAX_GROUP_RECORDS,
+                                        sizeof(*rows));
+    if (!rows) return false;
+    snprintf(group->source_id, sizeof(group->source_id), "%s", store->ct_source_id);
+    snprintf(group->generation, sizeof(group->generation), "%s", store->ct_generation);
+    group->stream_position = store->ct_durable_lsn + 1u;
+    group->records = rows;
+    size_t i = 0u, j = 0u;
+    while (i < incoming->count || j < existing->count) {
+        const kv_disk_record_t* source = i < incoming->count ? &incoming->rows[i] : NULL;
+        const kv_disk_record_t* target = j < existing->count ? &existing->rows[j] : NULL;
+        int order = source && target ? strcmp(source->key, target->key) :
+                    source ? -1 : 1;
+        if (group->count == QIHSE_KV_CT_MAX_GROUP_RECORDS) goto failed;
+        qihse_kv_ct_record_t* row = &rows[group->count++];
+        const char* key = source && order <= 0 ? source->key : target->key;
+        uint32_t resource_tenant = 0u;
+        if (!ct_resource_tenant(key, 0u, &resource_tenant)) goto failed;
+        bool source_tombstone = source && (source->flags & KV_FLAG_TOMBSTONE);
+        row->key = (char*)key;
+        row->value = source && order <= 0 && !source_tombstone ? source->val : NULL;
+        row->classification = source && order <= 0 ? source->classification : target->classification;
+        row->sci_compartment = source && order <= 0 ? source->sci_compartment : target->sci_compartment;
+        row->expire_time_ms = source && order <= 0 && !source_tombstone ? source->expire_time_ms : 0u;
+        row->actor_id = qihse_user_get_id(principal);
+        row->actor_tenant_id = 0u;
+        row->resource_tenant_id = resource_tenant;
+        row->actor_kind = QIHSE_KV_CT_ACTOR_REPLICA;
+        row->tombstone = !source || order > 0 || source_tombstone;
+        row->change_seq = group->count;
+        if (!qihse_auth_can_access(principal, row->classification, row->sci_compartment)) goto failed;
+        if (source && target && order == 0 &&
+            (source->classification < target->classification ||
+             (source->sci_compartment & target->sci_compartment) != target->sci_compartment)) goto failed;
+        if (source && order <= 0) i++;
+        if (target && order >= 0) j++;
+    }
+    group->first_seq = group->count ? 1u : 0u;
+    group->last_seq = group->count;
+    return true;
+failed:
+    free(rows);
+    memset(group, 0, sizeof(*group));
+    return false;
+}
+
+static bool ct_persist_baseline_fd(int source_fd, unsigned char digest[32]) {
+    char path[4096];
+    char* temp = malloc(8192u);
+    FILE* output = NULL;
+    if (!build_data_path(path, sizeof(path), "ct-baseline.qfs") ||
+        !temp || !atomic_file_begin(path, temp, 8192u, &output)) {
+        free(temp);
+        return false;
+    }
+    unsigned char chunk[4096];
+    off_t offset = 0;
+    bool ok = true;
+    for (;;) {
+        ssize_t n = pread(source_fd, chunk, sizeof(chunk), offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { ok = false; break; }
+        if (n == 0) break;
+        if (fwrite(chunk, 1u, (size_t)n, output) != (size_t)n) { ok = false; break; }
+        offset += n;
+    }
+    if (ok) ok = atomic_file_commit(output, temp, path) &&
+                 fsync_dir_path(get_qihse_data_dir());
+    else { fclose(output); unlink(temp); }
+    free(temp);
+    if (!ok) return false;
+    int fd = open_secure_read(path);
+    unsigned char actual[32];
+    ok = fd >= 0 && ct_fd_sha256(fd, actual) &&
+         memcmp(actual, digest, 32u) == 0;
+    if (fd >= 0) close(fd);
+    return ok;
+}
+
+static qihse_kv_replica_snapshot_t* ct_open_baseline_snapshot(
+    qihse_user_t* principal, const unsigned char expected_digest[32]) {
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "ct-baseline.qfs")) return NULL;
+    int fd = open_secure_read(path);
+    if (fd < 0) return NULL;
+    struct stat st;
+    unsigned char digest[32];
+    if (fstat(fd, &st) != 0 || st.st_size < 0 ||
+        !ct_fd_sha256(fd, digest) ||
+        memcmp(digest, expected_digest, 32u) != 0) {
+        close(fd); return NULL;
+    }
+    qihse_kv_replica_snapshot_t* snapshot = calloc(1u, sizeof(*snapshot));
+    if (!snapshot) { close(fd); return NULL; }
+    snapshot->fd = fd;
+    snapshot->size = (uint64_t)st.st_size;
+    snapshot->principal = principal;
+    snapshot->principal_id = qihse_user_get_id(principal);
+    snapshot->tenant_id = qihse_user_get_tenant_id(principal);
+    snapshot->classification = qihse_user_get_classification(principal);
+    snapshot->sci = qihse_user_get_sci(principal);
+    return snapshot;
+}
+
+int qihse_kv_ct_source_baseline_snapshot_create(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_replica_snapshot_t** out_snapshot,
+    uint64_t* out_baseline_row_seq, unsigned char out_digest[32]) {
+    if (out_snapshot) *out_snapshot = NULL;
+    if (out_baseline_row_seq) *out_baseline_row_seq = 0u;
+    if (out_digest) memset(out_digest, 0, 32u);
+    if (!store || !ct_replication_principal(store, principal) ||
+        !out_snapshot || !out_baseline_row_seq || !out_digest) return -1;
+    kv_store_rdlock(store);
+    bool allowed = store->ct_enabled && store->ct_mode == 1u &&
+        !store->recovery_pending;
+    bool sealed = allowed && store->ct_baseline_sealed;
+    unsigned char sealed_digest[32];
+    memcpy(sealed_digest, store->ct_baseline_digest, 32u);
+    uint64_t sealed_seq = store->ct_baseline_lsn;
+    bool initial = allowed && !sealed && !store->ct_admitted &&
+                   store->ct_durable_lsn == 0u;
+    kv_store_unlock(store);
+    if (!allowed) return -1;
+    if (sealed) {
+        qihse_kv_replica_snapshot_t* persisted =
+            ct_open_baseline_snapshot(principal, sealed_digest);
+        if (!persisted) return -1;
+        *out_snapshot = persisted;
+        *out_baseline_row_seq = sealed_seq;
+        memcpy(out_digest, sealed_digest, 32u);
+        return 0;
+    }
+    if (!initial) return -1;
+    qihse_kv_replica_snapshot_t* snapshot = NULL;
+    int rc = qihse_kv_replica_snapshot_create(store, principal, "*", &snapshot);
+    if (rc != 0) return rc;
+    unsigned char digest[32];
+    if (!ct_fd_sha256(snapshot->fd, digest)) {
+        qihse_kv_replica_snapshot_destroy(snapshot);
+        return -1;
+    }
+    kv_store_wrlock(store);
+    allowed = store->ct_enabled && store->ct_mode == 1u &&
+        !store->ct_admitted && store->ct_durable_lsn == 0u &&
+        !store->recovery_pending;
+    if (allowed && store->ct_baseline_sealed)
+        allowed = memcmp(store->ct_baseline_digest, digest, 32u) == 0;
+    if (allowed && !store->ct_baseline_sealed)
+        allowed = ct_persist_baseline_fd(snapshot->fd, digest);
+    if (allowed && !store->ct_baseline_sealed) {
+        memcpy(store->ct_baseline_digest, digest, 32u);
+        store->ct_baseline_sealed = true;
+        allowed = ct_state_write(store);
+        if (!allowed) {
+            memset(store->ct_baseline_digest, 0, 32u);
+            store->ct_baseline_sealed = false;
+        }
+    }
+    if (allowed) *out_baseline_row_seq = store->ct_baseline_lsn;
+    kv_store_unlock(store);
+    if (!allowed) { qihse_kv_replica_snapshot_destroy(snapshot); return -1; }
+    memcpy(out_digest, digest, 32u);
+    *out_snapshot = snapshot;
+    return 0;
+}
+
+bool qihse_kv_ct_source_ack(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* peer_id, const char* generation, uint64_t durable_lsn) {
+    if (!store || !ct_replication_principal(store, principal) || !peer_id || !generation) return false;
+    kv_store_wrlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 1u &&
+        !store->recovery_pending &&
+        store->ct_transfer_phase != 1u &&
+        strcmp(store->ct_successor_id, peer_id) == 0 &&
+        strcmp(store->ct_generation, generation) == 0 &&
+        durable_lsn >= store->ct_ack_lsn &&
+        durable_lsn <= store->ct_durable_lsn;
+    if (ok && durable_lsn > store->ct_ack_lsn) {
+        uint64_t prior = store->ct_ack_lsn;
+        store->ct_ack_lsn = durable_lsn;
+        if (!ct_state_write(store)) {
+            store->ct_ack_lsn = prior;
+            ok = false;
+        }
+    }
+    if (ok && store->ct_ack_lsn == store->ct_durable_lsn &&
+        store->ct_retained_bytes != 0u) {
+        /* The SST and its directory entry must be durable before the only
+         * recovery copy of an ACKed QKV6 frame can be retired. */
+        if (!kv_sync_store_locked(store)) ok = false;
+        if (ok) {
+            store->ct_retained_bytes = 0u;
+            if (!ct_state_write(store) || !rotate_wal_empty(store) ||
+                !fsync_dir_path(get_qihse_data_dir())) {
+                store->recovery_pending = true;
+                ok = false;
+            }
+        }
+    }
+    if (ok) {
+        pthread_mutex_lock(&store->ct_ack_lock);
+        pthread_cond_broadcast(&store->ct_ack_changed);
+        pthread_mutex_unlock(&store->ct_ack_lock);
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+static bool ct_source_reconcile_internal(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const char* peer_id, const char* generation,
+    const unsigned char receiver_baseline_digest[32],
+    uint64_t peer_durable_position) {
+    if (!store || !ct_admin(principal) || !peer_id || !generation ||
+        !receiver_baseline_digest) return false;
+    kv_store_wrlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 1u &&
+        !store->recovery_pending && store->ct_transfer_phase != 1u &&
+        (!data_principal || (store->replication_principal_id != 0u &&
+          qihse_auth_user_is_active(data_principal) &&
+          qihse_user_get_id(data_principal) == store->replication_principal_id)) &&
+        strcmp(store->ct_successor_id, peer_id) == 0 &&
+        strcmp(store->ct_generation, generation) == 0 &&
+        store->ct_baseline_sealed &&
+        memcmp(store->ct_baseline_digest, receiver_baseline_digest, 32u) == 0 &&
+        peer_durable_position >= store->ct_ack_lsn &&
+        peer_durable_position <= store->ct_durable_lsn &&
+        (store->ct_admitted || peer_durable_position == store->ct_durable_lsn);
+    /* During initial admission the successor must prove the exact current cut.
+     * Once admitted, a periodic reconcile can race a new local write after the
+     * successor's STATUS read. Accept that older, still-monotonic durable cut
+     * without claiming later groups: the ordinary ACK boundary advances only
+     * to peer_durable_position, and the pull loop will ACK any newer groups. */
+    if (ok && peer_durable_position > store->ct_ack_lsn) {
+        uint64_t prior = store->ct_ack_lsn;
+        store->ct_ack_lsn = peer_durable_position;
+        if (!ct_state_write(store)) {
+            store->ct_ack_lsn = prior;
+            ok = false;
+        }
+    }
+    if (ok) store->ct_admitted = true;
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_source_reconcile(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* peer_id, const char* generation,
+    const unsigned char receiver_baseline_digest[32],
+    uint64_t peer_durable_position) {
+    return ct_source_reconcile_internal(store, principal, NULL, peer_id,
+        generation, receiver_baseline_digest, peer_durable_position);
+}
+
+bool qihse_kv_ct_source_reconcile_peer(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const char* peer_id, const char* generation,
+    const unsigned char receiver_baseline_digest[32],
+    uint64_t peer_durable_position) {
+    if (!replication_principal) return false;
+    return ct_source_reconcile_internal(store, local_operator,
+        replication_principal, peer_id, generation,
+        receiver_baseline_digest, peer_durable_position);
+}
+
+void qihse_kv_ct_groups_free(qihse_kv_ct_group_t* groups, size_t count) {
+    if (!groups) return;
+    for (size_t i = 0; i < count; i++) qihse_ct_codec_clear(&groups[i]);
+    free(groups);
+}
+
+bool qihse_kv_ct_source_read(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* generation, uint64_t after_seq, size_t max_groups,
+    size_t max_bytes, qihse_kv_ct_group_t** out_groups, size_t* out_count,
+    uint64_t* out_resume_seq) {
+    if (out_groups) *out_groups = NULL;
+    if (out_count) *out_count = 0u;
+    if (out_resume_seq) *out_resume_seq = after_seq;
+    if (!store || !ct_replication_principal(store, principal) || !generation || !out_groups ||
+        !out_count || !out_resume_seq || max_groups == 0u || max_groups > 4096u ||
+        max_bytes == 0u || max_bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES) return false;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 1u &&
+        !store->recovery_pending &&
+        strcmp(store->ct_generation, generation) == 0 &&
+        after_seq >= store->ct_ack_lsn && after_seq <= store->ct_durable_lsn;
+    if (!ok) { kv_store_unlock(store); return false; }
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "wal.log")) {
+        kv_store_unlock(store); return false;
+    }
+    int fd = open_secure_read(path);
+    if (fd < 0) { kv_store_unlock(store); return false; }
+    FILE* input = fdopen(fd, "rb");
+    if (!input) { close(fd); kv_store_unlock(store); return false; }
+    qihse_kv_ct_group_t* groups = calloc(max_groups, sizeof(*groups));
+    if (!groups) { fclose(input); kv_store_unlock(store); return false; }
+    size_t count = 0u, used = 0u;
+    uint64_t cursor = after_seq;
+    for (;;) {
+        if (count == max_groups || used == max_bytes) break;
+        qihse_kv_ct_group_t next = {0};
+        uint8_t mode = 0u;
+        size_t read_bytes = 0u;
+        int rc = qihse_ct_codec_read(input, principal,
+            QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+            max_bytes - used, &next, &mode, &read_bytes);
+        if (rc == 0) break;
+        if (rc != 1 || mode != 1u ||
+            strcmp(next.source_id, store->ct_source_id) != 0 ||
+            strcmp(next.generation, store->ct_generation) != 0 ||
+            next.stream_position > store->ct_durable_lsn) {
+            qihse_ct_codec_clear(&next); ok = false; break;
+        }
+        if (next.stream_position <= after_seq) {
+            qihse_ct_codec_clear(&next);
+            continue;
+        }
+        if (count == max_groups || read_bytes > max_bytes - used) {
+            qihse_ct_codec_clear(&next);
+            if (count == 0u) ok = false;
+            break;
+        }
+        if (next.stream_position != cursor + 1u) {
+            qihse_ct_codec_clear(&next); ok = false; break;
+        }
+        groups[count++] = next;
+        used += read_bytes;
+        cursor = next.stream_position;
+    }
+    fclose(input);
+    kv_store_unlock(store);
+    if (!ok) { qihse_kv_ct_groups_free(groups, count); return false; }
+    *out_groups = groups;
+    *out_count = count;
+    *out_resume_seq = cursor;
+    return true;
+}
+
+bool qihse_kv_ct_receiver_bind(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* source_id, const char* target_id, const char* generation,
+    qihse_kv_ct_tenant_policy_t tenant_policy, uint32_t tenant_id,
+    uint64_t baseline_lsn,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(principal) || !ct_id_valid(source_id) ||
+        !ct_id_valid(target_id) ||
+        !ct_id_valid(generation) ||
+        (tenant_policy != QIHSE_KV_CT_TENANT_EXACT &&
+         tenant_policy != QIHSE_KV_CT_TENANT_SYSTEM_ALL) ||
+        (tenant_policy == QIHSE_KV_CT_TENANT_SYSTEM_ALL && tenant_id != 0u) ||
+        store->memory_snapshot) return false;
+    kv_store_wrlock(store);
+    bool ok = !store->ct_enabled && !store->recovery_pending &&
+        !store->bulk_load_mode && !store->durable_batch_mode &&
+        kv_sync_store_locked(store) && rotate_wal_empty(store) &&
+        fsync_dir_path(get_qihse_data_dir());
+    if (ok) {
+        store->ct_enabled = true;
+        store->ct_admitted = false;
+        store->ct_mode = 2u;
+        store->ct_system_principal = principal;
+        store->ct_tenant_id = tenant_id;
+        store->ct_tenant_policy = tenant_policy;
+        store->ct_baseline_lsn = baseline_lsn;
+        store->ct_baseline_sealed = false;
+        store->ct_durable_lsn = 0u;
+        store->ct_limit_bytes = 512u * 1024u * 1024u;
+        snprintf(store->ct_source_id, sizeof(store->ct_source_id), "%s", source_id);
+        snprintf(store->ct_target_id, sizeof(store->ct_target_id), "%s", target_id);
+        snprintf(store->ct_generation, sizeof(store->ct_generation), "%s", generation);
+        ok = ct_make_token(store->ct_owner_token, owner_token) && ct_state_write(store);
+        if (!ok) { store->ct_enabled = false; store->ct_mode = 0u; }
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_ct_receiver_status_t* out) {
+    if (!store || !out || !ct_replication_principal(store, principal)) return false;
+    memset(out, 0, sizeof(*out));
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 2u && !store->recovery_pending;
+    if (ok) {
+        snprintf(out->source_id, sizeof(out->source_id), "%s", store->ct_source_id);
+        snprintf(out->generation, sizeof(out->generation), "%s", store->ct_generation);
+        out->durable_cursor = store->ct_durable_lsn;
+        out->tenant_id = store->ct_tenant_id;
+        out->tenant_policy = store->ct_tenant_policy;
+        out->baseline_sealed = store->ct_baseline_sealed;
+        memcpy(out->baseline_digest, store->ct_baseline_digest,
+               sizeof(out->baseline_digest));
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* transfer_id, uint16_t first_slot, uint16_t last_slot,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t* out_cut_position) {
+    if (out_cut_position) *out_cut_position = 0u;
+    if (!store || !out_cut_position || !ct_admin(principal) ||
+        !ct_id_valid(transfer_id) || first_slot > last_slot ||
+        last_slot >= QIHSE_CLUSTER_SLOT_COUNT) return false;
+    kv_store_wrlock(store);
+    if (store->ct_enabled && store->ct_fence_state == 1u &&
+        strcmp(store->ct_transfer_id, transfer_id) == 0 &&
+        store->ct_fence_first == first_slot &&
+        store->ct_fence_last == last_slot &&
+        ct_token_matches(store, owner_token) && !store->recovery_pending) {
+        *out_cut_position = store->ct_fence_cut_position;
+        kv_store_unlock(store);
+        return true;
+    }
+    bool ok = ct_token_matches(store, owner_token) &&
+        !store->recovery_pending && store->ct_fence_state != 1u &&
+        (store->ct_mode != 1u ||
+         (store->ct_admitted && store->ct_ack_lsn == store->ct_durable_lsn));
+    for (uint32_t slot = first_slot; ok && slot <= last_slot; slot++)
+        if (store->ct_moved_slots[slot / 8u] & (1u << (slot % 8u))) ok = false;
+    if (ok) {
+        uint8_t prior_state = store->ct_fence_state;
+        uint16_t prior_first = store->ct_fence_first;
+        uint16_t prior_last = store->ct_fence_last;
+        uint64_t prior_cut = store->ct_fence_cut_position;
+        char prior_id[sizeof(store->ct_transfer_id)];
+        char prior_target[sizeof(store->ct_target_id)];
+        char prior_source[sizeof(store->ct_transfer_source_id)];
+        char prior_generation[sizeof(store->ct_transfer_source_generation)];
+        unsigned char prior_image[32], prior_group[32], prior_range[32];
+        uint64_t prior_source_cut = store->ct_transfer_source_cut;
+        uint64_t prior_target_position = store->ct_transfer_target_position;
+        memcpy(prior_id, store->ct_transfer_id, sizeof(prior_id));
+        memcpy(prior_target, store->ct_target_id, sizeof(prior_target));
+        memcpy(prior_source, store->ct_transfer_source_id, sizeof(prior_source));
+        memcpy(prior_generation, store->ct_transfer_source_generation,
+               sizeof(prior_generation));
+        memcpy(prior_image, store->ct_transfer_image_digest, 32u);
+        memcpy(prior_group, store->ct_transfer_group_digest, 32u);
+        memcpy(prior_range, store->ct_transfer_range_digest, 32u);
+        if (store->ct_mode == 1u) store->ct_target_id[0] = '\0';
+        store->ct_transfer_source_id[0] = '\0';
+        store->ct_transfer_source_generation[0] = '\0';
+        store->ct_transfer_source_cut = 0u;
+        store->ct_transfer_target_position = 0u;
+        store->ct_transfer_phase = 0u;
+        memset(store->ct_transfer_image_digest, 0, 32u);
+        memset(store->ct_transfer_group_digest, 0, 32u);
+        memset(store->ct_transfer_range_digest, 0, 32u);
+        store->ct_fence_state = 1u;
+        store->ct_fence_first = first_slot;
+        store->ct_fence_last = last_slot;
+        store->ct_fence_cut_position = store->ct_durable_lsn;
+        snprintf(store->ct_transfer_id, sizeof(store->ct_transfer_id), "%s", transfer_id);
+        ok = ct_state_write(store);
+        if (ok) *out_cut_position = store->ct_durable_lsn;
+        else {
+            store->ct_fence_state = prior_state;
+            store->ct_fence_first = prior_first;
+            store->ct_fence_last = prior_last;
+            memcpy(store->ct_transfer_id, prior_id, sizeof(prior_id));
+            memcpy(store->ct_target_id, prior_target, sizeof(prior_target));
+            memcpy(store->ct_transfer_source_id, prior_source, sizeof(prior_source));
+            memcpy(store->ct_transfer_source_generation, prior_generation,
+                   sizeof(prior_generation));
+            store->ct_transfer_source_cut = prior_source_cut;
+            store->ct_transfer_target_position = prior_target_position;
+            memcpy(store->ct_transfer_image_digest, prior_image, 32u);
+            memcpy(store->ct_transfer_group_digest, prior_group, 32u);
+            memcpy(store->ct_transfer_range_digest, prior_range, 32u);
+            store->ct_fence_cut_position = prior_cut;
+        }
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_target_prepare(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_target_receipt_claim_t* source_prepared_claim,
+    qihse_kv_ct_receipt_verify_fn verify_source_prepared,
+    void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t* out_local_cut) {
+    if (out_local_cut) *out_local_cut = 0u;
+    if (!store || !ct_admin(principal) || !source_prepared_claim ||
+        !verify_source_prepared || !owner_token || !out_local_cut) return false;
+    qihse_kv_ct_target_receipt_claim_t claim = *source_prepared_claim;
+    if (!ct_id_valid(claim.transfer_id) || !ct_id_valid(claim.source_id) ||
+        !ct_id_valid(claim.target_id) || !ct_id_valid(claim.generation) ||
+        claim.first_slot > claim.last_slot ||
+        claim.last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
+        !verify_source_prepared(&claim, verify_context)) return false;
+    kv_store_wrlock(store);
+    bool ok = ct_token_matches(store, owner_token) &&
+        !store->recovery_pending && store->ct_mode == 1u &&
+        strcmp(store->ct_source_id, claim.target_id) == 0;
+    if (ok && store->ct_fence_state == 3u &&
+        strcmp(store->ct_transfer_id, claim.transfer_id) == 0) {
+        ok = store->ct_fence_first == claim.first_slot &&
+            store->ct_fence_last == claim.last_slot &&
+            strcmp(store->ct_transfer_source_id, claim.source_id) == 0 &&
+            strcmp(store->ct_transfer_source_generation, claim.generation) == 0 &&
+            store->ct_transfer_source_cut == claim.source_cut &&
+            memcmp(store->ct_transfer_range_digest,
+                   claim.range_checksum, 32u) == 0;
+        if (ok) *out_local_cut = store->ct_fence_cut_position;
+        kv_store_unlock(store);
+        return ok;
+    }
+    ok = ok && store->ct_admitted &&
+         store->ct_ack_lsn == store->ct_durable_lsn;
+    if (ok && store->ct_fence_state == 1u) {
+        ok = strcmp(store->ct_transfer_id, claim.transfer_id) == 0 &&
+            store->ct_fence_first == claim.first_slot &&
+            store->ct_fence_last == claim.last_slot &&
+            strcmp(store->ct_transfer_source_id, claim.source_id) == 0 &&
+            strcmp(store->ct_transfer_source_generation, claim.generation) == 0 &&
+            store->ct_transfer_source_cut == claim.source_cut &&
+            memcmp(store->ct_transfer_range_digest,
+                   claim.range_checksum, 32u) == 0;
+        if (ok) *out_local_cut = store->ct_fence_cut_position;
+        kv_store_unlock(store);
+        return ok;
+    }
+    ok = ok && store->ct_transfer_phase == 0u;
+    if (ok) {
+        store->ct_fence_state = 1u;
+        store->ct_fence_first = claim.first_slot;
+        store->ct_fence_last = claim.last_slot;
+        store->ct_fence_cut_position = store->ct_durable_lsn;
+        snprintf(store->ct_transfer_id, sizeof(store->ct_transfer_id),
+                 "%s", claim.transfer_id);
+        snprintf(store->ct_transfer_source_id,
+                 sizeof(store->ct_transfer_source_id), "%s", claim.source_id);
+        snprintf(store->ct_transfer_source_generation,
+                 sizeof(store->ct_transfer_source_generation), "%s",
+                 claim.generation);
+        store->ct_transfer_source_cut = claim.source_cut;
+        store->ct_transfer_target_position = 0u;
+        memcpy(store->ct_transfer_range_digest,
+               claim.range_checksum, 32u);
+        memset(store->ct_transfer_image_digest, 0, 32u);
+        memset(store->ct_transfer_group_digest, 0, 32u);
+        ok = ct_state_write(store);
+        if (ok) *out_local_cut = store->ct_fence_cut_position;
+        else store->recovery_pending = true;
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_target_abort(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_target_receipt_claim_t* source_aborted_claim,
+    qihse_kv_ct_receipt_verify_fn verify_source_aborted,
+    void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(principal) || !source_aborted_claim ||
+        !verify_source_aborted || !owner_token) return false;
+    qihse_kv_ct_target_receipt_claim_t claim = *source_aborted_claim;
+    if (!ct_id_valid(claim.transfer_id) || !ct_id_valid(claim.source_id) ||
+        !ct_id_valid(claim.target_id) || !ct_id_valid(claim.generation) ||
+        claim.first_slot > claim.last_slot ||
+        claim.last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
+        !verify_source_aborted(&claim, verify_context)) return false;
+    kv_store_wrlock(store);
+    bool ok = ct_token_matches(store, owner_token) &&
+        !store->recovery_pending && store->ct_mode == 1u &&
+        strcmp(store->ct_transfer_id, claim.transfer_id) == 0 &&
+        strcmp(store->ct_transfer_source_id, claim.source_id) == 0 &&
+        strcmp(store->ct_source_id, claim.target_id) == 0 &&
+        strcmp(store->ct_transfer_source_generation, claim.generation) == 0 &&
+        store->ct_fence_first == claim.first_slot &&
+        store->ct_fence_last == claim.last_slot &&
+        store->ct_transfer_source_cut == claim.source_cut &&
+        memcmp(store->ct_transfer_range_digest,
+               claim.range_checksum, 32u) == 0;
+    if (ok && store->ct_fence_state == 4u) {
+        kv_store_unlock(store);
+        return true;
+    }
+    ok = ok && store->ct_fence_state == 1u &&
+        store->ct_transfer_phase == 0u;
+    if (ok) {
+        store->ct_fence_state = 4u;
+        ok = ct_state_write(store);
+        if (!ok) store->ct_fence_state = 1u;
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_transfer_status(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_kv_ct_transfer_status_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!store || !out || !ct_admin(control_principal)) return false;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && !store->recovery_pending &&
+        ct_admin(control_principal);
+    if (ok) {
+        out->mode = store->ct_mode;
+        out->fence_state = store->ct_fence_state;
+        out->transfer_phase = store->ct_transfer_phase;
+        out->first_slot = store->ct_fence_first;
+        out->last_slot = store->ct_fence_last;
+        out->cut_position = store->ct_fence_cut_position;
+        memcpy(out->transfer_id, store->ct_transfer_id,
+               sizeof(out->transfer_id));
+        memcpy(out->source_id, store->ct_source_id, sizeof(out->source_id));
+        memcpy(out->target_id, store->ct_target_id, sizeof(out->target_id));
+        memcpy(out->generation, store->ct_generation, sizeof(out->generation));
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_fence_finish(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* transfer_id, bool transferred,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    /* A caller assertion is never evidence of target durability. CT2 commit
+     * uses the proof-consuming completion path below. */
+    if (transferred) { errno = EACCES; return false; }
+    if (!store || !ct_admin(principal) || !transfer_id) return false;
+    kv_store_wrlock(store);
+    bool ok = ct_token_matches(store, owner_token) &&
+        !store->recovery_pending && store->ct_fence_state == 1u &&
+        store->ct_transfer_phase == 0u &&
+        store->ct_transfer_source_id[0] == '\0' &&
+        strcmp(store->ct_transfer_id, transfer_id) == 0;
+    if (ok) {
+        unsigned char prior[sizeof(store->ct_moved_slots)];
+        memcpy(prior, store->ct_moved_slots, sizeof(prior));
+        uint16_t prior_first = store->ct_fence_first;
+        uint16_t prior_last = store->ct_fence_last;
+        uint64_t prior_cut = store->ct_fence_cut_position;
+        char prior_id[sizeof(store->ct_transfer_id)];
+        char prior_target[sizeof(store->ct_target_id)];
+        memcpy(prior_id, store->ct_transfer_id, sizeof(prior_id));
+        memcpy(prior_target, store->ct_target_id, sizeof(prior_target));
+        store->ct_fence_state = 0u;
+        store->ct_fence_first = store->ct_fence_last = 0u;
+        store->ct_fence_cut_position = 0u;
+        store->ct_transfer_id[0] = '\0';
+        store->ct_target_id[0] = '\0';
+        ok = ct_state_write(store);
+        if (!ok) {
+            store->ct_fence_state = 1u;
+            memcpy(store->ct_moved_slots, prior, sizeof(prior));
+            store->ct_fence_first = prior_first;
+            store->ct_fence_last = prior_last;
+            store->ct_fence_cut_position = prior_cut;
+            memcpy(store->ct_transfer_id, prior_id, sizeof(prior_id));
+            memcpy(store->ct_target_id, prior_target, sizeof(prior_target));
+        }
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+static bool ct_proof_mac(qihse_kv_store_t* store,
+                         const qihse_kv_ct_proof_t* proof,
+                         unsigned char out[32]) {
+    unsigned int len = 0u;
+    return HMAC(EVP_sha256(), store->ct_owner_token,
+                (int)sizeof(store->ct_owner_token),
+                (const unsigned char*)proof,
+                offsetof(qihse_kv_ct_proof_t, mac), out, &len) != NULL &&
+           len == 32u;
+}
+
+static bool ct_proof_data_context_valid(const qihse_kv_ct_proof_t* proof,
+                                        qihse_user_t* data_principal) {
+    if (!proof) return false;
+    if (proof->kind == 1u) return data_principal == NULL;
+    return data_principal && proof->data_principal == data_principal &&
+        qihse_auth_validate_handle_generation(data_principal,
+                                              proof->data_generation) &&
+        proof->data_principal_id == qihse_user_get_id(data_principal) &&
+        proof->data_tenant_id == qihse_user_get_tenant_id(data_principal) &&
+        proof->data_classification == qihse_user_get_classification(data_principal) &&
+        proof->data_sci == qihse_user_get_sci(data_principal);
+}
+
+static bool ct_range_proof_state_locked(qihse_kv_store_t* store,
+    uint32_t kind, const char* transfer_id, const char* source_id,
+    const char* target_id, const char* generation, uint16_t first_slot,
+    uint16_t last_slot, uint64_t source_lsn, uint64_t target_lsn) {
+    if (!store->ct_enabled || store->recovery_pending ||
+        store->ct_fence_state != 1u ||
+        strcmp(store->ct_transfer_id, transfer_id) != 0 ||
+        store->ct_fence_first != first_slot ||
+        store->ct_fence_last != last_slot) return false;
+    if (kind == 2u)
+        return store->ct_mode == 1u && store->ct_baseline_sealed &&
+            strcmp(store->ct_source_id, source_id) == 0 &&
+            strcmp(store->ct_target_id, target_id) == 0 &&
+            strcmp(store->ct_generation, generation) == 0 &&
+            store->ct_fence_cut_position == source_lsn &&
+            store->ct_ack_lsn >= source_lsn && target_lsn == 0u;
+    if (kind == 3u && store->ct_mode == 2u)
+        return store->ct_baseline_sealed &&
+            strcmp(store->ct_source_id, source_id) == 0 &&
+            strcmp(store->ct_target_id, target_id) == 0 &&
+            strcmp(store->ct_generation, generation) == 0 &&
+            store->ct_fence_cut_position >= source_lsn &&
+            store->ct_durable_lsn >= source_lsn &&
+            store->ct_durable_lsn == target_lsn;
+    if (kind == 3u)
+        return store->ct_mode == 1u && store->ct_baseline_sealed &&
+            store->ct_transfer_phase == 2u &&
+            strcmp(store->ct_transfer_source_id, source_id) == 0 &&
+            strcmp(store->ct_source_id, target_id) == 0 &&
+            strcmp(store->ct_transfer_source_generation, generation) == 0 &&
+            store->ct_transfer_source_cut == source_lsn &&
+            store->ct_transfer_target_position == target_lsn &&
+            store->ct_ack_lsn >= target_lsn;
+    return false;
+}
+
+static bool ct_proof_valid_locked(qihse_kv_store_t* store,
+                                  const qihse_kv_ct_proof_t* proof) {
+    if (!store || !proof || !store->ct_enabled || store->recovery_pending ||
+        proof->store_instance_id != store->instance_id) return false;
+    unsigned char mac[32];
+    if (!ct_proof_mac(store, proof, mac)) return false;
+    unsigned mismatch = 0u;
+    for (size_t i = 0; i < sizeof(mac); i++) mismatch |= mac[i] ^ proof->mac[i];
+    if (mismatch) return false;
+    if (!ct_proof_data_context_valid(proof, proof->data_principal)) return false;
+    if (proof->kind == 1u)
+        return store->ct_mode == 2u && store->ct_baseline_sealed &&
+            strcmp(store->ct_source_id, proof->source_id) == 0 &&
+            strcmp(store->ct_target_id, proof->target_id) == 0 &&
+            strcmp(store->ct_generation, proof->generation) == 0 &&
+            store->ct_durable_lsn >= proof->source_lsn &&
+            proof->target_lsn == store->ct_durable_lsn &&
+            memcmp(proof->checksum, store->ct_baseline_digest, 32u) == 0;
+    if (proof->kind == 2u || proof->kind == 3u)
+        return ct_range_proof_state_locked(store, proof->kind,
+            proof->transfer_id, proof->source_id, proof->target_id,
+            proof->generation, proof->first_slot, proof->last_slot,
+            proof->source_lsn, proof->target_lsn);
+    return false;
+}
+
+qihse_kv_ct_proof_t* qihse_kv_ct_promotion_proof_create(
+    qihse_kv_store_t* store, qihse_user_t* principal, const char* source_id,
+    const char* target_id, const char* generation, uint64_t handoff_lsn) {
+    if (!store || !ct_admin(principal) || !source_id || !target_id ||
+        !generation) return NULL;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 2u &&
+        store->ct_baseline_sealed && !store->recovery_pending &&
+        strcmp(store->ct_source_id, source_id) == 0 &&
+        strcmp(store->ct_target_id, target_id) == 0 &&
+        strcmp(store->ct_generation, generation) == 0 &&
+        store->ct_durable_lsn >= handoff_lsn;
+    qihse_kv_ct_proof_t* proof = ok ? calloc(1u, sizeof(*proof)) : NULL;
+    if (proof) {
+        proof->kind = 1u;
+        proof->store_instance_id = store->instance_id;
+        snprintf(proof->source_id, sizeof(proof->source_id), "%s", source_id);
+        snprintf(proof->target_id, sizeof(proof->target_id), "%s", target_id);
+        snprintf(proof->generation, sizeof(proof->generation), "%s", generation);
+        proof->source_lsn = handoff_lsn;
+        proof->target_lsn = store->ct_durable_lsn;
+        memcpy(proof->checksum, store->ct_baseline_digest, 32u);
+        if (!ct_proof_mac(store, proof, proof->mac)) {
+            free(proof); proof = NULL;
+        }
+    }
+    kv_store_unlock(store);
+    return proof;
+}
+
+/* A local proof binds the durable fence, the actual canonical range image,
+ * and the exact ACKed target stream position. */
+static qihse_kv_ct_proof_t* ct_range_proof_create(
+    qihse_kv_store_t* store, qihse_user_t* principal,
+    qihse_user_t* data_principal, uint32_t kind,
+    const char* transfer_id, const char* source_id, const char* target_id,
+    const char* generation, uint16_t first_slot, uint16_t last_slot,
+    uint64_t source_lsn) {
+    if (!store || !ct_admin(principal) || !data_principal ||
+        !qihse_auth_user_is_active(data_principal) ||
+        !ct_id_valid(transfer_id) ||
+        !ct_id_valid(source_id) || !ct_id_valid(target_id) ||
+        !ct_id_valid(generation) || first_slot > last_slot ||
+        last_slot >= QIHSE_CLUSTER_SLOT_COUNT) return NULL;
+    uint32_t data_id = qihse_user_get_id(data_principal);
+    uint32_t data_tenant = qihse_user_get_tenant_id(data_principal);
+    uint16_t data_class = qihse_user_get_classification(data_principal);
+    uint16_t data_sci = qihse_user_get_sci(data_principal);
+    uint64_t data_generation = 0u;
+    qihse_user_t* borrowed = qihse_auth_borrow_principal_scoped(
+        data_id, &data_generation);
+    if (borrowed != data_principal || data_generation == 0u) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return NULL;
+    }
+    kv_store_rdlock(store);
+    bool source = kind == 2u;
+    uint64_t target_lsn = source ? 0u :
+        (store->ct_mode == 2u ? store->ct_durable_lsn :
+         store->ct_transfer_target_position);
+    bool ok = ct_range_proof_state_locked(store, kind, transfer_id,
+        source_id, target_id, generation, first_slot, last_slot,
+        source_lsn, target_lsn);
+    kv_store_unlock(store);
+    if (!ok) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return NULL;
+    }
+    unsigned char digest[32];
+    if (!ct_range_digest(store, data_principal, first_slot, last_slot, digest) ||
+        !qihse_auth_user_is_active(data_principal) ||
+        qihse_user_get_id(data_principal) != data_id ||
+        qihse_user_get_tenant_id(data_principal) != data_tenant ||
+        qihse_user_get_classification(data_principal) != data_class ||
+        qihse_user_get_sci(data_principal) != data_sci ||
+        !qihse_auth_validate_handle_generation(data_principal,
+                                               data_generation)) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return NULL;
+    }
+    kv_store_rdlock(store);
+    if (kind == 3u && store->ct_mode == 1u &&
+        memcmp(digest, store->ct_transfer_range_digest, 32u) != 0) {
+        kv_store_unlock(store);
+        qihse_auth_release_principal_scoped(borrowed);
+        return NULL;
+    }
+    ok = ct_range_proof_state_locked(store, kind, transfer_id,
+        source_id, target_id, generation, first_slot, last_slot,
+        source_lsn, target_lsn);
+    qihse_kv_ct_proof_t* proof = ok ? calloc(1u, sizeof(*proof)) : NULL;
+    if (proof) {
+        proof->kind = kind;
+        proof->store_instance_id = store->instance_id;
+        proof->data_principal = borrowed;
+        proof->data_generation = data_generation;
+        proof->data_principal_id = data_id;
+        proof->data_tenant_id = data_tenant;
+        proof->data_classification = data_class;
+        proof->data_sci = data_sci;
+        snprintf(proof->transfer_id, sizeof(proof->transfer_id), "%s", transfer_id);
+        snprintf(proof->source_id, sizeof(proof->source_id), "%s", source_id);
+        snprintf(proof->target_id, sizeof(proof->target_id), "%s", target_id);
+        snprintf(proof->generation, sizeof(proof->generation), "%s", generation);
+        proof->first_slot = first_slot;
+        proof->last_slot = last_slot;
+        proof->source_lsn = source_lsn;
+        proof->target_lsn = target_lsn;
+        memcpy(proof->checksum, digest, 32u);
+        if (!ct_proof_mac(store, proof, proof->mac)) {
+            free(proof); proof = NULL;
+        } else {
+            borrowed = NULL; /* proof owns the scoped handle */
+        }
+    }
+    kv_store_unlock(store);
+    qihse_auth_release_principal_scoped(borrowed);
+    return proof;
+}
+
+qihse_kv_ct_proof_t* qihse_kv_ct_target_seal_create(
+    qihse_kv_store_t* store, qihse_user_t* principal,
+    qihse_user_t* data_principal, const char* transfer_id,
+    const char* source_id, const char* target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn) {
+    return ct_range_proof_create(store, principal, data_principal, 3u,
+                                 transfer_id, source_id,
+                                 target_id, generation, first_slot, last_slot,
+                                 source_lsn);
+}
+
+qihse_kv_ct_proof_t* qihse_kv_ct_source_transfer_proof_create(
+    qihse_kv_store_t* store, qihse_user_t* principal,
+    qihse_user_t* data_principal, const char* transfer_id,
+    const char* source_id, const char* target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn) {
+    return ct_range_proof_create(store, principal, data_principal, 2u,
+                                 transfer_id, source_id,
+                                 target_id, generation, first_slot, last_slot,
+                                 source_lsn);
+}
+
+bool qihse_kv_ct_proof_validate(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_proof_t* proof) {
+    if (!store || !ct_admin(principal) || !proof) return false;
+    kv_store_rdlock(store);
+    bool ok = ct_proof_data_context_valid(proof, data_principal) &&
+        ct_proof_valid_locked(store, proof);
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_source_fence_commit(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_proof_t* source_proof,
+    const qihse_kv_ct_target_receipt_claim_t* target_claim,
+    qihse_kv_ct_receipt_verify_fn verify_receipt, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(principal) || !target_claim || !verify_receipt ||
+        !owner_token) return false;
+    qihse_kv_ct_target_receipt_claim_t claim = *target_claim;
+    if (!ct_id_valid(claim.transfer_id) || !ct_id_valid(claim.source_id) ||
+        !ct_id_valid(claim.target_id) || !ct_id_valid(claim.generation) ||
+        claim.first_slot > claim.last_slot ||
+        claim.last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
+        !verify_receipt(&claim, verify_context)) return false;
+    kv_store_wrlock(store);
+    bool ok = ct_token_matches(store, owner_token) &&
+        !store->recovery_pending && store->ct_mode == 1u &&
+        strcmp(store->ct_source_id, claim.source_id) == 0 &&
+        strcmp(store->ct_target_id, claim.target_id) == 0 &&
+        strcmp(store->ct_generation, claim.generation) == 0 &&
+        strcmp(store->ct_transfer_id, claim.transfer_id) == 0 &&
+        store->ct_fence_first == claim.first_slot &&
+        store->ct_fence_last == claim.last_slot &&
+        store->ct_fence_cut_position == claim.source_cut;
+    if (ok && store->ct_fence_state == 2u) {
+        ok = memcmp(store->ct_transfer_image_digest,
+                    claim.range_checksum, 32u) == 0 &&
+             store->ct_transfer_target_position == claim.target_durable_cursor;
+        kv_store_unlock(store);
+        return ok;
+    }
+    ok = ok && store->ct_fence_state == 1u && source_proof &&
+        source_proof->kind == 2u && ct_proof_valid_locked(store, source_proof) &&
+        strcmp(source_proof->transfer_id, claim.transfer_id) == 0 &&
+        source_proof->first_slot == claim.first_slot &&
+        source_proof->last_slot == claim.last_slot &&
+        source_proof->source_lsn == claim.source_cut &&
+        memcmp(source_proof->checksum, claim.range_checksum, 32u) == 0;
+    if (ok) {
+        unsigned char prior_slots[sizeof(store->ct_moved_slots)];
+        memcpy(prior_slots, store->ct_moved_slots, sizeof(prior_slots));
+        store->ct_fence_state = 2u;
+        for (uint32_t slot = claim.first_slot; slot <= claim.last_slot; slot++)
+            store->ct_moved_slots[slot / 8u] |= (unsigned char)(1u << (slot % 8u));
+        memcpy(store->ct_transfer_image_digest, claim.range_checksum, 32u);
+        store->ct_transfer_target_position = claim.target_durable_cursor;
+        ok = ct_state_write(store);
+        if (!ok) {
+            store->ct_fence_state = 1u;
+            memcpy(store->ct_moved_slots, prior_slots, sizeof(prior_slots));
+            memset(store->ct_transfer_image_digest, 0, 32u);
+            store->ct_transfer_target_position = 0u;
+        }
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_target_activate(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_proof_t* target_seal,
+    const qihse_kv_ct_target_receipt_claim_t* source_commit_claim,
+    qihse_kv_ct_receipt_verify_fn verify_source_commit, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(principal) || !source_commit_claim ||
+        !verify_source_commit || !owner_token) return false;
+    qihse_kv_ct_target_receipt_claim_t claim = *source_commit_claim;
+    if (!ct_id_valid(claim.transfer_id) || !ct_id_valid(claim.source_id) ||
+        !ct_id_valid(claim.target_id) || !ct_id_valid(claim.generation) ||
+        claim.first_slot > claim.last_slot ||
+        claim.last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
+        !verify_source_commit(&claim, verify_context)) return false;
+    kv_store_wrlock(store);
+    bool ok = ct_token_matches(store, owner_token) &&
+        !store->recovery_pending && store->ct_mode == 1u &&
+        strcmp(store->ct_transfer_id, claim.transfer_id) == 0 &&
+        strcmp(store->ct_transfer_source_id, claim.source_id) == 0 &&
+        strcmp(store->ct_source_id, claim.target_id) == 0 &&
+        strcmp(store->ct_transfer_source_generation, claim.generation) == 0 &&
+        store->ct_fence_first == claim.first_slot &&
+        store->ct_fence_last == claim.last_slot &&
+        store->ct_transfer_source_cut == claim.source_cut &&
+        store->ct_transfer_target_position == claim.target_durable_cursor &&
+        (store->ct_fence_state != 3u ||
+         memcmp(store->ct_transfer_range_digest,
+                claim.range_checksum, 32u) == 0);
+    if (ok && store->ct_fence_state == 3u) {
+        kv_store_unlock(store);
+        return true;
+    }
+    ok = ok && store->ct_fence_state == 1u &&
+        store->ct_transfer_phase == 2u &&
+        store->ct_ack_lsn >= store->ct_transfer_target_position &&
+        target_seal && target_seal->kind == 3u &&
+        ct_proof_valid_locked(store, target_seal) &&
+        memcmp(target_seal->checksum, claim.range_checksum, 32u) == 0;
+    if (ok) {
+        unsigned char prior_slots[sizeof(store->ct_moved_slots)];
+        memcpy(prior_slots, store->ct_moved_slots, sizeof(prior_slots));
+        store->ct_fence_state = 3u;
+        store->ct_transfer_phase = 0u;
+        for (uint32_t slot = claim.first_slot; slot <= claim.last_slot; slot++)
+            store->ct_moved_slots[slot / 8u] &=
+                (unsigned char)~(1u << (slot % 8u));
+        ok = ct_state_write(store);
+        if (!ok) {
+            store->ct_fence_state = 1u;
+            store->ct_transfer_phase = 2u;
+            memcpy(store->ct_moved_slots, prior_slots,
+                   sizeof(prior_slots));
+        }
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_proof_fields(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_proof_t* proof,
+    const char** out_transfer_id, const char** out_source_id,
+    const char** out_target_id, const char** out_generation,
+    uint16_t* out_first_slot, uint16_t* out_last_slot,
+    uint64_t* out_source_lsn, uint64_t* out_target_lsn,
+    unsigned char out_checksum[32]) {
+    if (!store || !ct_admin(principal) || !proof) return false;
+    kv_store_rdlock(store);
+    bool valid = ct_proof_data_context_valid(proof, data_principal) &&
+        ct_proof_valid_locked(store, proof);
+    if (!valid) { kv_store_unlock(store); return false; }
+    if (out_transfer_id) *out_transfer_id = proof->transfer_id;
+    if (out_source_id) *out_source_id = proof->source_id;
+    if (out_target_id) *out_target_id = proof->target_id;
+    if (out_generation) *out_generation = proof->generation;
+    if (out_first_slot) *out_first_slot = proof->first_slot;
+    if (out_last_slot) *out_last_slot = proof->last_slot;
+    if (out_source_lsn) *out_source_lsn = proof->source_lsn;
+    if (out_target_lsn) *out_target_lsn = proof->target_lsn;
+    if (out_checksum) memcpy(out_checksum, proof->checksum, 32u);
+    kv_store_unlock(store);
+    return true;
+}
+
+void qihse_kv_ct_proof_destroy(qihse_kv_ct_proof_t* proof) {
+    if (!proof) return;
+    qihse_auth_release_principal_scoped(proof->data_principal);
+    memset(proof, 0, sizeof(*proof));
+    free(proof);
+}
+
+bool qihse_kv_ct_receiver_promote(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_proof_t* proof,
+    const char* new_generation, const char* new_successor_id,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(principal) || !ct_id_valid(new_generation) ||
+        !ct_id_valid(new_successor_id)) return false;
+    kv_store_wrlock(store);
+    bool ok = ct_token_matches(store, owner_token) &&
+        ct_proof_valid_locked(store, proof) && proof->kind == 1u &&
+        strcmp(store->ct_generation, new_generation) != 0 &&
+        store->ct_fence_state == 0u && kv_sync_store_locked(store) &&
+        rotate_wal_empty(store) && fsync_dir_path(get_qihse_data_dir());
+    if (ok) {
+        store->ct_mode = 1u;
+        store->ct_admitted = false;
+        snprintf(store->ct_source_id, sizeof(store->ct_source_id), "%s",
+                 proof->target_id);
+        snprintf(store->ct_successor_id, sizeof(store->ct_successor_id), "%s",
+                 new_successor_id);
+        store->ct_target_id[0] = '\0';
+        snprintf(store->ct_generation, sizeof(store->ct_generation), "%s",
+                 new_generation);
+        store->ct_baseline_lsn = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
+        store->ct_baseline_sealed = false;
+        memset(store->ct_baseline_digest, 0, 32u);
+        store->ct_durable_lsn = 0u;
+        store->ct_ack_lsn = 0u;
+        store->ct_retained_bytes = 0u;
+        store->ct_limit_bytes = 512u * 1024u * 1024u;
+        memset(store->ct_last_group_digest, 0, 32u);
+        ok = ct_state_write(store);
+        if (!ok) store->recovery_pending = true;
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
 void qihse_kv_store_destroy(qihse_kv_store_t* store) {
     if (!store) return;
     if (store->qdd_ctx) qihse_qdd_free(__atomic_load_n(&store->qdd_ctx, __ATOMIC_ACQUIRE));
     if (store->wal_fd) { flush_wal_buffer(store); fclose(store->wal_fd); }
     sst_fd_cache_clear(store);
     pthread_mutex_destroy(&store->sst_fd_lock);
+    pthread_cond_destroy(&store->ct_ack_changed);
+    pthread_mutex_destroy(&store->ct_ack_lock);
     pthread_rwlock_destroy(&store->store_lock);
     if (store->trie) qihse_trinary_trie_destroy(store->trie);
     sst_meta_index_destroy(store->sst_meta);
@@ -2304,7 +4532,7 @@ const char* qihse_kv_store_data_directory(qihse_kv_store_t* store) {
 void qihse_kv_bulk_load_begin(qihse_kv_store_t* store) {
     if (!store || store->memory_snapshot) return;
     kv_store_wrlock(store);
-    if (!store->recovery_pending) store->bulk_load_mode = true;
+    if (!store->recovery_pending && !store->ct_enabled) store->bulk_load_mode = true;
     kv_store_unlock(store);
 }
 void qihse_kv_bulk_load_end(qihse_kv_store_t* store) {
@@ -2340,6 +4568,8 @@ static bool set_user_preflight(qihse_kv_store_t* store, const char* key, const c
                                 qihse_user_t* user) {
     if (!store || !store->trie || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
         !key || !value || key[0] == '\0') return false;
+    if (store->ct_enabled && (store->ct_mode != 1u ||
+        !ct_write_allowed(store, user, key))) return false;
     if (strlen(key) > KV_MAX_KEY_LEN || strlen(value) > KV_MAX_VALUE_LEN) return false;
     if (!qihse_auth_can_access(user, classification, sci_compartment)) return false;
     /* Determine whether the key already exists, and at what classification, so
@@ -2372,6 +4602,9 @@ static bool set_user_preflight(qihse_kv_store_t* store, const char* key, const c
         }
         lookup_result_free(&existing);
     }
+    if (key_exists && store->ct_enabled &&
+        (classification < ex_class ||
+         (sci_compartment & ex_comp) != ex_comp)) return false;
     return !key_exists || qihse_auth_can_access(user, ex_class, ex_comp);
 }
 
@@ -2381,15 +4614,28 @@ static bool set_user_with_expiry(qihse_kv_store_t* store, const char* key, const
                                  uint64_t* out_change_seq) {
     if (out_change_seq) *out_change_seq = 0u;
     if (!set_user_preflight(store, key, value, classification, sci_compartment, user)) return false;
+    if (store->ct_enabled &&
+        !ct_source_record(store, user, key, value, 1u, expire_time_ms,
+                          classification, sci_compartment, false, true,
+                          QIHSE_KV_CT_ACTOR_USER)) return false;
     /* Authorized mutation: issue the change sequence BEFORE any side effect,
      * so a failure after this point at worst skips a number (monotonicity is
      * what matters, not density) and no unauthorized mutation ever advances
      * or receives one. */
     uint64_t seq = kv_change_seq_next(store);
     if (seq == 0u) return false;
-    if (!wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms,
-                    classification, sci_compartment, 0u, seq)) return false;
-    if (!insert_internal(store, key, value, expire_time_ms, classification, sci_compartment, 0u, seq)) return false;
+    bool logged = store->ct_enabled
+        ? ct_source_record(store, user, key, value, seq, expire_time_ms,
+                           classification, sci_compartment, false, false,
+                           QIHSE_KV_CT_ACTOR_USER)
+        : wal_append(store, KV_WAL_OP_SET, key, value, expire_time_ms,
+                     classification, sci_compartment, 0u, seq);
+    if (!logged) return false;
+    if (!insert_internal(store, key, value, expire_time_ms, classification,
+                         sci_compartment, 0u, seq)) {
+        if (store->ct_enabled) store->recovery_pending = true;
+        return false;
+    }
     if (!store->bulk_load_mode && !store->durable_batch_mode &&
         store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
     if (out_change_seq) *out_change_seq = seq;
@@ -2431,6 +4677,65 @@ bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store,
     qsort(keys, count, sizeof(*keys), batch_key_compare);
     for (size_t i = 1u; i < count; i++) {
         if (strcmp(keys[i - 1u], keys[i]) == 0) goto done;
+    }
+
+    if (store->ct_enabled) {
+        if (store->ct_mode != 1u || !store->ct_admitted ||
+            store->ct_durable_lsn == UINT64_MAX) goto done;
+        qihse_kv_ct_record_t* rows = calloc(count, sizeof(*rows));
+        if (!rows) goto done;
+        qihse_kv_ct_group_t group = {0};
+        snprintf(group.source_id, sizeof(group.source_id), "%s", store->ct_source_id);
+        snprintf(group.generation, sizeof(group.generation), "%s", store->ct_generation);
+        group.stream_position = store->ct_durable_lsn + 1u;
+        group.records = rows;
+        group.count = count;
+        uint32_t actor_tenant = qihse_user_get_tenant_id(user);
+        for (size_t i = 0u; i < count; i++) {
+            const qihse_kv_batch_set_record_t* r = &records[i];
+            uint32_t resource_tenant = 0u;
+            if (!ct_resource_tenant(r->key, actor_tenant, &resource_tenant)) goto ct_batch_done;
+            rows[i] = (qihse_kv_ct_record_t){
+                .key = (char*)r->key, .value = (char*)r->value,
+                .change_seq = 1u, .expire_time_ms = r->expire_time_ms,
+                .actor_id = qihse_user_get_id(user),
+                .actor_tenant_id = actor_tenant,
+                .resource_tenant_id = resource_tenant,
+                .classification = r->classification,
+                .sci_compartment = r->sci_compartment,
+                .actor_kind = QIHSE_KV_CT_ACTOR_USER
+            };
+        }
+        group.first_seq = group.last_seq = 1u;
+        size_t frame_bytes = 0u;
+        if (!ct_admin(store->ct_system_principal) ||
+            !qihse_ct_codec_encoded_size(store->ct_system_principal,
+                                         QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 1u,
+                                         &group, (size_t)store->ct_limit_bytes,
+                                         &frame_bytes) ||
+            frame_bytes > store->ct_limit_bytes ||
+            store->ct_retained_bytes > store->ct_limit_bytes - frame_bytes) goto ct_batch_done;
+        for (size_t i = 0u; i < count; i++) {
+            rows[i].change_seq = kv_change_seq_next(store);
+            if (!rows[i].change_seq) goto ct_batch_done;
+        }
+        group.first_seq = rows[0].change_seq;
+        group.last_seq = rows[count - 1u].change_seq;
+        if (!ct_append_group_locked(store, user, &group)) goto ct_batch_done;
+        for (size_t i = 0u; i < count; i++) {
+            const qihse_kv_batch_set_record_t* r = &records[i];
+            if (!insert_internal(store, r->key, r->value, r->expire_time_ms,
+                                 r->classification, r->sci_compartment, 0u,
+                                 rows[i].change_seq)) {
+                store->recovery_pending = true;
+                goto ct_batch_done;
+            }
+        }
+        ct_scope_note_seq(store, group.stream_position);
+        ok = true;
+ct_batch_done:
+        free(rows);
+        goto done;
     }
 
     store->durable_batch_mode = true;
@@ -2536,7 +4841,7 @@ static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_us
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store) return NULL;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return NULL; }
     char* value = kv_get_user_impl(store, key, user);
     kv_store_unlock(store);
     return value;
@@ -2546,7 +4851,7 @@ bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
                         qihse_user_t* user, qihse_kv_record_meta_t* out) {
     if (!store || !key || !out) return false;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return false; }
     memset(out, 0, sizeof(*out));
     /* Same lookup and same authorization gate as the value path; the value
      * is materialized by the lookup and freed here without ever leaving
@@ -2574,7 +4879,7 @@ bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
     if (out_tombstone) *out_tombstone = false;
     if (!store || !key || !out_change_seq || !out_tombstone) return false;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return false; }
     kv_lookup_result_t r;
     kv_lookup_state_t state = logical_lookup(store, key, &r);
     bool tombstone = state == KV_LOOKUP_DEAD && (r.flags & KV_FLAG_TOMBSTONE) != 0u;
@@ -2589,10 +4894,34 @@ bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
     return ok;
 }
 
+bool qihse_kv_change_meta_user(qihse_kv_store_t* store, const char* key,
+                               qihse_user_t* user, qihse_kv_change_meta_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!store || !key || !out || !user || !qihse_auth_user_is_active(user))
+        return false;
+    kv_store_rdlock(store);
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return false; }
+    kv_lookup_result_t r;
+    kv_lookup_state_t state = logical_lookup(store, key, &r);
+    bool tombstone = state == KV_LOOKUP_DEAD && (r.flags & KV_FLAG_TOMBSTONE) != 0u;
+    bool ok = (state == KV_LOOKUP_LIVE || tombstone) &&
+              qihse_auth_user_is_active(user) &&
+              qihse_auth_can_access(user, r.classification, r.sci_compartment);
+    if (ok) {
+        out->classification = r.classification;
+        out->sci_compartment = r.sci_compartment;
+        out->change_seq = r.change_seq;
+        out->tombstone = tombstone;
+    }
+    lookup_result_free(&r);
+    kv_store_unlock(store);
+    return ok;
+}
+
 bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store) return false;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return false; }
     char* v = kv_get_user_impl(store, key, user);
     kv_store_unlock(store);
     if (!v) return false;
@@ -2604,17 +4933,32 @@ static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
                              qihse_user_t* user, uint64_t* out_change_seq) {
     if (out_change_seq) *out_change_seq = 0u;
     if (!store || !key) return false;
+    if (store->ct_enabled && (store->ct_mode != 1u ||
+        !ct_write_allowed(store, user, key))) return false;
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE) { lookup_result_free(&r); return false; }
     if (!qihse_auth_can_access(user, r.classification, r.sci_compartment)) { lookup_result_free(&r); return false; }
     uint16_t classification = r.classification, sci = r.sci_compartment; lookup_result_free(&r);
+    if (store->ct_enabled &&
+        !ct_source_record(store, user, key, NULL, 1u, 0u,
+                          classification, sci, true, true,
+                          QIHSE_KV_CT_ACTOR_USER)) return false;
     /* Authorized delete: the tombstone is stamped like any mutation, so a
      * delta can carry the deletion. */
     uint64_t seq = kv_change_seq_next(store);
     if (seq == 0u) return false;
-    if (!wal_append(store, KV_WAL_OP_DEL, key, "", 0u, classification, sci,
-                    KV_FLAG_TOMBSTONE, seq)) return false;
-    if (!insert_internal(store, key, "", 0u, classification, sci, KV_FLAG_TOMBSTONE, seq)) return false;
+    bool logged = store->ct_enabled
+        ? ct_source_record(store, user, key, NULL, seq, 0u,
+                           classification, sci, true, false,
+                           QIHSE_KV_CT_ACTOR_USER)
+        : wal_append(store, KV_WAL_OP_DEL, key, "", 0u, classification, sci,
+                     KV_FLAG_TOMBSTONE, seq);
+    if (!logged) return false;
+    if (!insert_internal(store, key, "", 0u, classification, sci,
+                         KV_FLAG_TOMBSTONE, seq)) {
+        if (store->ct_enabled) store->recovery_pending = true;
+        return false;
+    }
     if (!store->bulk_load_mode && !store->durable_batch_mode &&
         store->mem_usage > LSM_MEMTABLE_MAX && !flush_memtable_to_sstable(store)) return false;
     if (out_change_seq) *out_change_seq = seq;
@@ -2631,6 +4975,153 @@ bool qihse_kv_del_user_with_seq(qihse_kv_store_t* store, const char* key,
     kv_store_wrlock(store);
     if (store->recovery_pending) { kv_store_unlock(store); return 0; }
     bool ok = kv_del_user_impl(store, key, user, out_change_seq);
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_del_with_receipt_user(qihse_kv_store_t* store,
+    const char* source_key, uint64_t expected_source_seq,
+    const char* receipt_key, const char* expected_prepared_value,
+    uint16_t receipt_classification, uint16_t receipt_sci,
+    qihse_kv_receipt_builder_t build_receipt, void* context,
+    qihse_user_t* user, uint64_t* out_delete_seq) {
+    if (out_delete_seq) *out_delete_seq = 0u;
+    if (!store || !source_key || !receipt_key || !expected_prepared_value ||
+        !build_receipt || !user || !qihse_auth_user_is_active(user) ||
+        expected_source_seq == 0u) return false;
+    size_t source_len = strnlen(source_key, KV_MAX_KEY_LEN + 1u);
+    size_t receipt_len = strnlen(receipt_key, KV_MAX_KEY_LEN + 1u);
+    if (!source_len || !receipt_len || source_len > KV_MAX_KEY_LEN ||
+        receipt_len > KV_MAX_KEY_LEN || strcmp(source_key, receipt_key) == 0)
+        return false;
+    bool ok = false, writing = false;
+    char completed[QIHSE_KV_DELETE_RECEIPT_MAX_VALUE + 1u];
+    kv_store_wrlock(store);
+    if (!store->trie || !store->wal_fd || store->memory_snapshot ||
+        store->recovery_pending || store->bulk_load_mode || store->durable_batch_mode ||
+        __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
+        !qihse_auth_user_is_active(user) ||
+        !qihse_auth_can_access(user, receipt_classification, receipt_sci) ||
+        __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED) >= UINT64_MAX - 2u)
+        goto done;
+    if (store->ct_enabled && (store->ct_mode != 1u || !store->ct_admitted ||
+        !ct_write_allowed(store, user, source_key) ||
+        !ct_write_allowed(store, user, receipt_key) ||
+        store->ct_retained_bytes > store->ct_limit_bytes ||
+        (uint64_t)source_len + receipt_len + QIHSE_KV_DELETE_RECEIPT_MAX_VALUE + 1024u >
+            store->ct_limit_bytes - store->ct_retained_bytes)) goto done;
+    kv_lookup_result_t source, prepared;
+    kv_lookup_state_t source_state = logical_lookup(store, source_key, &source);
+    kv_lookup_state_t prepared_state = logical_lookup(store, receipt_key, &prepared);
+    bool match = source_state == KV_LOOKUP_LIVE &&
+        prepared_state == KV_LOOKUP_LIVE &&
+        source.change_seq == expected_source_seq &&
+        prepared.classification == receipt_classification &&
+        prepared.sci_compartment == receipt_sci &&
+        prepared.value && strcmp(prepared.value, expected_prepared_value) == 0 &&
+        qihse_auth_can_access(user, source.classification, source.sci_compartment) &&
+        qihse_auth_can_access(user, prepared.classification, prepared.sci_compartment);
+    uint16_t source_class = source.classification, source_sci = source.sci_compartment;
+    lookup_result_free(&source); lookup_result_free(&prepared);
+    if (!match) goto done;
+    uint64_t delete_seq = kv_change_seq_next(store);
+    uint64_t receipt_seq = kv_change_seq_next(store);
+    if (!delete_seq || receipt_seq != delete_seq + 1u) goto done;
+    memset(completed, 0, sizeof completed);
+    if (!build_receipt(delete_seq, completed, sizeof completed, context) ||
+        !memchr(completed, '\0', sizeof completed)) goto done;
+    size_t value_len = strlen(completed);
+    if (!value_len || value_len > QIHSE_KV_DELETE_RECEIPT_MAX_VALUE) goto done;
+
+    if (store->ct_enabled) {
+        uint32_t actor_tenant = qihse_user_get_tenant_id(user);
+        uint32_t source_tenant = 0u, receipt_tenant = 0u;
+        if (!ct_resource_tenant(source_key, actor_tenant, &source_tenant) ||
+            !ct_resource_tenant(receipt_key, actor_tenant, &receipt_tenant)) goto done;
+        qihse_kv_ct_record_t rows[2] = {
+            { .key = (char*)source_key, .value = NULL,
+              .change_seq = delete_seq, .actor_id = qihse_user_get_id(user),
+              .actor_tenant_id = actor_tenant,
+              .resource_tenant_id = source_tenant,
+              .classification = source_class, .sci_compartment = source_sci,
+              .actor_kind = QIHSE_KV_CT_ACTOR_USER, .tombstone = true },
+            { .key = (char*)receipt_key, .value = completed,
+              .change_seq = receipt_seq, .actor_id = qihse_user_get_id(user),
+              .actor_tenant_id = actor_tenant,
+              .resource_tenant_id = receipt_tenant,
+              .classification = receipt_classification,
+              .sci_compartment = receipt_sci,
+              .actor_kind = QIHSE_KV_CT_ACTOR_USER }
+        };
+        qihse_kv_ct_group_t group = {0};
+        snprintf(group.source_id, sizeof(group.source_id), "%s", store->ct_source_id);
+        snprintf(group.generation, sizeof(group.generation), "%s", store->ct_generation);
+        group.stream_position = store->ct_durable_lsn + 1u;
+        group.first_seq = delete_seq;
+        group.last_seq = receipt_seq;
+        group.records = rows;
+        group.count = 2u;
+        writing = true;
+        if (!ct_append_group_locked(store, user, &group)) goto failed;
+        if (!insert_internal(store, source_key, "", 0u, source_class,
+                             source_sci, KV_FLAG_TOMBSTONE, delete_seq) ||
+            !insert_internal(store, receipt_key, completed, 0u,
+                             receipt_classification, receipt_sci, 0u, receipt_seq))
+            goto failed;
+        ct_scope_note_seq(store, group.stream_position);
+        if (out_delete_seq) *out_delete_seq = delete_seq;
+        ok = true;
+        goto done;
+    }
+
+    unsigned char hdr[48] = {0};
+    uint16_t source_len16 = (uint16_t)source_len, receipt_len16 = (uint16_t)receipt_len;
+    uint32_t value_len32 = (uint32_t)value_len;
+    memcpy(hdr, KV_WAL_MAGIC_DELETE_RECEIPT, 4u);
+    memcpy(hdr + 4u, &source_len16, 2u); memcpy(hdr + 6u, &receipt_len16, 2u);
+    memcpy(hdr + 8u, &value_len32, 4u);
+    memcpy(hdr + 12u, &source_class, 2u); memcpy(hdr + 14u, &source_sci, 2u);
+    memcpy(hdr + 16u, &receipt_classification, 2u); memcpy(hdr + 18u, &receipt_sci, 2u);
+    memcpy(hdr + 20u, &delete_seq, 8u); memcpy(hdr + 28u, &receipt_seq, 8u);
+    uint64_t crc = wal_delete_receipt_crc(hdr, source_key, source_len, receipt_key,
+                                           receipt_len, completed, value_len);
+    memcpy(hdr + 36u, &crc, 8u);
+    writing = true;
+    if (aimem_durability_test_fail_once("forget-pair-partial-header")) {
+        (void)fwrite(hdr, 1u, sizeof(hdr) / 2u, store->wal_fd);
+        goto failed;
+    }
+    if (!fwrite_exact(hdr, 1u, sizeof hdr, store->wal_fd) ||
+        !fwrite_exact(source_key, 1u, source_len, store->wal_fd) ||
+        !fwrite_exact(receipt_key, 1u, receipt_len, store->wal_fd) ||
+        aimem_durability_test_fail_once("forget-pair-partial-body") ||
+        !fwrite_exact(completed, 1u, value_len, store->wal_fd) ||
+        aimem_durability_test_fail_once("forget-pair-fflush") ||
+        fflush(store->wal_fd) != 0 ||
+        aimem_durability_test_fail_once("forget-pair-fsync") ||
+        fdatasync(fileno(store->wal_fd)) != 0 ||
+        !fsync_dir_path(get_qihse_data_dir())) goto failed;
+    store->wal_unflushed_bytes = 0u;
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+    if (getenv("QIHSE_AIMEM_CRASH_AT") &&
+        strcmp(getenv("QIHSE_AIMEM_CRASH_AT"), "forget-pair-after-fsync") == 0)
+        _exit(86);
+#endif
+    store->durable_batch_mode = true;
+    if (!insert_internal(store, source_key, "", 0u, source_class, source_sci,
+                         KV_FLAG_TOMBSTONE, delete_seq) ||
+        !insert_internal(store, receipt_key, completed, 0u, receipt_classification,
+                         receipt_sci, 0u, receipt_seq)) {
+        store->durable_batch_mode = false;
+        goto failed;
+    }
+    store->durable_batch_mode = false;
+    if (out_delete_seq) *out_delete_seq = delete_seq;
+    ok = true;
+    goto done;
+failed:
+    if (writing) __atomic_store_n(&store->recovery_pending, true, __ATOMIC_RELEASE);
+done:
     kv_store_unlock(store);
     return ok;
 }
@@ -2698,6 +5189,7 @@ bool qihse_kv_apply_replica_record(qihse_kv_store_t* store,
         return false;
 
     kv_store_wrlock(store);
+    if (store->ct_enabled) { kv_store_unlock(store); errno = EACCES; return false; }
     if (store->recovery_pending) { kv_store_unlock(store); return 0; }
     kv_lookup_result_t current;
     kv_lookup_state_t state = logical_lookup(store, record->key, &current);
@@ -2772,7 +5264,7 @@ bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, 
 int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store || !key) return -2;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return -2; }
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return -2; }
     kv_lookup_result_t r; kv_lookup_state_t state = logical_lookup(store, key, &r);
     if (state != KV_LOOKUP_LIVE || !qihse_auth_can_access(user, r.classification, r.sci_compartment)) {
         lookup_result_free(&r); kv_store_unlock(store); return -2;
@@ -2804,10 +5296,35 @@ static bool collect_expired_cb(const char* key, void* value, size_t value_size, 
 
 static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t count) {
     for (size_t i = 0; i < count; i++) {
+        if (!ct_key_owned_for_read(store, keys[i])) continue;
         size_t sz = 0u;
         kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, keys[i], &sz);
         if (p) {
             uint16_t c = p->classification, s = p->sci_compartment;
+            if (store->ct_enabled) {
+                if (store->ct_mode != 1u || !store->ct_admitted ||
+                    !store->ct_system_principal ||
+                    !qihse_auth_can_access(store->ct_system_principal, c, s)) {
+                    store->recovery_pending = true;
+                    return;
+                }
+                if (!ct_source_record(store, store->ct_system_principal, keys[i],
+                                      NULL, 1u, 0u, c, s, true, true,
+                                      QIHSE_KV_CT_ACTOR_EXPIRY)) {
+                    store->recovery_pending = true;
+                    return;
+                }
+                uint64_t seq = kv_change_seq_next(store);
+                if (!seq || !ct_source_record(store, store->ct_system_principal,
+                       keys[i], NULL, seq, 0u, c, s, true, false,
+                       QIHSE_KV_CT_ACTOR_EXPIRY) ||
+                    !insert_internal(store, keys[i], "", 0u, c, s,
+                                     KV_FLAG_TOMBSTONE, seq)) {
+                    store->recovery_pending = true;
+                    return;
+                }
+                continue;
+            }
             /* A sweep tombstone is a mutation: it advances the sequence so a
              * delta consumer learns the key is gone. */
             uint64_t seq = kv_change_seq_next(store);
@@ -2845,6 +5362,12 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
     kv_store_wrlock(store);
     if (store->recovery_pending) { kv_store_unlock(store); return; }
     if (store->bulk_load_mode) { kv_store_unlock(store); return; }
+    /* Reads still treat expired values as absent. Defer the physical
+     * tombstone/compaction until the frozen CT2 image is no longer needed. */
+    if (store->ct_enabled && store->ct_fence_state == 1u) {
+        kv_store_unlock(store);
+        return;
+    }
     uint64_t now = current_time_ms();
     if (!store->sst_meta || store->sst_meta->degraded) {
         /* Index unavailable — expired SSTable records are invisible from RAM,
@@ -2890,6 +5413,7 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
 }
 
 typedef struct {
+    qihse_kv_store_t* store;
     qihse_user_t* user;
     qihse_kv_iter_cb cb;
     qihse_kv_iter_meta_cb meta_cb;
@@ -2914,6 +5438,7 @@ static bool foreach_user_deliver(foreach_user_ctx_t* ctx, const char* key,
                                  const char* value, uint16_t classification,
                                  uint16_t sci_compartment) {
     if (!ctx->ok) return false;
+    if (!ct_key_owned_for_read(ctx->store, key)) return true;
     if (ctx->meta_cb) {
         return ctx->meta_cb(key, value, classification, sci_compartment,
                             ctx->user_data);
@@ -2989,7 +5514,7 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
                                   uint16_t allowed_sci) {
     if (!store || !store->trie || (!cb && !meta_cb)) return false;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return false; }
     bool compact_needed = store->sstable_counter > 0 &&
                           (!store->sst_meta || store->sst_meta->degraded);
     kv_store_unlock(store);
@@ -2998,7 +5523,7 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
          * user callback always runs with only a read lock (it may re-enter
          * this store for another authorized read). */
         kv_store_wrlock(store);
-        if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+        if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return false; }
         bool ok = store->sstable_counter == 0 ||
                   ((store->sst_meta && !store->sst_meta->degraded) ||
                    compact_sstables_into_memtable(store));
@@ -3012,7 +5537,7 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
     /* Recheck after taking the read lock: a writer may have degraded the
      * index between the first probe and this lock. */
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return false; }
     if (store->sstable_counter > 0 && (!store->sst_meta || store->sst_meta->degraded)) {
         kv_store_unlock(store);
         return foreach_user_filtered(store, prefix, user, cb, meta_cb,
@@ -3020,7 +5545,7 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
                                      max_classification, allowed_sci);
     }
     foreach_user_ctx_t ctx = {
-        .user = user, .cb = cb, .meta_cb = meta_cb, .user_data = user_data,
+        .store = store, .user = user, .cb = cb, .meta_cb = meta_cb, .user_data = user_data,
         .prefix = prefix, .prefix_len = prefix ? strlen(prefix) : 0u,
         .now = current_time_ms(), .bounded_label = bounded_label,
         .max_classification = max_classification, .allowed_sci = allowed_sci,
@@ -3075,6 +5600,7 @@ bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
 }
 
 typedef struct {
+    qihse_kv_store_t* store;
     qihse_user_t* user;
     qihse_kv_key_iter_cb cb;
     void* user_data;
@@ -3088,6 +5614,7 @@ static bool key_iter_mem_cb(const char* key, void* value, size_t value_size,
     key_iter_ctx_t* ctx = (key_iter_ctx_t*)user_data;
     const kv_payload_t* p = (const kv_payload_t*)value;
     if (!ctx || !key || !p || payload_is_dead(p, ctx->now) ||
+        !ct_key_owned_for_read(ctx->store, key) ||
         !qihse_auth_can_access(ctx->user, p->classification,
                                p->sci_compartment)) return true;
     if (!ctx->cb(key, ctx->user_data)) {
@@ -3102,7 +5629,7 @@ bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,
     if (!store || !store->trie || !user ||
         !qihse_auth_user_is_active(user) || !cb) return false;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return false; }
     /* The index is the only source for flushed-record ACLs. If degraded, fail
      * closed instead of forcing a full value-materializing compaction. */
     if (store->sstable_counter > 0 &&
@@ -3110,14 +5637,15 @@ bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,
         kv_store_unlock(store);
         return false;
     }
-    key_iter_ctx_t ctx = { .user = user, .cb = cb, .user_data = user_data,
+    key_iter_ctx_t ctx = { .store = store, .user = user, .cb = cb, .user_data = user_data,
                            .now = current_time_ms(), .stopped = false };
     qihse_trinary_trie_foreach(store->trie, key_iter_mem_cb, &ctx);
     if (!ctx.stopped && store->sstable_counter > 0) {
         const sst_meta_index_t* idx = store->sst_meta;
         for (size_t i = 0; i < idx->cap; i++) {
             const sst_meta_entry_t* e = &idx->slots[i];
-            if (!e->key || (e->flags & KV_FLAG_TOMBSTONE) != 0u ||
+            if (!e->key || !ct_key_owned_for_read(store, e->key) ||
+                (e->flags & KV_FLAG_TOMBSTONE) != 0u ||
                 (e->expire_time_ms != 0u && e->expire_time_ms <= ctx.now) ||
                 qihse_trinary_trie_search(store->trie, e->key, NULL) != NULL ||
                 !qihse_auth_can_access(user, e->classification,
@@ -3132,23 +5660,25 @@ void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_d
     (void)qihse_kv_foreach_user(store, NULL, cb, user_data);
 }
 
-typedef struct { qihse_user_t* user; size_t count; uint64_t now; } count_ctx_t;
+typedef struct { qihse_kv_store_t* store; qihse_user_t* user;
+    size_t count; uint64_t now; } count_ctx_t;
 static bool count_cb(const char* key, void* value, size_t value_size, void* user_data) {
-    (void)key; (void)value_size; count_ctx_t* ctx = (count_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
+    (void)value_size; count_ctx_t* ctx = (count_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
     if (!ctx || !p) return false;
-    if (!payload_is_dead(p, ctx->now) && qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) ctx->count++;
+    if (!payload_is_dead(p, ctx->now) &&
+        ct_key_owned_for_read(ctx->store, key) && qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) ctx->count++;
     return true;
 }
 size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
     if (!store || !store->trie) return 0u;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return 0; }
     bool compact_needed = store->sstable_counter > 0 &&
                           (!store->sst_meta || store->sst_meta->degraded);
     kv_store_unlock(store);
     if (compact_needed) {
         kv_store_wrlock(store);
-        if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+        if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return 0; }
         bool ok = store->sstable_counter == 0 ||
                   ((store->sst_meta && !store->sst_meta->degraded) ||
                    compact_sstables_into_memtable(store));
@@ -3159,18 +5689,19 @@ size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
     /* No compaction: count live+authorized memtable keys, then live+
      * authorized index entries not shadowed by the memtable.  Pure RAM. */
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return 0; }
     if (store->sstable_counter > 0 && (!store->sst_meta || store->sst_meta->degraded)) {
         kv_store_unlock(store);
         return qihse_kv_count_user(store, user);
     }
     uint64_t now = current_time_ms();
-    count_ctx_t ctx = { .user = user, .count = 0u, .now = now };
+    count_ctx_t ctx = { .store = store, .user = user,
+                        .count = 0u, .now = now };
     qihse_trinary_trie_foreach(store->trie, count_cb, &ctx);
     const sst_meta_index_t* idx = store->sst_meta;
     for (size_t i = 0; idx && i < idx->cap; i++) {
         const sst_meta_entry_t* e = &idx->slots[i];
-        if (!e->key) continue;
+        if (!e->key || !ct_key_owned_for_read(store, e->key)) continue;
         if ((e->flags & KV_FLAG_TOMBSTONE) != 0u ||
             (e->expire_time_ms != 0u && e->expire_time_ms <= now)) continue;
         if (!qihse_auth_can_access(user, e->classification, e->sci_compartment)) continue;
@@ -3320,6 +5851,7 @@ static bool export_sst_write_cb(const char* key, const kv_disk_record_t* r, void
 
 typedef struct {
     FILE* f;
+    qihse_kv_store_t* store;
     qihse_user_t* user;
     const char* glob;
     uint64_t now;
@@ -3333,7 +5865,8 @@ static bool replica_snapshot_write_mem_cb(const char* key, void* value,
     replica_snapshot_write_ctx_t* ctx = (replica_snapshot_write_ctx_t*)ud;
     kv_payload_t* p = (kv_payload_t*)value;
     if (!ctx || !ctx->ok || !ctx->authorized || !key || !p) return false;
-    if (fnmatch(ctx->glob, key, 0) != 0 || payload_is_dead(p, ctx->now)) return true;
+    if (fnmatch(ctx->glob, key, 0) != 0 || payload_is_dead(p, ctx->now) ||
+        !ct_key_owned_for_read(ctx->store, key)) return true;
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
         ctx->authorized = false;
         return false;
@@ -3346,7 +5879,8 @@ static bool replica_snapshot_write_sst_cb(const char* key,
                                           const kv_disk_record_t* r, void* ud) {
     replica_snapshot_write_ctx_t* ctx = (replica_snapshot_write_ctx_t*)ud;
     if (!ctx || !ctx->ok || !ctx->authorized || !key || !r) return false;
-    if (fnmatch(ctx->glob, key, 0) != 0) return true;
+    if (fnmatch(ctx->glob, key, 0) != 0 ||
+        !ct_key_owned_for_read(ctx->store, key)) return true;
     if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) {
         ctx->authorized = false;
         return false;
@@ -3370,7 +5904,7 @@ static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
     char tmp[8192]; FILE* f = NULL;
     if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
     replica_snapshot_write_ctx_t ctx = {
-        .f = f, .user = user, .glob = glob, .now = current_time_ms(),
+        .f = f, .store = store, .user = user, .glob = glob, .now = current_time_ms(),
         .ok = true, .authorized = true
     };
     qihse_trinary_trie_foreach(store->trie, replica_snapshot_write_mem_cb, &ctx);
@@ -3389,6 +5923,7 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
      * !fast path compacts; taking the WRITE side unconditionally keeps the
      * snapshot internally consistent either way. */
     kv_store_wrlock(store);
+    if (store->ct_enabled) { kv_store_unlock(store); errno = EACCES; return -1; }
     if (store->recovery_pending) { kv_store_unlock(store); return -1; }
     uint64_t now = current_time_ms();
     bool fast = store->sst_meta && !store->sst_meta->degraded;
@@ -3468,20 +6003,43 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
     if (!snapshot) { close(fd); return -1; }
     snapshot->fd = fd;
     snapshot->size = (uint64_t)st.st_size;
+    snapshot->principal = user;
+    snapshot->principal_id = qihse_user_get_id(user);
+    snapshot->tenant_id = qihse_user_get_tenant_id(user);
+    snapshot->classification = qihse_user_get_classification(user);
+    snapshot->sci = qihse_user_get_sci(user);
     *out_snapshot = snapshot;
     return 0;
 }
 
-uint64_t qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot) {
-    return snapshot ? snapshot->size : 0u;
+static bool replica_snapshot_authorized(const qihse_kv_replica_snapshot_t* snapshot,
+    qihse_user_t* principal) {
+    return snapshot && principal && principal == snapshot->principal &&
+        qihse_auth_user_is_active(principal) &&
+        qihse_user_get_id(principal) == snapshot->principal_id &&
+        qihse_user_get_tenant_id(principal) == snapshot->tenant_id &&
+        qihse_auth_can_access(principal, snapshot->classification, snapshot->sci);
+}
+
+bool qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot,
+    qihse_user_t* principal, uint64_t* out_size) {
+    if (out_size) *out_size = 0u;
+    if (!out_size || !replica_snapshot_authorized(snapshot, principal)) {
+        errno = EACCES; return false;
+    }
+    *out_size = snapshot->size;
+    return true;
 }
 
 bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
-                                    uint64_t offset, void* out, size_t capacity,
+                                    qihse_user_t* principal, uint64_t offset, void* out, size_t capacity,
                                     size_t* out_read) {
     if (out_read) *out_read = 0u;
     if (!snapshot || snapshot->fd < 0 || !out_read || (capacity && !out) || offset > snapshot->size)
         return false;
+    if (!replica_snapshot_authorized(snapshot, principal)) {
+        errno = EACCES; return false;
+    }
     uint64_t remain = snapshot->size - offset;
     size_t want = remain < (uint64_t)capacity ? (size_t)remain : capacity;
     size_t done = 0u;
@@ -3490,6 +6048,11 @@ bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         done += (size_t)n;
+    }
+    if (!qihse_auth_user_is_active(principal) ||
+        !qihse_auth_can_access(principal, snapshot->classification, snapshot->sci)) {
+        if (done) memset(out, 0, done);
+        errno = EACCES; return false;
     }
     *out_read = done;
     return true;
@@ -3623,6 +6186,12 @@ static int qihse_kv_load_user_internal(qihse_kv_store_t* store, const char* file
         !build_data_path(meta_path, sizeof(meta_path), "replica-install.meta") ||
         !build_data_path(wal_path, sizeof(wal_path), "wal.log")) return -1;
     kv_store_wrlock(store);
+    if (store->ct_enabled &&
+        (store->ct_mode != 2u || store->ct_baseline_sealed ||
+         kv_ct_baseline_import_store != store ||
+         kv_ct_baseline_import_principal != user)) {
+        kv_store_unlock(store); errno = EACCES; return -1;
+    }
     if (store->recovery_pending) { kv_store_unlock(store); return -1; }
     replica_install_meta_t meta; bool present = false;
     if (!replica_install_meta_read(meta_path, &meta, &present) || present) {
@@ -3830,6 +6399,55 @@ bool qihse_kv_replica_snapshot_install(qihse_kv_store_t* store,
     return qihse_kv_load_user_internal(store, filepath, principal, &meta) == 0;
 }
 
+bool qihse_kv_ct_receiver_install_baseline(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const char* source_id, const char* generation,
+    const char* filepath, uint64_t baseline_row_seq,
+    const unsigned char expected_digest[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(principal) || !data_principal ||
+        !qihse_auth_user_is_active(data_principal) || !source_id || !generation ||
+        !filepath || !expected_digest || !owner_token) return false;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && store->ct_mode == 2u &&
+        store->replication_principal_id != 0u &&
+        qihse_user_get_id(data_principal) == store->replication_principal_id &&
+        !store->ct_baseline_sealed && store->ct_durable_lsn == 0u &&
+        !store->recovery_pending && ct_token_matches(store, owner_token) &&
+        strcmp(store->ct_source_id, source_id) == 0 &&
+        strcmp(store->ct_generation, generation) == 0 &&
+        store->ct_baseline_lsn == baseline_row_seq;
+    kv_store_unlock(store);
+    if (!ok) return false;
+    int fd = open_secure_read(filepath);
+    if (fd < 0) return false;
+    unsigned char digest[32];
+    ok = ct_fd_sha256(fd, digest);
+    close(fd);
+    if (!ok || memcmp(digest, expected_digest, 32u) != 0 ||
+        !replica_snapshot_file_valid(filepath, data_principal, "*", baseline_row_seq))
+        return false;
+    if (kv_ct_baseline_import_store) return false;
+    kv_ct_baseline_import_store = store;
+    kv_ct_baseline_import_principal = data_principal;
+    int rc = qihse_kv_load_user_internal(store, filepath, data_principal, NULL);
+    kv_ct_baseline_import_principal = NULL;
+    kv_ct_baseline_import_store = NULL;
+    if (rc != 0) return false;
+    kv_store_wrlock(store);
+    ok = store->ct_enabled && store->ct_mode == 2u &&
+        !store->ct_baseline_sealed && store->ct_durable_lsn == 0u &&
+        !store->recovery_pending && ct_token_matches(store, owner_token);
+    if (ok) {
+        memcpy(store->ct_baseline_digest, digest, 32u);
+        store->ct_baseline_sealed = true;
+        ok = ct_state_write(store);
+        if (!ok) store->recovery_pending = true;
+    }
+    kv_store_unlock(store);
+    return ok;
+}
+
 int qihse_kv_load(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_load_user(store, filepath, NULL); }
 
 /* ── Change sequence and incremental (delta) export ──────────────────────
@@ -3878,7 +6496,7 @@ bool qihse_kv_projection_marker(qihse_kv_store_t* store,
                                 uint64_t* out_seq, uint64_t* out_epoch) {
     if (!store || !out_seq || !out_epoch) return false;
     kv_store_rdlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return false; }
     *out_seq = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
     *out_epoch = __atomic_load_n(&store->projection_epoch, __ATOMIC_ACQUIRE);
     kv_store_unlock(store);
@@ -3895,6 +6513,7 @@ void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)
 }
 
 typedef struct {
+    qihse_kv_store_t* store;
     qihse_user_t* user;
     uint64_t since;
     uint64_t now;
@@ -3988,6 +6607,7 @@ static bool delta_trie_cb(const char* key, void* value, size_t value_size, void*
     delta_collect_ctx_t* ctx = (delta_collect_ctx_t*)user_data;
     kv_payload_t* p = (kv_payload_t*)value;
     if (!ctx || !ctx->ok || !key || !p) return false;
+    if (!ct_key_owned_for_read(ctx->store, key)) return true;
     if (p->change_seq <= ctx->since || p->change_seq == 0u) return true; /* skip */
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) return true;
     if (ctx->glob && fnmatch(ctx->glob, key, 0) != 0) return true;
@@ -4002,6 +6622,7 @@ static bool delta_trie_cb(const char* key, void* value, size_t value_size, void*
 static bool delta_sst_cb(const char* key, const kv_disk_record_t* r, void* ud) {
     delta_collect_ctx_t* ctx = (delta_collect_ctx_t*)ud;
     if (!ctx || !ctx->ok || !key || !r) return false;
+    if (!ct_key_owned_for_read(ctx->store, key)) return true;
     if (r->change_seq <= ctx->since || r->change_seq == 0u) return true;
     if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) return true;
     if (ctx->glob && fnmatch(ctx->glob, key, 0) != 0) return true;
@@ -4042,6 +6663,7 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
 
     delta_collect_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.store = store;
     ctx.user = user;
     ctx.since = since_seq;
     ctx.now = current_time_ms();
@@ -4063,7 +6685,7 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
     bool fast = store->sst_meta && !store->sst_meta->degraded;
     if (fast) kv_store_rdlock(store);
     else kv_store_wrlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return -1; }
+    if (store->recovery_pending || !ct_read_ready(store)) { kv_store_unlock(store); return -1; }
     if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return -1; }
     qihse_trinary_trie_foreach(store->trie, delta_trie_cb, &ctx);
     if (ctx.ok && fast) {
@@ -4173,4 +6795,6 @@ bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
     kv_store_unlock(store);
     return under_attack;
 }
+
+#include "qihse_ct_range_export.inc"
 

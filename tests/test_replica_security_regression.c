@@ -230,10 +230,23 @@ int main(void) {
                              operator_user));
     assert(qihse_kv_replica_snapshot_create(store, operator_user, "public:*",
                                             &snapshot) == 0);
-    uint64_t size = qihse_kv_replica_snapshot_size(snapshot);
+    uint64_t size = 0u;
+    assert(qihse_kv_replica_snapshot_size(snapshot, operator_user, &size));
     assert(size > 0u && size < 4096u);
     char bytes[4096]; size_t read_size = 0u;
-    assert(qihse_kv_replica_snapshot_read(snapshot, 0u, bytes, (size_t)size,
+    memset(bytes, 0x5a, sizeof(bytes));
+    read_size = 123u;
+    assert(!qihse_kv_replica_snapshot_read(snapshot, low_user, 0u, bytes,
+                                           sizeof(bytes), &read_size));
+    assert(read_size == 0u);
+    for (size_t i = 0u; i < sizeof(bytes); i++) assert(bytes[i] == 0x5a);
+    uint64_t denied_size = 123u;
+    assert(!qihse_kv_replica_snapshot_size(snapshot, low_user, &denied_size));
+    assert(denied_size == 0u);
+    assert(!qihse_kv_replica_snapshot_read(snapshot, NULL, 0u, bytes,
+                                           sizeof(bytes), &read_size));
+    assert(read_size == 0u);
+    assert(qihse_kv_replica_snapshot_read(snapshot, operator_user, 0u, bytes, (size_t)size,
                                           &read_size));
     assert(read_size == (size_t)size);
     bytes[read_size] = '\0';

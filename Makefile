@@ -181,7 +181,7 @@ QIHSE_TRINARY_SWEEP_BENCH_ITERS?=1
 
 # Use the most complete set of sources WITHOUT duplicates
 # We use qihse_exports.c to fill in any missing gaps for the Python layer
-SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.c core/qihse_rate_limit.c core/qihse_quota.c \
+SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.c core/qihse_rate_limit.c core/qihse_quota.c core/qihse_workload_admission.c \
             core/qihse_principal_record.c core/qihse_auth_maintenance.c core/qihse_auth_durable.c \
             core/qihse_auth_archive.c core/qihse_auth_archive_crypto.c \
             src/broad_oak/qihse_search.c src/broad_oak/qihse_hnsw.c \
@@ -238,6 +238,8 @@ ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
 SRCS_BASE += src/spinnaker/qihse_aimem_onnx_embedder.c
 endif
 
+SRCS_BASE += src/black_hole/qihse_ct_codec.c src/spinnaker/qihse_cluster_ownership.c \
+    src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c
 SRCS=$(SRCS_BASE)
 
 ifeq ($(LIB_TARGET),qihse.dll)
@@ -508,6 +510,101 @@ test-ownership-journal: lib
 	$(CC) $(CFLAGS) -o tests/test_ownership_journal tests/test_ownership_journal.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_journal
 
+# Exact-history transport serialization, real registry authorization, and
+# durable mutation/cursor recovery. Keep the fault-injected KV implementation
+# local to its test executable; production library fault hooks stay disabled.
+.PHONY: test-ct-codec test-ct-codec-auth test-ct-storage test-ct-storage-crash
+test-ct-codec:
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -I./include \
+	    -o tests/test_ct_codec tests/test_ct_codec.c src/black_hole/qihse_ct_codec.c -lcrypto
+	./tests/test_ct_codec
+
+test-ct-codec-auth: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_codec_auth tests/test_ct_codec_auth.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_codec_auth
+
+test-ct-storage: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_storage tests/test_ct_storage.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_storage
+
+test-ct-storage-crash: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_ct_storage_crash tests/test_ct_storage.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_storage_crash
+
+test-serial: test-ct-codec test-ct-codec-auth test-ct-storage test-ct-storage-crash
+
+.PHONY: test-ct-transport-protocol test-ct-transport-daemon
+test-ct-transport-protocol: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -I./persistence -UNDEBUG -o tests/test_ct_transport_protocol tests/test_ct_transport_protocol.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_transport_protocol
+
+test-ct-transport-daemon: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/test_ct_transfer.py
+	@echo "CT1 real-daemon replication tests passed"
+
+.PHONY: test-ct-slot-transfer
+test-ct-slot-transfer: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/test_ct_slot_transfer.py
+
+test-serial: test-ct-transport-protocol test-ct-transport-daemon test-ct-slot-transfer
+
+.PHONY: test-backup-merge test-brain-ct-pending
+test-backup-merge: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_backup_merge tests/test_backup_merge.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_backup_merge
+
+test-brain-ct-pending: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_brain_ct_pending tests/test_brain_ct_pending.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_brain_ct_pending
+
+test-serial: test-backup-merge test-brain-ct-pending
+
+.PHONY: test-ct-brain-balance
+test-ct-brain-balance: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/ct_brain_drill.py
+
+test-serial: test-ct-brain-balance
+
+.PHONY: test-consensus-authority-forward test-consensus-authority-auth
+test-consensus-authority-forward: lib
+	$(CC) $(CFLAGS) -I./persistence -UNDEBUG -DQIHSE_CONSENSUS_MESH_TESTING \
+	    -o tests/test_consensus_mesh_forward tests/test_consensus_mesh_forward.c \
+	    src/federation/qihse_consensus_mesh.c src/federation/qihse_consensus.c \
+	    src/federation/qihse_consensus_blob.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_mesh_forward
+
+test-consensus-authority-auth: lib
+	$(CC) $(CFLAGS) -I./persistence -UNDEBUG -o tests/test_consensus_authority_auth \
+	    tests/test_consensus_authority_auth.c src/federation/qihse_consensus.c \
+	    src/federation/qihse_consensus_blob.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_consensus_authority_auth
+
+test-serial: test-consensus-authority-forward test-consensus-authority-auth
+
+.PHONY: test-cluster-transfer
+test-cluster-transfer:
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_cluster_transfer tests/test_cluster_transfer.c src/spinnaker/qihse_cluster_transfer.c $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_transfer
+
+test-serial: test-cluster-transfer
+
+.PHONY: test-ct-transfer-storage
+test-ct-transfer-storage: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_transfer_storage tests/test_ct_transfer_storage.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_transfer_storage
+
+test-serial: test-ct-transfer-storage
+
+.PHONY: test-ct-target
+test-ct-target:
+	$(CC) $(CFLAGS) -std=c11 -UNDEBUG -o tests/test_ct_target tests/test_ct_target.c src/spinnaker/qihse_ct_target.c $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_target
+
+test-serial: test-ct-target
+
 test-audit-rotation: lib
 	$(CC) $(CFLAGS) -o tests/test_audit_rotation tests/test_audit_rotation.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_audit_rotation
@@ -686,7 +783,7 @@ test-http-lifecycle:
 
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_maintenance.c -Wl,--gc-sections -pthread -lcrypto
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_maintenance.c -Wl,--gc-sections -L. -lqihse -pthread -lcrypto
 	./build/test_cluster_bus_bind
 
 test-serial: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
@@ -983,6 +1080,37 @@ test-aimem-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_resp tests/test_aimem_resp.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_resp
 
+.PHONY: test-aimem-scoped-auth-matrix
+test-aimem-scoped-auth-matrix: lib
+	$(CC) $(CFLAGS) -o tests/test_aimem_scoped_auth_matrix tests/test_aimem_scoped_auth_matrix.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_scoped_auth_matrix
+
+test-aimem-hax-store-limit: lib
+	$(CC) $(CFLAGS) -o tests/test_aimem_hax_store_limit tests/test_aimem_hax_store_limit.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_hax_store_limit
+
+test-aimem-handoff-labels: lib
+	$(CC) $(CFLAGS) -o tests/test_aimem_handoff_labels tests/test_aimem_handoff_labels.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_handoff_labels
+
+test-kv-change-meta-auth: lib
+	$(CC) $(CFLAGS) -o tests/test_kv_change_meta_auth tests/test_kv_change_meta_auth.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_change_meta_auth
+
+.PHONY: test-kv-delete-receipt
+test-kv-delete-receipt: lib
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_kv_delete_receipt tests/test_kv_delete_receipt.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_delete_receipt
+
+test-aimem-forget-scoped-receipt: lib
+	$(CC) $(CFLAGS) -o tests/test_aimem_forget_scoped_receipt tests/test_aimem_forget_scoped_receipt.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_forget_scoped_receipt
+
+.PHONY: test-aimem-forget-scoped-crash
+test-aimem-forget-scoped-crash: lib
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_aimem_forget_scoped_crash tests/test_aimem_forget_scoped_receipt.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_forget_scoped_crash
+
 test-aimem-knowledge: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_knowledge tests/test_aimem_knowledge.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_knowledge
@@ -999,6 +1127,16 @@ test-aimem-qh08-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_qh08_resp tests/test_aimem_qh08_resp.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_qh08_resp
 
+test-workload-admission: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_workload_admission tests/test_workload_admission.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_workload_admission
+
+test-aimem-workload-admission: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_aimem_workload_admission tests/test_aimem_workload_admission.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_workload_admission
+
 # QH-00: separate process instances; SIGKILL immediately after durable ACK.
 test-aimem-durable-crash: lib
 	@mkdir -p build && chmod 0700 build
@@ -1009,6 +1147,25 @@ test-aimem-idem-migration: lib
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -o tests/test_aimem_idem_migration tests/test_aimem_idem_migration.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_idem_migration
+
+test-hax-recall-fixture: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_aimem_hax_recall_fixture tests/test_aimem_hax_recall_fixture.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_hax_recall_fixture
+
+.PHONY: bench-hax-recall
+bench-hax-recall: lib
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -o tests/test_aimem_hax_recall_fixture tests/test_aimem_hax_recall_fixture.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_aimem_hax_recall_fixture --benchmark
+else
+	@echo 'Semantic/hybrid benchmark requires QIHSE_ENABLE_AIMEM_KEYSTONE=1 and a configured provider' >&2
+	@false
+endif
+
+test-python-aimem-sdk: lib
+	PYTHONPATH=python LD_LIBRARY_PATH=. python3 tests/test_python_aimem_sdk.py -v
 
 bench-aimem-durability: lib
 	$(CC) $(CFLAGS) -o benchmarks/qihse_aimem_durability_bench benchmarks/qihse_aimem_durability_bench.c -L. -lqihse $(LDFLAGS)
@@ -1022,7 +1179,7 @@ test-aimem-replay-recovery: lib
 
 # Focused aggregate for the active W10 AIMEM workstream.
 test-w10-aimem: test-ai-memory test-ai-memory-embed test-ai-memory-ext \
-		test-aimem-resp test-aimem-durable-crash \
+		test-aimem-resp test-aimem-scoped-auth-matrix test-aimem-durable-crash \
 		test-aimem-replay-recovery test-aimem-knowledge \
 		test-aimem-idem-migration test-aimem-scope-index test-aimem-qh05-08 \
 		test-aimem-qh08 test-aimem-qh08-resp test-backup-cli \
@@ -1128,8 +1285,18 @@ test-edge-persistence: lib
 
 test-serial: test-auth-privilege-boundary test-object-acl test-aggregate-hardened test-uwp-regression test-graph test-qkp-access-negative test-graph-vector test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-cluster-bus test-cluster-failover test-guard-throttle test-cluster-scatter test-cluster-brain test-brain-incidents test-brain-actuate test-brain-rebalance test-brain-fed-journal test-overlay test-dht-peer-exchange test-federation-f0 test-federation-f1 test-federation-f2 test-federation-f3 test-federation-f4 test-lease-liveness test-federation-f5 test-federation-f6 test-federation-f7 test-federation-f8 test-federation-f8-ops test-federation-fuzz test-federation-bus-trust test-node-cap-records test-federation-mtls test-federation-repl test-federation-transport test-federation-rejoin test-federation-ca test-federation-crl test-federation-backup test-backup-auth test-consensus test-consensus-wire test-consensus-snapshot-stage test-consensus-channel test-consensus-mesh test-consensus-blob-channel test-fed-sim test-incremental-export test-replica-security test-replica-qkp test-replica-crash test-controller-sdk-py test-keystone-feed-w25 test-ai-memory test-ai-memory-embed test-ai-memory-ext test-aimem-resp test-aimem-durable-crash test-aimem-replay-recovery test-aimem-qh05-08 test-fabric-jobs test-fabric-dispatch test-task test-omni test-e2e test-e2e-memory-planner test-persist test-bytecode test-document-store test-column-store test-fts-engine test-neural-fts-fusion test-resp-hybrid test-http-adapters test-timeseries test-event-stream test-routing-persistence test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler test-quantization test-kv-read-integrity test-hnsw-anchor-seeding test-column-tsdb-anchor test-af-xdp-keystone-ingest test-dist-planner-hardware test-txn test-table-store-txn test-mvcc-delete test-indexes test-sql-completeness test-optimizer-governance test-sql-dml-exec test-bolt test-mongo-wire test-mongo-wire-security test-repl test-phase-c test-metrics-w52 test-parallel-query test-gold test-bus-signed-ops test-browser-unit test-browser test-snapshot-xfer test-federation-ingest test-controller-qkp test-keystone-feed-wire
 
-test-serial: test-build-verification test-aimem-scope-index
+test-serial: test-build-verification test-aimem-scope-index test-aimem-knowledge test-aimem-idem-migration
+test-serial: test-aimem-hax-store-limit
+test-serial: test-aimem-handoff-labels
+test-serial: test-aimem-scoped-auth-matrix
+test-serial: test-kv-change-meta-auth
+test-serial: test-kv-delete-receipt
+test-serial: test-aimem-forget-scoped-receipt
+test-serial: test-aimem-forget-scoped-crash
+test-serial: test-python-aimem-sdk
+test-serial: test-hax-recall-fixture
 test-serial: test-aimem-qh08 test-aimem-qh08-resp
+test-serial: test-workload-admission test-aimem-workload-admission
 test-serial: test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli
 test-serial: test-wal-durability
 test-serial: test-table-store-crash
@@ -1320,8 +1487,22 @@ test-cluster-failover: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_failover tests/test_cluster_failover.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_cluster_failover
 
+.PHONY: test-cluster-failover-unproven
+test-cluster-failover-unproven: lib
+	$(CC) $(CFLAGS) -o tests/test_cluster_failover_unproven tests/test_cluster_failover_unproven.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_failover_unproven
+
+test-serial: test-cluster-failover-unproven
+
 .PHONY: test-cluster-maintenance test-cluster-maintenance-resp
 test-serial: test-cluster-maintenance test-cluster-maintenance-resp
+test-serial: test-slot-migration-auth test-ownership-journal
+test-serial: test-document-store-user
+
+.PHONY: test-document-store-user
+test-document-store-user: lib
+	$(CC) $(CFLAGS) -o tests/test_document_store_user tests/test_document_store_user.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_document_store_user
 
 test-cluster-maintenance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance tests/test_cluster_maintenance.c src/spinnaker/qihse_cluster_maintenance.c -pthread $(LDFLAGS)
@@ -1917,6 +2098,7 @@ PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_l
     qihse_clickhouse_sql.h qihse_http_api.h \
     qihse_resp_engine.h qihse_resp_wire.h qihse_resp_fts_namespace.h qihse_qkp.h qihse_resp_cluster.h \
     qihse_cluster_bus.h qihse_cluster_maintenance.h qihse_cluster_failover.h qihse_cluster_scatter.h \
+    qihse_ct_codec.h qihse_cluster_ownership.h qihse_cluster_ownership_journal.h qihse_cluster_transfer.h qihse_ct_target.h \
     qihse_system_guard.h qihse_quota.h qihse_blob.h qihse_bundle.h \
     qihse_consensus.h qihse_consensus_blob.h qihse_consensus_blob_channel.h \
     qihse_consensus_channel.h qihse_consensus_mesh.h qihse_consensus_wire.h \
@@ -1973,16 +2155,70 @@ test-sqlite-vfs: qihse_vfs.so tests/test_sqlite_vfs.c
 # Requires json-c, OpenSSL and libzstd only for this optional executable.
 # This is NOT linked into HAX and adds no mandatory dependency to libqihse.so.
 .PHONY: test-codegraph
-qihse-codegraph: tools/qihse_codegraph.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_storage.h tools/qihse_codegraph_packed.c tools/qihse_codegraph_packed.h $(LIB_TARGET)
+CODEGRAPH_HELPERS := tools/qihse_codegraph_source.c tools/qihse_codegraph_projection.c tools/qihse_codegraph_generation.c tools/qihse_codegraph_generation_adapter.c tools/qihse_codegraph_checksum.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c tools/qihse_codegraph_dictionary.c tools/qihse_codegraph_csr.c
+CODEGRAPH_HEADERS := $(CODEGRAPH_HELPERS:.c=.h) tools/qihse_codegraph_progress.h tools/qihse_codegraph_json.h tools/qihse_codegraph_chunked.h
+qihse-codegraph: tools/qihse_codegraph.c $(CODEGRAPH_HELPERS) $(CODEGRAPH_HEADERS) $(LIB_TARGET) | codegraph-xxh3
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core \
-	  $< tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl libzstd) \
+	  $< $(CODEGRAPH_HELPERS) tools/codegraph_xxh3/build/libqihse_xxh3.a -o $@ -L. -lqihse $(shell pkg-config --cflags --libs json-c openssl libzstd) -pthread -lm -ldl \
 	  $(LDFLAGS) -Wl,-rpath,'$$ORIGIN'
 
-test-codegraph: qihse-codegraph test-codegraph-codec test-codegraph-packed
+test-codegraph: qihse-codegraph test-codegraph-xxh3 test-codegraph-codec test-codegraph-packed test-codegraph-dictionary test-codegraph-csr test-codegraph-progress-native test-codegraph-json test-codegraph-chunked test-codegraph-generations test-codegraph-persisted
 	python3 tests/test_codegraph_native.py --binary ./qihse-codegraph
 	python3 tests/test_codegraph_storage.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_auto.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_ids128.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_snapshot_xxh3.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_retention_bound.py --binary ./qihse-codegraph --expect-checksum xxh3-128
+	python3 tests/test_codegraph_projection.py --binary ./qihse-codegraph
 	python3 tests/test_codegraph_reindex.py
+	python3 tests/test_codegraph_progress.py
+	python3 tests/test_codegraph_reindex_pipeline.py
+	python3 tests/test_codegraph_sources.py --binary ./qihse-codegraph
 	python3 tests/test_codegraph_reindex_source.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_json_native.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_query_index.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_accounting.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_accounting_formats.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_runtime_spills.py --binary ./qihse-codegraph
+	python3 tests/test_codegraph_remaining_integration.py --binary ./qihse-codegraph
+	python3 -m unittest discover -s tests -p 'test_codegraph_incremental.py'
+
+.PHONY: test-codegraph-json test-codegraph-chunked test-codegraph-generations test-codegraph-persisted
+test-codegraph-json:
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Itools tests/test_codegraph_json.c -o tests/test_codegraph_json $(shell pkg-config --cflags --libs json-c)
+	./tests/test_codegraph_json
+
+test-codegraph-chunked: $(LIB_TARGET) | codegraph-xxh3
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude -Icore -Itools \
+	  tests/test_codegraph_chunked.c tools/qihse_codegraph_checksum.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c tools/qihse_codegraph_dictionary.c tools/codegraph_xxh3/build/libqihse_xxh3.a \
+	  -o tests/test_codegraph_chunked -L. -lqihse $(shell pkg-config --cflags --libs openssl libzstd) -pthread -lm -ldl $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./tests/test_codegraph_chunked
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./tests/test_codegraph_chunked --large 180000
+
+test-codegraph-generations: $(LIB_TARGET) | codegraph-xxh3
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -DCG_GENERATION_TEST_FAULTS -Iinclude -Icore -Itools \
+	  tests/test_codegraph_generations.c tools/qihse_codegraph_generation.c tools/qihse_codegraph_checksum.c tools/codegraph_xxh3/build/libqihse_xxh3.a \
+	  -o tests/test_codegraph_generations -L. -lqihse $(shell pkg-config --cflags --libs openssl libzstd json-c) -pthread -lm -ldl $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./tests/test_codegraph_generations
+
+test-codegraph-persisted: $(LIB_TARGET) | codegraph-xxh3
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Iinclude -Icore -Itools \
+	  tests/test_codegraph_persisted.c tools/qihse_codegraph_projection.c tools/qihse_codegraph_csr.c tools/qihse_codegraph_checksum.c tools/codegraph_xxh3/build/libqihse_xxh3.a \
+	  -o tests/test_codegraph_persisted -L. -lqihse $(shell pkg-config --cflags --libs openssl libzstd json-c) -pthread -lm -ldl $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./tests/test_codegraph_persisted
+
+.PHONY: test-codegraph-progress-native
+test-codegraph-progress-native:
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -Itools \
+	  tests/test_codegraph_progress_native.c -o tests/test_codegraph_progress_native -pthread
+	./tests/test_codegraph_progress_native
+
+.PHONY: test-codegraph-csr
+test-codegraph-csr: $(LIB_TARGET)
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
+	  tests/test_codegraph_csr.c tools/qihse_codegraph_csr.c -o tests/test_codegraph_csr \
+	  -L. -lqihse -pthread -lm $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
+	LD_LIBRARY_PATH=. ./tests/test_codegraph_csr
 
 # QIHSE Studio: ASP.NET Core 8 + React SPA real-time operations display
 .PHONY: studio install-studio
@@ -1997,6 +2233,36 @@ include benchmarks/w12.mk
 
 # Standalone experimental W12.1 scalar reference, never linked by lib targets.
 include quantization/w12.mk
+
+.PHONY: test-w12-engine-baseline
+test-w12-engine-baseline:
+	python3 -m unittest discover -s benchmarks/scripts -p qihse_w12_engine_baseline_test.py -v
+
+test-serial: test-w12-engine-baseline
+
+.PHONY: test-w12-sidecar
+test-w12-sidecar: lib
+	mkdir -p build/w12
+	$(CC) $(TQ_FLAGS) -Iinclude tests/test_turboquant_sidecar.c \
+		quantization/src/qihse_turboquant_sidecar.c $(TQ_SOURCES) \
+		-L. -lqihse -lm -o build/w12/test_turboquant_sidecar
+	LD_LIBRARY_PATH=. ./build/w12/test_turboquant_sidecar
+
+test-serial: test-w12-sidecar
+
+.PHONY: test-w12-shadow-gate
+test-w12-shadow-gate: lib
+	python3 benchmarks/scripts/qihse_w12_shadow_gate_test.py
+	python3 benchmarks/scripts/qihse_w12_shadow_gate.py --output build/w12/shadow_ci.json
+
+test-serial: test-w12-shadow-gate
+
+.PHONY: test-w11-combined-early
+test-w11-combined-early: lib
+	bash benchmarks/w11_combined_early.sh 8 7 > build/w11_combined_early_ci.json
+	python3 -m json.tool build/w11_combined_early_ci.json > /dev/null
+
+test-serial: test-w11-combined-early
 
 # FTS.SAVE/FTS.LOAD adapter: durable per-node projection plus the mandatory
 # low-clearance/high-data negative (AGENTS.md invariant #3) and autoload.
@@ -2035,9 +2301,9 @@ test-qihse-deps:
 	PYTHONPATH=tests python3 -m unittest -v test_qihse_deps
 
 .PHONY: test-codegraph-codec
-test-codegraph-codec: $(LIB_TARGET)
+test-codegraph-codec: $(LIB_TARGET) | codegraph-xxh3
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
-	  tests/test_codegraph_storage.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c -o tests/test_codegraph_storage \
+	  tests/test_codegraph_storage.c tools/qihse_codegraph_checksum.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c tools/qihse_codegraph_dictionary.c tools/codegraph_xxh3/build/libqihse_xxh3.a -o tests/test_codegraph_storage \
 	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
 	LD_LIBRARY_PATH=. ./tests/test_codegraph_storage
 
@@ -2060,10 +2326,23 @@ test-graph-property-index:
 test-serial: test-graph-property-index
 
 .PHONY: test-codegraph-memory
-test-codegraph-memory: $(LIB_TARGET)
+test-codegraph-memory: $(LIB_TARGET) | codegraph-xxh3
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -I./include -I./core -I./tools \
-	  tests/test_codegraph_memory.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c -o tests/test_codegraph_memory \
+	  tests/test_codegraph_memory.c tools/qihse_codegraph_checksum.c tools/qihse_codegraph_storage.c tools/qihse_codegraph_packed.c tools/qihse_codegraph_dictionary.c tools/codegraph_xxh3/build/libqihse_xxh3.a -o tests/test_codegraph_memory \
 	  -L. -lqihse $(shell pkg-config --cflags --libs libzstd) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN/..'
 	LD_LIBRARY_PATH=. ./tests/test_codegraph_memory
 
 test-serial: test-codegraph-memory
+
+.PHONY: test-codegraph-dictionary
+test-codegraph-dictionary: $(LIB_TARGET) | codegraph-xxh3
+	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -Iinclude -Icore -Itools tests/test_codegraph_dictionary.c tools/qihse_codegraph_checksum.c tools/qihse_codegraph_dictionary.c tools/codegraph_xxh3/build/libqihse_xxh3.a -o tests/test_codegraph_dictionary -L. -lqihse $(shell pkg-config --cflags --libs openssl libzstd) -lpthread -lm -ldl
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./tests/test_codegraph_dictionary
+
+# Standalone standard XXH3 backends used only for CodeGraph candidate identities.
+.PHONY: test-codegraph-xxh3 codegraph-xxh3
+codegraph-xxh3:
+	$(MAKE) -C tools/codegraph_xxh3 -j4 all
+
+test-codegraph-xxh3:
+	$(MAKE) -C tools/codegraph_xxh3 -j4 test

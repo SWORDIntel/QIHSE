@@ -1,5 +1,7 @@
 # QIHSE Backup & Restore Runbook
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 ## Model
 
 `qihse-backup` is a **local** tool — it opens the store directly (it does not

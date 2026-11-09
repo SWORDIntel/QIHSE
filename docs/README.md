@@ -23,9 +23,9 @@ If you are new to the project, start with the [root README](../README.md), then 
 | Work on the codebase | [Development](development/) |
 | Read the current technical treatment | [Technical Whitepaper v1.1](architecture/qihse_whitepaper_v1.1.md) |
 | See what is being built and in what order | [Roadmap](../ROADMAP.md) |
-| See where the project is headed | [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) |
+| Read the federation design and acceptance criteria | [Federation upgrade design](plans/qihse_federation_upgrade_plan.md) |
 
-The original [whitepaper v1.0](architecture/qihse_whitepaper_v1.0.md) is retained as a historical design snapshot. Use v1.1 for current implementation status, roadmap state, claim discipline, and production-readiness language.
+The original [whitepaper v1.0](architecture/qihse_whitepaper_v1.0.md) is retained as a historical design snapshot. Use v1.1 for technical treatment and claim discipline. [ROADMAP.md](../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance.
 
 ## Documentation status labels
 
@@ -152,13 +152,13 @@ Rust SDK at [`rust/qihse-rs/`](../rust/qihse-rs/) (see the
 
 ## Plans and design work
 
-The [`plans/`](plans/) directory contains design documents and implementation roadmaps. These are useful for understanding intended direction, but a plan should not be treated as evidence that every described capability is complete.
+The [`plans/`](plans/) directory retains supporting designs, acceptance criteria and dated evidence. Current delivery tracking is consolidated in [ROADMAP.md](../ROADMAP.md); historical phase labels and checklist records in supporting files do not establish current completion.
 
 Notable documents include:
 
 - [QIHSE Studio Display Architecture](plans/QIHSE_STUDIO_DISPLAY_ARCHITECTURE.md) — Real-time telemetry, 16,384-slot cluster mesh, and vector exploration display platform using ASP.NET Core 8 SignalR streaming and React 18 SPA.
 - [AMD Zen 4 & Zen 2 Hardware Acceleration Roadmap](plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md) — Multi-tier SIMD (AVX-512 VPOPCNTDQ, AVX-512 VNNI), cryptographic (SHA-NI, VPCLMULQDQ), cache (CLZERO, CLWB), and concurrency (RDPID, CX16) acceleration across the Secondary node (AMD Ryzen 9 7950X) and Relay node (AMD EPYC 7662).
-- [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) — **the accepted forward direction**: sovereign nodes, consistency classes, event journal and watches, leases/epochs/CAS, anti-entropy reconciliation, trust plane, and the Citadel build/supply-chain substrate. Stages F0–F8 and the post-F8 follow-ups are implemented, through the two 2026-09-25 waves (node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export); no tracked unbuilt items remain — the plan stays the design of record for residual documented boundaries only (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing).
+- [Federation upgrade plan](plans/qihse_federation_upgrade_plan.md) — supporting design for the implemented federation substrate: sovereign nodes, consistency classes, event journal and watches, leases/epochs/CAS, anti-entropy reconciliation, trust plane, and the Citadel build/supply-chain substrate. Stages F0–F8 and the post-F8 follow-ups are implemented, through the two 2026-09-25 waves (node-side CRL-file loader, backup container v3 with WAL segment and v1/v2 retirement, consensus log compaction; then consensus membership-change safety and incremental export); the master CT.1/CT.2 and W11 gates track present transport and application gaps. The plan retains residual design boundaries (joint-consensus bulk membership changes, voter weights/witnesses/learners, chunked/resumable snapshot transfer, snapshot space reclamation, automated config drift healing).
 - [General database engine roadmap](plans/qihse_general_db_engine_roadmap.md)
 - [PostgreSQL and Neo4j replacement plan](plans/qihse_pg_neo4j_full_replacement_plan.md)
 - [Redis cluster sharding plan](plans/qihse_redis_cluster_sharding_plan.md)

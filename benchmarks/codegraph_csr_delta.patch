@@ -1,0 +1,312 @@
+--- a/tools/qihse_codegraph.c
++++ b/tools/qihse_codegraph.c
+@@ -14,7 +14,7 @@
+ #endif
+ #define _XOPEN_SOURCE 700
+ #include "qihse_audit.h"
+-#include "qihse_graph_store.h"
++#include "qihse_codegraph_csr.h"
+ #include "qihse_kv_store.h"
+ #include "qihse_codegraph_storage.h"
+ #include <dirent.h>
+@@ -55,13 +55,14 @@
+ #define CG_MAX_LINE 262144u
+ #define CG_MAX_NODES 2000000u
+ #define CG_MAX_EDGES 8000000u
++#define CG_QUERY_EDGE_BUDGET 65536u
+ #define CG_MAX_OUT 100000u
+ #define CG_MAX_FILES 64u
+ #define CG_REQUEST_MAX 65536u
+
+ typedef struct {
+     char id[65];
+-    char *file, *name, *kind;
++    const char *file, *name, *kind;
+     int line, end_line, is_test;
+     uint64_t vertex;
+ } cg_node;
+@@ -69,7 +70,7 @@
+ typedef struct {
+     qihse_kv_store_t *kv;
+     qihse_user_t *principal;
+-    qihse_graph_t *graph;
++    cg_csr *graph;
+     cg_node *nodes;
+     cg_node **by_vertex, **by_name, **by_file;
+     size_t nn, capacity, edges, unresolved;
+@@ -405,14 +406,9 @@
+ }
+ static void graph_close(cg_state *st) {
+     if (st->graph)
+-        qihse_graph_destroy(st->graph);
++        cg_csr_destroy(st->graph);
+     if (st->kv)
+         qihse_kv_store_destroy(st->kv);
+-    for (size_t i = 0; i < st->nn; i++) {
+-        free(st->nodes[i].file);
+-        free(st->nodes[i].name);
+-        free(st->nodes[i].kind);
+-    }
+     free(st->nodes);
+     free(st->by_name);
+     st->by_name = NULL;
+@@ -1127,7 +1123,7 @@
+ }
+
+ /* Rebuild a memory-resident structural graph from one immutable QIHSE KV
+- * generation. The QIHSE graph engine provides indexed incident adjacency;
++ * generation. The private immutable CSR projection provides incident adjacency;
+  * raw CRG qualified names are never guessed or re-resolved here. */
+ static int compare_node_id(const void *a, const void *b) {
+     return strcmp(((const cg_node *)a)->id, ((const cg_node *)b)->id);
+@@ -1189,21 +1185,13 @@
+     cg_node *node = &st->nodes[st->nn++];
+     memset(node, 0, sizeof(*node));
+     snprintf(node->id, sizeof(node->id), "%s", json_string(row, "id"));
+-    node->file = strdup(json_string(row, "file"));
+-    node->name = strdup(json_string(row, "name"));
+-    node->kind = strdup(json_string(row, "kind"));
++    node->file = cg_csr_intern(st->graph, json_string(row, "file"));
++    node->name = cg_csr_intern(st->graph, json_string(row, "name"));
++    node->kind = cg_csr_intern(st->graph, json_string(row, "kind"));
+     node->line = (int)json_num(row, "line_start");
+     node->end_line = (int)json_num(row, "line_end");
+     node->is_test = json_flag(row, "is_test");
+-    const char *labels[] = {node->kind};
+-    const char *keys[] = {"file", "name"};
+-    graph_prop_t props[2] = {
+-        graph_prop_make_string(node->file),
+-        graph_prop_make_string(node->name),
+-    };
+-    node->vertex = qihse_graph_vertex_create(st->graph, labels, 1, keys, props, 2);
+-    graph_prop_free(&props[0]);
+-    graph_prop_free(&props[1]);
++    node->vertex = st->nn;
+     json_object_put(row);
+     if (!node->file || !node->name || !node->kind || !node->vertex) {
+         st->capacity = SIZE_MAX;
+@@ -1229,16 +1217,9 @@
+         if (!src || !dst) {
+             st->edges = SIZE_MAX; /* forged authoritative endpoint */
+         } else {
+-            const char *keys[] = {"file", "line", "confidence"};
+-            graph_prop_t props[3] = {
+-                graph_prop_make_string(json_string(row, "file")),
+-                graph_prop_make_int64(json_num(row, "line")),
+-                graph_prop_make_double(json_double(row, "confidence")),
+-            };
+-            uint64_t id = qihse_graph_edge_create(st->graph, json_string(row, "relation"),
+-                                                  src->vertex, dst->vertex, keys, props, 3);
+-            graph_prop_free(&props[0]);
+-            if (!id)
++            if (!cg_csr_add_edge(st->graph, (uint32_t)src->vertex, (uint32_t)dst->vertex,
++                                 json_string(row, "relation"), json_string(row, "file"),
++                                 json_num(row, "line"), json_double(row, "confidence")))
+                 st->edges = SIZE_MAX;
+         }
+     } else
+@@ -1249,9 +1230,10 @@
+
+ static bool build_native_graph(cg_state *st, size_t expected_nodes, size_t expected_edges,
+                                size_t expected_unresolved) {
+-    if (st->graph)
+-        return false;
+-    st->graph = qihse_graph_create();
++    if (st->graph || expected_nodes > CG_MAX_NODES || expected_edges > CG_MAX_EDGES ||
++        expected_unresolved > expected_edges)
++        return false;
++    st->graph = cg_csr_create(st->principal, expected_nodes, expected_edges - expected_unresolved);
+     if (!st->graph ||
+         !qihse_kv_foreach_prefix_user(st->kv, "n:", st->principal, nodes_from_kv, st) ||
+         st->capacity == SIZE_MAX || st->nn != expected_nodes)
+@@ -1274,7 +1256,7 @@
+     qsort(st->by_file, st->nn, sizeof(*st->by_file), compare_node_file);
+     return qihse_kv_foreach_prefix_user(st->kv, "e:", st->principal, edges_from_kv, st) &&
+            st->edges != SIZE_MAX && st->edges == expected_edges &&
+-           st->unresolved == expected_unresolved;
++           st->unresolved == expected_unresolved && cg_csr_finish(st->graph);
+ }
+
+ static struct json_object *read_json_file(const char *path) {
+@@ -1954,6 +1936,28 @@
+     json_text(obj, "error", reason);
+     return obj;
+ }
++/* Preserve the established traversal contract: insertion order, incoming
++ * self-loop exclusion, type filtering before the 2048-neighbor bound. Count
++ * every examined edge against a graph-walk/subquery budget, including filtered edges, so
++ * high-degree input cannot turn a bounded result into an unbounded scan. */
++static size_t bounded_neighbors(cg_state *st, uint32_t vertex, bool incoming,
++                                const char *type, uint32_t *out, size_t limit,
++                                size_t *remaining, bool *exhausted) {
++    size_t available = 0, count = 0;
++    const uint32_t *incident = cg_csr_incident(st->graph, vertex, incoming, &available);
++    if (!incident) return SIZE_MAX;
++    for (size_t i = 0; i < available && count < limit; ++i) {
++        if (!*remaining) { *exhausted = true; break; }
++        --*remaining;
++        const cg_csr_edge *edge = cg_csr_get_edge(st->graph, incident[i]);
++        if (!edge) return SIZE_MAX;
++        if ((incoming && edge->source == vertex) || (type && strcmp(edge->type, type)))
++            continue;
++        out[count++] = incident[i];
++    }
++    return count;
++}
++
+ static struct json_object *query_graph(cg_state *st, const char *action, const char *symbol,
+                                        const char *files[], size_t nfiles, const char *base,
+                                        int depth, size_t max_nodes, int token_budget,
+@@ -2000,13 +2004,14 @@
+      * Seed candidates outside the output limit remain eligible as neighbours. */
+     uint8_t *visited = calloc(st->nn + 2, sizeof(*visited));
+     uint64_t *queue = calloc(max_nodes + 1, sizeof(*queue));
+-    graph_adj_t *edges = calloc(2048, sizeof(*edges));
++    uint32_t *edges = calloc(2048, sizeof(*edges));
+     struct json_object *found = json_object_new_array();
+     struct json_object *tests = json_object_new_array();
+     struct json_object *affected = json_object_new_array();
+     struct json_object *evidence = json_object_new_array();
+     struct json_object *gaps = json_object_new_array();
+-    bool truncated = false;
++    bool truncated = false, work_exhausted = false;
++    size_t remaining_edges = CG_QUERY_EDGE_BUDGET;
+     size_t start = 0, used = 0, seeds = 0;
+     if (!visited || !queue || !edges) {
+         json_object_put(report);
+@@ -2107,18 +2112,20 @@
+         if (hop >= depth)
+             continue;
+         for (int direction = 0; direction < 2; ++direction) {
+-            graph_dir_t dir = direction == 0 ? GRAPH_DIR_INCOMING : GRAPH_DIR_OUTGOING;
+-            size_t count = qihse_graph_get_neighbors(st->graph, id, dir, NULL, edges, 2048);
+-            if (count == 2048)
++            bool incoming = direction == 0;
++            size_t count = bounded_neighbors(st, (uint32_t)id, incoming, NULL, edges, 2048,
++                                             &remaining_edges, &work_exhausted);
++            if (count == SIZE_MAX) goto projection_failed;
++            if (count == 2048 || work_exhausted)
+                 truncated = true;
+             for (size_t e = 0; e < count; ++e) {
+-                graph_adj_t *adj = &edges[e];
+-                bool incoming = dir == GRAPH_DIR_INCOMING;
++                const cg_csr_edge *edge = cg_csr_get_edge(st->graph, edges[e]);
++                if (!edge) goto projection_failed;
+                 if (strcmp(action, "query") != 0 &&
+-                    !(compact ? context_edge(adj->edge_type, incoming)
+-                              : impact_edge(adj->edge_type, incoming)))
++                    !(compact ? context_edge(edge->type, incoming)
++                              : impact_edge(edge->type, incoming)))
+                     continue;
+-                uint64_t neighbor = adj->neighbor_id;
++                uint64_t neighbor = (incoming ? edge->source : edge->target);
+                 if (neighbor > st->nn || visited[neighbor] >= 2)
+                     continue;
+                 if (used >= max_nodes) {
+@@ -2130,33 +2137,24 @@
+                 /* Explain each included relationship with its original
+                  * source line and confidence. No guessed targets are here. */
+                 if (json_object_array_length(evidence) < evidence_limit) {
+-                    graph_edge_t *edge = qihse_graph_edge_get(st->graph, adj->edge_id);
+-                    if (edge) {
++                    {
+                         cg_node *related = st->by_vertex[neighbor];
+                         struct json_object *ev = json_object_new_object();
+-                        json_text(ev, "relation", adj->edge_type);
++                        json_text(ev, "relation", edge->type);
+                         json_text(ev, "from",
+-                                  dir == GRAPH_DIR_INCOMING ? related->name : node->name);
+-                        json_text(ev, "to", dir == GRAPH_DIR_INCOMING ? node->name : related->name);
++                                  incoming ? related->name : node->name);
++                        json_text(ev, "to", incoming ? node->name : related->name);
+                         if (batch_query || output_compact) {
+                             json_text(ev, "from_id",
+-                                      dir == GRAPH_DIR_INCOMING ? related->id : node->id);
++                                      incoming ? related->id : node->id);
+                             json_text(ev, "to_id",
+-                                      dir == GRAPH_DIR_INCOMING ? node->id : related->id);
++                                      incoming ? node->id : related->id);
+                         }
+-                        const graph_prop_t *file = graph_edge_get_property(edge, "file");
+-                        const graph_prop_t *line = graph_edge_get_property(edge, "line");
+-                        const graph_prop_t *confidence =
+-                            graph_edge_get_property(edge, "confidence");
+-                        if (file && file->type == GRAPH_PROP_STRING)
+-                            json_text(ev, "file", file->val.s);
+-                        if (line && line->type == GRAPH_PROP_INT64)
+-                            json_int(ev, "line", line->val.i);
+-                        if (confidence && confidence->type == GRAPH_PROP_DOUBLE)
+-                            json_object_object_add(ev, "confidence",
+-                                                   json_object_new_double(confidence->val.d));
++                        json_text(ev, "file", edge->file);
++                        json_int(ev, "line", edge->line);
++                        json_object_object_add(ev, "confidence",
++                                               json_object_new_double(edge->confidence));
+                         json_object_array_add(evidence, ev);
+-                        graph_edge_free(edge);
+                     }
+                 } else
+                     truncated = true;
+@@ -2176,15 +2174,21 @@
+             if (node->is_test || !node->file[0])
+                 continue;
+             bool has_test = false;
+-            size_t n = qihse_graph_get_neighbors(st->graph, node->vertex, GRAPH_DIR_OUTGOING,
+-                                                 "TESTED_BY", edges, 2048);
++            size_t n = bounded_neighbors(st, (uint32_t)node->vertex, false,
++                                         "TESTED_BY", edges, 2048, &remaining_edges, &work_exhausted);
++            if (n == SIZE_MAX) goto projection_failed;
++            if (work_exhausted) { truncated = true; break; }
+             if (n)
+                 has_test = true;
+-            n = qihse_graph_get_neighbors(st->graph, node->vertex, GRAPH_DIR_INCOMING, "CALLS",
+-                                          edges, 2048);
+-            for (size_t j = 0; j < n; ++j)
+-                if (st->by_vertex[edges[j].neighbor_id]->is_test)
+-                    has_test = true;
++            n = bounded_neighbors(st, (uint32_t)node->vertex, true, "CALLS", edges, 2048,
++                                  &remaining_edges, &work_exhausted);
++            if (n == SIZE_MAX) goto projection_failed;
++            if (work_exhausted) { truncated = true; break; }
++            for (size_t j = 0; j < n; ++j) {
++                const cg_csr_edge *edge = cg_csr_get_edge(st->graph, edges[j]);
++                if (!edge) goto projection_failed;
++                if (st->by_vertex[edge->source]->is_test) has_test = true;
++            }
+             if (!has_test) {
+                 struct json_object *gap = json_object_new_object();
+                 json_text(gap, "symbol", node->name);
+@@ -2232,6 +2236,15 @@
+     free(edges);
+     *rc = seeds || (!symbol && nfiles == 0) ? 0 : 2;
+     return report;
++projection_failed:
++    if (changed) {
++        for (size_t i = 0; i < nfiles; ++i) free(changed[i]);
++        free(changed);
++    }
++    free(visited); free(queue); free(edges);
++    json_object_put(found); json_object_put(tests); json_object_put(affected);
++    json_object_put(evidence); json_object_put(gaps); json_object_put(report);
++    return request_error("CodeGraph projection unavailable or authorization revoked");
+ }
+
+ /* A generation read lease pins these structures until a request finishes. Replacement
+@@ -2239,16 +2252,11 @@
+  * filesystem freshness checks and response construction can run independently. */
+ static void clear_generation(cg_state *st) {
+     if (st->graph)
+-        qihse_graph_destroy(st->graph);
++        cg_csr_destroy(st->graph);
+     st->graph = NULL;
+     if (st->kv)
+         qihse_kv_store_destroy(st->kv);
+     st->kv = NULL;
+-    for (size_t i = 0; i < st->nn; ++i) {
+-        free(st->nodes[i].file);
+-        free(st->nodes[i].name);
+-        free(st->nodes[i].kind);
+-    }
+     free(st->nodes);
+     st->nodes = NULL;
+     free(st->by_name);

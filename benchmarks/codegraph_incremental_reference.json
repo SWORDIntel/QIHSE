@@ -1,0 +1,221 @@
+{
+  "schema": "qihse-codegraph-incremental-producer-benchmark-v1",
+  "python": "3.11.16",
+  "files": 41,
+  "methodology": "Warm same-workspace pairs: incremental then full; exact-byte output comparison. Source hashing, full resolution and complete export remain in both paths.",
+  "producer_files_sha256": {
+    "incremental.py": "be69fabc5355ec91ccfa43d4c2b2a42fb663562f812bfe9d1babf9a8b9dad42a",
+    "exports.py": "03f6e7dc03a049c385fba5cf2070245dd25bf612a36585f023d8de059568c9cc"
+  },
+  "initial": {
+    "status": "ok",
+    "build_type": "full",
+    "requested_mode": "full",
+    "incremental_capable": true,
+    "files_parsed": 41,
+    "files_updated": 0,
+    "nodes": 82,
+    "edges": 44,
+    "unresolved_edges": 1,
+    "records": 128,
+    "export_bytes": 32193,
+    "source_sha256": "74b06bdd5ea1015cc7a9060c9200f0dcdb9eaa87e6b941c08c2bc76cc4813183",
+    "database": {
+      "page_size": 4096,
+      "pages": 72,
+      "free_pages": 0,
+      "reclaimable_page_bytes": 0,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 294912,
+          "allocated_bytes": 294912
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 327680,
+      "allocated_bytes": 327680
+    },
+    "reclamation": null,
+    "persistent_export_created": false,
+    "seconds": 2.0866579839785118
+  },
+  "no_op": {
+    "status": "ok",
+    "build_type": "incremental",
+    "requested_mode": "incremental",
+    "incremental_capable": true,
+    "files_parsed": 0,
+    "files_updated": 0,
+    "nodes": 82,
+    "edges": 44,
+    "unresolved_edges": 1,
+    "records": 128,
+    "export_bytes": 32193,
+    "source_sha256": "74b06bdd5ea1015cc7a9060c9200f0dcdb9eaa87e6b941c08c2bc76cc4813183",
+    "database": {
+      "page_size": 4096,
+      "pages": 72,
+      "free_pages": 0,
+      "reclaimable_page_bytes": 0,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 294912,
+          "allocated_bytes": 294912
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 327680,
+      "allocated_bytes": 327680
+    },
+    "reclamation": null,
+    "persistent_export_created": false,
+    "seconds": 0.28790941802435555
+  },
+  "pairs": [
+    {
+      "scenario": "edit",
+      "files_updated": 1,
+      "full_files_parsed": 41,
+      "incremental_seconds": 0.3090610259969253,
+      "full_seconds": 0.4110514909843914,
+      "equivalent_export_bytes": 32193,
+      "equivalent_sha256": "1f8f5425361a2f9e1899d144cac9fca6c11b59ff0f560bf978a465452f779b7f",
+      "nodes": 82,
+      "edges": 44
+    },
+    {
+      "scenario": "rename",
+      "files_updated": 2,
+      "full_files_parsed": 40,
+      "incremental_seconds": 0.31739028202719055,
+      "full_seconds": 0.37592827298794873,
+      "equivalent_export_bytes": 31388,
+      "equivalent_sha256": "77dfd30cf68fc940d4233bdc1d2d2542f88b6bfc4eb901d11d9a53b6addf7e37",
+      "nodes": 80,
+      "edges": 43
+    },
+    {
+      "scenario": "delete",
+      "files_updated": 1,
+      "full_files_parsed": 39,
+      "incremental_seconds": 0.32019783899886534,
+      "full_seconds": 0.4072012010146864,
+      "equivalent_export_bytes": 30637,
+      "equivalent_sha256": "be2ff0c58d24c86089237d2a98b7757748387a62d81002b250d676045091d760",
+      "nodes": 78,
+      "edges": 42
+    },
+    {
+      "scenario": "resolve-external",
+      "files_updated": 0,
+      "full_files_parsed": 39,
+      "incremental_seconds": 0.30301435000728816,
+      "full_seconds": 0.4242997230030596,
+      "equivalent_export_bytes": 30637,
+      "equivalent_sha256": "0e7dadf6da74de827e96a7506739888344dcd4fe22157a3facc29a1e86aeb675",
+      "nodes": 78,
+      "edges": 42
+    },
+    {
+      "scenario": "revert-to-head",
+      "files_updated": 1,
+      "full_files_parsed": 39,
+      "incremental_seconds": 0.31537548897904344,
+      "full_seconds": 0.3872072210069746,
+      "equivalent_export_bytes": 30637,
+      "equivalent_sha256": "3815c84e70baf96a92baf585b4ab41b356320361596365c2c1fd84a22cd83064",
+      "nodes": 78,
+      "edges": 42
+    }
+  ],
+  "median_incremental_seconds": 0.31537548897904344,
+  "median_full_seconds": 0.4072012010146864,
+  "interrupted_build_recovered_as_full": true,
+  "reclamation": {
+    "status": "reclaimed",
+    "before": {
+      "page_size": 4096,
+      "pages": 75,
+      "free_pages": 25,
+      "reclaimable_page_bytes": 102400,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 307200,
+          "allocated_bytes": 307200
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 339968,
+      "allocated_bytes": 339968
+    },
+    "after": {
+      "page_size": 4096,
+      "pages": 50,
+      "free_pages": 0,
+      "reclaimable_page_bytes": 0,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 204800,
+          "allocated_bytes": 204800
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 237568,
+      "allocated_bytes": 237568
+    },
+    "checkpoint": [
+      0,
+      0,
+      0
+    ],
+    "indexes_removed": 0
+  },
+  "private_export_only": true,
+  "existing_shared_export_preserved": true,
+  "note": "Native snapshots still encode complete generations; producer incrementality is not native per-file storage.",
+  "overlay": {
+    "non_git_original": true,
+    "no_fake_git": true,
+    "overlay_edit_add_delete_exact": true,
+    "staged_tamper_denied": true,
+    "prepared_source_policy": "filesystem-overlay-content-v1",
+    "nodes": 4,
+    "edges": 2
+  },
+  "platform": "Linux-7.0.14-28-pve-x86_64-with-glibc2.41",
+  "machine": "x86_64",
+  "logical_cpus": 40,
+  "adapter_sha256": "3d754a7538fdcb923f671d6b48599e4fc8d35190edc08b26379181eb5358a77e"
+}

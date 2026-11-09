@@ -1,0 +1,58 @@
+{
+  "fixture": {
+    "nodes": 800,
+    "edges": 2400
+  },
+  "conditions": "Synthetic shared snapshot, same libqihse and compiler; current RSS after one context query, concurrent host workloads, page cache not dropped",
+  "pairs": [
+    {
+      "before": {
+        "Rss_KiB": 26292,
+        "Pss_KiB": 16013,
+        "Private_Clean_KiB": 348,
+        "Private_Dirty_KiB": 15252
+      },
+      "after": {
+        "Rss_KiB": 142388,
+        "Pss_KiB": 132055,
+        "Private_Clean_KiB": 1528,
+        "Private_Dirty_KiB": 129864
+      }
+    }
+  ],
+  "binary_sha256": {
+    "before": "fe4b172a6261ef0931d86aba6736da149e833ddfd7a53b638cad47f6a24da12c",
+    "after": "5f8fd25652acf41f4c3d9d0e9329b55f467a35270117664eb6bbf1c4ec6044e8"
+  },
+  "source_sha256": {},
+  "shared_library_sha256": "8ead12e45e4fc434dbf1e1b4d4e2787b0210603fe4b3cb05b84d3c78ba9e4841",
+  "measurement_order": "All RSS pairs use the same immutable snapshot; refresh and authorization checks follow.",
+  "import": {
+    "wall_ms": 8524.425,
+    "cpu_ms": 6975.882,
+    "peak_rss_kib": 77100,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 9305364
+  },
+  "storage_format": "qihse-codegraph-packed-v2",
+  "cold_before": {
+    "wall_ms": 9328.791,
+    "cpu_ms": 8668.033,
+    "peak_rss_kib": 71036,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "cold_after": {
+    "wall_ms": 10760.577,
+    "cpu_ms": 9581.438,
+    "peak_rss_kib": 140668,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "refresh_invalidation_and_revocation": "passed",
+  "median_rss_KiB": {
+    "before": 26292,
+    "after": 142388
+  },
+  "cold_query_parity": true
+}

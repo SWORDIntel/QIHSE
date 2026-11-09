@@ -76,4 +76,13 @@ bool qihse_consensus_blob_read_committed_transaction_user(
     const qihse_consensus_t* consensus, qihse_user_t* user,
     uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len);
 
+/* Recovery-only counterpart: exact locally durable entry, committed or not.
+ * Requires a live system Operator authorized for its labels; never a quorum
+ * proof. All envelope/hash checks and zero-output denial match committed read.
+ * Caller serializes with consensus mutation. */
+bool qihse_consensus_blob_read_durable_transaction_user(
+    qihse_consensus_blob_context_t* context,
+    const qihse_consensus_t* consensus, qihse_user_t* user,
+    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len);
+
 #endif /* QIHSE_CONSENSUS_BLOB_H */

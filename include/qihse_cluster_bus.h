@@ -179,6 +179,26 @@ typedef struct {
     uint64_t config_epoch;
 } qihse_cluster_bus_slot_update_t;
 
+/* Proof-bearing v2 ownership announcement. The datagram is a claim only;
+ * receivers must verify a matching durable receipt over the configured QKP
+ * pin and persist local ownership state before adopting the map. */
+#define QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC 0x31544351u /* "QCT1", LE */
+typedef struct {
+    uint32_t magic;
+    uint16_t start, end;
+    uint16_t reserved;
+    uint64_t config_epoch;
+    uint64_t source_lsn, target_lsn;
+    char transfer_id[65];
+    char source_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char target_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char source_qkp_id[65];
+    char target_qkp_id[65];
+    char generation[65];
+    char owner_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    uint8_t checksum[32];
+} qihse_cluster_bus_ct_slot_update_t;
+
 typedef struct qihse_cluster_bus qihse_cluster_bus_t;
 
 typedef void (*qihse_cluster_bus_on_fail_cb)(qihse_cluster_topology_t* topology,
@@ -194,6 +214,10 @@ typedef void (*qihse_cluster_bus_on_takeover_cb)(qihse_cluster_topology_t* topol
                                                  uint16_t start, uint16_t end,
                                                  void* user_data);
 
+typedef void (*qihse_cluster_bus_on_ct_slot_update_cb)(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct_slot_update_t* update, void* user_data);
+
 typedef struct {
     qihse_cluster_topology_t* topology;
     qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
@@ -207,6 +231,11 @@ typedef struct {
     uint32_t timeout_ms;
     qihse_cluster_bus_on_fail_cb on_fail;
     void* on_fail_user_data;
+    /* Proof-bearing ownership claims are queued to a dedicated worker; the
+     * callback resolves the exact tuple over the pinned QKP transport and
+     * invokes ownership-journal validation before adopting it. */
+    qihse_cluster_bus_on_ct_slot_update_cb on_ct_slot_update;
+    void* on_ct_slot_update_user_data;
     /* Group update push. on_group_update fires on every member when an update
      * frame arrives; on_group_ack fires on the pusher when a member reports
      * applied/rejected. Both run on the bus thread: keep them short. */
@@ -346,6 +375,9 @@ void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,
 void qihse_cluster_bus_set_takeover_callback(qihse_cluster_bus_t* bus,
                                             qihse_cluster_bus_on_takeover_cb cb,
                                             void* user_data);
+void qihse_cluster_bus_set_ct_slot_update_callback(
+    qihse_cluster_bus_t* bus, qihse_cluster_bus_on_ct_slot_update_cb cb,
+    void* user_data);
 
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching
@@ -369,6 +401,9 @@ void qihse_cluster_bus_destroy(qihse_cluster_bus_t* bus);
 bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
                                              uint16_t start, uint16_t end,
                                              uint16_t owner_index);
+bool qihse_cluster_bus_broadcast_ct_slot_update(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct_slot_update_t* update);
 
 /* Broadcast a node metadata update (role change, health change). */
 bool qihse_cluster_bus_broadcast_node_update(qihse_cluster_bus_t* bus,

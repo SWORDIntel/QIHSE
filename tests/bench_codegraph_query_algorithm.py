@@ -139,7 +139,10 @@ def main():
             binary = temp / label
             subprocess.run(['cc', '-std=c11', '-O2', '-D_GNU_SOURCE', f'-DSOURCE="{source}"',
                 *(['-DVERIFY_SCRATCH'] if label == 'after' else []), '-I'+str(root/'include'), '-I'+str(root/'core'), '-I'+str(root/'tools'), str(harness),
-                str(root/'tools/qihse_codegraph_storage.c'), '-L'+str(args.library_dir.resolve()),
+                str(root/'tools/qihse_codegraph_storage.c'),
+                str(root/'tools/qihse_codegraph_packed.c'), str(root/'tools/qihse_codegraph_dictionary.c'),
+                str(root/'tools/qihse_codegraph_checksum.c'),
+                str(root/'tools/codegraph_xxh3/build/libqihse_xxh3.a'), '-L'+str(args.library_dir.resolve()),
                 '-lqihse', *libs, '-o', str(binary)], check=True)
             env = {**os.environ, 'LD_LIBRARY_PATH': str(args.library_dir.resolve())}
             lines = subprocess.check_output([str(binary), str(args.nodes), str(args.repeats)], env=env, cwd=temp, text=True).splitlines()

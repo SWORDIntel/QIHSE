@@ -1,0 +1,88 @@
+{
+  "method": "Reproduce bounded-v4 versus Zstd storage costs on synthetic CodeGraph facts.\n\nOptional benchmark, not a live-storage reader. It reuses the established graph\nfixture, gives every public identifier 128 bits, and writes an equivalent exact\nKV export in lexical key order. Every codec sees the same bytes. Timings exclude\nfixture/auth setup and include codec work; reported peak RSS is process-wide.\n",
+  "driver_sha256": "3f0d8f50d03276f1786629343020b2f1b28ab264307790d8dab44bf852009dbd",
+  "host": "Linux-7.0.14-28-pve-x86_64-with-glibc2.41",
+  "python": "3.13.5 (main, Aug 10 2026, 12:06:59) [GCC 14.2.0]",
+  "compiler": "cc (Debian 14.2.0-19) 14.2.0",
+  "nodes": 40000,
+  "edges": 120000,
+  "source_bytes": 74334253,
+  "source_sha256": "72b0f44f01a3b8f60e8c8cfe8c181caf4465523f93ba47979b07b4947242359c",
+  "raw_roundtrip": true,
+  "runs": [
+    {
+      "mode": "--encode-v4",
+      "input_bytes": 74334253,
+      "output_bytes": 7956752,
+      "seconds": 4.2121,
+      "peak_rss_kib": 74672,
+      "repeat": 0
+    },
+    {
+      "mode": "--encode-zstd",
+      "input_bytes": 74334253,
+      "output_bytes": 9172486,
+      "seconds": 7.279906,
+      "peak_rss_kib": 40740,
+      "repeat": 0
+    },
+    {
+      "mode": "--encode-zstd",
+      "input_bytes": 74334253,
+      "output_bytes": 9172486,
+      "seconds": 4.630662,
+      "peak_rss_kib": 40640,
+      "repeat": 1
+    },
+    {
+      "mode": "--encode-v4",
+      "input_bytes": 74334253,
+      "output_bytes": 7956752,
+      "seconds": 4.238451,
+      "peak_rss_kib": 74604,
+      "repeat": 1
+    },
+    {
+      "mode": "--encode-v4",
+      "input_bytes": 74334253,
+      "output_bytes": 7956752,
+      "seconds": 4.295362,
+      "peak_rss_kib": 74512,
+      "repeat": 2
+    },
+    {
+      "mode": "--encode-zstd",
+      "input_bytes": 74334253,
+      "output_bytes": 9172486,
+      "seconds": 4.569576,
+      "peak_rss_kib": 40604,
+      "repeat": 2
+    }
+  ],
+  "summary": {
+    "--encode-v4": {
+      "encoded_bytes": 7956752,
+      "median_seconds": 4.238451,
+      "peak_rss_kib": 74672
+    },
+    "--encode-zstd": {
+      "encoded_bytes": 9172486,
+      "median_seconds": 4.630662,
+      "peak_rss_kib": 40740
+    }
+  },
+  "decode": {
+    "mode": "--decode-v4",
+    "input_bytes": 7956752,
+    "output_bytes": 74334253,
+    "seconds": 2.575198,
+    "peak_rss_kib": 49120
+  },
+  "baseline_decode": {
+    "mode": "--decode-zstd",
+    "input_bytes": 9172486,
+    "output_bytes": 74334253,
+    "seconds": 0.367256,
+    "peak_rss_kib": 30684
+  }
+}

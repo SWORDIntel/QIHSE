@@ -117,6 +117,9 @@ bool qihse_cluster_topology_set_stable(qihse_cluster_topology_t* topology, uint1
 bool qihse_cluster_topology_get_slot(const qihse_cluster_topology_t* topology, uint16_t slot, uint16_t* owner_index, qihse_cluster_slot_state_t* state, uint16_t* peer_index);
 qihse_cluster_route_t qihse_cluster_topology_route(const qihse_cluster_topology_t* topology, uint16_t slot, bool asking, bool local_key_exists);
 size_t qihse_cluster_topology_ranges(const qihse_cluster_topology_t* topology, qihse_cluster_slot_range_t* out_ranges, size_t capacity);
+/* Constant-time atomic coverage snapshot. During a range mutation the count
+ * may temporarily understate assigned slots; it never reports full coverage
+ * while an unassignment is modifying the map. Exact after a mutator returns. */
 size_t qihse_cluster_topology_assigned_slots(const qihse_cluster_topology_t* topology);
 bool qihse_cluster_topology_is_covered(const qihse_cluster_topology_t* topology);
 

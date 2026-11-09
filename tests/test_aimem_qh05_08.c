@@ -106,16 +106,43 @@ int main(void) {
     };
     snprintf(relation.target_version_id, sizeof relation.target_version_id,
              "%s", first.version_id);
+    qihse_ai_memory_source_ref_t document_source = {
+        .system = "hax-file", .id = "src/a file|name.c",
+        .revision = "sha384-0123456789abcdef", .line_start = 11u, .line_end = 19u
+    };
     qihse_ai_memory_knowledge_provenance_t provenance = {
         .idempotency_key = "qh07-provenance", .source_event_ids = sources,
         .source_event_count = 1u, .relations = &relation, .relation_count = 1u,
-        .confidence_ppm = 800000u
+        .confidence_ppm = 800000u, .source_ref = &document_source
     };
     qihse_ai_memory_knowledge_version_t related;
     assert(qihse_ai_memory_knowledge_create_ex(server, owner, &scope,
         QIHSE_AIMEM_KNOWLEDGE_ARCHITECTURE, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
         "QH07 provenance and relation round trip", &provenance, &related) ==
         QIHSE_AIMEM_WRITE_NEW);
+    assert(strcmp(related.source_ref.id, document_source.id) == 0);
+    qihse_ai_memory_query_v1_t source_query = {
+        .scope = scope, .source_ref = &document_source,
+        .mode = QIHSE_AIMEM_MODE_BM25, .max_rows = 8u
+    };
+    qihse_ai_memory_query_snapshot_t* source_snapshot =
+        qihse_ai_memory_query_begin(server, reader, &source_query);
+    assert(source_snapshot);
+    qihse_ai_memory_query_hit_t source_hits[8] = {0};
+    size_t source_count = qihse_ai_memory_query_next(source_snapshot,
+        reader, source_hits, 8u);
+    assert(source_count == 1u &&
+           strcmp(source_hits[0].version.version_id, related.version_id) == 0);
+    qihse_ai_memory_query_hits_free(source_hits, source_count);
+    qihse_ai_memory_query_end(source_snapshot);
+    qihse_ai_memory_source_ref_t wrong_revision = document_source;
+    snprintf(wrong_revision.revision, sizeof wrong_revision.revision, "%s", "sha384-other");
+    source_query.source_ref = &wrong_revision;
+    source_snapshot = qihse_ai_memory_query_begin(server, reader, &source_query);
+    assert(source_snapshot);
+    assert(qihse_ai_memory_query_next(source_snapshot, reader,
+        source_hits, 8u) == 0u);
+    qihse_ai_memory_query_end(source_snapshot);
 
     qihse_ai_memory_query_v1_t query = {
         .scope = scope, .current_only = true, .text = "stable paging", .max_rows = 8u
@@ -352,10 +379,41 @@ int main(void) {
     /* Same project membership, insufficient label: query and export omit it. */
     assert(qihse_ai_memory_store_scoped(server, high, "high owner seed",
         QIHSE_AIMEM_EPISODIC, &scope, seed));
+    qihse_ai_memory_source_ref_t high_source = {
+        .system = "hax-file", .id = "src/high.c",
+        .revision = "sha384-high", .line_start = 3u, .line_end = 7u
+    };
+    qihse_ai_memory_knowledge_provenance_t high_provenance = {
+        .source_ref = &high_source
+    };
     qihse_ai_memory_knowledge_version_t secret;
-    assert(qihse_ai_memory_knowledge_create(server, high, &scope,
+    assert(qihse_ai_memory_knowledge_create_ex(server, high, &scope,
         QIHSE_AIMEM_KNOWLEDGE_GOTCHA, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
-        "stable paging QH0508_HIGH_SECRET", &secret) == QIHSE_AIMEM_WRITE_NEW);
+        "stable paging QH0508_HIGH_SECRET", &high_provenance,
+        &secret) == QIHSE_AIMEM_WRITE_NEW);
+    assert(!qihse_ai_memory_knowledge_get(server, reader,
+        secret.version_id, &scope, &latest));
+    source_query.source_ref = &high_source;
+    source_snapshot = qihse_ai_memory_query_begin(server, reader, &source_query);
+    assert(source_snapshot);
+    assert(qihse_ai_memory_query_next(source_snapshot, reader,
+        source_hits, 8u) == 0u);
+    qihse_ai_memory_query_end(source_snapshot);
+    source_snapshot = qihse_ai_memory_query_begin(server, high, &source_query);
+    assert(source_snapshot);
+    source_count = qihse_ai_memory_query_next(source_snapshot, high,
+        source_hits, 8u);
+    assert(source_count == 1u);
+    qihse_ai_memory_query_hits_free(source_hits, source_count);
+    qihse_ai_memory_query_end(source_snapshot);
+    qihse_ai_memory_scope_t wrong_scope = scope;
+    snprintf(wrong_scope.worktree, sizeof wrong_scope.worktree, "%s", "tree-other");
+    source_query.scope = wrong_scope;
+    source_snapshot = qihse_ai_memory_query_begin(server, high, &source_query);
+    assert(source_snapshot);
+    assert(qihse_ai_memory_query_next(source_snapshot, high,
+        source_hits, 8u) == 0u);
+    qihse_ai_memory_query_end(source_snapshot);
     qihse_ai_memory_query_v1_t hidden_query = query;
     hidden_query.text = "QH0508_HIGH_SECRET";
     qihse_ai_memory_query_snapshot_t* hidden_snapshot =
@@ -452,6 +510,10 @@ int main(void) {
            strcmp(latest.source_event_ids[0], event_id) == 0 &&
            latest.relations[0].type == QIHSE_AIMEM_RELATION_CAUSES &&
            latest.confidence_ppm == 800000u);
+    assert(strcmp(latest.source_ref.system, document_source.system) == 0 &&
+           strcmp(latest.source_ref.id, document_source.id) == 0 &&
+           strcmp(latest.source_ref.revision, document_source.revision) == 0 &&
+           latest.source_ref.line_start == 11u && latest.source_ref.line_end == 19u);
     qihse_ai_memory_knowledge_free(&latest);
     qihse_ai_memory_hit_t restored_event = {0};
     assert(qihse_ai_memory_event_get(server, owner, event_id, &scope, &restored_event));
@@ -504,6 +566,29 @@ int main(void) {
     assert(qihse_ai_memory_knowledge_latest(server, owner, flagged.knowledge_id,
         &scope, &latest));
     assert(strcmp(latest.content, "explicitly contradictory item") == 0);
+    qihse_ai_memory_knowledge_free(&latest);
+
+    /* Existing QHK2 records remain readable and can be revised into QHK3
+     * without fabricating an external source reference. */
+    const char* legacy_id = "00000000-0000-4000-8000-000000000111";
+    const char* legacy_version = "00000000-0000-4000-8000-000000000112";
+    char legacy_key[128], legacy_raw[1024];
+    assert(snprintf(legacy_key, sizeof legacy_key,
+        "t:17/aimem-knowledge:%s", legacy_id) > 0);
+    assert(snprintf(legacy_raw, sizeof legacy_raw,
+        "QHK2|%s|9501|%s|%s|%s|%s|1|1|%s|1|1|1|0|1|9501|9501|0|0||"
+        "c49fea7425fa7f8699897a97c159c6690267d9003bb78c53fafa8fc15c325d84|0|0|"
+        "6c6567616379", legacy_id, scope.project, scope.worktree,
+        scope.workstream, scope.session, legacy_version) > 0);
+    assert(qihse_kv_set_user(store, legacy_key, legacy_raw, 0u, 0u, owner));
+    assert(qihse_ai_memory_knowledge_get(server, owner,
+        legacy_version, &scope, &latest));
+    assert(strcmp(latest.content, "legacy") == 0 && !latest.source_ref.system[0]);
+    qihse_ai_memory_knowledge_free(&latest);
+    assert(qihse_ai_memory_knowledge_revise(server, owner, legacy_id,
+        legacy_version, 1u, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+        "legacy revised", &latest) == QIHSE_AIMEM_WRITE_NEW);
+    assert(!latest.source_ref.system[0]);
     qihse_ai_memory_knowledge_free(&latest);
 
     qihse_ai_memory_export_free(&low_export);

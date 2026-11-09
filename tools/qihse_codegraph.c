@@ -14,9 +14,14 @@
 #endif
 #define _XOPEN_SOURCE 700
 #include "qihse_audit.h"
-#include "qihse_graph_store.h"
+#include "qihse_codegraph_csr.h"
 #include "qihse_kv_store.h"
 #include "qihse_codegraph_storage.h"
+#include "qihse_codegraph_source.h"
+#include "qihse_codegraph_progress.h"
+#include "qihse_codegraph_json.h"
+#include "qihse_codegraph_projection.h"
+#include "qihse_codegraph_generation_adapter.h"
 #include <dirent.h>
 #include <assert.h>
 #include <errno.h>
@@ -36,6 +41,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <string.h>
 #include <sys/file.h>
 #include <sys/resource.h>
@@ -52,32 +60,32 @@ extern char **environ;
 #define CG_MAX_LINE 262144u
 #define CG_MAX_NODES 2000000u
 #define CG_MAX_EDGES 8000000u
+#define CG_QUERY_EDGE_BUDGET 65536u
 #define CG_MAX_OUT 100000u
 #define CG_MAX_FILES 64u
 #define CG_REQUEST_MAX 65536u
 
-typedef struct {
-    char id[65];
-    char *file, *name, *kind;
-    int line, end_line, is_test;
-    uint64_t vertex;
-} cg_node;
+typedef cg_projection_node cg_node;
 
 typedef struct {
     qihse_kv_store_t *kv;
     qihse_user_t *principal;
-    qihse_graph_t *graph;
+    cg_csr *graph;
+    cg_projection *projection;
     cg_node *nodes;
     cg_node **by_vertex, **by_name, **by_file;
     size_t nn, capacity, edges, unresolved;
+    size_t id_hex_chars; /* 32 for declared semantic-128, 64 for legacy IDs. */
     struct json_object *meta, *manifest;
     cg_storage_info_t storage_info;
-    bool stats_mode;
+    cg_generation_info generation_info, generation_write_info;
+    bool stats_mode, read_only_graph;
     const char *requested_storage_format;
     bool audit_ready;
     int lifecycle_fd, lease_fd;
     char directory[PATH_MAX], repository[PATH_MAX];
-    char scratch[PATH_MAX];
+    char scratch[PATH_MAX], kv_directory[PATH_MAX];
+    uint64_t spill_reclaimed_bytes, spill_reclaimed_files;
 } cg_state;
 
 static char *json_string(struct json_object *obj, const char *key) {
@@ -92,6 +100,11 @@ static int64_t json_num(struct json_object *obj, const char *key) {
     if (!json_object_object_get_ex(obj, key, &field))
         return 0;
     return json_object_get_int64(field);
+}
+static bool json_integer_equals(struct json_object *obj, const char *key, int64_t expected) {
+    struct json_object *field = NULL;
+    return json_object_object_get_ex(obj, key, &field) &&
+           json_object_is_type(field, json_type_int) && json_object_get_int64(field) == expected;
 }
 static double json_double(struct json_object *obj, const char *key) {
     struct json_object *field = NULL;
@@ -260,6 +273,7 @@ static bool storage_lock(cg_state *st, int operation) {
 }
 static struct json_object *read_json_file(const char *path);
 static bool load_snapshot_unlocked(cg_state *st, bool build_graph);
+static bool generation_cleanup_unlocked(cg_state *st, struct json_object *manifest, size_t *removed, uint64_t *bytes);
 static bool snapshot_name(const char *name) {
     if (!name) return false;
     size_t length = strlen(name);
@@ -288,6 +302,57 @@ static bool snapshot_name(const char *name) {
     /* Original publishers used getpid(); newer ones use mkstemps(). */
     return random_suffix || pid_suffix;
 }
+/* Called only under the exclusive storage lock, after a verified generation's
+ * manifest has been published. Keep the current and one rollback generation. */
+static bool prune_snapshots_unlocked(cg_state *st, struct json_object *manifest,
+                                     size_t *removed) {
+    if (!st || !st->principal || !qihse_auth_user_is_active(st->principal) ||
+        !qihse_auth_can_access(st->principal, 0, 0)) return false;
+    const char *current = json_string(manifest, "snapshot");
+    const char *previous = json_string(manifest, "previous_snapshot");
+    struct json_object *previous_field = NULL;
+    if (!snapshot_name(current) ||
+        (json_object_object_get_ex(manifest, "previous_snapshot", &previous_field) &&
+         !snapshot_name(previous))) return false;
+    DIR *dir = opendir(st->directory);
+    if (!dir) return false;
+    bool ok = true;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno) ok = false;
+            break;
+        }
+        const char *name = entry->d_name;
+        char parent[128];
+        size_t length = strlen(name);
+        bool sidecar = length > 4 && length - 4 < sizeof(parent) &&
+                       !strcmp(name + length - 4, ".qci");
+        if (sidecar) {
+            memcpy(parent, name, length - 4); parent[length - 4] = '\0';
+            if (!snapshot_name(parent) || !strcmp(parent, current)) continue;
+        } else if (!snapshot_name(name) || !strcmp(name, current) ||
+                   (previous && !strcmp(name, previous))) continue;
+        struct stat info;
+        if (fstatat(dirfd(dir), name, &info, AT_SYMLINK_NOFOLLOW)) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            break;
+        }
+        if (!S_ISREG(info.st_mode) || info.st_uid != geteuid()) continue;
+        if (sidecar && ((info.st_mode & 077) || info.st_nlink != 1)) continue;
+        if (unlinkat(dirfd(dir), name, 0)) {
+            ok = false;
+            break;
+        }
+        (*removed)++;
+    }
+    if (fsync(dirfd(dir))) ok = false;
+    if (closedir(dir)) ok = false;
+    return ok;
+}
 /* Keep the ownership lease until every data entry has been removed. A crash
  * during a large cleanup must leave a runtime that later GC can still identify. */
 static int delete_scratch_entry(const char *path, const struct stat *st, int flags,
@@ -308,22 +373,144 @@ static int remove_scratch(const char *path) {
     if (unlink(lease) && errno != ENOENT) return -1;
     return rmdir(path);
 }
-static void graph_close(cg_state *st) {
-    if (st->graph)
-        qihse_graph_destroy(st->graph);
-    if (st->kv)
-        qihse_kv_store_destroy(st->kv);
-    for (size_t i = 0; i < st->nn; i++) {
-        free(st->nodes[i].file);
-        free(st->nodes[i].name);
-        free(st->nodes[i].kind);
+/* A lease proves a runtime belongs to this lifecycle. An active lease, a
+ * missing lease, or an unfamiliar directory is never removed automatically. */
+static bool prune_runtimes_unlocked(cg_state *st, size_t *removed) {
+    DIR *dir = opendir(st->directory);
+    if (!dir) return false;
+    bool ok = true;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno) ok = false;
+            break;
+        }
+        const char *name = entry->d_name;
+        if (strncmp(name, ".runtime-", 9)) continue;
+        char path[PATH_MAX], lease[PATH_MAX];
+        struct stat info;
+        if (snprintf(path, sizeof(path), "%s/%s", st->directory, name) >=
+                (int)sizeof(path) ||
+            snprintf(lease, sizeof(lease), "%s/.lease", path) >=
+                (int)sizeof(lease)) { ok = false; break; }
+        if (lstat(path, &info)) {
+            if (errno == ENOENT) continue;
+            ok = false;
+            break;
+        }
+        if (!S_ISDIR(info.st_mode) || info.st_uid != geteuid() || (info.st_mode & 077))
+            continue;
+        int fd = private_lock(lease, LOCK_EX | LOCK_NB, false);
+        if (fd < 0) continue;
+        int failure = remove_scratch(path);
+        close(fd);
+        if (failure) { ok = false; break; }
+        (*removed)++;
     }
-    free(st->nodes);
-    free(st->by_name);
-    st->by_name = NULL;
-    free(st->by_file);
-    st->by_file = NULL;
-    free(st->by_vertex);
+    if (fsync(dirfd(dir))) ok = false;
+    if (closedir(dir)) ok = false;
+    return ok;
+}
+/* Only after validating an existing generation or durably publishing a new one,
+ * while holding the exclusive lifecycle lock. Receipt fields are not persisted. */
+static void report_retention_unlocked(cg_state *st, struct json_object *manifest,
+                                      struct json_object *report) {
+    size_t removed = 0, runtimes = 0;
+    bool pruned = prune_snapshots_unlocked(st, manifest, &removed);
+    if (!prune_runtimes_unlocked(st, &runtimes)) pruned = false;
+    size_t shared_removed = 0; uint64_t shared_bytes = 0;
+    if (!generation_cleanup_unlocked(st, manifest, &shared_removed, &shared_bytes)) pruned = false;
+    json_int(report, "removed_shared_blocks", (int64_t)shared_removed);
+    json_int(report, "removed_shared_block_bytes", (int64_t)shared_bytes);
+    json_int(report, "removed_snapshots", (int64_t)removed);
+    json_int(report, "removed_runtimes", (int64_t)runtimes);
+    if (!pruned) json_text(report, "retention_warning", "storage cleanup incomplete");
+}
+/* KV and audit both use QIHSE_DATA_DIR. Keep that environment stable for
+ * audit's background signer and place it under this runtime's lease. Cleanup
+ * recognises only KV-owned leaves, never audit state, locks or arbitrary files. */
+static bool kv_spill_name(const char *name) {
+    if (!strcmp(name, "wal.log") || !strcmp(name, "restore-highwater.bin") ||
+        !strcmp(name, "replica-cursors.bin")) return true;
+    if (strncmp(name, "sstable_", 8)) return false;
+    const char *p = name + 8;
+    if (*p < '0' || *p > '9' || (*p == '0' && p[1] != '.')) return false;
+    unsigned long id = 0;
+    while (*p >= '0' && *p <= '9') {
+        unsigned digit = (unsigned)(*p++ - '0');
+        if (id > ((unsigned long)INT_MAX - digit) / 10u) return false;
+        id = id * 10u + digit;
+    }
+    return !strcmp(p, ".db");
+}
+static bool release_decoded_spills(cg_state *st) {
+    /* Refresh already holds graph_api_lock. Auth owns its own synchronization;
+     * do not recursively take the CLI graph mutex through principal_active(). */
+    if (!st || !st->read_only_graph || st->kv || !st->kv_directory[0] ||
+        st->lease_fd < 0 || !st->principal ||
+        !qihse_auth_user_is_active(st->principal) ||
+        !qihse_auth_can_access(st->principal, 0, 0)) return false;
+    char expected[PATH_MAX], lease_path[PATH_MAX];
+    struct stat held, named;
+    if (snprintf(expected, sizeof(expected), "%s/decoded-store", st->scratch) >=
+            (int)sizeof(expected) || strcmp(expected, st->kv_directory) ||
+        snprintf(lease_path, sizeof(lease_path), "%s/.lease", st->scratch) >=
+            (int)sizeof(lease_path) ||
+        fstat(st->lease_fd, &held) || lstat(lease_path, &named) ||
+        !S_ISREG(named.st_mode) || named.st_uid != geteuid() || (named.st_mode & 077) ||
+        named.st_nlink != 1 || held.st_dev != named.st_dev || held.st_ino != named.st_ino ||
+        flock(st->lease_fd, LOCK_EX | LOCK_NB)) return false;
+    int fd = open(st->kv_directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat directory;
+    if (fd < 0) return false;
+    if (fstat(fd, &directory) || directory.st_uid != geteuid() ||
+        (directory.st_mode & 077)) { close(fd); return false; }
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return false; }
+    bool ok = true;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno) ok = false; break; }
+        if (!kv_spill_name(entry->d_name)) continue;
+        struct stat info;
+        if (fstatat(fd, entry->d_name, &info, AT_SYMLINK_NOFOLLOW)) {
+            if (errno != ENOENT) ok = false;
+            continue;
+        }
+        /* A lookalike, symlink, directory or shared inode is never ours to
+         * delete. No payload is read. Destroy has closed all SST/WAL handles. */
+        if (!S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
+            (info.st_mode & 077) || info.st_nlink != 1 || info.st_size < 0) continue;
+        if (unlinkat(fd, entry->d_name, 0)) { ok = false; continue; }
+        st->spill_reclaimed_bytes += (uint64_t)info.st_size;
+        st->spill_reclaimed_files++;
+    }
+    if (fsync(fd)) ok = false;
+    if (closedir(dir)) ok = false;
+    return ok;
+}
+static void release_query_graph(cg_state *st) {
+    if (st->projection) cg_projection_destroy(st->projection);
+    else {
+        if (st->graph) cg_csr_destroy(st->graph);
+        free(st->nodes);
+        free(st->by_name);
+        free(st->by_file);
+        free(st->by_vertex);
+    }
+    st->projection = NULL;
+    st->graph = NULL;
+    st->nodes = NULL;
+    st->by_name = st->by_file = st->by_vertex = NULL;
+    st->nn = st->capacity = st->edges = st->unresolved = 0;
+}
+static void graph_close(cg_state *st) {
+    release_query_graph(st);
+    if (st->kv) qihse_kv_store_destroy(st->kv);
     if (st->meta)
         json_object_put(st->meta);
     if (st->manifest)
@@ -343,10 +530,8 @@ static bool graph_open(cg_state *st, const char *repo, bool importing) {
     st->lifecycle_fd = st->lease_fd = -1;
     if (!realpath(repo, st->repository))
         return false;
-    char work_marker[PATH_MAX];
-    if (snprintf(work_marker, sizeof(work_marker), "%s/.git", st->repository) >=
-            (int)sizeof(work_marker) ||
-        access(work_marker, F_OK) != 0)
+    struct stat repository_info;
+    if (stat(st->repository, &repository_info) || !S_ISDIR(repository_info.st_mode))
         return false;
     const char *state = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
     char base[PATH_MAX];
@@ -388,7 +573,9 @@ static bool graph_open(cg_state *st, const char *repo, bool importing) {
     /* Force QIHSE's KV runtime into our private disposable directory,
      * never the host's production /opt/qihse-data. This process is single
      * purpose; QIHSE caches its data dir for the process lifetime. */
-    if (setenv("QIHSE_DATA_DIR", st->scratch, 1) != 0)
+    if (snprintf(st->kv_directory, sizeof(st->kv_directory), "%s/decoded-store", st->scratch) >=
+            (int)sizeof(st->kv_directory) || mkdir(st->kv_directory, 0700) ||
+        setenv("QIHSE_DATA_DIR", st->kv_directory, 1) != 0)
         return false;
     /* This offline process has its own authenticated realm. Never inherit
      * credentials or storage from a running QIHSE service. */
@@ -419,7 +606,7 @@ static bool graph_open(cg_state *st, const char *repo, bool importing) {
     auth_ms = monotonic_ms() - auth_start;
     if (!st->principal)
         return false;
-    st->kv = qihse_kv_store_create();
+    st->kv = qihse_kv_store_create_user(st->principal);
     if (!st->kv)
         return false;
     return true;
@@ -473,8 +660,144 @@ static bool atomic_write(const char *path, const char *text, bool *committed) {
     }
     return ok;
 }
-static bool validate_node(struct json_object *item) {
-    char *id = json_string(item, "id"), *file = json_string(item, "file");
+/* Source and snapshot digests remain SHA-256. Only graph identities use
+ * this explicitly versioned schema; a width cannot be inferred from one row. */
+static bool identity_string(struct json_object *value, const char *expected) {
+    return value && json_object_is_type(value, json_type_string) &&
+           (size_t)json_object_get_string_len(value) == strlen(expected) &&
+           memcmp(json_object_get_string(value), expected, strlen(expected)) == 0;
+}
+static bool identity_schema(struct json_object *meta, size_t *width) {
+    struct json_object *identity = NULL, *algorithm = NULL, *bits = NULL, *collision = NULL, *attempts = NULL;
+    struct json_object *seed = NULL, *encoding = NULL;
+    bool has_identity = json_object_object_get_ex(meta, "identity", &identity);
+    bool has_algorithm = json_object_object_get_ex(meta, "id_algorithm", &algorithm);
+    bool has_bits = json_object_object_get_ex(meta, "id_bits", &bits);
+    bool has_collision = json_object_object_get_ex(meta, "id_collision", &collision);
+    bool has_attempts = json_object_object_get_ex(meta, "id_collision_attempts", &attempts);
+    bool has_seed = json_object_object_get_ex(meta, "id_seed", &seed);
+    bool has_encoding = json_object_object_get_ex(meta, "id_encoding", &encoding);
+    if (has_identity && (!json_object_is_type(identity, json_type_string) ||
+        (size_t)json_object_get_string_len(identity) != strlen(json_object_get_string(identity)))) return false;
+    const char *name = has_identity ? json_object_get_string(identity) : NULL;
+    bool xxh3 = name && !strcmp(name, "qihse-semantic-xxh3-128-v1");
+    bool sha128 = name && !strcmp(name, "qihse-semantic-128-v1");
+    if (xxh3 || sha128) {
+        if (!has_algorithm || !identity_string(algorithm, xxh3 ? "xxh3-128" : "sha256-128") ||
+            !has_bits || !json_object_is_type(bits, json_type_int) ||
+            json_object_get_int64(bits) != 128 ||
+            !has_collision || !identity_string(collision, xxh3 ? "counter-xxh3-128-v1" : "counter-sha256-128-v1") ||
+            !has_attempts || !json_object_is_type(attempts, json_type_int) ||
+            json_object_get_int64(attempts) != 256) return false;
+        if (xxh3) {
+            if (!has_seed || !json_object_is_type(seed, json_type_int) ||
+                json_object_get_int64(seed) != 0 || !has_encoding ||
+                !identity_string(encoding, "xxh128-canonical")) return false;
+        } else if (has_seed || has_encoding) return false;
+        *width = 32;
+        return true;
+    }
+    if ((name && strcmp(name, "qihse-semantic-edges-v2")) || has_algorithm || has_bits ||
+        has_collision || has_attempts || has_seed || has_encoding) return false;
+    *width = 64;
+    return true;
+}
+static void identity_metadata(struct json_object *out, struct json_object *meta) {
+    if (!meta) return;
+    const char *identity = json_string(meta, "identity");
+    if (identity) json_text(out, "identity", identity);
+    if (identity && (!strcmp(identity, "qihse-semantic-128-v1") ||
+                     !strcmp(identity, "qihse-semantic-xxh3-128-v1"))) {
+        /* The profile was validated before admission. Retain its exact declared
+         * algorithm/encoding rather than relabelling a different identifier. */
+        static const char *fields[] = {"id_algorithm", "id_bits", "id_collision",
+            "id_collision_attempts", "id_seed", "id_encoding"};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            struct json_object *value = NULL;
+            if (json_object_object_get_ex(meta, fields[i], &value))
+                json_object_object_add(out, fields[i], json_object_get(value));
+        }
+    }
+}
+/* Source identity is independent of public graph IDs. Keep the exact provider
+ * contract in both authoritative metadata and the published manifest. */
+static const char *source_string(struct json_object *obj, const char *key) {
+    struct json_object *value = NULL;
+    if (!obj || !json_object_object_get_ex(obj, key, &value) ||
+        !json_object_is_type(value, json_type_string)) return NULL;
+    const char *text = json_object_get_string(value);
+    return text && (size_t)json_object_get_string_len(value) == strlen(text) ? text : NULL;
+}
+static bool source_present(struct json_object *obj, const char *key) {
+    struct json_object *value = NULL;
+    return json_object_object_get_ex(obj, key, &value);
+}
+static bool source_schema(struct json_object *obj, bool header) {
+    const char *policy = source_string(obj, "freshness");
+    const char *head = source_string(obj, "head");
+    const char *tree = source_string(obj, "worktree");
+    const char *v2 = source_string(obj, "worktree_v2");
+    if (!policy || !(hex_n(head, 40) || hex_n(head, 64)) || !hex64(tree) ||
+        (header && !hex64(v2)) || (!header && source_present(obj, "worktree_v2"))) return false;
+    static const char *extras[] = {"source_provider", "source_disk_digest", "source_effective_digest",
+                                  "source_overlay", "source_overlay_digest"};
+    if (!strcmp(policy, "git-status-diff-index-untracked-v2")) {
+        for (size_t i = 0; i < sizeof(extras)/sizeof(extras[0]); ++i)
+            if (source_present(obj, extras[i])) return false;
+        return true;
+    }
+    bool overlay = !strcmp(policy, CG_SOURCE_OVERLAY_POLICY);
+    if (!overlay && strcmp(policy, CG_SOURCE_FILESYSTEM_POLICY)) return false;
+    const char *provider = source_string(obj, "source_provider");
+    const char *disk = source_string(obj, "source_disk_digest");
+    const char *effective = source_string(obj, "source_effective_digest");
+    const char *overlay_path = source_string(obj, "source_overlay");
+    const char *overlay_digest = source_string(obj, "source_overlay_digest");
+    static const char zero_head[] =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    return !strcmp(head, zero_head) && (!header || !strcmp(tree, v2)) &&
+           provider && !strcmp(provider, "filesystem") && hex64(disk) && hex64(effective) &&
+           (overlay ? (overlay_path && overlay_path[0] == '/' && strlen(overlay_path) < PATH_MAX &&
+                       hex64(overlay_digest)) :
+                      (!source_present(obj, "source_overlay") &&
+                       !source_present(obj, "source_overlay_digest")));
+}
+static void source_metadata(struct json_object *out, struct json_object *meta) {
+    json_text(out, "freshness", source_string(meta, "freshness"));
+    json_text(out, "head", source_string(meta, "head"));
+    const char *tree = source_string(meta, "worktree_v2");
+    json_text(out, "worktree", tree ? tree : source_string(meta, "worktree"));
+    static const char *extras[] = {"source_provider", "source_disk_digest", "source_effective_digest",
+                                  "source_overlay", "source_overlay_digest"};
+    for (size_t i = 0; i < sizeof(extras)/sizeof(extras[0]); ++i) {
+        const char *value = source_string(meta, extras[i]);
+        if (value) json_text(out, extras[i], value);
+    }
+}
+static bool same_source(struct json_object *a, struct json_object *b) {
+    static const char *keys[] = {"head", "freshness", "source_provider", "source_disk_digest",
+        "source_effective_digest", "source_overlay", "source_overlay_digest"};
+    for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i) {
+        const char *left = source_string(a, keys[i]), *right = source_string(b, keys[i]);
+        if ((!left != !right) || (left && strcmp(left, right))) return false;
+    }
+    const char *left = source_string(a, "worktree_v2");
+    if (!left) left = source_string(a, "worktree");
+    const char *right = source_string(b, "worktree_v2");
+    if (!right) right = source_string(b, "worktree");
+    return left && right && !strcmp(left, right);
+}
+static bool identity_hex_field(struct json_object *item, const char *key, size_t width,
+                               bool allow_empty) {
+    struct json_object *value = NULL;
+    if (!json_object_object_get_ex(item, key, &value) ||
+        !json_object_is_type(value, json_type_string)) return false;
+    size_t length = (size_t)json_object_get_string_len(value);
+    return (allow_empty && length == 0) ||
+           (length == width && hex_n(json_object_get_string(value), width));
+}
+static bool validate_node(struct json_object *item, size_t width) {
+    char *file = json_string(item, "file");
     char *name = json_string(item, "name"), *kind = json_string(item, "kind");
     struct json_object *classification = NULL, *sci = NULL;
     if ((json_object_object_get_ex(item, "classification", &classification) &&
@@ -483,12 +806,12 @@ static bool validate_node(struct json_object *item) {
         (json_object_object_get_ex(item, "sci", &sci) &&
          (!json_object_is_type(sci, json_type_int) || json_object_get_int64(sci) != 0)))
         return false;
-    return hex64(id) && file && safe_relative(file) && strlen(file) <= 4096 && name &&
+    return identity_hex_field(item, "id", width, false) && file && safe_relative(file) && strlen(file) <= 4096 && name &&
            strlen(name) <= 512 && kind && strlen(kind) <= 64 && json_num(item, "line_start") >= 0 &&
            json_num(item, "line_end") >= 0;
 }
-static bool validate_edge(struct json_object *item) {
-    char *id = json_string(item, "id"), *file = json_string(item, "file");
+static bool validate_edge(struct json_object *item, size_t width) {
+    char *file = json_string(item, "file");
     char *src = json_string(item, "source"), *dst = json_string(item, "target");
     char *type = json_string(item, "relation");
     char *resolution = json_string(item, "resolution");
@@ -501,12 +824,12 @@ static bool validate_edge(struct json_object *item) {
         (json_object_object_get_ex(item, "sci", &sci) &&
          (!json_object_is_type(sci, json_type_int) || json_object_get_int64(sci) != 0)))
         return false;
-    return hex64(id) && file && safe_relative(file) && src && (!*src || hex64(src)) && dst &&
-           (!*dst || hex64(dst)) && type && strlen(type) < 32 && resolution &&
+    return identity_hex_field(item, "id", width, false) && file && safe_relative(file) && src && identity_hex_field(item, "source", width, true) && dst &&
+           identity_hex_field(item, "target", width, true) && type && strlen(type) < 32 && resolution &&
            json_num(item, "line") >= 0 && json_double(item, "confidence") >= 0.0 &&
            json_double(item, "confidence") <= 1.0 &&
            (!traversable ||
-            (hex64(src) && hex64(dst) && tier && strcmp(resolution, "direct") == 0 &&
+            (hex_n(src, width) && hex_n(dst, width) && tier && strcmp(resolution, "direct") == 0 &&
              strcmp(tier, "EXTRACTED") == 0 && json_double(item, "confidence") >= 0.8));
 }
 
@@ -554,32 +877,6 @@ static bool record_fingerprint(cg_state *st, char result[65], size_t *count) {
     }
     *count = f.n;
     free(f.hashes);
-    return ok;
-}
-static bool sha256_private_user(cg_state *st, const char *path, char result[65]) {
-    if (!principal_active(st)) return false;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    bool ok = fd >= 0;
-    struct stat info;
-    if (ok && (fstat(fd, &info) || !S_ISREG(info.st_mode) ||
-               info.st_uid != geteuid() || info.st_nlink != 1)) ok = false;
-    EVP_MD_CTX *digest = ok ? EVP_MD_CTX_new() : NULL;
-    if (!digest || EVP_DigestInit_ex(digest, EVP_sha256(), NULL) != 1) ok = false;
-    unsigned char chunk[65536], sum[32];
-    unsigned int length = 0;
-    while (ok) {
-        if (!principal_active(st)) { ok = false; break; }
-        ssize_t n = read(fd, chunk, sizeof(chunk));
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0) { ok = false; break; }
-        if (!n) break;
-        ok = EVP_DigestUpdate(digest, chunk, (size_t)n) == 1;
-    }
-    if (ok) ok = principal_active(st) &&
-        EVP_DigestFinal_ex(digest, sum, &length) == 1 && length == 32;
-    if (ok) digest_hex(sum, sizeof(sum), result);
-    EVP_MD_CTX_free(digest);
-    if (fd >= 0) close(fd);
     return ok;
 }
 /* Compare complete authenticated live-record exports, including labels,
@@ -654,16 +951,68 @@ static bool export_fingerprint(cg_state *st, char result[65]) {
     unlink(path);
     return ok;
 }
+/* Snapshot checksums are separate from SHA-256 source/trailer identities. */
+static bool manifest_checksum(struct json_object *manifest, cg_snapshot_checksum *out) {
+    struct json_object *algorithm = NULL, *digest = NULL, *legacy = NULL;
+    bool has_algorithm = json_object_object_get_ex(manifest, "snapshot_hash_algorithm", &algorithm);
+    bool has_digest = json_object_object_get_ex(manifest, "snapshot_hash", &digest);
+    bool has_legacy = json_object_object_get_ex(manifest, "sha256", &legacy);
+    memset(out, 0, sizeof(*out));
+    if (has_algorithm || has_digest) {
+        if (has_legacy || !has_algorithm || !has_digest ||
+            !json_object_is_type(algorithm, json_type_string) ||
+            !json_object_is_type(digest, json_type_string)) return false;
+        const char *name = json_object_get_string(algorithm);
+        if (json_object_get_string_len(algorithm) != 8 || strcmp(name, "xxh3-128")) return false;
+        out->algorithm = CG_CHECKSUM_XXH3_128;
+    } else {
+        if (!has_legacy || !json_object_is_type(legacy, json_type_string)) return false;
+        digest = legacy;
+        out->algorithm = CG_CHECKSUM_SHA256;
+    }
+    size_t length = out->algorithm == CG_CHECKSUM_XXH3_128 ? 32u : 64u;
+    if (json_object_get_string_len(digest) != (int)length ||
+        !hex_n(json_object_get_string(digest), length)) return false;
+    memcpy(out->hex, json_object_get_string(digest), length + 1);
+    return cg_checksum_valid(out);
+}
+static void checksum_metadata(struct json_object *out, const cg_snapshot_checksum *checksum) {
+    json_text(out, "snapshot_hash_algorithm", cg_checksum_algorithm_name(checksum->algorithm));
+    json_text(out, "snapshot_hash", checksum->hex);
+}
+static bool checksum_equal(const cg_snapshot_checksum *a, const cg_snapshot_checksum *b) {
+    return a->algorithm == b->algorithm && !strcmp(a->hex, b->hex);
+}
 /* Retain bounded snapshots in memory without installing a runtime SST copy.
  * Large snapshots keep the durable path; auth/corruption never triggers fallback. */
+static bool generation_block_directory(cg_state *st, char path[PATH_MAX], bool create) {
+    if (!st || !st->principal || !qihse_auth_user_is_active(st->principal) ||
+        snprintf(path, PATH_MAX, "%s/blocks", st->directory) >= PATH_MAX) return false;
+    if (create && mkdir(path, 0700) && errno != EEXIST) return false;
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat info;
+    bool ok = fd >= 0 && !fstat(fd, &info) && S_ISDIR(info.st_mode) &&
+              info.st_uid == geteuid() && !(info.st_mode & 077);
+    if (fd >= 0) close(fd);
+    return ok;
+}
 static bool replace_snapshot_store(cg_state *st, const char *path,
-                                   const char *expected_sha) {
+                                   const cg_snapshot_checksum *expected) {
     memset(&st->storage_info, 0, sizeof(st->storage_info));
+    memset(&st->generation_info, 0, sizeof(st->generation_info));
+    if (cg_generation_path_user(path, st->principal)) {
+        char blocks[PATH_MAX];
+        if (!expected || !generation_block_directory(st, blocks, false)) return false;
+        if (st->kv) qihse_kv_store_destroy(st->kv);
+        st->kv = cg_generation_store_open_user(path, st->scratch, blocks, st->principal,
+            expected, &st->storage_info, &st->generation_info);
+        return st->kv != NULL;
+    }
     bool bound_info = st->stats_mode ||
         (st->manifest && json_string(st->manifest, "storage_format"));
-    qihse_kv_store_t *loaded = expected_sha ?
-        cg_storage_open_verified_info(path, st->principal, UINT64_C(64) << 20,
-                                      150000, expected_sha, &st->storage_info) :
+    qihse_kv_store_t *loaded = expected ?
+        cg_storage_open_checksum_info(path, st->principal, UINT64_C(64) << 20,
+                                      150000, expected, &st->storage_info) :
         bound_info ? cg_storage_open_info(path, st->principal, UINT64_C(64) << 20,
                                           150000, &st->storage_info) :
         cg_storage_open(path, st->principal, UINT64_C(64) << 20, 150000);
@@ -674,26 +1023,80 @@ static bool replace_snapshot_store(cg_state *st, const char *path,
     }
     if (errno != EFBIG && errno != E2BIG) return false;
     if (st->kv) qihse_kv_store_destroy(st->kv);
-    st->kv = qihse_kv_store_create();
-    return st->kv && (expected_sha ?
-        cg_storage_load_verified_info(st->kv, path, st->principal, expected_sha,
+    st->kv = qihse_kv_store_create_user(st->principal);
+    return st->kv && (expected ?
+        cg_storage_load_checksum_info(st->kv, path, st->principal, expected,
                                       &st->storage_info) :
         bound_info ? cg_storage_load_info(st->kv, path, st->principal,
                                           &st->storage_info) :
         cg_storage_load(st->kv, path, st->principal));
 }
-static bool verify_saved(cg_state *st, const char *path, const char *expected_sha) {
+static bool verify_saved(cg_state *st, const char *path, const cg_snapshot_checksum *expected) {
     char before[65], after[65]; size_t n_before, n_after;
     return record_fingerprint(st, before, &n_before) &&
-           replace_snapshot_store(st, path, expected_sha) &&
+           replace_snapshot_store(st, path, expected) &&
            record_fingerprint(st, after, &n_after) &&
            n_before == n_after && !strcmp(before, after);
 }
-static bool verify_saved_full(cg_state *st, const char *path) {
-    char before[65], after[65], sha[65];
-    return export_fingerprint(st, before) && sha256_private_user(st, path, sha) &&
-           replace_snapshot_store(st, path, sha) &&
+static bool verify_saved_full(cg_state *st, const char *path, const cg_snapshot_checksum *checksum) {
+    char before[65], after[65];
+    return export_fingerprint(st, before) &&
+           replace_snapshot_store(st, path, checksum) &&
            export_fingerprint(st, after) && !strcmp(before, after);
+}
+static bool automatic_storage(cg_state *st) {
+    return !st->requested_storage_format || !strcmp(st->requested_storage_format, "auto");
+}
+static cg_storage_format requested_format(cg_state *st) {
+    const char *f = st->requested_storage_format;
+    return f && !strcmp(f, "generations-v1") ? CG_STORAGE_GENERATIONS :
+           f && !strcmp(f, "packed-v4") ? CG_STORAGE_CHUNKED :
+           f && !strcmp(f, "packed-v3") ? CG_STORAGE_DICTIONARY :
+           f && !strcmp(f, "packed-v2") ? CG_STORAGE_PACKED : CG_STORAGE_ZSTD;
+}
+static bool packed_format(const char *f) {
+    return f && (!strcmp(f, "qihse-codegraph-packed-v2") ||
+                 !strcmp(f, "qihse-codegraph-packed-v3") ||
+                 !strcmp(f, "qihse-codegraph-packed-v4"));
+}
+static bool known_storage_format(const char *format) {
+    return format && (!strcmp(format, cg_storage_format_name(CG_STORAGE_ZSTD)) ||
+                      packed_format(format) ||
+                      !strcmp(format, cg_storage_format_name(CG_STORAGE_GENERATIONS)));
+}
+static bool storage_matches(const char *format, const cg_storage_info_t *info) {
+    if (!format) return !info->compact && !info->packed && !info->generations;
+    if (!strcmp(format, cg_storage_format_name(CG_STORAGE_GENERATIONS))) return info->generations;
+    if (info->generations) return false;
+    if (!strcmp(format, cg_storage_format_name(CG_STORAGE_ZSTD)))
+        return info->compact && !info->packed;
+    if (!info->packed || info->compact) return false;
+    if (!strcmp(format, cg_storage_format_name(CG_STORAGE_CHUNKED))) return info->chunked;
+    if (info->chunked) return false;
+    if (!strcmp(format, cg_storage_format_name(CG_STORAGE_DICTIONARY))) return info->dictionary;
+    return !strcmp(format, cg_storage_format_name(CG_STORAGE_PACKED)) && !info->dictionary;
+}
+static const char *detected_storage_format(const cg_storage_info_t *info) {
+    return info->generations ? cg_storage_format_name(CG_STORAGE_GENERATIONS) :
+           info->chunked ? cg_storage_format_name(CG_STORAGE_CHUNKED) :
+           info->dictionary ? cg_storage_format_name(CG_STORAGE_DICTIONARY) :
+           info->packed ? cg_storage_format_name(CG_STORAGE_PACKED) :
+           info->compact ? cg_storage_format_name(CG_STORAGE_ZSTD) : "qihse-kv-legacy";
+}
+static bool save_selected_storage(cg_state *st, const char *path, cg_storage_format *format) {
+    if (automatic_storage(st))
+        return cg_storage_save_auto_format(st->kv, path, st->principal, format);
+    *format = requested_format(st);
+    if (*format == CG_STORAGE_GENERATIONS) {
+        char blocks[PATH_MAX];
+        return generation_block_directory(st, blocks, true) &&
+            cg_generation_store_save_user(st->kv, path, st->scratch, blocks, st->principal,
+                                         &st->generation_write_info);
+    }
+    return *format == CG_STORAGE_CHUNKED ? cg_storage_save_chunked(st->kv, path, st->principal) :
+           *format == CG_STORAGE_DICTIONARY ? cg_storage_save_dictionary(st->kv, path, st->principal) :
+           *format == CG_STORAGE_PACKED ? cg_storage_save_packed(st->kv, path, st->principal) :
+                                         cg_storage_save(st->kv, path, st->principal);
 }
 static int import_snapshot_unlocked(cg_state *st, const char *input) {
     char lock_path[PATH_MAX], manifest_path[PATH_MAX];
@@ -731,13 +1134,18 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     struct json_object *meta = NULL;
     const char *problem = "invalid CodeGraph snapshot";
     ssize_t length;
+    uint64_t consumed = 0;
+    uint64_t input_bytes = source_stat.st_size < 0 ? UINT64_MAX : (uint64_t)source_stat.st_size;
+    cg_progress_emit("import", "bytes", 0, input_bytes);
     while (ok && (length = getline(&line, &capacity, stream)) > 0) {
+        consumed += (uint64_t)length;
+        cg_progress_emit("import", "bytes", consumed, input_bytes);
         if ((size_t)length > CG_MAX_LINE || line[length - 1] != '\n') {
             problem = "oversized/unterminated CodeGraph record";
             ok = false;
             break;
         }
-        struct json_object *row = json_tokener_parse(line);
+        struct json_object *row = cg_json_parse_object(line, (size_t)length);
         if (!row || !json_object_is_type(row, json_type_object)) {
             if (row)
                 json_object_put(row);
@@ -745,20 +1153,15 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
             ok = false;
             break;
         }
-        char *type = json_string(row, "t");
+        const char *type = source_string(row, "t");
         if (!type || trailer) {
             problem = "bad record ordering";
             ok = false;
         } else if (!header) {
-            char *format = json_string(row, "format");
-            char *head = json_string(row, "head");
-            char *worktree = json_string(row, "worktree");
-            const char *policy = json_string(row, "freshness");
-            const char *worktree_v2 = json_string(row, "worktree_v2");
+            const char *format = source_string(row, "format");
             if (strcmp(type, "h") || !format || strcmp(format, "qihse-codegraph-v1") ||
-                json_num(row, "version") != 1 || !(hex_n(head, 40) || hex_n(head, 64)) ||
-                !hex64(worktree) || !policy ||
-                strcmp(policy, "git-status-diff-index-untracked-v2") || !hex64(worktree_v2)) {
+                !json_integer_equals(row, "version", 1) || !source_schema(row, true) ||
+                !identity_schema(row, &st->id_hex_chars)) {
                 problem = "invalid header/version";
                 ok = false;
             } else {
@@ -767,13 +1170,18 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
             }
         } else if (strcmp(type, "n") == 0 || strcmp(type, "e") == 0) {
             bool is_node = strcmp(type, "n") == 0;
-            if ((is_node ? !validate_node(row) : !validate_edge(row))) {
+            if ((is_node ? !validate_node(row, st->id_hex_chars) : !validate_edge(row, st->id_hex_chars))) {
                 problem = "invalid node/edge evidence";
                 ok = false;
             } else {
                 char key[72];
                 snprintf(key, sizeof(key), "%c:%s", is_node ? 'n' : 'e', json_string(row, "id"));
-                if (qihse_kv_exists_user(st->kv, key, st->principal) ||
+                char other_key[72];
+                snprintf(other_key, sizeof(other_key), "%c:%s", is_node ? 'e' : 'n',
+                         json_string(row, "id"));
+                if ((st->id_hex_chars == 32 &&
+                     qihse_kv_exists_user(st->kv, other_key, st->principal)) ||
+                    qihse_kv_exists_user(st->kv, key, st->principal) ||
                     !qihse_kv_set_user(st->kv, key, line, 0, 0, st->principal)) {
                     problem = "duplicate record or QIHSE KV write failed";
                     ok = false;
@@ -799,11 +1207,11 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
                 ok = false;
             } else {
                 digest_hex(sum, 32, input_hash);
-                char *claimed = json_string(row, "sha256");
+                const char *claimed = source_string(row, "sha256");
                 if (!claimed || strcmp(claimed, input_hash) ||
-                    json_num(row, "nodes") != (int64_t)nodes ||
-                    json_num(row, "edges") != (int64_t)edges ||
-                    json_num(row, "unresolved_edges") != (int64_t)unresolved) {
+                    !json_integer_equals(row, "nodes", (int64_t)nodes) ||
+                    !json_integer_equals(row, "edges", (int64_t)edges) ||
+                    !json_integer_equals(row, "unresolved_edges", (int64_t)unresolved)) {
                     problem = "snapshot checksum/count mismatch";
                     ok = false;
                 } else
@@ -862,9 +1270,7 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     /* The source may change between CRG export and QIHSE import. Verify the
      * very same HEAD + porcelain + content-diff identity before publishing. */
     st->manifest = json_object_new_object();
-    json_text(st->manifest, "freshness", "git-status-diff-index-untracked-v2");
-    json_text(st->manifest, "head", json_string(meta, "head"));
-    json_text(st->manifest, "worktree", json_string(meta, "worktree_v2"));
+    source_metadata(st->manifest, meta);
     const char *stale_reason = NULL;
     bool current = freshness(st, &stale_reason);
     json_object_put(st->manifest);
@@ -878,39 +1284,42 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     struct json_object *previous = read_json_file(manifest_path);
     const char *old_name = previous ? json_string(previous, "snapshot") : NULL;
     const char *old_hash = previous ? json_string(previous, "input_sha256") : NULL;
-    const char *old_sha = previous ? json_string(previous, "sha256") : NULL;
-    char old_path[PATH_MAX], old_actual[65], rollback[128] = {0};
+    cg_snapshot_checksum old_checksum = {0}, old_actual = {0};
+    if (previous && !manifest_checksum(previous, &old_checksum)) {
+        json_object_put(previous); json_object_put(meta); close(lfd);
+        return error_json("existing snapshot checksum metadata invalid");
+    }
+    char old_path[PATH_MAX], rollback[128] = {0};
+    char rollback_format[64] = {0};
+    const char *prior_format = previous ? source_string(previous, "storage_format") : NULL;
+    if (prior_format) snprintf(rollback_format, sizeof(rollback_format), "%s", prior_format);
     struct json_object *old_format_field = NULL;
     bool old_format_valid = !previous ||
         !json_object_object_get_ex(previous, "storage_format", &old_format_field) ||
-        (json_object_is_type(old_format_field, json_type_string) &&
-         (!strcmp(json_object_get_string(old_format_field), "qihse-codegraph-zstd-v1") ||
-          !strcmp(json_object_get_string(old_format_field), "qihse-codegraph-packed-v2")));
+        (source_string(previous, "storage_format") &&
+         known_storage_format(source_string(previous, "storage_format")));
     if (snapshot_name(old_name)) {
         snprintf(rollback, sizeof(rollback), "%s", old_name);
         if (old_format_valid &&
-            (!st->requested_storage_format ||
+            ((automatic_storage(st) && old_format_field) ||
              (old_format_field &&
               !strcmp(json_object_get_string(old_format_field),
-                  !strcmp(st->requested_storage_format, "packed-v2") ?
-                  "qihse-codegraph-packed-v2" : "qihse-codegraph-zstd-v1"))) &&
-            old_hash && !strcmp(old_hash, input_hash) && hex64(old_sha) &&
+                  cg_storage_format_name(requested_format(st))))) &&
+            old_hash && !strcmp(old_hash, input_hash) && cg_checksum_valid(&old_checksum) &&
             snprintf(old_path, sizeof(old_path), "%s/%s", st->directory, old_name) <
-                (int)sizeof(old_path) && sha256_file(old_path, old_actual, 0) &&
-            !strcmp(old_actual, old_sha) &&
+                (int)sizeof(old_path) && cg_snapshot_checksum_file_user(old_path, st->principal, old_checksum.algorithm, &old_actual) &&
+            checksum_equal(&old_actual, &old_checksum) &&
             json_string(previous, "head") &&
             !strcmp(json_string(previous, "head"), json_string(meta, "head")) &&
             json_string(previous, "worktree") &&
             !strcmp(json_string(previous, "worktree"), json_string(meta, "worktree_v2")) &&
-            json_string(previous, "freshness") &&
-            !strcmp(json_string(previous, "freshness"), "git-status-diff-index-untracked-v2") &&
+            source_schema(previous, false) && same_source(meta, previous) &&
             json_num(previous, "nodes") == (int64_t)nodes &&
             json_num(previous, "edges") == (int64_t)edges &&
             json_num(previous, "unresolved_edges") == (int64_t)unresolved) {
-            if (!verify_saved(st, old_path,
-                              old_format_field &&
-                              !strcmp(json_object_get_string(old_format_field),
-                                      "qihse-codegraph-packed-v2") ? old_sha : NULL)) {
+            if (!verify_saved(st, old_path, &old_checksum) ||
+                (old_format_field && !storage_matches(json_object_get_string(old_format_field),
+                                                       &st->storage_info))) {
                 json_object_put(previous); json_object_put(meta); close(lfd);
                 return error_json("existing snapshot does not match verified import records");
             }
@@ -924,6 +1333,7 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
                 return error_json("source changed during unchanged snapshot verification");
             }
             json_text(previous, "status", "unchanged");
+            report_retention_unlocked(st, previous, previous);
             print_json(previous);
             json_object_put(previous);
             json_object_put(meta);
@@ -936,8 +1346,8 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     snprintf(name, sizeof(name), "graph-%s-XXXXXX.kv", input_hash);
     if (snprintf(published, sizeof(published), "%s/%s", st->directory, name) >=
             (int)sizeof(published) ||
-        snprintf(temporary, sizeof(temporary), "%s/.snapshot-%ld.tmp", st->directory,
-                 (long)getpid()) >= (int)sizeof(temporary)) {
+        snprintf(temporary, sizeof(temporary), "%s/snapshot.tmp", st->scratch) >=
+                (int)sizeof(temporary)) {
         json_object_put(meta);
         close(lfd);
         return error_json("CodeGraph snapshot path too long");
@@ -950,25 +1360,24 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
     }
     close(reserved);
     snprintf(name, sizeof(name), "%s", strrchr(published, '/') + 1);
-    bool write_packed = st->requested_storage_format &&
-        !strcmp(st->requested_storage_format, "packed-v2");
-    if (!(write_packed ? cg_storage_save_packed(st->kv, temporary, st->principal) :
-                         cg_storage_save(st->kv, temporary, st->principal))) {
+    cg_storage_format write_packed = CG_STORAGE_ZSTD;
+    if (!save_selected_storage(st, temporary, &write_packed)) {
         unlink(published);
         unlink(temporary);
         json_object_put(meta);
         close(lfd);
         return error_json("QIHSE KV snapshot serialization failed");
     }
-    if (write_packed && !verify_saved_full(st, temporary)) {
+    cg_snapshot_checksum binary_checksum;
+    if (!cg_snapshot_checksum_file_user(temporary, st->principal, CG_CHECKSUM_XXH3_128, &binary_checksum) ||
+        (write_packed && !verify_saved_full(st, temporary, &binary_checksum))) {
         unlink(published);
         unlink(temporary);
         json_object_put(meta);
         close(lfd);
         return error_json("packed CodeGraph snapshot metadata verification failed");
     }
-    char binary_hash[65];
-    if (!sha256_file(temporary, binary_hash, 0) || rename(temporary, published) != 0) {
+    if (rename(temporary, published) != 0) {
         unlink(published);
         unlink(temporary);
         json_object_put(meta);
@@ -976,14 +1385,17 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
         return error_json("QIHSE snapshot hashing/publication failed");
     }
     struct json_object *manifest = json_object_new_object();
+    identity_metadata(manifest, meta);
     json_text(manifest, "snapshot", name);
-    json_text(manifest, "storage_format", write_packed ?
-        "qihse-codegraph-packed-v2" : "qihse-codegraph-zstd-v1");
+    json_text(manifest, "storage_format", cg_storage_format_name(write_packed));
     if (rollback[0]) json_text(manifest, "previous_snapshot", rollback);
-    json_text(manifest, "sha256", binary_hash);
-    json_text(manifest, "head", json_string(meta, "head"));
-    json_text(manifest, "worktree", json_string(meta, "worktree_v2"));
-    json_text(manifest, "freshness", "git-status-diff-index-untracked-v2");
+    if (rollback[0] && cg_checksum_valid(&old_checksum)) {
+        json_text(manifest, "previous_snapshot_hash_algorithm", cg_checksum_algorithm_name(old_checksum.algorithm));
+        json_text(manifest, "previous_snapshot_hash", old_checksum.hex);
+        if (rollback_format[0]) json_text(manifest, "previous_snapshot_storage_format", rollback_format);
+    }
+    checksum_metadata(manifest, &binary_checksum);
+    source_metadata(manifest, meta);
     json_int(manifest, "nodes", (int64_t)nodes);
     json_int(manifest, "edges", (int64_t)edges);
     json_int(manifest, "unresolved_edges", (int64_t)unresolved);
@@ -998,12 +1410,30 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
         close(lfd);
         return error_json("source changed during import; previous generation retained");
     }
+    bool manifest_committed = false;
     bool persisted = atomic_write(
-        manifest_path, json_object_to_json_string_ext(manifest, JSON_C_TO_STRING_PLAIN), NULL);
+        manifest_path, json_object_to_json_string_ext(manifest, JSON_C_TO_STRING_PLAIN), &manifest_committed);
+    /* A failed pre-commit publication must not accumulate orphan generations.
+     * After commit, preserve the referenced generation even if fsync failed. */
+    if (!persisted && !manifest_committed && unlink(published) == 0) {
+        int directory_fd = open(st->directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory_fd >= 0) { (void)fsync(directory_fd); close(directory_fd); }
+    }
     if (persisted) {
         struct json_object *result = json_object_new_object();
+        identity_metadata(result, meta);
+        checksum_metadata(result, &binary_checksum);
         json_text(result, "status", "published");
         json_text(result, "snapshot", name);
+        json_text(result, "storage_format", cg_storage_format_name(write_packed));
+        if (write_packed == CG_STORAGE_GENERATIONS) {
+            json_int(result, "generation_parent_bytes", (int64_t)st->generation_write_info.parent_bytes);
+            json_int(result, "generation_new_block_bytes", (int64_t)st->generation_write_info.new_block_bytes);
+            json_int(result, "generation_reused_block_bytes", (int64_t)st->generation_write_info.reused_block_bytes);
+            json_int(result, "generation_new_blocks", st->generation_write_info.new_blocks);
+            json_int(result, "generation_reused_blocks", st->generation_write_info.reused_blocks);
+        }
+        report_retention_unlocked(st, manifest, result);
         json_int(result, "nodes", (int64_t)nodes);
         json_int(result, "edges", (int64_t)edges);
         json_int(result, "unresolved_edges", (int64_t)unresolved);
@@ -1020,7 +1450,7 @@ static int import_snapshot_unlocked(cg_state *st, const char *input) {
 }
 
 /* Rebuild a memory-resident structural graph from one immutable QIHSE KV
- * generation. The QIHSE graph engine provides indexed incident adjacency;
+ * generation. The private immutable CSR projection provides incident adjacency;
  * raw CRG qualified names are never guessed or re-resolved here. */
 static int compare_node_id(const void *a, const void *b) {
     return strcmp(((const cg_node *)a)->id, ((const cg_node *)b)->id);
@@ -1052,17 +1482,18 @@ static size_t node_lower_bound(cg_node **index, size_t count, const char *key, b
 }
 static cg_node *find_node(cg_state *st, const char *id) {
     cg_node probe = {0};
-    if (!id || !hex64(id))
+    if (!id || !hex_n(id, st->id_hex_chars))
         return NULL;
-    memcpy(probe.id, id, 65);
+    memcpy(probe.id, id, st->id_hex_chars + 1);
     return bsearch(&probe, st->nodes, st->nn, sizeof(*st->nodes), compare_node_id);
 }
 static bool nodes_from_kv(const char *key, const char *value, void *user) {
     cg_state *st = user;
     if (strncmp(key, "n:", 2) != 0)
         return true;
-    struct json_object *row = json_tokener_parse(value);
-    if (!row || !validate_node(row) || st->nn >= CG_MAX_NODES) {
+    struct json_object *row = cg_json_parse_object(value, strlen(value));
+    if (!row || !validate_node(row, st->id_hex_chars) ||
+        strcmp(key + 2, json_string(row, "id")) || st->nn >= CG_MAX_NODES) {
         if (row)
             json_object_put(row);
         st->capacity = SIZE_MAX; /* record parse failure */
@@ -1082,21 +1513,13 @@ static bool nodes_from_kv(const char *key, const char *value, void *user) {
     cg_node *node = &st->nodes[st->nn++];
     memset(node, 0, sizeof(*node));
     snprintf(node->id, sizeof(node->id), "%s", json_string(row, "id"));
-    node->file = strdup(json_string(row, "file"));
-    node->name = strdup(json_string(row, "name"));
-    node->kind = strdup(json_string(row, "kind"));
+    node->file = cg_csr_intern(st->graph, json_string(row, "file"));
+    node->name = cg_csr_intern(st->graph, json_string(row, "name"));
+    node->kind = cg_csr_intern(st->graph, json_string(row, "kind"));
     node->line = (int)json_num(row, "line_start");
     node->end_line = (int)json_num(row, "line_end");
     node->is_test = json_flag(row, "is_test");
-    const char *labels[] = {node->kind};
-    const char *keys[] = {"file", "name"};
-    graph_prop_t props[2] = {
-        graph_prop_make_string(node->file),
-        graph_prop_make_string(node->name),
-    };
-    node->vertex = qihse_graph_vertex_create(st->graph, labels, 1, keys, props, 2);
-    graph_prop_free(&props[0]);
-    graph_prop_free(&props[1]);
+    node->vertex = st->nn;
     json_object_put(row);
     if (!node->file || !node->name || !node->kind || !node->vertex) {
         st->capacity = SIZE_MAX;
@@ -1108,8 +1531,9 @@ static bool edges_from_kv(const char *key, const char *value, void *user) {
     cg_state *st = user;
     if (strncmp(key, "e:", 2) != 0)
         return true;
-    struct json_object *row = json_tokener_parse(value);
-    if (!row || !validate_edge(row)) {
+    struct json_object *row = cg_json_parse_object(value, strlen(value));
+    if (!row || !validate_edge(row, st->id_hex_chars) ||
+        strcmp(key + 2, json_string(row, "id"))) {
         if (row)
             json_object_put(row);
         st->edges = SIZE_MAX;
@@ -1122,16 +1546,9 @@ static bool edges_from_kv(const char *key, const char *value, void *user) {
         if (!src || !dst) {
             st->edges = SIZE_MAX; /* forged authoritative endpoint */
         } else {
-            const char *keys[] = {"file", "line", "confidence"};
-            graph_prop_t props[3] = {
-                graph_prop_make_string(json_string(row, "file")),
-                graph_prop_make_int64(json_num(row, "line")),
-                graph_prop_make_double(json_double(row, "confidence")),
-            };
-            uint64_t id = qihse_graph_edge_create(st->graph, json_string(row, "relation"),
-                                                  src->vertex, dst->vertex, keys, props, 3);
-            graph_prop_free(&props[0]);
-            if (!id)
+            if (!cg_csr_add_edge(st->graph, (uint32_t)src->vertex, (uint32_t)dst->vertex,
+                                 json_string(row, "relation"), json_string(row, "file"),
+                                 json_num(row, "line"), json_double(row, "confidence")))
                 st->edges = SIZE_MAX;
         }
     } else
@@ -1142,9 +1559,10 @@ static bool edges_from_kv(const char *key, const char *value, void *user) {
 
 static bool build_native_graph(cg_state *st, size_t expected_nodes, size_t expected_edges,
                                size_t expected_unresolved) {
-    if (st->graph)
+    if (st->graph || expected_nodes > CG_MAX_NODES || expected_edges > CG_MAX_EDGES ||
+        expected_unresolved > expected_edges)
         return false;
-    st->graph = qihse_graph_create();
+    st->graph = cg_csr_create(st->principal, expected_nodes, expected_edges - expected_unresolved);
     if (!st->graph ||
         !qihse_kv_foreach_prefix_user(st->kv, "n:", st->principal, nodes_from_kv, st) ||
         st->capacity == SIZE_MAX || st->nn != expected_nodes)
@@ -1167,7 +1585,7 @@ static bool build_native_graph(cg_state *st, size_t expected_nodes, size_t expec
     qsort(st->by_file, st->nn, sizeof(*st->by_file), compare_node_file);
     return qihse_kv_foreach_prefix_user(st->kv, "e:", st->principal, edges_from_kv, st) &&
            st->edges != SIZE_MAX && st->edges == expected_edges &&
-           st->unresolved == expected_unresolved;
+           st->unresolved == expected_unresolved && cg_csr_finish(st->graph);
 }
 
 static struct json_object *read_json_file(const char *path) {
@@ -1199,13 +1617,149 @@ static struct json_object *read_json_file(const char *path) {
     }
     close(fd);
     buf[have] = '\0';
-    struct json_object *row = ok ? json_tokener_parse(buf) : NULL;
+    struct json_object *row = ok ? cg_json_parse_object(buf, have) : NULL;
     free(buf);
     if (row && !json_object_is_type(row, json_type_object)) {
         json_object_put(row);
         return NULL;
     }
     return row;
+}
+static bool named_checksum(struct json_object *obj, const char *algorithm_key,
+                           const char *hash_key, cg_snapshot_checksum *out) {
+    memset(out, 0, sizeof(*out));
+    const char *algorithm = source_string(obj, algorithm_key), *hash = source_string(obj, hash_key);
+    if (!algorithm || !hash || strlen(hash) >= sizeof(out->hex)) return false;
+    out->algorithm = !strcmp(algorithm, "xxh3-128") ? CG_CHECKSUM_XXH3_128 :
+                     !strcmp(algorithm, "sha256") ? CG_CHECKSUM_SHA256 : 0;
+    memcpy(out->hex, hash, strlen(hash) + 1);
+    return cg_checksum_valid(out);
+}
+static uint32_t projection_source_format(const char *format) {
+    for (int i = CG_STORAGE_ZSTD; i <= CG_STORAGE_GENERATIONS; ++i)
+        if (format && !strcmp(format, cg_storage_format_name((cg_storage_format)i))) return (uint32_t)i + 1;
+    return 0;
+}
+/* Parent hashing alone cannot validate an immutable generation's blocks. */
+static bool generation_validate_path(cg_state *st, const char *path,
+                                     const cg_snapshot_checksum *expected) {
+    char blocks[PATH_MAX];
+    if (!generation_block_directory(st, blocks, false)) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return false;
+    FILE *parent = fdopen(fd, "rb");
+    if (!parent) { close(fd); return false; }
+    cg_generation_root root = {.parent = parent, .checksum = *expected};
+    cg_generation_account account;
+    bool ok = cg_generation_account_user(blocks, st->principal, &root, 1, &account);
+    fclose(parent);
+    return ok;
+}
+static bool projection_binding(cg_state *st, cg_projection_binding *binding,
+                               cg_snapshot_checksum *cache_checksum) {
+    memset(binding, 0, sizeof(*binding));
+    memset(cache_checksum, 0, sizeof(*cache_checksum));
+    if (!source_string(st->manifest, "projection_format") ||
+        strcmp(source_string(st->manifest, "projection_format"), CG_PROJECTION_FORMAT) ||
+        !manifest_checksum(st->manifest, &binding->source)) return false;
+    static const char *fields[] = {"projection_classification", "projection_sci",
+                                   "projection_tenant", "projection_principal_id"};
+    uint32_t values[4];
+    for (size_t i = 0; i < 4; ++i) {
+        struct json_object *field = NULL;
+        if (!json_object_object_get_ex(st->manifest, fields[i], &field) ||
+            !json_object_is_type(field, json_type_int)) return false;
+        int64_t value = json_object_get_int64(field);
+        if (value < 0 || (uint64_t)value > (i < 2 ? UINT16_MAX : UINT32_MAX)) return false;
+        values[i] = (uint32_t)value;
+    }
+    /* The native CLI admits only public, nonexpiring graph records. An index
+     * cannot expand that contract or substitute another realm's principal. */
+    if (values[0] || values[1] || values[2] != qihse_user_get_tenant_id(st->principal) ||
+        values[3] != qihse_user_get_id(st->principal)) return false;
+    binding->classification = (uint16_t)values[0];
+    binding->sci = (uint16_t)values[1];
+    binding->tenant = values[2]; binding->principal_id = values[3];
+    binding->source_format = projection_source_format(source_string(st->manifest, "storage_format"));
+    const char *algorithm = source_string(st->manifest, "projection_hash_algorithm");
+    const char *hash = source_string(st->manifest, "projection_hash");
+    if (!algorithm || !hash || strlen(hash) >= sizeof(cache_checksum->hex)) return false;
+    cache_checksum->algorithm = !strcmp(algorithm, "xxh3-128") ? CG_CHECKSUM_XXH3_128 :
+                                !strcmp(algorithm, "sha256") ? CG_CHECKSUM_SHA256 : 0;
+    memcpy(cache_checksum->hex, hash, strlen(hash) + 1);
+    return cg_checksum_valid(cache_checksum);
+}
+static bool bounded_count(struct json_object *obj, const char *key, uint64_t maximum,
+                          uint64_t *out) {
+    struct json_object *field = NULL;
+    if (!obj || !json_object_is_type(obj, json_type_object) ||
+        !json_object_object_get_ex(obj, key, &field) ||
+        !json_object_is_type(field, json_type_int)) return false;
+    int64_t value = json_object_get_int64(field);
+    if (value < 0 || (uint64_t)value > maximum) return false;
+    *out = (uint64_t)value;
+    return true;
+}
+static bool loaded_metadata_valid(cg_state *st, struct json_object *meta,
+                                  struct json_object *trailer) {
+    uint64_t version, nodes, edges, unresolved, trailer_nodes, trailer_edges, trailer_unresolved;
+    return meta && trailer && source_schema(meta, true) &&
+           source_schema(st->manifest, false) && same_source(meta, st->manifest) &&
+           identity_schema(meta, &st->id_hex_chars) && source_string(meta, "t") &&
+           !strcmp(source_string(meta, "t"), "h") &&
+           bounded_count(meta, "version", 1, &version) && version == 1 &&
+           source_string(meta, "format") &&
+           !strcmp(source_string(meta, "format"), "qihse-codegraph-v1") &&
+           bounded_count(st->manifest, "nodes", CG_MAX_NODES, &nodes) &&
+           bounded_count(st->manifest, "edges", CG_MAX_EDGES, &edges) &&
+           bounded_count(st->manifest, "unresolved_edges", edges, &unresolved) &&
+           bounded_count(trailer, "nodes", CG_MAX_NODES, &trailer_nodes) &&
+           bounded_count(trailer, "edges", CG_MAX_EDGES, &trailer_edges) &&
+           bounded_count(trailer, "unresolved_edges", trailer_edges, &trailer_unresolved) &&
+           nodes == trailer_nodes && edges == trailer_edges && unresolved == trailer_unresolved;
+}
+static bool try_query_projection(cg_state *st, const char *snapshot_path,
+                                 const cg_snapshot_checksum *expected) {
+    cg_projection_binding binding;
+    cg_snapshot_checksum checksum, canonical;
+    if (!projection_binding(st, &binding, &checksum) ||
+        !cg_snapshot_checksum_file_user(snapshot_path, st->principal, expected->algorithm,
+                                       &canonical) || !checksum_equal(expected, &canonical)) return false;
+    if (cg_generation_path_user(snapshot_path, st->principal) &&
+        !generation_validate_path(st, snapshot_path, expected)) return false;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s.qci", snapshot_path) >= (int)sizeof(path)) return false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return false;
+    FILE *input = fdopen(fd, "rb");
+    if (!input) { close(fd); return false; }
+    cg_projection *projection = cg_projection_open(input, st->principal, &binding, &checksum);
+    fclose(input);
+    const cg_projection_view *view = projection ? cg_projection_get(projection) : NULL;
+    struct json_object *meta = view ? cg_json_parse_object(view->meta_json, strlen(view->meta_json)) : NULL;
+    struct json_object *trailer = view ? cg_json_parse_object(view->end_json, strlen(view->end_json)) : NULL;
+    bool ok = view && loaded_metadata_valid(st, meta, trailer) &&
+        view->node_count == (size_t)json_num(st->manifest, "nodes") &&
+        view->edge_count == (size_t)json_num(st->manifest, "edges") &&
+        view->unresolved == (size_t)json_num(st->manifest, "unresolved_edges");
+    for (size_t i = 0; ok && i < view->node_count; ++i) {
+        cg_node *node = &view->nodes[i];
+        ok = hex_n(node->id, st->id_hex_chars) && node->file && safe_relative(node->file) &&
+             node->name && node->kind && *node->name && *node->kind;
+    }
+    if (trailer) json_object_put(trailer);
+    if (!ok) {
+        if (meta) json_object_put(meta);
+        if (projection) cg_projection_destroy(projection);
+        return false;
+    }
+    st->projection = projection; st->graph = view->graph; st->nodes = view->nodes;
+    st->by_vertex = view->by_vertex; st->by_name = view->by_name; st->by_file = view->by_file;
+    st->nn = st->capacity = view->node_count; st->edges = view->edge_count;
+    st->unresolved = view->unresolved; st->meta = meta;
+    if (st->kv) { qihse_kv_store_destroy(st->kv); st->kv = NULL; }
+    (void)release_decoded_spills(st);
+    return true;
 }
 static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
     double phase_start = monotonic_ms();
@@ -1216,38 +1770,38 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
     st->manifest = read_json_file(manifest_path);
     if (!st->manifest)
         return false;
-    const char *format = json_string(st->manifest, "storage_format");
+    const char *format = source_string(st->manifest, "storage_format");
     struct json_object *format_field;
     if (json_object_object_get_ex(st->manifest, "storage_format", &format_field) &&
-        (!format || (strcmp(format, "qihse-codegraph-zstd-v1") &&
-                     strcmp(format, "qihse-codegraph-packed-v2")))) return false;
-    char *snapshot = json_string(st->manifest, "snapshot");
-    char *sha = json_string(st->manifest, "sha256");
-    if (!snapshot || strncmp(snapshot, "graph-", 6) != 0 || strlen(snapshot) > 120 ||
-        strchr(snapshot, '/') || !strstr(snapshot, ".kv") || !hex64(sha))
+        (!format || !known_storage_format(format))) return false;
+    const char *snapshot = source_string(st->manifest, "snapshot");
+    cg_snapshot_checksum expected, actual;
+    if (!manifest_checksum(st->manifest, &expected)) return false;
+    if (!snapshot_name(snapshot))
         return false;
-    char snapshot_path[PATH_MAX], actual[65];
+    char snapshot_path[PATH_MAX];
     if (snprintf(snapshot_path, sizeof(snapshot_path), "%s/%s", st->directory, snapshot) >=
             (int)sizeof(snapshot_path))
         return false;
     if (!st->stats_mode && !format &&
-        (!sha256_file(snapshot_path, actual, 0) || strcmp(actual, sha)))
+        (!cg_snapshot_checksum_file_user(snapshot_path, st->principal, expected.algorithm, &actual) ||
+         !checksum_equal(&actual, &expected)))
         return false;
     snapshot_verify_ms = monotonic_ms() - phase_start;
     phase_start = monotonic_ms();
-    bool loaded = replace_snapshot_store(st, snapshot_path,
-        format && !strcmp(format, "qihse-codegraph-packed-v2") ? sha : NULL);
+    if (build_graph && st->read_only_graph && try_query_projection(st, snapshot_path, &expected)) {
+        graph_build_ms = monotonic_ms() - phase_start;
+        kv_load_ms = 0;
+        return true;
+    }
+    bool loaded = replace_snapshot_store(st, snapshot_path, &expected);
     kv_load_ms = monotonic_ms() - phase_start;
     if (!loaded)
         return false;
     if ((st->stats_mode || format) &&
-        (!st->storage_info.valid || strcmp(st->storage_info.sha256, sha)))
+        (!st->storage_info.valid || !checksum_equal(&st->storage_info.checksum, &expected)))
         return false;
-    if (format && ((!strcmp(format, "qihse-codegraph-zstd-v1") &&
-                   (!st->storage_info.compact || st->storage_info.packed)) ||
-                  (!strcmp(format, "qihse-codegraph-packed-v2") &&
-                   (!st->storage_info.packed || st->storage_info.compact))))
-        return false;
+    if (st->storage_info.valid && !storage_matches(format, &st->storage_info)) return false;
     char *header = qihse_kv_get_user(st->kv, "_meta", st->principal);
     char *end = qihse_kv_get_user(st->kv, "_end", st->principal);
     if (!header || !end) {
@@ -1255,16 +1809,11 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
         free(end);
         return false;
     }
-    st->meta = json_tokener_parse(header);
-    struct json_object *trailer = json_tokener_parse(end);
+    st->meta = cg_json_parse_object(header, strlen(header));
+    struct json_object *trailer = cg_json_parse_object(end, strlen(end));
     free(header);
     free(end);
-    bool ok = st->meta && trailer &&
-              strcmp(json_string(st->meta, "format") ? json_string(st->meta, "format") : "",
-                     "qihse-codegraph-v1") == 0 &&
-              json_num(st->manifest, "nodes") == json_num(trailer, "nodes") &&
-              json_num(st->manifest, "edges") == json_num(trailer, "edges") &&
-              json_num(st->manifest, "unresolved_edges") == json_num(trailer, "unresolved_edges");
+    bool ok = loaded_metadata_valid(st, st->meta, trailer);
     if (trailer)
         json_object_put(trailer);
     if (!ok)
@@ -1276,6 +1825,17 @@ static bool load_snapshot_unlocked(cg_state *st, bool build_graph) {
                                     (size_t)json_num(st->manifest, "edges"),
                                     (size_t)json_num(st->manifest, "unresolved_edges"));
     graph_build_ms = monotonic_ms() - phase_start;
+    /* Query generations own their node strings and graph properties. Keep the
+     * decoded KV only for commands that still serialize or inspect its records. */
+    if (built && st->read_only_graph) {
+        qihse_kv_store_destroy(st->kv);
+        st->kv = NULL;
+        if (!release_decoded_spills(st))
+            fprintf(stderr, "CodeGraph decoded spill cleanup incomplete; leased runtime retained\n");
+#ifdef __GLIBC__
+        (void)malloc_trim(0);
+#endif
+    }
     return built;
 }
 
@@ -1296,19 +1856,25 @@ static int import_snapshot(cg_state *st, const char *input) {
 static int migrate_snapshot(cg_state *st) {
     if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");
     int rc = 1;
-    char output[PATH_MAX] = {0}, manifest_path[PATH_MAX];
+    char output[PATH_MAX] = {0}, staged[PATH_MAX], manifest_path[PATH_MAX];
     bool committed = false;
     const char *failure = "CodeGraph migration failed while loading the current graph";
     if (!load_snapshot_unlocked(st, true)) goto done;
-    bool write_packed = st->requested_storage_format &&
-        !strcmp(st->requested_storage_format, "packed-v2");
-    const char *target_format = write_packed ? "qihse-codegraph-packed-v2" :
-        "qihse-codegraph-zstd-v1";
+    bool auto_format = automatic_storage(st);
+    cg_storage_format write_packed = requested_format(st);
+    cg_storage_info_t current_info = st->storage_info;
+    uint64_t current_required_bytes = current_info.encoded_bytes +
+        (current_info.generations ? st->generation_info.block_bytes : 0);
+    cg_snapshot_checksum previous_checksum;
+    if (!manifest_checksum(st->manifest, &previous_checksum)) goto done;
+    char previous_format[64] = {0};
+    const char *old_declared_format = source_string(st->manifest, "storage_format");
+    if (old_declared_format) snprintf(previous_format, sizeof(previous_format), "%s", old_declared_format);
+    const char *target_format = cg_storage_format_name(write_packed);
     const char *current_format = json_string(st->manifest, "storage_format");
-    if (current_format && (!strcmp(current_format, target_format) ||
-        (!st->requested_storage_format &&
-         !strcmp(current_format, "qihse-codegraph-packed-v2")))) {
+    if (!auto_format && current_format && !strcmp(current_format, target_format)) {
         json_text(st->manifest, "status", "unchanged");
+        report_retention_unlocked(st, st->manifest, st->manifest);
         print_json(st->manifest);
         rc = 0;
         goto done;
@@ -1327,18 +1893,47 @@ static int migrate_snapshot(cg_state *st) {
     int fd = mkstemps(output, 3);
     if (fd < 0) { output[0] = 0; goto done; }
     close(fd);
-    char sha[65];
+    cg_snapshot_checksum checksum;
     failure = "CodeGraph migration failed while writing the compact snapshot";
-    if (!(write_packed ? cg_storage_save_packed(st->kv, output, st->principal) :
-                         cg_storage_save(st->kv, output, st->principal))) goto done;
+    if (snprintf(staged, sizeof(staged), "%s/snapshot.tmp", st->scratch) >=
+            (int)sizeof(staged) ||
+        !save_selected_storage(st, staged, &write_packed)) goto done;
+    target_format = cg_storage_format_name(write_packed);
     failure = "CodeGraph migration failed while verifying the compact snapshot";
-    if (!(write_packed ? verify_saved_full(st, output) :
-                         verify_saved(st, output, NULL)) ||
-        !sha256_file(output, sha, 0)) goto done;
+    if (!cg_snapshot_checksum_file_user(staged, st->principal, CG_CHECKSUM_XXH3_128, &checksum) ||
+        !(write_packed ? verify_saved_full(st, staged, &checksum) :
+                         verify_saved(st, staged, &checksum))) goto done;
+    /* Candidate and current are authenticated before comparing sizes. A
+     * reserialization can compress worse even when its format is unchanged. */
+    if (auto_format && current_info.valid) {
+        struct stat candidate_info;
+        if (stat(staged, &candidate_info) || candidate_info.st_size < 0) goto done;
+        if ((uint64_t)candidate_info.st_size >= current_required_bytes) {
+            if (unlink(output)) goto done;
+            output[0] = '\0';
+            json_text(st->manifest, "status", "unchanged");
+            report_retention_unlocked(st, st->manifest, st->manifest);
+            print_json(st->manifest);
+            rc = 0;
+            goto done;
+        }
+    }
+    /* Compression candidates stay under our lease until verified. A killed
+     * writer leaves only reclaimable runtime files or a managed generation. */
+    if (rename(staged, output)) goto done;
     json_text(st->manifest, "snapshot", strrchr(output, '/') + 1);
-    json_text(st->manifest, "sha256", sha);
+    json_object_object_del(st->manifest, "sha256");
+    checksum_metadata(st->manifest, &checksum);
     json_text(st->manifest, "storage_format", target_format);
     json_text(st->manifest, "previous_snapshot", previous);
+    json_text(st->manifest, "previous_snapshot_hash_algorithm", cg_checksum_algorithm_name(previous_checksum.algorithm));
+    json_text(st->manifest, "previous_snapshot_hash", previous_checksum.hex);
+    if (previous_format[0]) json_text(st->manifest, "previous_snapshot_storage_format", previous_format);
+    else json_object_object_del(st->manifest, "previous_snapshot_storage_format");
+    static const char *cache_fields[] = {"projection_format", "projection_hash_algorithm", "projection_hash",
+        "projection_classification", "projection_sci", "projection_tenant", "projection_principal_id"};
+    for (size_t i = 0; i < sizeof(cache_fields)/sizeof(cache_fields[0]); ++i)
+        json_object_object_del(st->manifest, cache_fields[i]);
     failure = "CodeGraph migration failed while publishing the manifest; inspect current status before retry";
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory) >=
         (int)sizeof(manifest_path)) goto done;
@@ -1346,6 +1941,7 @@ static int migrate_snapshot(cg_state *st) {
                       json_object_to_json_string_ext(st->manifest, JSON_C_TO_STRING_PLAIN),
                       &committed)) goto done;
     json_text(st->manifest, "status", "migrated");
+    report_retention_unlocked(st, st->manifest, st->manifest);
     print_json(st->manifest);
     rc = 0;
 done:
@@ -1357,49 +1953,12 @@ static int collect_snapshots(cg_state *st) {
     if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");
     int rc = 1;
     size_t removed = 0, runtimes = 0;
-    DIR *dir = NULL;
     /* Authenticate and validate the retained current graph before removing anything. */
     if (!load_snapshot_unlocked(st, true)) goto done;
-    const char *current = json_string(st->manifest, "snapshot");
-    const char *previous = json_string(st->manifest, "previous_snapshot");
-    struct json_object *previous_field = NULL;
-    if (!snapshot_name(current) ||
-        (json_object_object_get_ex(st->manifest, "previous_snapshot", &previous_field) &&
-         !snapshot_name(previous))) goto done;
-    dir = opendir(st->directory);
-    if (!dir) goto done;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        const char *name = entry->d_name;
-        char path[PATH_MAX];
-        struct stat info;
-        if (snprintf(path, sizeof(path), "%s/%s", st->directory, name) >=
-                (int)sizeof(path)) goto done;
-        if (lstat(path, &info)) {
-            if (errno == ENOENT) continue;
-            goto done;
-        }
-        if (snapshot_name(name) && S_ISREG(info.st_mode) && info.st_uid == geteuid() &&
-            strcmp(name, current) && (!previous || strcmp(name, previous))) {
-            if (unlink(path)) goto done;
-            removed++;
-        } else if (!strncmp(name, ".runtime-", 9) && S_ISDIR(info.st_mode) &&
-                   info.st_uid == geteuid() && !(info.st_mode & 077)) {
-            char lease[PATH_MAX];
-            if (snprintf(lease, sizeof(lease), "%s/.lease", path) >= (int)sizeof(lease))
-                goto done;
-            int fd = private_lock(lease, LOCK_EX | LOCK_NB, false);
-            if (fd < 0) continue; /* Active or legacy/unmanaged scratch: preserve. */
-            int failure = remove_scratch(path);
-            close(fd);
-            if (failure) goto done;
-            runtimes++;
-        }
-    }
-    if (fsync(dirfd(dir))) goto done;
+    if (!prune_snapshots_unlocked(st, st->manifest, &removed)) goto done;
+    if (!prune_runtimes_unlocked(st, &runtimes)) goto done;
     rc = 0;
 done:
-    if (dir) closedir(dir);
     storage_lock(st, LOCK_UN);
     struct json_object *report = json_object_new_object();
     json_text(report, "status", rc ? "collection_failed" : "collected");
@@ -1590,6 +2149,23 @@ static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
     return ok;
 }
 static bool freshness(cg_state *st, const char **reason) {
+    if (!st->manifest || !source_schema(st->manifest, false)) {
+        *reason = "invalid CodeGraph source provider metadata";
+        return false;
+    }
+    const char *policy = source_string(st->manifest, "freshness");
+    if (strcmp(policy, "git-status-diff-index-untracked-v2")) {
+        cg_source_identity actual;
+        const char *overlay = source_string(st->manifest, "source_overlay");
+        bool valid = cg_source_identity_user(st->repository, overlay, st->principal, 0, 0, &actual) &&
+            !strcmp(actual.digest, source_string(st->manifest, "worktree")) &&
+            !strcmp(actual.disk_digest, source_string(st->manifest, "source_disk_digest")) &&
+            !strcmp(actual.effective_digest, source_string(st->manifest, "source_effective_digest")) &&
+            (!overlay || !strcmp(actual.overlay_digest,
+                                source_string(st->manifest, "source_overlay_digest")));
+        if (!valid) *reason = "filesystem or unsaved overlay changed since CodeGraph export";
+        return valid;
+    }
     const char *const flags_args[] = {
         "git", "--no-optional-locks",          "ls-files", "--stage", "-v", "-f", "-z", "--",
         ".",   ":(exclude).code-review-graph", NULL};
@@ -1690,6 +2266,13 @@ static struct json_object *summary(cg_state *st, bool freshness_verified) {
     struct json_object *obj = json_object_new_object();
     json_text(obj, "backend", "QIHSE native CodeGraph");
     json_text(obj, "format", "qihse-codegraph-v1");
+    identity_metadata(obj, st->meta);
+    cg_snapshot_checksum checksum;
+    if (st->manifest && manifest_checksum(st->manifest, &checksum)) checksum_metadata(obj, &checksum);
+    json_boolean(obj, "query_index_loaded", st->projection != NULL);
+    if (st->projection) json_int(obj, "query_index_resident_bytes", (int64_t)cg_projection_bytes(st->projection));
+    json_int(obj, "runtime_spill_reclaimed_bytes", (int64_t)st->spill_reclaimed_bytes);
+    json_int(obj, "runtime_spill_reclaimed_files", (int64_t)st->spill_reclaimed_files);
     json_int(obj, "nodes", json_num(st->manifest, "nodes"));
     json_int(obj, "edges", json_num(st->manifest, "edges"));
     json_int(obj, "unresolved_edges", json_num(st->manifest, "unresolved_edges"));
@@ -1703,6 +2286,318 @@ static struct json_object *summary(cg_state *st, bool freshness_verified) {
     return obj;
 }
 
+typedef struct {
+    uint64_t logical, allocated, files, directories;
+} cg_disk_usage;
+typedef struct {
+    cg_disk_usage current, previous, historical, auxiliary, shared_blocks;
+    cg_disk_usage active_runtime, abandoned_runtime, unleased_runtime, other;
+    uint64_t entries;
+    bool complete, history_complete;
+} cg_disk_accounting;
+#define CG_ACCOUNTING_MAX_ENTRIES UINT64_C(1000000)
+#define CG_ACCOUNTING_MAX_DEPTH 32u
+static bool account_stat(cg_disk_usage *usage, const struct stat *info) {
+    if (info->st_size < 0 || info->st_blocks < 0 ||
+        (uint64_t)info->st_size > INT64_MAX - usage->logical ||
+        (uint64_t)info->st_blocks > (INT64_MAX - usage->allocated) / 512u)
+        return false;
+    usage->logical += (uint64_t)info->st_size;
+    usage->allocated += (uint64_t)info->st_blocks * 512u;
+    if (S_ISDIR(info->st_mode)) usage->directories++;
+    else usage->files++;
+    return true;
+}
+/* Descriptor-relative scan, same-owner private directories only. Symlinks,
+ * hardlinked files, special files and public entries are excluded, never followed.
+ * Metadata can change under an active lease; report incomplete on races/I/O. */
+static bool account_tree(qihse_user_t *principal, int fd, unsigned depth,
+                         cg_disk_usage *usage, cg_disk_accounting *scan) {
+    if (!principal || !qihse_auth_user_is_active(principal) ||
+        !qihse_auth_can_access(principal, 0, 0) || depth > CG_ACCOUNTING_MAX_DEPTH)
+        return false;
+    int duplicate = dup(fd);
+    if (duplicate < 0) return false;
+    DIR *dir = fdopendir(duplicate);
+    if (!dir) { close(duplicate); return false; }
+    bool ok = true;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno) ok = false; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (++scan->entries > CG_ACCOUNTING_MAX_ENTRIES ||
+            !qihse_auth_user_is_active(principal)) { ok = false; break; }
+        struct stat info;
+        if (fstatat(fd, entry->d_name, &info, AT_SYMLINK_NOFOLLOW)) { ok = false; continue; }
+        if (info.st_uid != geteuid() || (info.st_mode & 077) ||
+            (!S_ISDIR(info.st_mode) && (!S_ISREG(info.st_mode) || info.st_nlink != 1))) {
+            ok = false; continue;
+        }
+        if (!account_stat(usage, &info)) { ok = false; break; }
+        if (S_ISDIR(info.st_mode)) {
+            int child = openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            struct stat opened;
+            if (child < 0 || fstat(child, &opened) || opened.st_dev != info.st_dev ||
+                opened.st_ino != info.st_ino ||
+                !account_tree(principal, child, depth + 1, usage, scan)) ok = false;
+            if (child >= 0) close(child);
+        }
+    }
+    if (closedir(dir)) ok = false;
+    return ok && qihse_auth_user_is_active(principal) &&
+           qihse_auth_can_access(principal, 0, 0);
+}
+static bool historical_snapshot_authorized(cg_state *st, const char *name) {
+    if (!principal_active(st)) return false;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", st->directory, name) >= (int)sizeof(path))
+        return false;
+    cg_snapshot_checksum expected;
+    if (!cg_snapshot_checksum_file_user(path, st->principal, CG_CHECKSUM_XXH3_128,
+                                         &expected)) return false;
+    if (cg_generation_path_user(path, st->principal))
+        return generation_validate_path(st, path, &expected);
+    cg_storage_info_t info;
+    /* A disposable immutable read cannot install historical data in the live
+     * scratch store. Bound the accounting operation; over-limit histories are
+     * explicitly excluded rather than inheriting current-generation authority. */
+    qihse_kv_store_t *store = cg_storage_open_checksum_info(path, st->principal,
+        UINT64_C(128) << 20, 300000u, &expected, &info);
+    if (!store) return false;
+    qihse_kv_store_destroy(store);
+    return info.valid && principal_active(st);
+}
+static void close_generation_roots(cg_generation_root roots[2], size_t count) {
+    for (size_t i = 0; i < count; ++i) if (roots[i].parent) fclose(roots[i].parent);
+}
+static bool retained_generation_roots(cg_state *st, struct json_object *manifest,
+                                      cg_generation_root roots[2], size_t *count) {
+    *count = 0; memset(roots, 0, sizeof(*roots) * 2);
+    if (!manifest || !principal_active(st)) return false;
+    for (size_t i = 0; i < 2; ++i) {
+        const char *key = i ? "previous_snapshot" : "snapshot";
+        const char *name = source_string(manifest, key);
+        if (i && !source_present(manifest, key)) continue;
+        if (!snapshot_name(name)) goto failure;
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", st->directory, name) >= (int)sizeof(path)) goto failure;
+        cg_snapshot_checksum checksum;
+        bool declared = i ? source_present(manifest, "previous_snapshot_hash") : true;
+        if (i && declared) {
+            if (!named_checksum(manifest, "previous_snapshot_hash_algorithm", "previous_snapshot_hash", &checksum)) goto failure;
+        } else if (!i) {
+            if (!manifest_checksum(manifest, &checksum)) goto failure;
+        } else if (!cg_snapshot_checksum_file_user(path, st->principal, CG_CHECKSUM_XXH3_128, &checksum)) goto failure;
+        const char *format = source_string(manifest, i ? "previous_snapshot_storage_format" : "storage_format");
+        if (cg_generation_path_user(path, st->principal)) {
+            if (!format || strcmp(format, cg_storage_format_name(CG_STORAGE_GENERATIONS))) goto failure;
+            int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            if (fd < 0) goto failure;
+            roots[*count].parent = fdopen(fd, "rb");
+            if (!roots[*count].parent) { close(fd); goto failure; }
+            roots[*count].checksum = checksum; ++*count;
+        } else {
+            /* A normal retained snapshot cannot hide a shared-block root.
+             * Its complete labels are admitted, with the same historical
+             * accounting bound; over-limit/denied roots conservatively stop GC. */
+            cg_storage_info_t info;
+            qihse_kv_store_t *admitted = cg_storage_open_checksum_info(path, st->principal,
+                UINT64_C(128) << 20, 300000u, &checksum, &info);
+            if (!admitted) goto failure;
+            bool valid = info.valid && (!format || storage_matches(format, &info));
+            qihse_kv_store_destroy(admitted);
+            if (!valid) goto failure;
+        }
+    }
+    return true;
+failure:
+    close_generation_roots(roots, *count); *count = 0; return false;
+}
+static bool generation_cleanup_unlocked(cg_state *st, struct json_object *manifest,
+                                        size_t *removed, uint64_t *bytes) {
+    char blocks[PATH_MAX];
+    *removed = 0; *bytes = 0;
+    if (!generation_block_directory(st, blocks, false)) return errno == ENOENT;
+    cg_generation_root roots[2]; size_t count;
+    if (!retained_generation_roots(st, manifest, roots, &count)) return false;
+    bool ok = cg_generation_gc(blocks, st->principal, roots, count, removed, bytes);
+    close_generation_roots(roots, count);
+    return ok;
+}
+static bool generation_accounting(cg_state *st, cg_generation_account *out) {
+    char blocks[PATH_MAX];
+    if (!generation_block_directory(st, blocks, false)) return false;
+    cg_generation_root roots[2]; size_t count;
+    if (!retained_generation_roots(st, st->manifest, roots, &count)) return false;
+    bool ok = cg_generation_account_user(blocks, st->principal, roots, count, out);
+    close_generation_roots(roots, count);
+    return ok;
+}
+static struct json_object *generation_account_json(const cg_generation_account *account, bool valid) {
+    struct json_object *out = json_object_new_object();
+    json_boolean(out, "valid", valid);
+    json_boolean(out, "coverage_complete", valid && account->coverage_complete);
+    if (valid) {
+        json_int(out, "referenced_bytes", (int64_t)account->referenced_bytes);
+        json_int(out, "referenced_allocated_bytes", (int64_t)account->referenced_allocated_bytes);
+        json_int(out, "referenced_blocks", account->referenced_blocks);
+        json_int(out, "orphan_bytes", (int64_t)account->orphan_bytes);
+        json_int(out, "orphan_allocated_bytes", (int64_t)account->orphan_allocated_bytes);
+        json_int(out, "orphan_blocks", account->orphan_blocks);
+    }
+    return out;
+}
+static struct json_object *usage_json(const cg_disk_usage *usage) {
+    struct json_object *out = json_object_new_object();
+    json_int(out, "logical_bytes", (int64_t)usage->logical);
+    json_int(out, "allocated_bytes", (int64_t)usage->allocated);
+    json_int(out, "files", (int64_t)usage->files);
+    json_int(out, "directories", (int64_t)usage->directories);
+    return out;
+}
+static struct json_object *storage_accounting(cg_state *st) {
+    if (!principal_active(st)) return NULL;
+    int fd = open(st->directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat directory;
+    if (fstat(fd, &directory) || directory.st_uid != geteuid() || (directory.st_mode & 077)) {
+        close(fd); return NULL;
+    }
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); return NULL; }
+    cg_disk_accounting scan = {.complete = true, .history_complete = true};
+    cg_generation_account block_account = {0};
+    bool saw_blocks = false, blocks_valid = false;
+    bool full_directory_authority = qihse_user_get_role(st->principal) == QIHSE_ROLE_OPERATOR;
+    /* A directory inode's size/blocks encode the number of entries, even
+     * when an entry is a snapshot this principal cannot read. Account the
+     * root inode only for the Operator; lower principals get authorized file
+     * totals with an explicitly incomplete aggregate. */
+    if (full_directory_authority) {
+        if (!account_stat(&scan.other, &directory)) scan.complete = false;
+    } else {
+        /* A guest cannot attest that no higher-classified history exists. */
+        scan.complete = scan.history_complete = false;
+    }
+    const char *current = json_string(st->manifest, "snapshot");
+    const char *previous = json_string(st->manifest, "previous_snapshot");
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno) scan.complete = false; break; }
+        const char *name = entry->d_name;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        if (++scan.entries > CG_ACCOUNTING_MAX_ENTRIES || !principal_active(st)) {
+            scan.complete = false; break;
+        }
+        struct stat info;
+        if (fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW)) { scan.complete = false; continue; }
+        if (info.st_uid != geteuid() || (info.st_mode & 077) ||
+            (!S_ISDIR(info.st_mode) && (!S_ISREG(info.st_mode) || info.st_nlink != 1))) {
+            scan.complete = false; continue;
+        }
+        if (!strcmp(name, "blocks")) {
+            saw_blocks = true;
+            blocks_valid = S_ISDIR(info.st_mode) && generation_accounting(st, &block_account);
+            if (!blocks_valid) { scan.complete = scan.history_complete = false; continue; }
+            scan.shared_blocks.logical = block_account.referenced_bytes + block_account.orphan_bytes;
+            scan.shared_blocks.allocated = block_account.referenced_allocated_bytes + block_account.orphan_allocated_bytes;
+            scan.shared_blocks.files = (uint64_t)block_account.referenced_blocks + block_account.orphan_blocks;
+            if (!full_directory_authority) block_account.coverage_complete = false;
+            if (!block_account.coverage_complete) scan.complete = false;
+            /* Directory size can encode the number of excluded entries. */
+            if (block_account.coverage_complete &&
+                !account_stat(&scan.shared_blocks, &info)) scan.complete = false;
+            continue;
+        }
+        cg_disk_usage *usage = &scan.other;
+        if (S_ISREG(info.st_mode) && snapshot_name(name)) {
+            if (strcmp(name, current) && !historical_snapshot_authorized(st, name)) {
+                scan.history_complete = scan.complete = false; continue;
+            }
+            usage = !strcmp(name, current) ? &scan.current :
+                previous && !strcmp(name, previous) ? &scan.previous : &scan.historical;
+        } else if (S_ISREG(info.st_mode) && !strncmp(name, "graph-", 6) &&
+                   strlen(name) > 4 && !strcmp(name + strlen(name) - 4, ".qci")) {
+            char parent[128];
+            size_t length = strlen(name) - 4;
+            if (length >= sizeof(parent)) { scan.complete = false; continue; }
+            memcpy(parent, name, length); parent[length] = '\0';
+            if (!snapshot_name(parent) ||
+                (strcmp(parent, current) && !historical_snapshot_authorized(st, parent))) {
+                scan.history_complete = scan.complete = false; continue;
+            }
+            usage = &scan.auxiliary;
+        } else if (S_ISDIR(info.st_mode) && !strncmp(name, ".runtime-", 9)) {
+            int child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            struct stat opened;
+            if (child < 0 || fstat(child, &opened) || opened.st_dev != info.st_dev ||
+                opened.st_ino != info.st_ino) {
+                if (child >= 0) close(child);
+                scan.complete = false; continue;
+            }
+            usage = &scan.unleased_runtime;
+            int lease = openat(child, ".lease", O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+            struct stat lease_info;
+            if (lease >= 0 && !fstat(lease, &lease_info) && S_ISREG(lease_info.st_mode) &&
+                lease_info.st_uid == geteuid() && !(lease_info.st_mode & 077) && lease_info.st_nlink == 1) {
+                if (!flock(lease, LOCK_EX | LOCK_NB)) usage = &scan.abandoned_runtime;
+                else if (errno == EWOULDBLOCK || errno == EAGAIN) usage = &scan.active_runtime;
+                else scan.complete = false;
+            }
+            if (!account_stat(usage, &info) ||
+                !account_tree(st->principal, child, 1, usage, &scan)) scan.complete = false;
+            if (lease >= 0) close(lease);
+            close(child);
+            continue;
+        }
+        if (!account_stat(usage, &info)) scan.complete = false;
+        if (S_ISDIR(info.st_mode)) {
+            int child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            struct stat opened;
+            if (child < 0 || fstat(child, &opened) || opened.st_dev != info.st_dev ||
+                opened.st_ino != info.st_ino ||
+                !account_tree(st->principal, child, 1, usage, &scan)) scan.complete = false;
+            if (child >= 0) close(child);
+        }
+    }
+    if (closedir(dir)) scan.complete = false;
+    if (!principal_active(st)) return NULL;
+    struct json_object *out = json_object_new_object(), *categories = json_object_new_object();
+    cg_disk_usage total = {0};
+#define ADD_CATEGORY(key, field) do { \
+    json_object_object_add(categories, key, usage_json(&scan.field)); \
+    if (scan.field.logical > INT64_MAX - total.logical || \
+        scan.field.allocated > INT64_MAX - total.allocated) { \
+        json_object_put(categories); json_object_put(out); return NULL; \
+    } \
+    total.logical += scan.field.logical; total.allocated += scan.field.allocated; \
+    total.files += scan.field.files; total.directories += scan.field.directories; \
+} while (0)
+    ADD_CATEGORY("current_snapshot", current);
+    ADD_CATEGORY("previous_snapshot", previous);
+    ADD_CATEGORY("historical_snapshots", historical);
+    ADD_CATEGORY("auxiliary_indexes", auxiliary);
+    ADD_CATEGORY("shared_generation_blocks", shared_blocks);
+    ADD_CATEGORY("active_runtimes", active_runtime);
+    ADD_CATEGORY("abandoned_runtimes", abandoned_runtime);
+    ADD_CATEGORY("unleased_runtimes", unleased_runtime);
+    ADD_CATEGORY("other_private_metadata", other);
+#undef ADD_CATEGORY
+    json_text(out, "coverage", "authorized_snapshots_and_private_filesystem_metadata");
+    json_boolean(out, "complete", scan.complete);
+    json_boolean(out, "historical_authorization_complete", scan.history_complete);
+    json_boolean(out, "symlinks_followed", false);
+    json_text(out, "consistency", "best_effort_active_runtimes_may_change");
+    if (saw_blocks) json_object_object_add(out, "generation_account", generation_account_json(&block_account, blocks_valid));
+    json_object_object_add(out, "categories", categories);
+    json_object_object_add(out, "total", usage_json(&total));
+    return out;
+}
+
 /* Account only for the generation the principal has just loaded and authorized.
  * Historical files may have different labels and cannot be enumerated as data
  * merely because their names appear in the same directory. */
@@ -1713,23 +2608,37 @@ static int storage_stats(cg_state *st) {
     if (!load_snapshot_unlocked(st, false) || !st->storage_info.valid ||
         !principal_active(st)) goto done;
     const char *name = json_string(st->manifest, "snapshot");
-    const char *declared_format = json_string(st->manifest, "storage_format");
-    if (!snapshot_name(name) ||
-        (declared_format && strcmp(declared_format, "qihse-codegraph-zstd-v1") &&
-         strcmp(declared_format, "qihse-codegraph-packed-v2")) ||
-        (declared_format && !strcmp(declared_format, "qihse-codegraph-zstd-v1") &&
-         !st->storage_info.compact) ||
-        (declared_format && !strcmp(declared_format, "qihse-codegraph-packed-v2") &&
-         !st->storage_info.packed) ||
-        (!declared_format && (st->storage_info.compact || st->storage_info.packed))) goto done;
+    const char *declared_format = source_string(st->manifest, "storage_format");
+    if (!snapshot_name(name) || (declared_format && !known_storage_format(declared_format)) ||
+        !storage_matches(declared_format, &st->storage_info)) goto done;
     struct json_object *report = summary(st, false);
-    json_text(report, "storage_format", st->storage_info.packed ?
-        "qihse-codegraph-packed-v2" : st->storage_info.compact ?
-        "qihse-codegraph-zstd-v1" : "qihse-kv-legacy");
+    json_text(report, "storage_format", detected_storage_format(&st->storage_info));
     json_text(report, "coverage", "authorized_current_generation");
     json_int(report, "encoded_bytes", (int64_t)st->storage_info.encoded_bytes);
     json_int(report, "allocated_bytes", (int64_t)st->storage_info.allocated_bytes);
     json_int(report, "decoded_bytes", (int64_t)st->storage_info.decoded_bytes);
+    json_boolean(report, "section_accounting_valid", st->storage_info.section_accounting_valid);
+    if (st->storage_info.section_accounting_valid) {
+        json_int(report, "framing_encoded_bytes", (int64_t)st->storage_info.framing_encoded_bytes);
+        json_int(report, "metadata_encoded_bytes", (int64_t)st->storage_info.metadata_encoded_bytes);
+        json_int(report, "body_encoded_bytes", (int64_t)st->storage_info.body_encoded_bytes);
+        json_int(report, "storage_chunks", (int64_t)st->storage_info.storage_chunks);
+        json_int(report, "storage_sections", (int64_t)st->storage_info.storage_sections);
+    }
+    struct json_object *accounting = storage_accounting(st);
+    if (!accounting || !principal_active(st)) {
+        if (accounting) json_object_put(accounting);
+        json_object_put(report);
+        goto done;
+    }
+    struct json_object *block_report = NULL;
+    if (json_object_object_get_ex(accounting, "generation_account", &block_report))
+        json_object_object_add(report, "generation_account", json_object_get(block_report));
+    if (st->storage_info.generations) {
+        json_int(report, "referenced_current_block_bytes", (int64_t)st->generation_info.block_bytes);
+        json_int(report, "required_current_generation_bytes", (int64_t)(st->storage_info.encoded_bytes + st->generation_info.block_bytes));
+    }
+    json_object_object_add(report, "storage_accounting", accounting);
     print_json(report);
     json_object_put(report);
     rc = 0;
@@ -1852,6 +2761,28 @@ static struct json_object *request_error(const char *reason) {
     json_text(obj, "error", reason);
     return obj;
 }
+/* Preserve the established traversal contract: insertion order, incoming
+ * self-loop exclusion, type filtering before the 2048-neighbor bound. Count
+ * every examined edge against a graph-walk/subquery budget, including filtered edges, so
+ * high-degree input cannot turn a bounded result into an unbounded scan. */
+static size_t bounded_neighbors(cg_state *st, uint32_t vertex, bool incoming,
+                                const char *type, uint32_t *out, size_t limit,
+                                size_t *remaining, bool *exhausted) {
+    size_t available = 0, count = 0;
+    const uint32_t *incident = cg_csr_incident(st->graph, vertex, incoming, &available);
+    if (!incident) return SIZE_MAX;
+    for (size_t i = 0; i < available && count < limit; ++i) {
+        if (!*remaining) { *exhausted = true; break; }
+        --*remaining;
+        const cg_csr_edge *edge = cg_csr_get_edge(st->graph, incident[i]);
+        if (!edge) return SIZE_MAX;
+        if ((incoming && edge->source == vertex) || (type && strcmp(edge->type, type)))
+            continue;
+        out[count++] = incident[i];
+    }
+    return count;
+}
+
 static struct json_object *query_graph(cg_state *st, const char *action, const char *symbol,
                                        const char *files[], size_t nfiles, const char *base,
                                        int depth, size_t max_nodes, int token_budget,
@@ -1898,13 +2829,14 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
      * Seed candidates outside the output limit remain eligible as neighbours. */
     uint8_t *visited = calloc(st->nn + 2, sizeof(*visited));
     uint64_t *queue = calloc(max_nodes + 1, sizeof(*queue));
-    graph_adj_t *edges = calloc(2048, sizeof(*edges));
+    uint32_t *edges = calloc(2048, sizeof(*edges));
     struct json_object *found = json_object_new_array();
     struct json_object *tests = json_object_new_array();
     struct json_object *affected = json_object_new_array();
     struct json_object *evidence = json_object_new_array();
     struct json_object *gaps = json_object_new_array();
-    bool truncated = false;
+    bool truncated = false, work_exhausted = false;
+    size_t remaining_edges = CG_QUERY_EDGE_BUDGET;
     size_t start = 0, used = 0, seeds = 0;
     if (!visited || !queue || !edges) {
         json_object_put(report);
@@ -2005,18 +2937,20 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
         if (hop >= depth)
             continue;
         for (int direction = 0; direction < 2; ++direction) {
-            graph_dir_t dir = direction == 0 ? GRAPH_DIR_INCOMING : GRAPH_DIR_OUTGOING;
-            size_t count = qihse_graph_get_neighbors(st->graph, id, dir, NULL, edges, 2048);
-            if (count == 2048)
+            bool incoming = direction == 0;
+            size_t count = bounded_neighbors(st, (uint32_t)id, incoming, NULL, edges, 2048,
+                                             &remaining_edges, &work_exhausted);
+            if (count == SIZE_MAX) goto projection_failed;
+            if (count == 2048 || work_exhausted)
                 truncated = true;
             for (size_t e = 0; e < count; ++e) {
-                graph_adj_t *adj = &edges[e];
-                bool incoming = dir == GRAPH_DIR_INCOMING;
+                const cg_csr_edge *edge = cg_csr_get_edge(st->graph, edges[e]);
+                if (!edge) goto projection_failed;
                 if (strcmp(action, "query") != 0 &&
-                    !(compact ? context_edge(adj->edge_type, incoming)
-                              : impact_edge(adj->edge_type, incoming)))
+                    !(compact ? context_edge(edge->type, incoming)
+                              : impact_edge(edge->type, incoming)))
                     continue;
-                uint64_t neighbor = adj->neighbor_id;
+                uint64_t neighbor = (incoming ? edge->source : edge->target);
                 if (neighbor > st->nn || visited[neighbor] >= 2)
                     continue;
                 if (used >= max_nodes) {
@@ -2028,33 +2962,24 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
                 /* Explain each included relationship with its original
                  * source line and confidence. No guessed targets are here. */
                 if (json_object_array_length(evidence) < evidence_limit) {
-                    graph_edge_t *edge = qihse_graph_edge_get(st->graph, adj->edge_id);
-                    if (edge) {
+                    {
                         cg_node *related = st->by_vertex[neighbor];
                         struct json_object *ev = json_object_new_object();
-                        json_text(ev, "relation", adj->edge_type);
+                        json_text(ev, "relation", edge->type);
                         json_text(ev, "from",
-                                  dir == GRAPH_DIR_INCOMING ? related->name : node->name);
-                        json_text(ev, "to", dir == GRAPH_DIR_INCOMING ? node->name : related->name);
+                                  incoming ? related->name : node->name);
+                        json_text(ev, "to", incoming ? node->name : related->name);
                         if (batch_query || output_compact) {
                             json_text(ev, "from_id",
-                                      dir == GRAPH_DIR_INCOMING ? related->id : node->id);
+                                      incoming ? related->id : node->id);
                             json_text(ev, "to_id",
-                                      dir == GRAPH_DIR_INCOMING ? node->id : related->id);
+                                      incoming ? node->id : related->id);
                         }
-                        const graph_prop_t *file = graph_edge_get_property(edge, "file");
-                        const graph_prop_t *line = graph_edge_get_property(edge, "line");
-                        const graph_prop_t *confidence =
-                            graph_edge_get_property(edge, "confidence");
-                        if (file && file->type == GRAPH_PROP_STRING)
-                            json_text(ev, "file", file->val.s);
-                        if (line && line->type == GRAPH_PROP_INT64)
-                            json_int(ev, "line", line->val.i);
-                        if (confidence && confidence->type == GRAPH_PROP_DOUBLE)
-                            json_object_object_add(ev, "confidence",
-                                                   json_object_new_double(confidence->val.d));
+                        json_text(ev, "file", edge->file);
+                        json_int(ev, "line", edge->line);
+                        json_object_object_add(ev, "confidence",
+                                               json_object_new_double(edge->confidence));
                         json_object_array_add(evidence, ev);
-                        graph_edge_free(edge);
                     }
                 } else
                     truncated = true;
@@ -2074,15 +2999,21 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
             if (node->is_test || !node->file[0])
                 continue;
             bool has_test = false;
-            size_t n = qihse_graph_get_neighbors(st->graph, node->vertex, GRAPH_DIR_OUTGOING,
-                                                 "TESTED_BY", edges, 2048);
+            size_t n = bounded_neighbors(st, (uint32_t)node->vertex, false,
+                                         "TESTED_BY", edges, 2048, &remaining_edges, &work_exhausted);
+            if (n == SIZE_MAX) goto projection_failed;
+            if (work_exhausted) { truncated = true; break; }
             if (n)
                 has_test = true;
-            n = qihse_graph_get_neighbors(st->graph, node->vertex, GRAPH_DIR_INCOMING, "CALLS",
-                                          edges, 2048);
-            for (size_t j = 0; j < n; ++j)
-                if (st->by_vertex[edges[j].neighbor_id]->is_test)
-                    has_test = true;
+            n = bounded_neighbors(st, (uint32_t)node->vertex, true, "CALLS", edges, 2048,
+                                  &remaining_edges, &work_exhausted);
+            if (n == SIZE_MAX) goto projection_failed;
+            if (work_exhausted) { truncated = true; break; }
+            for (size_t j = 0; j < n; ++j) {
+                const cg_csr_edge *edge = cg_csr_get_edge(st->graph, edges[j]);
+                if (!edge) goto projection_failed;
+                if (st->by_vertex[edge->source]->is_test) has_test = true;
+            }
             if (!has_test) {
                 struct json_object *gap = json_object_new_object();
                 json_text(gap, "symbol", node->name);
@@ -2130,32 +3061,24 @@ static struct json_object *query_graph(cg_state *st, const char *action, const c
     free(edges);
     *rc = seeds || (!symbol && nfiles == 0) ? 0 : 2;
     return report;
+projection_failed:
+    if (changed) {
+        for (size_t i = 0; i < nfiles; ++i) free(changed[i]);
+        free(changed);
+    }
+    free(visited); free(queue); free(edges);
+    json_object_put(found); json_object_put(tests); json_object_put(affected);
+    json_object_put(evidence); json_object_put(gaps); json_object_put(report);
+    return request_error("CodeGraph projection unavailable or authorization revoked");
 }
 
 /* A generation read lease pins these structures until a request finishes. Replacement
  * takes the write lease; graph/KV APIs remain serialized by graph_api_lock, while
  * filesystem freshness checks and response construction can run independently. */
 static void clear_generation(cg_state *st) {
-    if (st->graph)
-        qihse_graph_destroy(st->graph);
-    st->graph = NULL;
-    if (st->kv)
-        qihse_kv_store_destroy(st->kv);
+    release_query_graph(st);
+    if (st->kv) qihse_kv_store_destroy(st->kv);
     st->kv = NULL;
-    for (size_t i = 0; i < st->nn; ++i) {
-        free(st->nodes[i].file);
-        free(st->nodes[i].name);
-        free(st->nodes[i].kind);
-    }
-    free(st->nodes);
-    st->nodes = NULL;
-    free(st->by_name);
-    st->by_name = NULL;
-    free(st->by_file);
-    st->by_file = NULL;
-    free(st->by_vertex);
-    st->by_vertex = NULL;
-    st->nn = st->capacity = st->edges = st->unresolved = 0;
     if (st->meta)
         json_object_put(st->meta);
     if (st->manifest)
@@ -2192,7 +3115,7 @@ static bool refresh_generation(cg_state *st) {
     /* Drop the old graph before trying the new publication. An invalid
      * replacement must never leave an older generation serviceable. */
     clear_generation(st);
-    st->kv = qihse_kv_store_create();
+    st->kv = qihse_kv_store_create_user(st->principal);
     if (!st->kv || !load_snapshot(st, true)) {
         clear_generation(st);
         return false;
@@ -2509,7 +3432,8 @@ static struct json_object *execute_read(cg_state *st, struct json_object *reques
     begin = monotonic_ms();
     struct json_object *published = NULL;
     bool current = current_manifest(st, &published) && same_manifest(st->manifest, published) &&
-                   freshness(st, &reason) && principal_active(st);
+                   freshness(st, &reason) && principal_active(st) &&
+                   (!st->projection || cg_projection_get(st->projection));
     if (published)
         json_object_put(published);
     double post_ms = monotonic_ms() - begin;
@@ -2551,6 +3475,24 @@ static struct json_object *execute_read(cg_state *st, struct json_object *reques
                 continue;
             }
             if (!count) {
+                /* The response budget applies to facts and metadata alike.
+                 * Omit optional runtime diagnostics before failing a valid
+                 * bounded batch with no remaining facts to trim. */
+                static const char *const optional[] = {
+                    "runtime_spill_reclaimed_bytes", "runtime_spill_reclaimed_files",
+                    "query_index_resident_bytes", "query_index_loaded",
+                    "backend", "format", "edges", "unresolved_edges", "head"};
+                bool removed = false;
+                for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); ++i) {
+                    struct json_object *field = NULL;
+                    if (json_object_object_get_ex(report, optional[i], &field)) {
+                        json_object_object_del(report, optional[i]);
+                        removed = true;
+                        break;
+                    }
+                }
+                if (removed)
+                    continue;
                 json_object_put(report);
                 *rc = 1;
                 return request_error("CodeGraph batch metadata exceeds shared token budget");
@@ -3201,17 +4143,114 @@ static int memory_option(const char *text, int maximum) {
 }
 
 static const char *usage_text =
-    "usage: qihse-codegraph <import|migrate|gc|status|stats|query|impact|review|context|serve> "
+    "usage: qihse-codegraph <import|migrate|gc|query-index|status|stats|query|impact|review|context|serve> "
     "[--repo DIR] [--input JSONL] [--symbol NAME] [--file PATH] "
     "[--base GITREF] [--depth 1..5] [--limit 1..256] "
     "[--max-tokens 128..16000] [--socket PATH] [--token-file PATH] "
     "[--idle-seconds 1..3600] [--workers 1..4] [--fallback error|oneshot] "
     "[--memory-limit-mib 128..65536] [--pool-file PATH --pool-budget-mib 128..262144] "
-    "[--storage-format zstd-v1|packed-v2 (import/migrate)] "
+    "[--storage-format auto|zstd-v1|packed-v2|packed-v3|packed-v4|generations-v1 (import/migrate; default auto)] "
     "[--match auto|exact|qualified|prefix|substring] [--timings] [--compact]\n";
 static int usage(void) {
     fputs(usage_text, stderr);
     return 2;
+}
+
+typedef struct { char *keys; size_t count, capacity, width; bool valid; } cache_edge_keys;
+static bool cache_edge_key(const char *key, void *opaque) {
+    cache_edge_keys *keys = opaque;
+    if (strncmp(key, "e:", 2)) return true;
+    if (strlen(key) + 1 > keys->width || keys->count >= keys->capacity) {
+        keys->valid = false; return false;
+    }
+    memcpy(keys->keys + keys->count++ * keys->width, key, strlen(key) + 1);
+    return true;
+}
+static bool cache_record_immutable(cg_state *st, const char *key) {
+    qihse_kv_record_meta_t meta;
+    return qihse_kv_meta_user(st->kv, key, st->principal, &meta) &&
+           !meta.classification && !meta.sci_compartment && !meta.expire_time_ms && !meta.flags;
+}
+static bool cacheable_graph_source(cg_state *st) {
+    /* The projection has no per-record expiry clock. Certify all materialized
+     * records and structural metadata through authenticated metadata APIs.
+     * Collect keys first, outside iteration's store lock for metadata lookups. */
+    if (!st->kv || !cache_record_immutable(st, "_meta") ||
+        !cache_record_immutable(st, "_end")) return false;
+    for (size_t i = 0; i < st->nn; ++i) {
+        char key[68];
+        snprintf(key, sizeof(key), "n:%s", st->nodes[i].id);
+        if (!cache_record_immutable(st, key)) return false;
+    }
+    cache_edge_keys keys = {.capacity = st->edges, .width = st->id_hex_chars + 3, .valid = true};
+    if (keys.capacity > SIZE_MAX / keys.width) return false;
+    keys.keys = calloc(keys.capacity ? keys.capacity : 1, keys.width);
+    if (!keys.keys) return false;
+    bool ok = qihse_kv_foreach_key_user(st->kv, st->principal, cache_edge_key, &keys) &&
+              keys.valid && keys.count == st->edges;
+    for (size_t i = 0; ok && i < keys.count; ++i)
+        ok = cache_record_immutable(st, keys.keys + i * keys.width);
+    free(keys.keys);
+    return ok && principal_active(st);
+}
+static int build_query_index(cg_state *st) {
+    if (!storage_lock(st, LOCK_EX)) return error_json("cannot lock query index publication");
+    int result = 1;
+    char temporary[PATH_MAX] = {0}, published[PATH_MAX], manifest_path[PATH_MAX];
+    FILE *output = NULL;
+    char *end_json = NULL;
+    struct json_object *visible = NULL;
+    const char *reason = NULL;
+    bool renamed = false, committed = false;
+    if (!load_snapshot_unlocked(st, true) || !freshness(st, &reason) ||
+        !cacheable_graph_source(st)) goto done;
+    const char *snapshot = source_string(st->manifest, "snapshot");
+    if (!snapshot_name(snapshot) ||
+        snprintf(temporary, sizeof(temporary), "%s/query-index-XXXXXX", st->scratch) >= (int)sizeof(temporary) ||
+        snprintf(published, sizeof(published), "%s/%s.qci", st->directory, snapshot) >= (int)sizeof(published) ||
+        snprintf(manifest_path, sizeof(manifest_path), "%s/current.json", st->directory) >= (int)sizeof(manifest_path)) goto done;
+    int fd = mkstemp(temporary);
+    if (fd < 0) goto done;
+    output = fdopen(fd, "w+b");
+    if (!output) { close(fd); goto done; }
+    cg_projection_binding binding = {.tenant = qihse_user_get_tenant_id(st->principal),
+        .principal_id = qihse_user_get_id(st->principal),
+        .source_format = projection_source_format(detected_storage_format(&st->storage_info))};
+    cg_snapshot_checksum checksum;
+    end_json = qihse_kv_get_user(st->kv, "_end", st->principal);
+    if (!end_json || !manifest_checksum(st->manifest, &binding.source) ||
+        !cg_projection_write(output, st->principal, &binding, st->graph, st->nodes, st->nn,
+                             st->by_name, st->by_file, st->edges, st->unresolved,
+                             json_object_to_json_string_ext(st->meta, JSON_C_TO_STRING_PLAIN),
+                             end_json, &checksum) || fflush(output) || fsync(fileno(output))) goto done;
+    if (fclose(output)) { output = NULL; goto done; } output = NULL;
+    if (!current_manifest(st, &visible) || !same_manifest(st->manifest, visible) ||
+        !freshness(st, &reason) || !principal_active(st) || rename(temporary, published)) goto done;
+    renamed = true;
+    json_text(st->manifest, "projection_format", CG_PROJECTION_FORMAT);
+    json_text(st->manifest, "projection_hash_algorithm", cg_checksum_algorithm_name(checksum.algorithm));
+    json_text(st->manifest, "projection_hash", checksum.hex);
+    json_int(st->manifest, "projection_classification", 0); json_int(st->manifest, "projection_sci", 0);
+    json_int(st->manifest, "projection_tenant", binding.tenant);
+    json_int(st->manifest, "projection_principal_id", binding.principal_id);
+    if (!atomic_write(manifest_path, json_object_to_json_string_ext(st->manifest, JSON_C_TO_STRING_PLAIN), &committed)) goto done;
+    struct json_object *receipt = json_object_new_object();
+    json_text(receipt, "status", "indexed"); json_text(receipt, "projection_format", CG_PROJECTION_FORMAT);
+    json_text(receipt, "projection_hash", checksum.hex);
+    struct stat info;
+    if (!stat(published, &info)) {
+        json_int(receipt, "projection_encoded_bytes", info.st_size);
+        json_int(receipt, "projection_allocated_bytes", (int64_t)info.st_blocks * 512);
+    }
+    print_json(receipt); json_object_put(receipt); result = 0;
+done:
+    if (output) fclose(output);
+    if (temporary[0]) unlink(temporary);
+    if (renamed && !committed) unlink(published);
+    if (visible) json_object_put(visible);
+    free(end_json);
+    (void)storage_lock(st, LOCK_UN);
+    return result ? error_json("query index publication failed; canonical graph retained") : 0;
 }
 
 int main(int argc, char **argv) {
@@ -3237,7 +4276,7 @@ int main(int argc, char **argv) {
         const char *flag = argv[i];
         if (!strcmp(flag, "--help")) {
             if (!read_action(action) && strcmp(action, "stats") && strcmp(action, "serve") && strcmp(action, "import") &&
-                strcmp(action, "migrate") && strcmp(action, "gc"))
+                strcmp(action, "migrate") && strcmp(action, "gc") && strcmp(action, "query-index"))
                 return usage();
             fputs(usage_text, stdout);
             return 0;
@@ -3296,7 +4335,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(action, "import") && strcmp(action, "status") && strcmp(action, "stats") && strcmp(action, "query") &&
         strcmp(action, "impact") && strcmp(action, "review") && strcmp(action, "context") &&
-        strcmp(action, "serve") && strcmp(action, "migrate") && strcmp(action, "gc"))
+        strcmp(action, "serve") && strcmp(action, "migrate") && strcmp(action, "gc") && strcmp(action, "query-index"))
         return usage();
     /* Bare impact/review means "changed since HEAD", never whole-repo
      * pseudo-review with no seeds. Graph context requires an explicit seed. */
@@ -3307,8 +4346,12 @@ int main(int argc, char **argv) {
         (!strcmp(action, "serve") && (!socket_path || !token_path)) ||
         (!strcmp(action, "stats") && (socket_path || token_path || input)) ||
         (requested_storage_format &&
-         (strcmp(requested_storage_format, "zstd-v1") &&
-          strcmp(requested_storage_format, "packed-v2"))) ||
+         (strcmp(requested_storage_format, "auto") &&
+          strcmp(requested_storage_format, "zstd-v1") &&
+          strcmp(requested_storage_format, "packed-v2") &&
+          strcmp(requested_storage_format, "packed-v3") &&
+          strcmp(requested_storage_format, "packed-v4") &&
+          strcmp(requested_storage_format, "generations-v1"))) ||
         (requested_storage_format && strcmp(action, "import") && strcmp(action, "migrate")) ||
         (!!socket_path != !!token_path) || !valid_match(match) ||
         (strcmp(fallback, "error") && strcmp(fallback, "oneshot")))
@@ -3372,6 +4415,8 @@ int main(int argc, char **argv) {
         return error_json("CodeGraph repo/runtime not available");
     }
     st.requested_storage_format = requested_storage_format;
+    st.read_only_graph = !strcmp(action, "serve") ||
+                         (read_action(action) && strcmp(action, "status"));
     int rc;
     if (!strcmp(action, "import")) {
         rc = input ? import_snapshot(&st, input) : usage();
@@ -3379,6 +4424,8 @@ int main(int argc, char **argv) {
         rc = migrate_snapshot(&st);
     } else if (!strcmp(action, "gc")) {
         rc = collect_snapshots(&st);
+    } else if (!strcmp(action, "query-index")) {
+        rc = build_query_index(&st);
     } else if (!strcmp(action, "stats")) {
         rc = storage_stats(&st);
     } else if (!load_snapshot(&st, strcmp(action, "status") != 0)) {

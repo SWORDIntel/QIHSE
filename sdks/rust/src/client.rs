@@ -14,6 +14,58 @@ use tokio_postgres::types::ToSql;
 /// Explicit plaintext connector; requires [`Config::disable_tls`].
 pub use tokio_postgres::NoTls;
 
+/// SQLSTATE from a PostgreSQL server error. Transport and local client errors
+/// have no SQLSTATE and return `None` from [`SqlState::from_io`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlState(String);
+
+/// Meaning of a database SQLSTATE for transaction-aware callers. Only a
+/// serialization conflict is a candidate for replay of the whole logical
+/// transaction; an ambiguous outcome requires a durable retry lookup first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlErrorKind {
+    PermissionDenied,
+    SerializationConflict,
+    AmbiguousOutcome,
+    TransactionAborted,
+    Other,
+}
+
+impl SqlState {
+    pub fn from_io(error: &io::Error) -> Option<Self> {
+        let pg = error.get_ref()?.downcast_ref::<tokio_postgres::Error>()?;
+        Some(Self(pg.as_db_error()?.code().code().to_owned()))
+    }
+
+    pub fn code(&self) -> &str {
+        &self.0
+    }
+
+    /// Classify a server error while retaining the exact SQLSTATE in `code`.
+    pub fn kind(&self) -> SqlErrorKind {
+        match self.0.as_str() {
+            "42501" => SqlErrorKind::PermissionDenied,
+            "40001" | "40P01" => SqlErrorKind::SerializationConflict,
+            "40003" => SqlErrorKind::AmbiguousOutcome,
+            "25P02" => SqlErrorKind::TransactionAborted,
+            _ => SqlErrorKind::Other,
+        }
+    }
+}
+
+/// Outcome of sending COMMIT. `ServerResponded` means the server accepted the
+/// command; tokio-postgres does not expose its command tag, so callers must not
+/// use this alone as proof that an already-aborted transaction committed.
+#[derive(Debug)]
+pub enum CommitOutcome {
+    ServerResponded,
+    Rejected { state: SqlState, error: io::Error },
+    NotSent(io::Error),
+    /// Transport failed after send, or the server reported SQLSTATE 40003.
+    /// The original SQLSTATE remains available through `SqlState::from_io`.
+    Indeterminate(io::Error),
+}
+
 /// Connection configuration builder.
 pub struct Config {
     host: String,
@@ -294,6 +346,30 @@ impl Transaction {
         self.done = true;
         Ok(())
     }
+    /// Classify server rejection separately from local refusal and transport
+    /// uncertainty. On any failure the handle is closed by `Drop`, so a pooled
+    /// client cannot continue with an unresolved transaction.
+    pub async fn commit_outcome(mut self) -> CommitOutcome {
+        let client = match self.client().await {
+            Ok(client) => client,
+            Err(error) => return CommitOutcome::NotSent(error),
+        };
+        match client.batch_execute("COMMIT").await {
+            Ok(()) => {
+                self.done = true;
+                CommitOutcome::ServerResponded
+            }
+            Err(error) => {
+                let error = pg_error(error);
+                match SqlState::from_io(&error) {
+                    Some(state) if state.kind() == SqlErrorKind::AmbiguousOutcome =>
+                        CommitOutcome::Indeterminate(error),
+                    Some(state) => CommitOutcome::Rejected { state, error },
+                    None => CommitOutcome::Indeterminate(error),
+                }
+            }
+        }
+    }
     pub async fn rollback(mut self) -> io::Result<()> {
         self.client()
             .await?
@@ -354,5 +430,43 @@ mod tests {
         assert_eq!(config.dbname, "test");
         assert_eq!(config.ssl_mode, SslMode::Require);
         assert_eq!(config.disable_tls().ssl_mode, SslMode::Disable);
+    }
+
+    #[tokio::test]
+    async fn commit_without_connection_is_not_sent() {
+        let transaction = Transaction {
+            inner: Arc::new(Mutex::new(ClientInner {
+                client: None,
+                closed: false,
+                auth_state: AuthState::Authenticated,
+            })),
+            done: false,
+        };
+        match transaction.commit_outcome().await {
+            CommitOutcome::NotSent(error) => assert_eq!(error.kind(), io::ErrorKind::NotConnected),
+            other => panic!("unexpected commit outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_error_has_no_sqlstate() {
+        let error = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        assert_eq!(SqlState::from_io(&error), None);
+    }
+
+    #[test]
+    fn transaction_sqlstate_mapping_preserves_raw_code() {
+        for (code, kind) in [
+            ("42501", SqlErrorKind::PermissionDenied),
+            ("40001", SqlErrorKind::SerializationConflict),
+            ("40P01", SqlErrorKind::SerializationConflict),
+            ("40003", SqlErrorKind::AmbiguousOutcome),
+            ("25P02", SqlErrorKind::TransactionAborted),
+            ("23505", SqlErrorKind::Other),
+        ] {
+            let state = SqlState(code.to_owned());
+            assert_eq!(state.kind(), kind);
+            assert_eq!(state.code(), code);
+        }
     }
 }

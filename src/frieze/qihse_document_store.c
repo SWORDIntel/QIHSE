@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #include "qihse_bytecode.h"
 #include "qihse_bytecode_compiler.h"
@@ -17,11 +18,30 @@ typedef struct qihse_doc {
     uint16_t sci_compartment;
 } qihse_doc_t;
 
+typedef struct qihse_doc_version {
+    uint64_t version;
+    uint16_t classification;
+    uint16_t sci;
+    char* json;
+    struct qihse_doc_version* next;
+} qihse_doc_version_t;
+
+typedef struct qihse_doc_secure {
+    uint64_t id;
+    uint32_t tenant;
+    uint64_t last_version;
+    size_t version_count;
+    qihse_doc_version_t* versions;
+    struct qihse_doc_secure* next;
+} qihse_doc_secure_t;
+
 struct qihse_document_store {
     qihse_kv_store_t* kv;
     qihse_doc_arena_block_t* arena_head;
     qihse_radix_node_t* index_root;
     qihse_doc_t* docs_head;
+    pthread_mutex_t secure_mutex;
+    qihse_doc_secure_t* secure_head;
 };
 
 static uint64_t simple_hash(const char* str) {
@@ -36,9 +56,13 @@ static uint64_t simple_hash(const char* str) {
 qihse_document_store_t* qihse_doc_store_create(qihse_kv_store_t* kv) {
     qihse_document_store_t* store = (qihse_document_store_t*)malloc(sizeof(qihse_document_store_t));
     if (!store) return NULL;
+    if (pthread_mutex_init(&store->secure_mutex, NULL) != 0) {
+        free(store); return NULL;
+    }
     
     store->kv = kv;
     store->docs_head = NULL;
+    store->secure_head = NULL;
     
     /* Allocate initial arena block */
     store->arena_head = (qihse_doc_arena_block_t*)malloc(sizeof(qihse_doc_arena_block_t) + 4096);
@@ -58,6 +82,20 @@ qihse_document_store_t* qihse_doc_store_create(qihse_kv_store_t* kv) {
 
 void qihse_doc_store_destroy(qihse_document_store_t* store) {
     if (!store) return;
+    qihse_doc_secure_t* secure = store->secure_head;
+    while (secure) {
+        qihse_doc_secure_t* next = secure->next;
+        qihse_doc_version_t* version = secure->versions;
+        while (version) {
+            qihse_doc_version_t* next_version = version->next;
+            free(version->json);
+            free(version);
+            version = next_version;
+        }
+        free(secure);
+        secure = next;
+    }
+    pthread_mutex_destroy(&store->secure_mutex);
     
     qihse_doc_arena_block_t* curr_arena = store->arena_head;
     while (curr_arena) {
@@ -237,4 +275,221 @@ qihse_document_result_t qihse_doc_store_query_user(qihse_document_store_t* store
         curr = curr->next;
     }
     return res;
+}
+
+/* The secure lane never reads a legacy record: its context-free insert path
+ * cannot establish an authoritative tenant or classification. */
+bool qihse_doc_store_insert_json_user(qihse_document_store_t* store,
+        uint64_t doc_id, const char* json_payload, qihse_user_t* user) {
+    if (!store || !json_payload || !user) return false;
+    uint32_t tenant = 0;
+    uint64_t generation = 0;
+    bool active = false;
+    qihse_auth_user_active_and_tenant(user, &active, &tenant);
+    if (!active) return false;
+    qihse_user_t* borrowed = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (borrowed != user || !generation) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    size_t length = strnlen(json_payload, 1024u * 1024u + 1u);
+    if (!length || length > 1024u * 1024u) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    char* copy = strdup(json_payload);
+    if (!copy) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    qihse_doc_version_t* version = calloc(1, sizeof(*version));
+    if (!version) {
+        free(copy);
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    version->json = copy;
+    uint16_t classification = qihse_user_get_classification(user);
+    uint16_t sci = qihse_user_get_sci(user);
+    pthread_mutex_lock(&store->secure_mutex);
+    if (!qihse_auth_validate_handle_generation(user, generation)) {
+        pthread_mutex_unlock(&store->secure_mutex);
+        free(version->json); free(version);
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    qihse_doc_secure_t* doc = store->secure_head;
+    while (doc && (doc->tenant != tenant || doc->id != doc_id)) doc = doc->next;
+    qihse_doc_version_t* current = doc ? doc->versions : NULL;
+    if (doc && (doc->last_version == UINT64_MAX || !current ||
+                !qihse_auth_can_access(user, current->classification, current->sci) ||
+                classification < current->classification ||
+                (sci & current->sci) != current->sci)) {
+        pthread_mutex_unlock(&store->secure_mutex);
+        free(version->json); free(version);
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    if (!doc) {
+        doc = calloc(1, sizeof(*doc));
+        if (!doc) {
+            pthread_mutex_unlock(&store->secure_mutex);
+            free(version->json); free(version);
+            qihse_auth_release_principal_scoped(borrowed);
+            return false;
+        }
+        doc->id = doc_id;
+        doc->tenant = tenant;
+        doc->next = store->secure_head;
+        store->secure_head = doc;
+    }
+    version->version = ++doc->last_version;
+    version->classification = classification;
+    version->sci = sci;
+    version->next = doc->versions;
+    doc->versions = version;
+    doc->version_count++;
+    if (doc->version_count > QIHSE_DOC_VERSION_RETENTION) {
+        qihse_doc_version_t* tail = doc->versions;
+        for (size_t i = 1; i < QIHSE_DOC_VERSION_RETENTION; i++)
+            tail = tail->next;
+        qihse_doc_version_t* expired = tail->next;
+        tail->next = NULL;
+        while (expired) {
+            qihse_doc_version_t* next = expired->next;
+            free(expired->json);
+            free(expired);
+            expired = next;
+        }
+        doc->version_count = QIHSE_DOC_VERSION_RETENTION;
+    }
+    pthread_mutex_unlock(&store->secure_mutex);
+    qihse_auth_release_principal_scoped(borrowed);
+    return true;
+}
+
+static bool secure_get_json_user(qihse_document_store_t* store,
+        uint64_t doc_id, uint64_t version_id, qihse_user_t* user,
+        char** out_json) {
+    if (out_json) *out_json = NULL;
+    if (!store || !user || !out_json) return false;
+    uint32_t tenant = 0;
+    uint64_t generation = 0;
+    bool active = false;
+    qihse_auth_user_active_and_tenant(user, &active, &tenant);
+    if (!active) return false;
+    qihse_user_t* borrowed = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (borrowed != user || !generation) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return false;
+    }
+    pthread_mutex_lock(&store->secure_mutex);
+    qihse_doc_secure_t* doc = store->secure_head;
+    while (doc && (doc->tenant != tenant || doc->id != doc_id)) doc = doc->next;
+    qihse_doc_version_t* version = doc ? doc->versions : NULL;
+    if (version_id)
+        while (version && version->version != version_id) version = version->next;
+    char* copy = NULL;
+    if (version && qihse_auth_can_access(user, version->classification, version->sci))
+        copy = strdup(version->json);
+    bool valid = qihse_auth_validate_handle_generation(user, generation);
+    pthread_mutex_unlock(&store->secure_mutex);
+    qihse_auth_release_principal_scoped(borrowed);
+    if (!valid) { free(copy); return false; }
+    *out_json = copy;
+    return copy != NULL;
+}
+
+bool qihse_doc_store_get_json_user(qihse_document_store_t* store,
+        uint64_t doc_id, qihse_user_t* user, char** out_json) {
+    return secure_get_json_user(store, doc_id, 0u, user, out_json);
+}
+
+bool qihse_doc_store_get_version_json_user(qihse_document_store_t* store,
+        uint64_t doc_id, uint64_t version, qihse_user_t* user, char** out_json) {
+    if (out_json) *out_json = NULL;
+    return version && secure_get_json_user(store, doc_id, version, user, out_json);
+}
+
+qihse_document_result_t qihse_doc_store_list_user(qihse_document_store_t* store,
+        qihse_user_t* user, size_t limit) {
+    qihse_document_result_t result = {0};
+    if (!store || !user || !limit || limit > QIHSE_DOC_USER_LIST_MAX) return result;
+    uint32_t tenant = 0;
+    uint64_t generation = 0;
+    bool active = false;
+    qihse_auth_user_active_and_tenant(user, &active, &tenant);
+    if (!active) return result;
+    qihse_user_t* borrowed = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (borrowed != user || !generation) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return result;
+    }
+    uint64_t* ids = calloc(limit, sizeof(*ids));
+    if (!ids) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return result;
+    }
+    pthread_mutex_lock(&store->secure_mutex);
+    for (qihse_doc_secure_t* doc = store->secure_head;
+         doc && result.count < limit; doc = doc->next) {
+        if (doc->tenant == tenant &&
+            doc->versions && qihse_auth_can_access(user,
+                doc->versions->classification, doc->versions->sci))
+            ids[result.count++] = doc->id;
+    }
+    bool valid = qihse_auth_validate_handle_generation(user, generation);
+    pthread_mutex_unlock(&store->secure_mutex);
+    qihse_auth_release_principal_scoped(borrowed);
+    if (!valid || !result.count) {
+        free(ids);
+        result.count = 0;
+    } else {
+        result.doc_ids = ids;
+    }
+    return result;
+}
+
+qihse_document_versions_t qihse_doc_store_list_versions_user(
+        qihse_document_store_t* store, uint64_t doc_id, qihse_user_t* user) {
+    qihse_document_versions_t result = {0};
+    if (!store || !user) return result;
+    uint32_t tenant = 0;
+    uint64_t generation = 0;
+    bool active = false;
+    qihse_auth_user_active_and_tenant(user, &active, &tenant);
+    if (!active) return result;
+    qihse_user_t* borrowed = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (borrowed != user || !generation) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return result;
+    }
+    uint64_t* versions = calloc(QIHSE_DOC_VERSION_RETENTION, sizeof(*versions));
+    if (!versions) {
+        qihse_auth_release_principal_scoped(borrowed);
+        return result;
+    }
+    pthread_mutex_lock(&store->secure_mutex);
+    qihse_doc_secure_t* doc = store->secure_head;
+    while (doc && (doc->tenant != tenant || doc->id != doc_id)) doc = doc->next;
+    for (qihse_doc_version_t* version = doc ? doc->versions : NULL;
+         version && result.count < QIHSE_DOC_VERSION_RETENTION;
+         version = version->next) {
+        if (qihse_auth_can_access(user, version->classification, version->sci))
+            versions[result.count++] = version->version;
+    }
+    bool valid = qihse_auth_validate_handle_generation(user, generation);
+    pthread_mutex_unlock(&store->secure_mutex);
+    qihse_auth_release_principal_scoped(borrowed);
+    if (!valid || !result.count) {
+        free(versions);
+        result.count = 0;
+    } else {
+        result.versions = versions;
+    }
+    return result;
 }

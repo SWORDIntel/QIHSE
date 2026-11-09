@@ -1,5 +1,7 @@
 # W12.1 experimental scalar reference
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 Status: **standalone research implementation, not promoted** (2026-10-22).
 W12.0's full-engine/corpus/comparator gate remains open. This increment pins a
 numerical reference while that baseline work continues; it does not enable an
@@ -17,6 +19,7 @@ new stable engine ABI or a durable sidecar format.
 ```sh
 make -f quantization/w12.mk test-w12-turboquant
 ASAN_OPTIONS=detect_leaks=0 make -f quantization/w12.mk test-w12-turboquant-sanitize
+make -f quantization/w12.mk test-w12-turboquant-profile-max
 # Optional GNU-linker allocation failure checks, also ASan+UBSan:
 ASAN_OPTIONS=detect_leaks=0 make -f quantization/w12.mk test-w12-turboquant-alloc
 # Expensive dense-QR checks through d=1536, excluded from the default suite:
@@ -94,11 +97,12 @@ does not establish the exact spherical/Gaussian premises of this reference.
 
 Same seeds/configuration and the **same generator, compiler, floating-point
 profile and libm** reproduce matrices, tables and code bytes. Cross-libm,
-cross-architecture or cross-build bit identity is **not** promised. Fingerprints
-include exact rounded matrices/tables and configuration; mismatching profiles
-are rejected rather than silently rescored. Recreating a profile from seeds is
-only an in-memory same-build reopen test. Persisting exact profiles, portable
-reopen and crash-safe publication remain future work, not this byte envelope.
+cross-architecture or cross-build bit identity from seed regeneration is **not**
+promised. Fingerprints include exact rounded matrices/tables and configuration;
+mismatching profiles are rejected rather than silently rescored. The standalone
+profile envelope below preserves those exact binary64 values across reopen,
+without rerunning QR or centroid generation. Cross-architecture decode and score
+behavior has not yet been tested. Crash-safe publication remains future work.
 
 The exact-size envelope is little-endian. Floats use IEEE binary64 bit patterns;
 all integer and floating fields are loaded without alignment assumptions.
@@ -133,6 +137,44 @@ not ambient errno. Callers must propagate failures and own object lifetimes.
 **CRC-32 and FNV-1a are noncryptographic.** They detect accidental corruption or
 profile mismatch; a malicious sender can forge them. This format is not a
 secure transport, classified-data retrieval primitive or authenticated sidecar.
+
+### Standalone exact-profile envelope
+
+`qihse_tq_profile_serialized_size`, `qihse_tq_profile_serialize` and
+`qihse_tq_profile_deserialize` operate on caller-owned bytes. The byte layout is
+little-endian, exact-length, and capped at 37,748,928 bytes (PRODUCT, d=1536).
+It is distinct from the per-vector `QTQR` envelope above:
+
+| Byte offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | `QTQP` magic |
+| 4 | 4 | Profile envelope version 1 |
+| 8 | 4 | Dimensions |
+| 12 | 4 | Scalar bits |
+| 16 | 4 | Variant |
+| 20 | 4 | Dimension-aware table version |
+| 24 | 8 | Rotation seed |
+| 32 | 8 | Projection seed |
+| 40 | 8 | Exact-profile fingerprint |
+| 48 | 4 | Payload bytes |
+| 52 | 4 | Centroid count |
+| 56 | 4 | Reserved, zero |
+| 60 | 4 | CRC-32/ISO-HDLC over the envelope, excluding this field |
+| 64 | variable | Row-major rotation, optional projection, then centroids as binary64 |
+
+The loader rejects wrong versions, lengths, checksum, nonfinite values,
+nonmonotone or asymmetric centroids, row/column norm failures, failed fixed
+orthogonality probes and fingerprint mismatches. Nine deterministic matrix-vector
+probes bound numerical validation to O(d^2); they are a corruption check, not
+a proof that an adversarial matrix is Haar-distributed or even fully orthogonal.
+The independent projection cannot be proven Gaussian from stored values. CRC and fingerprint are not
+authentication; this envelope has no row IDs, source generation or ACLs and
+must not be used as the W12.2 sidecar.
+The optional max-profile test constructs a checksum-valid 1536D PRODUCT envelope
+with exact bounded length and a deliberately wrong profile fingerprint. It
+forces the full numeric validation and hash path before rejection and prints
+process CPU time. This is a worst-shape malformed-input check, not a throughput
+claim for an authenticated production loader.
 
 ## Cost accounting
 
@@ -187,7 +229,7 @@ many correlated rows under one projection. These deterministic statistical
 regressions can detect common distribution/scaling/residual mistakes but cannot
 prove the asymptotic theorem or universal corpus quality.
 
-Remaining before W12.1 promotion: portable exact-profile persistence/reopen,
+Remaining before W12.1 promotion: crash-safe exact-profile persistence,
 additional compiler/architecture validation, longer fuzz campaigns, measured
 setup/encode/score costs at representative full dimensions, and satisfaction of
 the W12.0 corpus/comparator prerequisites. W12.2 durability, W12.3 authorization

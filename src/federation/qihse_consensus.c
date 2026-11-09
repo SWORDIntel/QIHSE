@@ -3618,6 +3618,20 @@ bool qihse_consensus_read_committed_exact(const qihse_consensus_t* cs,
                               out_count, true);
 }
 
+bool qihse_consensus_read_durable_entry_user(const qihse_consensus_t* cs,
+    const qihse_user_t* user, uint64_t index, qihse_consensus_entry_t* out_entry) {
+    if (!out_entry) return false;
+    memset(out_entry, 0, sizeof(*out_entry));
+    if (!cs || !user || !qihse_auth_user_is_active(user) ||
+        qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(user) != QIHSE_TENANT_SYSTEM ||
+        !index || index > qcs_abs_last_index(cs)) return false;
+    const qihse_consensus_entry_t* entry = qcs_entry_at(cs, index);
+    if (!entry || !qihse_auth_can_access(user, entry->classif, entry->sci)) return false;
+    *out_entry = *entry;
+    return true;
+}
+
 static bool qcs_sha256_u64(EVP_MD_CTX* ctx, uint64_t value) {
     uint8_t encoded[8];
     for (size_t i = sizeof(encoded); i > 0u; i--) {

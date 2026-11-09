@@ -15,6 +15,274 @@ extern "C" {
 /** Opaque handle for the QIHSE Key-Value Store. */
 typedef struct qihse_kv_store qihse_kv_store_t;
 typedef struct qihse_kv_replica_snapshot qihse_kv_replica_snapshot_t;
+typedef struct qihse_kv_ct_range_snapshot qihse_kv_ct_range_snapshot_t;
+
+/* CT storage protocol. IDs are stable, printable 1..64-byte configuration
+ * identifiers. The 32-byte owner capability is generated or supplied at
+ * initialization, persisted, and retrievable only by an active Operator for
+ * internal control-plane setup. CT mode is opt-in and persisted. */
+#define QIHSE_KV_CT_ID_MAX 64u
+#define QIHSE_KV_CT_TOKEN_BYTES 32u
+#define QIHSE_KV_CT_MAX_GROUP_RECORDS 4096u
+typedef struct qihse_kv_ct_writer_scope qihse_kv_ct_writer_scope_t;
+typedef struct qihse_kv_ct_proof qihse_kv_ct_proof_t;
+
+typedef enum {
+    QIHSE_KV_CT_ACTOR_USER = 1,
+    QIHSE_KV_CT_ACTOR_EXPIRY = 2,
+    QIHSE_KV_CT_ACTOR_REPLICA = 3
+} qihse_kv_ct_actor_t;
+typedef enum {
+    QIHSE_KV_CT_TENANT_EXACT = 1,
+    QIHSE_KV_CT_TENANT_SYSTEM_ALL = 2
+} qihse_kv_ct_tenant_policy_t;
+
+typedef struct {
+    char* key;
+    char* value; /* NULL for tombstone */
+    uint64_t change_seq;
+    uint64_t expire_time_ms;
+    uint32_t actor_id;
+    uint32_t actor_tenant_id;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    qihse_kv_ct_actor_t actor_kind;
+    bool tombstone;
+} qihse_kv_ct_record_t;
+
+typedef struct {
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t stream_position; /* dense committed group ordinal */
+    uint64_t first_seq;
+    uint64_t last_seq;
+    qihse_kv_ct_record_t* records;
+    size_t count;
+} qihse_kv_ct_group_t;
+
+typedef struct {
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    char successor_id[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t durable_lsn; /* dense group position, not row change_seq */
+    uint64_t oldest_lsn;
+    uint64_t acknowledged_lsn;
+    uint64_t retained_bytes;
+    uint64_t limit_bytes;
+    uint64_t baseline_row_seq;
+    unsigned char baseline_digest[32];
+    bool admitted; /* source reconciled with its pinned successor this process */
+} qihse_kv_ct_source_status_t;
+
+typedef struct {
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t durable_cursor; /* dense group position */
+    uint32_t tenant_id;
+    qihse_kv_ct_tenant_policy_t tenant_policy;
+    bool baseline_sealed;
+    unsigned char baseline_digest[32];
+} qihse_kv_ct_receiver_status_t;
+
+/* A thread-bound writer scope lets existing KV mutators called by RESP use
+ * the persisted CT owner capability. It is tied to this store and principal;
+ * direct calls outside the scope fail closed. The caller must leave on every
+ * path before returning to a pooled thread. */
+bool qihse_kv_ct_writer_scope_enter(qihse_kv_store_t* store,
+    qihse_user_t* principal, const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    qihse_kv_ct_writer_scope_t** out_scope);
+void qihse_kv_ct_writer_scope_leave(qihse_kv_ct_writer_scope_t* scope);
+/* Call only after releasing any outer server KV lock. Waits for the durable
+ * successor ACK covering every mutation issued in this scope, then leaves
+ * the scope. False means the write outcome is unresolved for the caller. */
+bool qihse_kv_ct_writer_scope_finish(qihse_kv_ct_writer_scope_t* scope,
+    uint32_t timeout_ms, uint64_t* out_last_seq);
+bool qihse_kv_ct_owner_token_get(qihse_kv_store_t* store,
+    qihse_user_t* principal, unsigned char out[QIHSE_KV_CT_TOKEN_BYTES]);
+
+/* Source capture and exact bounded ordered history. A successful read never
+ * coalesces intermediate overwrites. The active principal is checked at the
+ * lowest read layer before any protected body allocation. */
+bool qihse_kv_ct_source_enable(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* source_id, const char* successor_id, const char* generation,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t max_retained_bytes);
+bool qihse_kv_ct_source_status(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_ct_source_status_t* out);
+int qihse_kv_ct_source_baseline_snapshot_create(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_replica_snapshot_t** out_snapshot,
+    uint64_t* out_baseline_row_seq, unsigned char out_digest[32]);
+bool qihse_kv_ct_source_read(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* generation, uint64_t after_seq, size_t max_groups,
+    size_t max_bytes, qihse_kv_ct_group_t** out_groups, size_t* out_count,
+    uint64_t* out_resume_seq);
+void qihse_kv_ct_groups_free(qihse_kv_ct_group_t* groups, size_t count);
+bool qihse_kv_ct_source_ack(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* peer_id, const char* generation, uint64_t durable_lsn);
+/* Called only after pinned QKP peer STATUS. Re-arms a reopened or timed-out
+ * source when successor cursor covers every locally durable group. */
+bool qihse_kv_ct_source_reconcile(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* peer_id, const char* generation,
+    const unsigned char receiver_baseline_digest[32],
+    uint64_t peer_durable_position);
+
+/* Runtime-only admission after authenticated, exact pinned QKP STATUS.
+ * Local Operator control identity is not accepted from the wire. The separate
+ * replication principal must match this store's configured service identity. */
+bool qihse_kv_ct_source_reconcile_peer(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const char* peer_id, const char* generation,
+    const unsigned char receiver_baseline_digest[32],
+    uint64_t peer_durable_position);
+
+/* Receiver writes row group and cursor in one recoverable WAL transaction.
+ * An identical retry succeeds; gaps, conflicting duplicates, stale generation,
+ * unauthorized labels or tenant mismatch fail without advancing the cursor. */
+bool qihse_kv_ct_receiver_bind(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* source_id, const char* target_id, const char* generation,
+    qihse_kv_ct_tenant_policy_t tenant_policy, uint32_t tenant_id,
+    uint64_t baseline_lsn,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_receiver_install_baseline(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const char* source_id, const char* generation,
+    const char* filepath, uint64_t baseline_row_seq,
+    const unsigned char expected_digest[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_receiver_apply(qihse_kv_store_t* store, qihse_user_t* principal,
+    const qihse_kv_ct_group_t* group, uint64_t* out_durable_cursor);
+bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_ct_receiver_status_t* out);
+
+/* Store-level durable fences and locally minted, opaque ownership evidence.
+ * QKP peer pinning remains a transport responsibility. A proof is only valid
+ * against the same live store and its current persisted generation/cursor. */
+bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* transfer_id, uint16_t first_slot, uint16_t last_slot,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t* out_cut_position);
+/* Read-only durable fence identity for journal recovery. An ABORTED journal
+ * record may answer only after the matching source fence is absent/released. */
+typedef struct {
+    uint32_t mode, fence_state, transfer_phase;
+    uint16_t first_slot, last_slot;
+    uint64_t cut_position;
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+} qihse_kv_ct_transfer_status_t;
+bool qihse_kv_ct_transfer_status(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_kv_ct_transfer_status_t* out);
+bool qihse_kv_ct_fence_finish(qihse_kv_store_t* store, qihse_user_t* principal,
+    const char* transfer_id, bool transferred,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+typedef struct {
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint16_t first_slot, last_slot;
+    uint64_t source_cut, target_durable_cursor;
+    unsigned char range_checksum[32];
+} qihse_kv_ct_target_receipt_claim_t;
+/* Callback must verify the claim against the pinned authenticated QKP peer's
+ * signed durable target receipt; it is called outside the KV lock. */
+typedef bool (*qihse_kv_ct_receipt_verify_fn)(
+    const qihse_kv_ct_target_receipt_claim_t* claim, void* context);
+/* Prepare an incoming transfer on an existing CT1 primary, including a
+ * range it previously moved away. The callback verifies a distinct pinned
+ * source PREPARED receipt before this store persists the target fence. */
+bool qihse_kv_ct_target_prepare(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_target_receipt_claim_t* source_prepared_claim,
+    qihse_kv_ct_receipt_verify_fn verify_source_prepared,
+    void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t* out_local_cut);
+/* Abort a target PREPARED fence only with an authenticated, exact source
+ * ABORTED receipt. Once an import group has started, abort stays unresolved
+ * and the range remains frozen for recovery. */
+bool qihse_kv_ct_target_abort(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_target_receipt_claim_t* source_aborted_claim,
+    qihse_kv_ct_receipt_verify_fn verify_source_aborted,
+    void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_source_fence_commit(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_proof_t* source_proof,
+    const qihse_kv_ct_target_receipt_claim_t* target_claim,
+    qihse_kv_ct_receipt_verify_fn verify_receipt, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Activate an imported target range only after an authenticated source commit
+ * receipt. The callback verifies a distinct source COMMITTED phase, never a
+ * target SEALED receipt. Exact retries are idempotent after durable activation. */
+bool qihse_kv_ct_target_activate(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_proof_t* target_seal,
+    const qihse_kv_ct_target_receipt_claim_t* source_commit_claim,
+    qihse_kv_ct_receipt_verify_fn verify_source_commit, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Bounded CT2 transfer image: at most 4096 live rows and 64 MiB. The source
+ * must already hold the matching durable range fence. */
+int qihse_kv_ct_range_export(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const char* transfer_id, const char* target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    qihse_kv_ct_range_snapshot_t** out_snapshot, uint64_t* out_source_cut,
+    unsigned char out_sha256[32]);
+bool qihse_kv_ct_range_snapshot_size(qihse_kv_ct_range_snapshot_t* snapshot,
+    qihse_user_t* principal, uint64_t* out_size);
+bool qihse_kv_ct_range_snapshot_read(qihse_kv_ct_range_snapshot_t* snapshot,
+    qihse_user_t* principal, uint64_t offset, void* buffer, size_t capacity,
+    size_t* out_read);
+void qihse_kv_ct_range_snapshot_destroy(qihse_kv_ct_range_snapshot_t* snapshot);
+/* Target remains a CT1 source for its own successor. Import merges the
+ * source range in one QKV6 group, including tombstones for target-only keys.
+ * Source change_seq in the image is transfer provenance; imported mutations
+ * receive target-local change_seq and ACTOR_REPLICA with the authenticated
+ * transfer principal. Original historical actor identity is unavailable in
+ * QFS and is not inferred.
+ * The caller waits for target successor ACK before requesting a target seal. */
+bool qihse_kv_ct_range_import(qihse_kv_store_t* store, qihse_user_t* principal,
+    qihse_user_t* data_principal, const char* transfer_id, const char* source_id,
+    const char* source_generation, uint16_t first_slot, uint16_t last_slot,
+    uint64_t source_cut, const char* snapshot_filepath,
+    const unsigned char expected_sha256[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t* out_target_position);
+qihse_kv_ct_proof_t* qihse_kv_ct_promotion_proof_create(
+    qihse_kv_store_t* store, qihse_user_t* principal, const char* source_id,
+    const char* target_id, const char* generation, uint64_t handoff_lsn);
+/* Persistently seal receiver generation and promote it to source. The old
+ * source generation must never be rebound after this transition. */
+bool qihse_kv_ct_receiver_promote(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_proof_t* proof,
+    const char* new_generation, const char* new_successor_id,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+qihse_kv_ct_proof_t* qihse_kv_ct_target_seal_create(
+    qihse_kv_store_t* store, qihse_user_t* principal,
+    qihse_user_t* data_principal, const char* transfer_id,
+    const char* source_id, const char* target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn);
+qihse_kv_ct_proof_t* qihse_kv_ct_source_transfer_proof_create(
+    qihse_kv_store_t* store, qihse_user_t* principal,
+    qihse_user_t* data_principal, const char* transfer_id,
+    const char* source_id, const char* target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn);
+bool qihse_kv_ct_proof_fields(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_proof_t* proof,
+    const char** out_transfer_id, const char** out_source_id,
+    const char** out_target_id, const char** out_generation,
+    uint16_t* out_first_slot, uint16_t* out_last_slot,
+    uint64_t* out_source_lsn, uint64_t* out_target_lsn,
+    unsigned char out_checksum[32]);
+bool qihse_kv_ct_proof_validate(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_proof_t* proof);
+void qihse_kv_ct_proof_destroy(qihse_kv_ct_proof_t* proof);
 
 /* Context-free open refuses an unfinished full-image publication. Recovery
  * requires an active principal authorized for every record in the intent's
@@ -119,9 +387,10 @@ void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
 int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user,
                                      const char* namespace_glob,
                                      qihse_kv_replica_snapshot_t** out_snapshot);
-uint64_t qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot);
+bool qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot,
+    qihse_user_t* principal, uint64_t* out_size);
 bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
-                                    uint64_t offset, void* out, size_t capacity,
+                                    qihse_user_t* principal, uint64_t offset, void* out, size_t capacity,
                                     size_t* out_read);
 void qihse_kv_replica_snapshot_destroy(qihse_kv_replica_snapshot_t* snapshot);
 bool qihse_kv_replica_snapshot_installed(qihse_kv_store_t* store,
@@ -190,6 +459,26 @@ bool qihse_kv_set_user_with_seq(qihse_kv_store_t* store, const char* key,
                                 uint64_t* out_change_seq);
 bool qihse_kv_del_user_with_seq(qihse_kv_store_t* store, const char* key,
                                 qihse_user_t* user, uint64_t* out_change_seq);
+
+/* Atomically publish a tombstone and a completed receipt as one durable WAL
+ * frame. The source must be live at expected_source_seq and receipt_key must
+ * contain exactly expected_prepared_value. Both rows and the new receipt
+ * labels must be accessible to the active principal. build_receipt is called
+ * once under the store write lock, before any WAL write, with the reserved
+ * deletion sequence; it must only fill out_value and return success. The
+ * receipt row receives delete_seq + 1. A false result after a WAL write fences
+ * the store until authenticated reopen; replay either applies the entire
+ * validated pair or neither row. Completed receipts are ordinary persistent
+ * SET rows and survive tombstone compaction. */
+#define QIHSE_KV_DELETE_RECEIPT_MAX_VALUE 4096u
+typedef bool (*qihse_kv_receipt_builder_t)(uint64_t delete_seq, char* out_value,
+                                            size_t capacity, void* context);
+bool qihse_kv_del_with_receipt_user(qihse_kv_store_t* store,
+    const char* source_key, uint64_t expected_source_seq,
+    const char* receipt_key, const char* expected_prepared_value,
+    uint16_t receipt_classification, uint16_t receipt_sci,
+    qihse_kv_receipt_builder_t build_receipt, void* context,
+    qihse_user_t* user, uint64_t* out_delete_seq);
 /* Read state only for an authorized live record or retained tombstone.
  * Success with sequence 0 means LEGACY_UNVERSIONED, not ordered mutation,
  * version, or cursor evidence. Callers requiring such evidence must reject 0.
@@ -198,6 +487,21 @@ bool qihse_kv_del_user_with_seq(qihse_kv_store_t* store, const char* key,
 bool qihse_kv_change_seq_user(qihse_kv_store_t* store, const char* key,
                               qihse_user_t* user, uint64_t* out_change_seq,
                               bool* out_tombstone);
+
+/* Authenticated metadata for an existing live row or a retained tombstone.
+ * A miss, expired row, denied principal, or recovery-pending store returns
+ * false and zeroes out. A tombstone can disappear after compaction, so this
+ * is evidence only while retained; callers must not use absence as proof of
+ * deletion. Sequence 0 denotes a legacy unversioned record. */
+typedef struct {
+    uint64_t change_seq;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    bool tombstone;
+} qihse_kv_change_meta_t;
+
+bool qihse_kv_change_meta_user(qihse_kv_store_t* store, const char* key,
+                               qihse_user_t* user, qihse_kv_change_meta_t* out);
 static inline char* qihse_kv_get(qihse_kv_store_t* store, const char* key) {
     return qihse_kv_get_user(store, key, NULL);
 }

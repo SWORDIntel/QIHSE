@@ -54,10 +54,11 @@ static void prepare_snapshot(const char* root) {
     assert(qihse_kv_change_seq(store) == SNAPSHOT_HIGHWATER);
     qihse_kv_replica_snapshot_t* snapshot = NULL;
     assert(qihse_kv_replica_snapshot_create(store, op, "public:*", &snapshot) == 0);
-    uint64_t size = qihse_kv_replica_snapshot_size(snapshot);
+    uint64_t size = 0u;
+    assert(qihse_kv_replica_snapshot_size(snapshot, op, &size));
     assert(size > 0u && size < 1024u);
     uint8_t bytes[1024]; size_t read_size = 0u;
-    assert(qihse_kv_replica_snapshot_read(snapshot, 0u, bytes, (size_t)size, &read_size));
+    assert(qihse_kv_replica_snapshot_read(snapshot, op, 0u, bytes, (size_t)size, &read_size));
     assert(read_size == (size_t)size);
     snprintf(filepath, sizeof(filepath), "%s/snapshot.qkv", root);
     write_file(filepath, bytes, read_size);

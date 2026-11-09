@@ -1,0 +1,97 @@
+{
+  "method": "CPU-time samples, shuffled method order per phase/sample; same synthetic canonical node/edge frames and checked collision registry; lazy binding warmed before timing",
+  "limits": "Shared host; CPU frequency and sibling contention uncontrolled. Resident identity hashing/allocation only: excludes Git, filesystem I/O, serialization, graph construction and queries. No security-equivalence claim.",
+  "nodes": 8000,
+  "edges": 24000,
+  "samples": 11,
+  "python": "3.11.16 (main, Aug 25 2026, 14:00:53) [Clang 22.1.3 ]",
+  "python_executable": "/home/john/Documents/code-review-graph/.venv/bin/python",
+  "platform": "Linux-7.0.14-28-pve-x86_64-with-glibc2.41",
+  "configured_backend": "auto",
+  "sources": {
+    "exports_sha256": "f9b1adcb2d92561a7364c77584c193b87be2899e701a75ed94a0beed77f6fabe",
+    "binding_sha256": "04d0099be9721252cf5b675d38c8eafbf02173f4c893f7a00e84d65d4647f6d8",
+    "library_sha256": "c8b566afebdd8e0b3c3c56c13b81b84fec5aa4e568d79e824c4946eb7a9b9a8b",
+    "benchmark_sha256": "4887bdae0d1791c425620d57edbfd6dfbdf4ceccaf027eadaaa81a5194316e9e"
+  },
+  "hash_ms_median": {
+    "sha256_128": 126.30756900000017,
+    "xxh3_batch": 52.04652099999984,
+    "xxh3_single_ctypes": 223.96246399999998
+  },
+  "checked_allocation_ms_median": {
+    "sha256_128": 244.28402199999866,
+    "xxh3_batch": 162.675798
+  },
+  "raw_hash_samples_ms": {
+    "sha256_128": [
+      141.04151600000003,
+      129.54780700000023,
+      126.30756900000017,
+      120.73066699999968,
+      120.14801299999966,
+      150.46758999999986,
+      121.20062700000034,
+      118.31854600000025,
+      120.51608999999885,
+      142.8207350000008,
+      128.87676700000128
+    ],
+    "xxh3_batch": [
+      55.49574599999985,
+      70.20007299999986,
+      52.04652099999984,
+      51.67720200000004,
+      49.22816399999963,
+      52.684251000000515,
+      49.88420099999935,
+      48.85174999999986,
+      49.72720800000019,
+      56.630976999999305,
+      60.120047999999926
+    ],
+    "xxh3_single_ctypes": [
+      245.38774899999981,
+      252.65715799999987,
+      223.96246399999998,
+      231.96651000000034,
+      213.9994559999998,
+      221.37234199999955,
+      221.40857499999987,
+      209.69748100000007,
+      211.79551100000003,
+      254.7346620000006,
+      231.57096299999935
+    ]
+  },
+  "raw_allocation_samples_ms": {
+    "sha256_128": [
+      256.6160230000001,
+      249.69303700000012,
+      265.09035800000015,
+      221.8609229999995,
+      274.65364499999987,
+      228.21900199999945,
+      259.8782790000005,
+      222.96691099999944,
+      225.07285900000085,
+      232.73172400000064,
+      244.28402199999866
+    ],
+    "xxh3_batch": [
+      183.65196699999987,
+      163.66293500000006,
+      162.675798,
+      188.0154850000002,
+      153.13829000000024,
+      164.90145300000057,
+      152.55746299999996,
+      152.25959999999984,
+      157.32591799999972,
+      153.7841009999994,
+      191.24562999999915
+    ]
+  },
+  "hashing_speedup": 2.4268205938299037,
+  "checked_allocation_speedup": 1.5016617407341606
+}

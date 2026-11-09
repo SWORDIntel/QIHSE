@@ -1,0 +1,212 @@
+{
+  "schema": "qihse-codegraph-incremental-producer-benchmark-v1",
+  "python": "3.11.16",
+  "files": 401,
+  "methodology": "Warm same-workspace pairs: incremental then full; exact-byte output comparison. Source hashing, full resolution and complete export remain in both paths.",
+  "producer_files_sha256": {
+    "incremental.py": "be69fabc5355ec91ccfa43d4c2b2a42fb663562f812bfe9d1babf9a8b9dad42a",
+    "exports.py": "03f6e7dc03a049c385fba5cf2070245dd25bf612a36585f023d8de059568c9cc"
+  },
+  "initial": {
+    "status": "ok",
+    "build_type": "full",
+    "requested_mode": "full",
+    "incremental_capable": true,
+    "files_parsed": 401,
+    "files_updated": 0,
+    "nodes": 802,
+    "edges": 404,
+    "unresolved_edges": 1,
+    "records": 1208,
+    "export_bytes": 302555,
+    "source_sha256": "d7cdf4fc5a9561bc34c09042e2a6f69ade96ef7ea5a6cc1afffa666f17d435fa",
+    "database": {
+      "page_size": 4096,
+      "pages": 347,
+      "free_pages": 0,
+      "reclaimable_page_bytes": 0,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 1421312,
+          "allocated_bytes": 1421312
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 1454080,
+      "allocated_bytes": 1454080
+    },
+    "reclamation": null,
+    "persistent_export_created": false,
+    "seconds": 3.226850478997221
+  },
+  "no_op": {
+    "status": "ok",
+    "build_type": "incremental",
+    "requested_mode": "incremental",
+    "incremental_capable": true,
+    "files_parsed": 0,
+    "files_updated": 0,
+    "nodes": 802,
+    "edges": 404,
+    "unresolved_edges": 1,
+    "records": 1208,
+    "export_bytes": 302555,
+    "source_sha256": "d7cdf4fc5a9561bc34c09042e2a6f69ade96ef7ea5a6cc1afffa666f17d435fa",
+    "database": {
+      "page_size": 4096,
+      "pages": 347,
+      "free_pages": 0,
+      "reclaimable_page_bytes": 0,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 1421312,
+          "allocated_bytes": 1421312
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 1454080,
+      "allocated_bytes": 1454080
+    },
+    "reclamation": null,
+    "persistent_export_created": false,
+    "seconds": 1.1899898319970816
+  },
+  "pairs": [
+    {
+      "scenario": "edit",
+      "files_updated": 1,
+      "full_files_parsed": 401,
+      "incremental_seconds": 1.2758194929920137,
+      "full_seconds": 1.9046113450021949,
+      "equivalent_export_bytes": 302555,
+      "equivalent_sha256": "f4850827643d4b3628fa7c19717d56d7a29d04a593cf5dd33653713dd45ed35e",
+      "nodes": 802,
+      "edges": 404
+    },
+    {
+      "scenario": "rename",
+      "files_updated": 2,
+      "full_files_parsed": 400,
+      "incremental_seconds": 1.3110761920106597,
+      "full_seconds": 1.9371924519946333,
+      "equivalent_export_bytes": 301750,
+      "equivalent_sha256": "7be2a0df14a5491daf7c0b237aa5c18d77f158f1604ffa8141393229ff6ae05a",
+      "nodes": 800,
+      "edges": 403
+    },
+    {
+      "scenario": "delete",
+      "files_updated": 1,
+      "full_files_parsed": 399,
+      "incremental_seconds": 1.2831796420214232,
+      "full_seconds": 2.2123362620186526,
+      "equivalent_export_bytes": 300999,
+      "equivalent_sha256": "fba28ee2cf97b16623261e7bcfc40bb26abec2d93c0d6251c90fbdc83aa22f8a",
+      "nodes": 798,
+      "edges": 402
+    },
+    {
+      "scenario": "resolve-external",
+      "files_updated": 0,
+      "full_files_parsed": 399,
+      "incremental_seconds": 1.3114659870043397,
+      "full_seconds": 2.023323822999373,
+      "equivalent_export_bytes": 300999,
+      "equivalent_sha256": "cb93a7d1edc14ebfec262e33fc3e945b9653788898e3f72574faf296e863fe0f",
+      "nodes": 798,
+      "edges": 402
+    },
+    {
+      "scenario": "revert-to-head",
+      "files_updated": 1,
+      "full_files_parsed": 399,
+      "incremental_seconds": 1.254865886992775,
+      "full_seconds": 1.9204978210036643,
+      "equivalent_export_bytes": 300999,
+      "equivalent_sha256": "698efdeaa43f8eb184e596cd452cfb7ad0fe71c92de0ab2ec332be59e62fbf73",
+      "nodes": 798,
+      "edges": 402
+    }
+  ],
+  "median_incremental_seconds": 1.2831796420214232,
+  "median_full_seconds": 1.9371924519946333,
+  "interrupted_build_recovered_as_full": true,
+  "reclamation": {
+    "status": "reclaimed",
+    "before": {
+      "page_size": 4096,
+      "pages": 349,
+      "free_pages": 225,
+      "reclaimable_page_bytes": 921600,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 1429504,
+          "allocated_bytes": 1429504
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 1462272,
+      "allocated_bytes": 1462272
+    },
+    "after": {
+      "page_size": 4096,
+      "pages": 117,
+      "free_pages": 0,
+      "reclaimable_page_bytes": 0,
+      "indexes": 23,
+      "files": {
+        "database": {
+          "logical_bytes": 479232,
+          "allocated_bytes": 479232
+        },
+        "wal": {
+          "logical_bytes": 0,
+          "allocated_bytes": 0
+        },
+        "shared_memory": {
+          "logical_bytes": 32768,
+          "allocated_bytes": 32768
+        }
+      },
+      "logical_bytes": 512000,
+      "allocated_bytes": 512000
+    },
+    "checkpoint": [
+      0,
+      0,
+      0
+    ],
+    "indexes_removed": 0
+  },
+  "private_export_only": true,
+  "existing_shared_export_preserved": true,
+  "note": "Native snapshots still encode complete generations; producer incrementality is not native per-file storage.",
+  "platform": "Linux-7.0.14-28-pve-x86_64-with-glibc2.41",
+  "machine": "x86_64",
+  "logical_cpus": 40,
+  "adapter_sha256": "3d754a7538fdcb923f671d6b48599e4fc8d35190edc08b26379181eb5358a77e"
+}

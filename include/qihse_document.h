@@ -83,4 +83,27 @@ typedef struct {
 #include "qihse_auth.h"
 qihse_document_result_t qihse_doc_store_query_user(qihse_document_store_t* store, const char* where_clause, qihse_user_t* user);
 
+/* Authenticated document lane. Legacy context-free inserts have no trusted
+ * tenant or label and are deliberately invisible to these reads. Version IDs
+ * start at 1 per tenant/document and rise monotonically. The most recent 16
+ * versions are retained in memory; older versions are pruned after a write.
+ * Version IDs are logical write order, not timestamps or durable commit IDs.
+ * Destroying the store loses all authenticated versions. */
+#define QIHSE_DOC_USER_LIST_MAX 128u
+#define QIHSE_DOC_VERSION_RETENTION 16u
+bool qihse_doc_store_insert_json_user(qihse_document_store_t* store,
+    uint64_t doc_id, const char* json_payload, qihse_user_t* user);
+bool qihse_doc_store_get_json_user(qihse_document_store_t* store,
+    uint64_t doc_id, qihse_user_t* user, char** out_json);
+qihse_document_result_t qihse_doc_store_list_user(qihse_document_store_t* store,
+    qihse_user_t* user, size_t limit);
+bool qihse_doc_store_get_version_json_user(qihse_document_store_t* store,
+    uint64_t doc_id, uint64_t version, qihse_user_t* user, char** out_json);
+typedef struct {
+    uint64_t* versions;
+    size_t count;
+} qihse_document_versions_t;
+qihse_document_versions_t qihse_doc_store_list_versions_user(
+    qihse_document_store_t* store, uint64_t doc_id, qihse_user_t* user);
+
 #endif /* QIHSE_DOCUMENT_H */

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Cluster failover drill: seed a duplicate through authenticated RESP on the
-successor, SIGKILL the lead, then verify the successor owns all slots and the
-seeded key survives. The legacy plaintext redundancy flag must stay disabled.
+"""Cluster failover safety drill: seed a duplicate through authenticated RESP
+on the successor, SIGKILL the lead, and verify it does not claim ownership
+without a proven write stream and all-writer fence. The duplicate is a local
+fixture, not evidence of replication. Legacy plaintext redundancy is disabled.
 
 Destructive by design: it kills the daemons it launched and relaunches both
 nodes. Runs on a single host by default (two loopback daemon processes); for
@@ -205,8 +206,8 @@ def main():
         return 1
     lead.kill()
     log(f"lead killed (SIGKILL, pid {lead.pid}).")
-    # Settle by CONDITION, not a fixed sleep: wait until the successor
-    # reports itself owning the full ring (or 60 s under starvation).
+    # Wait for the successor endpoint, then observe a complete health window
+    # so an unsafe delayed promotion cannot masquerade as a passing refusal.
     for _ in range(240):
         try:
             s = socket.create_connection((N1_HOST, PORT1), timeout=1)
@@ -215,27 +216,42 @@ def main():
         except OSError:
             time.sleep(0.25)
 
-    # Failover must COMPLETE, not merely start: poll until the successor
-    # claims the full ring (or 60 s under starvation), then assert.
     state = {}
+    own_line = None
+    unsafe_owned = False
     for _ in range(240):
         n1.fresh(); n1.cmd("AUTH", "GODMODE_OP", PW)
         t, info = n1.cmd("CLUSTER", "INFO")
         state = dict(line.split(":", 1) for line in info.splitlines() if ":" in line)
-        if state.get("cluster_state") == "ok" and \
-           state.get("cluster_slots_assigned") == "16384":
+        t, nodes = n1.cmd("CLUSTER", "NODES")
+        own_lines = [line for line in nodes.splitlines()
+                     if len(line.split()) >= 8 and
+                     "myself" in line.split()[2].split(",")]
+        own_line = own_lines[0] if len(own_lines) == 1 else None
+        unsafe_owned |= own_line is not None and any(
+            slot.isdigit() or
+            ("-" in slot and all(bound.isdigit() for bound in slot.split("-", 1)))
+            for slot in own_line.split()[8:])
+        if unsafe_owned:
             break
         time.sleep(0.25)
-    check("successor cluster_state ok", state.get("cluster_state") == "ok", state.get("cluster_state"))
-    check("successor owns all 16384 slots",
-          state.get("cluster_slots_assigned") == "16384" and state.get("cluster_slots_ok") == "16384",
-          f"{state.get('cluster_slots_assigned')}/{state.get('cluster_slots_ok')}")
+    check("successor remains unavailable without data proof",
+          state.get("cluster_state") != "ok",
+          state.get("cluster_state"))
+    check("successor did not claim slots",
+          not unsafe_owned and own_line is not None,
+          own_line)
 
-    n1.cmd("ASKING")
     t, r = n1.cmd("GET", "redundant:k1")
-    check("duplicated key survives lead death", (t, r) == ("$", "survives-lead-death"), f"{t} {r}")
+    n1.cmd("ASKING")
+    seed_t, seed_r = n1.cmd("GET", "redundant:k1")
+    check("ordinary read refused; preseeded copy remains local",
+          t == "-" and r.startswith(("CLUSTERDOWN", "MOVED")) and
+          "survives-lead-death" not in r and
+          (seed_t, seed_r) == ("$", "survives-lead-death"),
+          f"ordinary={t} {r}; ASKING={seed_t} {seed_r}")
 
-    log(f"\nfailover drill: {sum(results)}/{len(results)} checks passed")
+    log(f"\nfailover guard: {sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
 if __name__ == "__main__":

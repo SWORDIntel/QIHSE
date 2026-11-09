@@ -2,7 +2,11 @@
 """Reindex and publish a compact QIHSE CodeGraph, or migrate the existing graph."""
 import argparse
 import codecs
+import hashlib
+import json
 import os
+import selectors
+import shlex
 from pathlib import Path
 import shutil
 import signal
@@ -15,6 +19,15 @@ from qihse_codegraph_reindex_source import prepare_export, source_identity
 
 
 SPINNER = "|/-\\"
+PROGRESS_FD_ENV = 'QIHSE_CODEGRAPH_PROGRESS_FD'
+PROGRESS_MAX_LINE = 512
+PROGRESS_LOG_INTERVAL = 2.0
+PROGRESS_PHASES = frozenset((
+    'scan', 'source-hash', 'parse', 'resolve', 'export', 'import', 'prepare',
+    'encode-zstd', 'encode-v2', 'encode-v3', 'encode-v4', 'encode-generations',
+    'decode-generations', 'gc-generations', 'account-generations', 'decode', 'verify',
+    'publish', 'compact'))
+PROGRESS_UNITS = frozenset(('files', 'bytes', 'records', 'chunks'))
 
 
 class StopRequested(Exception):
@@ -22,13 +35,25 @@ class StopRequested(Exception):
         self.signum = signum
 
 
-def progress(completed, total, label, elapsed=None, tick=0):
+def progress(completed, total, label, elapsed=None, tick=0, remaining=None, detail=None):
     """The bar counts finished stages, never estimated work within a stage."""
     width = 24
     filled = width * completed // total
     line = f"[{'#' * filled}{'-' * (width - filled)}] {completed}/{total} stages {label}"
+    if detail is not None:
+        current, maximum = detail['completed'], detail['total']
+        # Child counters describe work already performed, not publication success.
+        # A phase reaching its total must never fill the overall stage bar.
+        if maximum:
+            done = min(width - 1, width * current // maximum)
+            counter = f"{current}/{maximum} {detail['unit']}"
+            line += f" | {detail['phase']} [{'#' * done}{'-' * (width - done)}] {counter}"
+        else:
+            line += f" | {detail['phase']} {current} {detail['unit']}"
     if elapsed is not None:
         line += f" {SPINNER[tick % 4]} elapsed {elapsed:.1f}s"
+    if remaining is not None:
+        line += f" ETA ~{max(1, round(remaining))}s"
     tty = sys.stderr.isatty()
     print(('\r\033[2K' if tty else '') + line,
           end='' if tty and elapsed is not None else '\n', file=sys.stderr, flush=True)
@@ -83,63 +108,385 @@ def exported_path(output):
     return paths[0]
 
 
-def run_stage(command, env, completed, total, label, native, exporting=False):
+class ProgressEvents:
+    """Bounded, content-free child progress; invalid events never affect work.
+
+    Producers opt in through QIHSE_CODEGRAPH_PROGRESS_FD. Each write is one
+    <=512-byte JSON line with version/phase/unit/completed/total only. Counters
+    are real completed work and monotonic per phase/unit; total may be unknown.
+    The pipe is nonblocking: producers must drop telemetry on EAGAIN/EPIPE.
+    """
+    def __init__(self):
+        self.buffer = bytearray()
+        self.discarding = False
+        self.seen = {}
+        self.latest = None
+        self.serial = 0
+
+    @staticmethod
+    def _object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate progress field')
+            result[key] = value
+        return result
+
+    def accept(self, line):
+        try:
+            event = json.loads(line, object_pairs_hook=self._object)
+        except (ValueError, UnicodeError, RecursionError):
+            return
+        if not isinstance(event, dict) or set(event) != {
+                'version', 'phase', 'unit', 'completed', 'total'}:
+            return
+        if type(event['version']) is not int or event['version'] != 1:
+            return
+        phase, unit = event['phase'], event['unit']
+        if (not isinstance(phase, str) or phase not in PROGRESS_PHASES or
+                not isinstance(unit, str) or unit not in PROGRESS_UNITS):
+            return
+        current, total = event['completed'], event['total']
+        if type(current) is not int or not 0 <= current <= (1 << 63) - 1:
+            return
+        if total is not None and (type(total) is not int or
+                not current <= total <= (1 << 63) - 1):
+            return
+        key = phase, unit
+        previous = self.seen.get(key)
+        if previous is not None:
+            if current < previous['completed']:
+                return
+            if previous['total'] is not None and total != previous['total']:
+                return
+            if event == previous:
+                return
+        self.seen[key] = event
+        self.latest = event
+        self.serial += 1
+
+    def feed(self, data):
+        # Split without retaining an unbounded line, including a child that
+        # never writes a newline. At most one 512-byte fragment stays resident.
+        for part in data.splitlines(keepends=True):
+            ended = part.endswith(b'\n')
+            if not self.discarding:
+                if len(self.buffer) + len(part) > PROGRESS_MAX_LINE:
+                    self.buffer.clear()
+                    self.discarding = True
+                else:
+                    self.buffer.extend(part)
+                    if ended:
+                        self.accept(self.buffer)
+                        self.buffer.clear()
+            if ended:
+                self.discarding = False
+
+    def drain(self, fd):
+        # A flooding or inherited child descriptor must not starve process
+        # status, signals, or other work. Read only currently available bytes.
+        budget = 65536
+        while budget:
+            try:
+                data = os.read(fd, min(8192, budget))
+            except BlockingIOError:
+                return False
+            if not data:
+                return True
+            self.feed(data)
+            budget -= len(data)
+        return False
+
+
+def run_stage(command, env, completed, total, label, native, exporting=False,
+              stage_estimate=None, later_estimate=0, expected_export=None):
     started = time.monotonic()
     tty = sys.stderr.isatty()
-    progress(completed, total, label, 0 if tty else None)
+    remaining = stage_estimate + later_estimate if stage_estimate is not None else None
+    progress(completed, total, label, 0 if tty else None, remaining=remaining)
     # Capturing avoids interleaving a live bar with child logs or native JSON.
     # Temporary files bound parent memory even when a stage emits large logs.
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         proc = None
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+        child_env = dict(env)
+        child_env[PROGRESS_FD_ENV] = str(write_fd)
+        events = ProgressEvents()
+        shown_serial = 0
+        shown_keys = set()
+        last_log = None
         try:
-            proc = subprocess.Popen(command, env=env, stdout=output, stderr=errors,
-                                    start_new_session=True)
+            proc = subprocess.Popen(command, env=child_env, stdout=output, stderr=errors,
+                                    start_new_session=True, pass_fds=(write_fd,))
+            os.close(write_fd)
+            write_fd = -1
             tick = 0
-            while True:
-                try:
-                    result = proc.wait(timeout=0.2)
-                    if result:
-                        stop_child(proc, signal.SIGTERM)
-                    return result, exported_path(output) if exporting and result == 0 else None
-                except subprocess.TimeoutExpired:
-                    if tty:
+            with selectors.DefaultSelector() as selector:
+                selector.register(read_fd, selectors.EVENT_READ)
+                telemetry_open = True
+                while True:
+                    if telemetry_open and selector.select(0.2):
+                        if events.drain(read_fd):
+                            selector.unregister(read_fd)
+                            telemetry_open = False
+                    # EOF is perpetually readable. Once telemetry closes,
+                    # bounded waitpid handles even a still-running stage.
+                    if not telemetry_open:
+                        try:
+                            proc.wait(timeout=0.2)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    result = proc.poll()
+                    if result is not None:
+                        events.drain(read_fd)
+                    now = time.monotonic()
+                    elapsed = now - started
+                    if not tty:
+                        # Preserve short real phases even when many events
+                        # arrive in one read. Each allowed phase/unit gets at
+                        # most one initial line; the finite schema bounds this
+                        # independently of event volume or phase alternation.
+                        for key, detail in events.seen.items():
+                            if key in shown_keys:
+                                continue
+                            progress(completed, total, label, detail=detail)
+                            shown_keys.add(key)
+                            if detail is events.latest:
+                                shown_serial = events.serial
+                                last_log = now
+                    changed = events.serial != shown_serial
+                    # After initial phase lines, counter updates are limited
+                    # to one every two seconds plus the final pending update.
+                    # Idle children generate no repetitive non-TTY log lines.
+                    if ((tty and result is None) or (changed and
+                            (last_log is None or now - last_log >= PROGRESS_LOG_INTERVAL or
+                             result is not None))):
                         tick += 1
-                        progress(completed, total, label, time.monotonic() - started, tick)
+                        remaining = (max(0, stage_estimate - elapsed) + later_estimate
+                                     if stage_estimate is not None else None)
+                        progress(completed, total, label, elapsed if tty else None,
+                                 tick, remaining, detail=events.latest)
+                        shown_serial = events.serial
+                        last_log = now
+                    if result is not None:
+                        if result:
+                            stop_child(proc, signal.SIGTERM)
+                        return (result, (adapter_exported_path(output, expected_export)
+                                         if expected_export is not None else exported_path(output))
+                                if exporting and result == 0 else None,
+                                time.monotonic() - started)
         except (KeyboardInterrupt, StopRequested) as exc:
             if proc is not None:
                 stop_child(proc, exc.signum if isinstance(exc, StopRequested) else signal.SIGINT)
             raise
         finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            os.close(read_fd)
             clear_progress()
             replay(output, sys.stdout if native else sys.stderr)
             replay(errors, sys.stderr)
 
 
-def preflight(repo, root, migrate_only):
+def adapter_exported_path(output, expected):
+    """Accept exactly one successful producer receipt for our private output."""
+    output.seek(0)
+    receipts = []
+    while line := output.readline(65536):
+        if len(line) == 65536 and not line.endswith(b'\n'):
+            # Discard a complete oversized log line without retaining it.
+            while line and not line.endswith(b'\n'):
+                line = output.readline(65536)
+            continue
+        try:
+            row = json.loads(line, object_pairs_hook=ProgressEvents._object)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(row, dict) and row.get('status') == 'ok' and 'export_path' in row:
+            receipts.append(row)
+            if len(receipts) > 1:
+                break
+    if (len(receipts) != 1 or not isinstance(receipts[0]['export_path'], str) or
+            Path(receipts[0]['export_path']) != expected or not expected.is_file()):
+        raise ValueError('Producer did not report exactly the expected private export')
+    return expected
+
+
+def producer_interpreter(launcher, explicit=None):
+    """Use the producer's environment, never silently use this wrapper's Python."""
+    if explicit is not None:
+        candidate = Path(explicit).expanduser()
+        if not candidate.is_absolute():
+            located = shutil.which(str(candidate))
+            candidate = Path(located) if located else candidate.absolute()
+    else:
+        with Path(launcher).resolve(strict=True).open('rb') as handle:
+            first = handle.readline(513)
+        if len(first) > 512 or not first.startswith(b'#!'):
+            raise ValueError('Cannot determine producer Python; set --producer-python')
+        try:
+            words = shlex.split(first[2:].decode('utf-8').strip())
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError('Invalid producer shebang; set --producer-python') from exc
+        if words and Path(words[0]).name == 'env':
+            words = words[1:]
+            if words and words[0] == '-S':
+                words = words[1:]
+            if len(words) != 1:
+                raise ValueError('Unsupported producer env shebang; set --producer-python')
+            located = shutil.which(words[0])
+            if not located:
+                raise ValueError('Producer shebang Python is unavailable')
+            candidate = Path(located)
+        elif len(words) == 1 and Path(words[0]).is_absolute():
+            candidate = Path(words[0])
+        else:
+            raise ValueError('Unsupported producer shebang; set --producer-python')
+        if not candidate.name.startswith(('python', 'pypy')):
+            raise ValueError('Producer launcher is not a Python script; set --producer-python')
+    # Keep the venv spelling: resolving its Python symlink would lose the
+    # producer's installed packages even though it reaches the same executable.
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise ValueError('Producer Python is missing or not executable')
+    return candidate
+
+
+def preflight(repo, root, migrate_only, source_provider='git', explicit_python=None):
     repo = repo.resolve(strict=True)
-    if not repo.is_dir() or not (repo / '.git').exists():
-        raise ValueError(f'Not a Git repository root: {repo}')
+    if not repo.is_dir() or (not migrate_only and source_provider == 'git' and
+                            not (repo / '.git').exists()):
+        raise ValueError('Source directory is not a Git repository root; '
+                         'use --source-provider filesystem for non-Git sources')
     cli = root / 'qihse-codegraph'
     if not cli.is_file() or not os.access(cli, os.X_OK):
         raise ValueError(f'Native CodeGraph executable is missing or not executable: {cli}; '
                          'build it with make qihse-codegraph')
-    crg = None if migrate_only else shutil.which('code-review-graph')
-    if not migrate_only and not crg:
-        raise ValueError('code-review-graph is not executable on PATH')
-    return repo, cli, crg
+    if migrate_only:
+        return repo, cli, None
+    crg = shutil.which('code-review-graph')
+    if not crg and explicit_python is None:
+        raise ValueError('code-review-graph is not executable on PATH; set --producer-python')
+    adapter = root / 'tools' / 'qihse_codegraph_incremental.py'
+    if not adapter.is_file():
+        raise ValueError('Private incremental producer adapter is missing')
+    return repo, cli, producer_interpreter(crg, explicit_python)
+
+
+def timing_path(env):
+    state = Path(env.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
+    if not state.is_absolute():
+        state = Path.home() / '.local' / 'state'
+    return state / 'qihse-codegraph-reindex' / 'timings.json'
+
+
+def graph_bytes(cli, repo, env):
+    """Use only authenticated CLI accounting; failure merely disables the estimate."""
+    try:
+        result = subprocess.run([str(cli), 'stats', '--repo', str(repo)], env=env,
+                                capture_output=True, timeout=30, check=True)
+        data = json.loads(result.stdout)
+        size = data.get('encoded_bytes')
+        return size if type(size) is int and size > 0 and data.get('coverage') == 'authorized_current_generation' else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def load_samples(path, repo, stages, plan=None):
+    try:
+        if path.stat().st_size > 32768:
+            return []
+        data = json.loads(path.read_text())
+        key = hashlib.sha256(os.fsencode(repo)).hexdigest()
+        rows = data.get(key, []) if isinstance(data, dict) else []
+        return [row for row in rows[-3:] if isinstance(row, dict) and
+                (plan is None or row.get('plan') == plan) and
+                type(row.get('encoded_bytes')) is int and row['encoded_bytes'] > 0 and
+                isinstance(row.get('seconds'), list) and len(row['seconds']) == stages and
+                all(type(t) in (float, int) and 0 < t < 86400 for t in row['seconds']) and
+                type(row.get('overhead_seconds', 0)) in (float, int) and
+                0 <= row.get('overhead_seconds', 0) < 86400]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def stage_estimates(samples, current_bytes):
+    if not samples:
+        return None
+    estimates = []
+    for row in samples:
+        ratio = current_bytes / row['encoded_bytes'] if current_bytes else 1
+        ratio = min(2, max(0.5, ratio))
+        estimates.append([seconds * ratio for seconds in row['seconds']] +
+                         [row.get('overhead_seconds', 0) * ratio])
+    return [sorted(stage[i] for stage in estimates)[len(estimates) // 2]
+            for i in range(len(estimates[0]))]
+
+
+def save_sample(path, repo, encoded_bytes, seconds, overhead_seconds, plan=None):
+    if not encoded_bytes:
+        return
+    key = hashlib.sha256(os.fsencode(repo)).hexdigest()
+    try:
+        if path.exists() and path.stat().st_size <= 32768:
+            data = json.loads(path.read_text())
+        else:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        rows = data.get(key, [])
+        if not isinstance(rows, list):
+            rows = []
+        sample = {'encoded_bytes': encoded_bytes, 'seconds': seconds,
+                  'overhead_seconds': overhead_seconds}
+        if plan is not None:
+            sample['plan'] = plan
+        data[key] = (rows + [sample])[-3:]
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.timings-', dir=path.parent)
+        try:
+            with os.fdopen(fd, 'w') as output:
+                json.dump(data, output, separators=(',', ':'))
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    except (OSError, ValueError, TypeError):
+        print('Timing history unavailable; this run was not saved for future estimates.',
+              file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--repo', type=Path, default=Path.cwd(), help='Git repository root')
+    parser.add_argument('--repo', type=Path, default=Path.cwd(), help='Source repository root')
     parser.add_argument('--migrate-only', action='store_true',
                         help='Convert the existing graph with native migrate; skip source reindexing')
-    parser.add_argument('--storage-format', choices=('zstd-v1', 'packed-v2'),
-                        help='Select the published CodeGraph storage format')
+    parser.add_argument('--storage-format', choices=(
+        'auto', 'zstd-v1', 'packed-v2', 'packed-v3', 'packed-v4', 'generations-v1'),
+        help='Choose the smaller lossless encoding (default: auto), or force a format')
+    parser.add_argument('--source-provider', choices=('git', 'filesystem'),
+                        help='Checked source identity (default: git, or filesystem with --overlay)')
+    parser.add_argument('--overlay', type=Path,
+                        help='Explicit unsaved-editor snapshot; requires filesystem source identity')
+    parser.add_argument('--producer-python', type=Path,
+                        help='Producer environment Python (default: code-review-graph shebang)')
+    parser.add_argument('--query-index', action='store_true',
+                        help='Build an optional principal-bound query index after publication')
+    parser.add_argument('--full', action='store_true', help='Force full source reparse')
+    parser.add_argument('--reclaim', action='store_true',
+                        help='Explicitly reclaim source SQLite free pages after indexing')
     args = parser.parse_args()
+    if args.source_provider == 'git' and args.overlay is not None:
+        parser.error('--overlay requires --source-provider filesystem')
+    if args.migrate_only and (args.overlay is not None or args.full or args.reclaim or args.query_index):
+        parser.error('--migrate-only cannot index overlays, reparse, reclaim or build a query index')
+    provider = args.source_provider or ('filesystem' if args.overlay is not None else 'git')
     root = Path(__file__).resolve().parent.parent
     try:
-        repo, cli, crg = preflight(args.repo, root, args.migrate_only)
+        repo, cli, python = preflight(args.repo, root, args.migrate_only, provider,
+                                      args.producer_python)
+        overlay = args.overlay.resolve(strict=True) if args.overlay is not None else None
     except (OSError, ValueError) as exc:
         print(f'Preflight failed: {exc}', file=sys.stderr)
         return 2
@@ -147,48 +494,112 @@ def main():
     previous = env.get('LD_LIBRARY_PATH', '')
     env['LD_LIBRARY_PATH'] = str(root) + (os.pathsep + previous if previous else '')
     storage_args = ['--storage-format', args.storage_format] if args.storage_format else []
-    stages = ([('Migrating existing graph', [str(cli), 'migrate', '--repo', str(repo),
-                *storage_args], True)]
-              if args.migrate_only else [
-                  ('Rebuilding source index', [crg, 'build', '--repo', str(repo)], False),
-                  ('Exporting graph', [crg, 'visualize', '--format', 'qihse', '--repo', str(repo)], False),
-                  ('Publishing compact graph', [str(cli), 'import', '--repo', str(repo),
-                                                *storage_args], True),
-              ])
+    stages = 1 if args.migrate_only else (3 if args.query_index else 2)
+    encoding = args.storage_format or 'auto'
+    plan = (f'migrate-v1:{encoding}' if args.migrate_only else
+            f"private-source-v1:{provider}:{'overlay' if overlay else 'disk'}:"
+            f"{'full' if args.full else 'incremental'}:{'reclaim' if args.reclaim else 'retain'}:"
+            f"{encoding}:{'index' if args.query_index else 'plain'}")
+    history = timing_path(env)
+    samples = load_samples(history, repo, stages, plan)
+    previous_bytes = graph_bytes(cli, repo, env) if samples else None
+    estimates = stage_estimates(samples, previous_bytes)
+    durations = []
+    if estimates:
+        size_note = (f'current graph {previous_bytes / 1048576:.1f} MiB'
+                     if previous_bytes else 'current graph size unavailable')
+        print(f'Estimated total ~{max(1, round(sum(estimates)))}s from '
+              f'{len(samples)} completed run(s); {size_note}.', file=sys.stderr)
+    else:
+        print('ETA calibrating: no completed reindex timing for this repository.',
+              file=sys.stderr)
 
     def request_stop(signum, _frame):
         raise StopRequested(signum)
 
+    def identity():
+        return (source_identity(repo) if provider == 'git' else
+                source_identity(repo, provider='filesystem', overlay_path=overlay))
+
+    def execute(command, index, label, *, native, exporting=False, expected=None):
+        try:
+            result, exported, duration = run_stage(
+                command, env, index, stages, label, native, exporting=exporting,
+                stage_estimate=estimates[index] if estimates else None,
+                later_estimate=sum(estimates[index + 1:]) if estimates else 0,
+                expected_export=expected)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValueError(f'Failed during {label}: {exc}') from exc
+        durations.append(duration)
+        if result:
+            print(f'Failed during {label}: exit status {result}', file=sys.stderr)
+        return result, exported
+
     previous_handler = signal.signal(signal.SIGTERM, request_stop)
     try:
-        baseline = None
-        if not args.migrate_only:
-            progress(0, len(stages), 'Checking source identity')
-            baseline = source_identity(repo)
-        with tempfile.TemporaryDirectory(prefix='qihse-codegraph-export-') as scratch:
-            snapshot = None
-            for i, (label, command, native) in enumerate(stages):
-                if native and not args.migrate_only:
-                    command = command + ['--input', str(snapshot)]
-                try:
-                    result, exported = run_stage(command, env, i, len(stages), label, native,
-                                                 exporting=not args.migrate_only and i == 1)
-                    if exported is not None:
-                        progress(i, len(stages), 'Checking exported source identity')
-                        if source_identity(repo) != baseline:
-                            raise ValueError('Source changed during reindex/export; refusing publication')
-                        snapshot = Path(scratch) / 'graph.qihse.jsonl'
-                        prepare_export(exported, snapshot, baseline)
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    print(f'Failed during {label}: {exc}', file=sys.stderr)
-                    return 1
+        plan_started = time.monotonic()
+        if args.migrate_only:
+            result, _ = execute([str(cli), 'migrate', '--repo', str(repo), *storage_args],
+                                0, 'Migrating existing graph', native=True)
+            if result:
+                return result if result > 0 else 128 - result
+        else:
+            progress(0, stages, 'Checking source identity')
+            baseline = identity()
+            with tempfile.TemporaryDirectory(prefix='qihse-codegraph-export-') as temporary:
+                scratch = Path(temporary)
+                parse_repo = repo
+                if provider == 'filesystem':
+                    from qihse_codegraph_reindex_source import materialize_source
+                    progress(0, stages, 'Staging checked source bytes')
+                    parse_repo = scratch / 'workspace'
+                    if materialize_source(repo, parse_repo, overlay_path=overlay) != baseline:
+                        raise ValueError('Source changed before producer staging')
+                expected_identity = scratch / 'source-identity.json'
+                with expected_identity.open('x') as output:
+                    os.chmod(expected_identity, 0o600)
+                    json.dump(baseline, output, separators=(',', ':'))
+                raw_export = scratch / 'producer.qihse.jsonl'
+                command = [str(python), str(root / 'tools' / 'qihse_codegraph_incremental.py'),
+                           '--repo', str(parse_repo), '--source-provider', provider,
+                           '--output', str(raw_export),
+                           '--expected-identity', str(expected_identity)]
+                if provider == 'filesystem':
+                    command += ['--identity-repo', str(repo)]
+                if overlay is not None:
+                    command += ['--overlay', str(overlay)]
+                if args.full:
+                    command.append('--full')
+                if args.reclaim:
+                    command.append('--reclaim')
+                result, exported = execute(command, 0, 'Updating source graph and private export',
+                                           native=False, exporting=True, expected=raw_export)
                 if result:
-                    print(f'Failed during {label}: exit status {result}', file=sys.stderr)
                     return result if result > 0 else 128 - result
-        progress(len(stages), len(stages), 'Complete')
+                progress(1, stages, 'Checking exported source identity')
+                if identity() != baseline:
+                    raise ValueError('Source changed during reindex/export; refusing publication')
+                snapshot = scratch / 'graph.qihse.jsonl'
+                prepare_export(exported, snapshot, baseline)
+                if identity() != baseline:
+                    raise ValueError('Source changed during export preparation; refusing publication')
+                result, _ = execute([str(cli), 'import', '--repo', str(repo),
+                                     '--input', str(snapshot), *storage_args],
+                                    1, 'Publishing compact graph', native=True)
+                if result:
+                    return result if result > 0 else 128 - result
+                if args.query_index:
+                    result, _ = execute([str(cli), 'query-index', '--repo', str(repo)],
+                                        2, 'Building optional query index', native=True)
+                    if result:
+                        return result if result > 0 else 128 - result
+        size = graph_bytes(cli, repo, env)
+        overhead = max(0, time.monotonic() - plan_started - sum(durations))
+        save_sample(history, repo, size, durations, overhead, plan)
+        progress(stages, stages, 'Complete')
         return 0
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(f'Preflight failed while checking source identity: {exc}', file=sys.stderr)
+        print(f'CodeGraph reindex failed: {exc}', file=sys.stderr)
         return 1
     except (KeyboardInterrupt, StopRequested) as exc:
         clear_progress()

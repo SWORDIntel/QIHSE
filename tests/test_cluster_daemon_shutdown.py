@@ -219,13 +219,15 @@ bool qihse_kv_sync_store(void *store) {
                 time.sleep(.1)
             self.assertEqual(session.execute_resp('CLUSTER', 'FAILOVER.RESUME'), b'+RESUMED\r\n')
             self.assertEqual(session.execute_resp('CLUSTER', 'FAILOVER.RESUME'), b'+ALREADY-RUNNING\r\n')
-            deadline = time.monotonic() + 10
-            while True:
+            # Resuming the coordinator does not establish a pinned durable
+            # replica cursor or a writer fence. Keep observing through a
+            # health-check cycle; neither node may acquire the peer's slots.
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
                 peer, local = nodes()
-                if b'0-16383' in local.split():
-                    self.assertNotIn(b'8192-16383', peer.split())
-                    break
-                self.assertLess(time.monotonic(), deadline, (peer, local))
+                self.assertIn(b'8192-16383', peer.split())
+                self.assertIn(b'0-8191', local.split())
+                self.assertNotIn(b'0-16383', local.split())
                 time.sleep(.1)
             process.terminate()
             self.assertEqual(process.wait(timeout=15), 0)

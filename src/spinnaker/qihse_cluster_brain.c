@@ -13,6 +13,11 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,7 +176,26 @@ typedef struct {
 } brain_decision_header_t;
 
 typedef struct {
+    bool active;
+    uint16_t first, last;
+    char source[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char target[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char id[33];
+    char generation[33];
+} brain_pending_t;
+
+typedef struct {
     qihse_resp_server_t* server;
+    qihse_user_t* control_principal;
+    qihse_user_t* data_principal;
+    qihse_cluster_maintenance_t* maintenance_gate;
+    qihse_brain_transfer_fn transfer;
+    void* transfer_context;
+    char transfer_generation[33];
+    bool (*transfer_generation_get)(void*, qihse_user_t*, char[33]);
+    brain_pending_t pending;
+    int pending_lock;
+    bool pending_ready;
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
     char journal_dir[512];
@@ -271,14 +295,18 @@ static bool brain_kind_is_routine(const char* kind) {
  * a range and re-home it to a peer. */
 static void brain_record_incident(brain_t* brain, const char* kind, const char* detail) {
     if (!brain || !brain->server || !kind || brain_kind_is_routine(kind)) return;
-    qihse_user_t* sys = qihse_auth_get_user(0);
-    if (!sys) return;
+    qihse_user_t* sys = brain->control_principal;
+    if (!sys || !qihse_auth_user_is_active(sys)) return;
     char text[1200];
     int n = snprintf(text, sizeof(text), "brain incident %s: %s", kind,
                      detail ? detail : "{}");
     if (n <= 0 || n >= (int)sizeof(text)) return;
     char mem_id[QIHSE_AIMEM_ID_LEN + 1u];
+    if (brain->maintenance_gate && !qihse_cluster_maintenance_enter(
+            brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN)) return;
     (void)qihse_ai_memory_store(brain->server, sys, text, QIHSE_AIMEM_EPISODIC, mem_id);
+    if (brain->maintenance_gate) qihse_cluster_maintenance_leave(
+        brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN);
 }
 
 static void brain_journal(brain_t* brain, const char* kind, const char* detail) {
@@ -1402,11 +1430,10 @@ static void brain_check_asymmetry(brain_t* brain, const brain_obs_t* obs) {
     }
 }
 
-/* ---- Actuation (R1 re-home + R4 rollback) -------------------------------
- * Every action goes through qihse_cluster_handoff_range() — the same audited
- * path CLUSTER MOVESLOTS uses — so the brain adds policy, never data-path
- * code. One action per cycle keeps the journal readable and the state
- * reversible. */
+/* ---- Actuation ---------------------------------------------------------
+ * Configured balancing uses the typed CT2 adapter below. The legacy R1 path
+ * remains a refusal guard; failed-owner recovery requires CT1 promotion.
+ * A committed CT2 transfer cannot be undone by rewriting a local owner map. */
 
 static bool brain_range_cooled(brain_t* brain, uint16_t first, uint16_t last, uint64_t now) {
     for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
@@ -1498,7 +1525,7 @@ static bool brain_node_caps(brain_t* brain, uint16_t index,
         /* The system principal: this is an internal placement decision, not a
          * request on behalf of a caller. The record's own trust is re-checked
          * by the admissible lookup below. */
-        qihse_user_t* sys = qihse_auth_get_user(0);
+        qihse_user_t* sys = brain->control_principal;
         if (store && sys) {
             qihse_uuid_t nu;
             memcpy(nu.bytes, node->node_uuid, sizeof nu.bytes);
@@ -1546,7 +1573,7 @@ static void brain_caps_evidence(brain_t* brain, uint16_t index, char* out, size_
  * asymmetric link, not a dead node, so the brain journals and waits.
  * Returns true when an action was taken. */
 static bool brain_check_rehome(brain_t* brain, const brain_obs_t* obs) {
-    if (!brain->act || !brain->server) return false;
+    if (!brain->act || !brain->server || brain->transfer) return false;
     uint16_t local = obs->local_index;
     if (obs->node_count == 0 || local == QIHSE_CLUSTER_NODE_NONE) return false;
 
@@ -1593,39 +1620,13 @@ static bool brain_check_rehome(brain_t* brain, const brain_obs_t* obs) {
 
         /* Only re-home a range this node can actually serve. */
         if (!have_local_keys) {
-            /* Nothing to stream: the range is orphaned — its data died with
-             * the owner, or it never held any. Skipping forever (the old
-             * behavior) deadlocks against R6, which refuses to prune a node
-             * that still owns slots, so a data-less corpse kept the cluster
-             * short-covered for good. Instead the lowest-index healthy
-             * primary claims the range deterministically: an ownership flip
-             * only, through the same audited path, under the same evidence
-             * gate as a streamed re-home. */
-            uint16_t coordinator = QIHSE_CLUSTER_NODE_NONE;
-            for (size_t i = 0; i < obs->node_count; i++) {
-                const brain_obs_node_t* candidate = &obs->nodes[i];
-                if (!(candidate->flags & BRAIN_OBS_F_HEALTHY) ||
-                    candidate->role != QIHSE_CLUSTER_NODE_PRIMARY) continue;
-                if (coordinator == QIHSE_CLUSTER_NODE_NONE || candidate->index < coordinator)
-                    coordinator = candidate->index;
-            }
-            if (local == coordinator && brain_gate(brain, "rehome-orphan", evidence)) {
-                if (qihse_cluster_set_range_owner(brain->server, run->start, run->end, local)) {
-                    char detail[256];
-                    snprintf(detail, sizeof(detail),
-                             "{\"range\":\"%u-%u\",\"owner\":\"%.12s\",\"reason\":\"no-local-data\","
-                             "\"claimed_by\":\"%.12s\"}",
-                             run->start, run->end, owner_node->id, self->id);
-                    brain_journal(brain, "REHOME_ORPHAN", detail);
-                    brain_decision_record(brain, "rehome-orphan", detail, true);
-                    brain_range_cooldown(brain, run->start, run->end, now);
-                    acted = true;
-                    break; /* one action per cycle: predictable, journalable, reversible */
-                }
-            }
-            char detail[192];
+            /* A bounded probe cannot prove the range empty, and direct KV
+             * writers bypass the RESP lock. Do not claim ownership based on
+             * this observation while handoff lacks an all-writer fence. */
+            char detail[224];
             snprintf(detail, sizeof(detail),
-                     "{\"range\":\"%u-%u\",\"owner\":\"%.12s\",\"reason\":\"no-local-data\"}",
+                     "{\"range\":\"%u-%u\",\"owner\":\"%.12s\","
+                     "\"reason\":\"transfer-unavailable-no-writer-fence\"}",
                      run->start, run->end, owner_node->id);
             brain_journal(brain, "REHOME_SKIP", detail);
             brain_decision_record(brain, "rehome-skip", detail, false);
@@ -1653,18 +1654,21 @@ static bool brain_check_rehome(brain_t* brain, const brain_obs_t* obs) {
         brain_decision_record(brain, "rehome", detail, true);
         brain_range_cooldown(brain, run->start, run->end, now);
 
-        /* R4: evaluate this handoff once the rollback window closes. */
-        for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
-            if (brain->handoffs[i].active) continue;
-            brain->handoffs[i].active = true;
-            brain->handoffs[i].first = run->start;
-            brain->handoffs[i].last = run->end;
-            brain->handoffs[i].target = target;
-            brain->handoffs[i].deadline_ms =
-                now + (uint64_t)brain->rollback_window_seconds * 1000u;
-            brain->handoffs[i].moved = moved;
-            brain->handoffs[i].collected = collected;
-            break;
+        /* A refused handoff never changed ownership and must not be enrolled
+         * for rollback, which could otherwise flip this range later. */
+        if (rc == 0) {
+            for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
+                if (brain->handoffs[i].active) continue;
+                brain->handoffs[i].active = true;
+                brain->handoffs[i].first = run->start;
+                brain->handoffs[i].last = run->end;
+                brain->handoffs[i].target = target;
+                brain->handoffs[i].deadline_ms =
+                    now + (uint64_t)brain->rollback_window_seconds * 1000u;
+                brain->handoffs[i].moved = moved;
+                brain->handoffs[i].collected = collected;
+                break;
+            }
         }
         acted = true;
         break; /* one action per cycle: predictable, journalable, reversible */
@@ -1672,13 +1676,12 @@ static bool brain_check_rehome(brain_t* brain, const brain_obs_t* obs) {
     return acted;
 }
 
-/* R4 — rollback. A re-home is kept only if the range arrived completely and
- * the target is still healthy when the window closes; otherwise ownership
- * returns to the local node, which still holds whatever did not transfer. */
+/* R4 — legacy handoff diagnostics. Health changes cannot roll ownership back;
+ * CT2 recovery reconciles the durable tuple, or the current owner initiates a
+ * new fenced reverse transfer. */
 static void brain_check_rollback(brain_t* brain, const brain_obs_t* obs) {
     if (!brain->act || !obs->valid) return;
     uint64_t now = brain_now_ms();
-    uint16_t local = obs->local_index;
     for (size_t i = 0; i < BRAIN_MAX_HANDOFFS; i++) {
         brain_handoff_t* h = &brain->handoffs[i];
         if (!h->active || now < h->deadline_ms) continue;
@@ -1698,17 +1701,9 @@ static void brain_check_rollback(brain_t* brain, const brain_obs_t* obs) {
             /* No action without a journaled pre-condition: a refused rollback
              * keeps the hand-off pending and is retried next cycle. */
             if (!brain_gate(brain, "rollback", evidence)) continue;
-            if (qihse_cluster_set_range_owner(brain->server, h->first, h->last, local)) {
-                char detail[256];
-                snprintf(detail, sizeof(detail),
-                         "{\"range\":\"%u-%u\",\"target\":%u,\"reason\":\"%s\",\"moved\":%llu,"
-                         "\"collected\":%llu}",
-                         h->first, h->last, (unsigned)h->target, reason,
-                         (unsigned long long)h->moved, (unsigned long long)h->collected);
-                brain_journal(brain, "ROLLBACK", detail);
-                brain_decision_record(brain, "rollback", detail, true);
-                brain_range_cooldown(brain, h->first, h->last, now);
-            }
+            /* Health alone cannot undo a committed fenced transfer. R4 is
+             * diagnostic only; recovery must reconcile or reverse through CT2. */
+            brain_journal(brain, "ROLLBACK_REFUSED", evidence);
         } else {
             if (!brain_gate(brain, "rehome-confirm", evidence)) continue;
             char detail[192];
@@ -1774,9 +1769,182 @@ static void brain_check_prune(brain_t* brain, const brain_obs_t* obs) {
     }
 }
 
-/* R5 — rebalance on join. A healthy, slotless primary receives a proportional
- * share from the largest owner. Deterministic: only the largest owner acts
- * (tie-break by lowest index), so exactly one node moves the range. */
+/* One outstanding tuple, synced before any transport call. A lost reply or
+ * process crash retries the same CT2 operation; no later placement may pass it. */
+static bool brain_transfer_authorized(const brain_t* b) {
+    return b && b->control_principal && b->data_principal &&
+        qihse_auth_user_is_active(b->control_principal) &&
+        qihse_auth_user_is_active(b->data_principal) &&
+        qihse_user_get_role(b->control_principal) == QIHSE_ROLE_OPERATOR &&
+        qihse_user_get_tenant_id(b->control_principal) == QIHSE_TENANT_SYSTEM;
+}
+
+static bool brain_pending_save(brain_t* b) {
+    char path[640], temp[640], body[320];
+    snprintf(path, sizeof(path), "%s/ct2-pending", b->journal_dir);
+    snprintf(temp, sizeof(temp), "%s/ct2-pending.tmp", b->journal_dir);
+    int n = snprintf(body, sizeof(body), "QBP1 %u %u %u %s %s %s %s\n",
+        b->pending.active ? 1u : 0u, b->pending.first, b->pending.last,
+        b->pending.source[0] ? b->pending.source : "-",
+        b->pending.target[0] ? b->pending.target : "-",
+        b->pending.id[0] ? b->pending.id : "-",
+        b->pending.generation[0] ? b->pending.generation : "-");
+    if (n < 0 || (size_t)n + 65u >= sizeof(body)) return false;
+    unsigned char sum[32]; unsigned int sum_len = 0;
+    if (EVP_Digest(body, (size_t)n, sum, &sum_len, EVP_sha256(), NULL) != 1 || sum_len != 32) return false;
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; i++) {
+        body[n + 2*i] = digits[sum[i] >> 4]; body[n + 2*i+1] = digits[sum[i] & 15];
+    }
+    n += 64; body[n++] = '\n';
+    /* The lock excludes another writer. A crashed temporary file has no
+     * publication authority and is removed without opening its contents. */
+    if (unlink(temp) && errno != ENOENT) return false;
+    int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    bool ok = write(fd, body, (size_t)n) == n && fsync(fd) == 0;
+    if (close(fd)) ok = false;
+    if (ok) ok = rename(temp, path) == 0;
+    int dir = open(b->journal_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) ok = false;
+    else { if (ok && fsync(dir)) ok = false; close(dir); }
+    if (!ok) b->pending_ready = false; /* uncertain publication: stop acting */
+    return ok;
+}
+
+static bool brain_pending_open(brain_t* b) {
+    char path[640], body[320]; struct stat st;
+    int dir = open(b->journal_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) return false;
+    bool private_dir = fstat(dir, &st) == 0 && st.st_uid == geteuid() && !(st.st_mode & 022);
+    close(dir);
+    if (!private_dir) return false;
+    snprintf(path, sizeof(path), "%s/ct2-pending.lock", b->journal_dir);
+    b->pending_lock = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (b->pending_lock < 0 || fstat(b->pending_lock, &st) ||
+        !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077) ||
+        st.st_nlink != 1 || flock(b->pending_lock, LOCK_EX | LOCK_NB)) return false;
+    snprintf(path, sizeof(path), "%s/ct2-pending", b->journal_dir);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return errno == ENOENT;
+    bool ok = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
+        !(st.st_mode & 077) && st.st_nlink == 1 && st.st_size > 0 && (uint64_t)st.st_size < sizeof(body);
+    ssize_t n = ok ? read(fd, body, sizeof(body) - 1u) : -1;
+    close(fd);
+    if (!ok || n != st.st_size) return false;
+    body[n] = 0;
+    char* newline = strchr(body, '\n');
+    if (!newline || n - (newline + 1 - body) != 65 || body[n-1] != '\n') return false;
+    size_t header_len = (size_t)(newline + 1 - body);
+    unsigned char sum[32]; unsigned int sum_len = 0; char expected[64];
+    if (EVP_Digest(body, header_len, sum, &sum_len, EVP_sha256(), NULL) != 1 || sum_len != 32) return false;
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; i++) {
+        expected[2*i] = digits[sum[i] >> 4]; expected[2*i+1] = digits[sum[i] & 15];
+    }
+    if (CRYPTO_memcmp(expected, body + header_len, 64)) return false;
+    body[header_len] = 0; n = (ssize_t)header_len;
+    unsigned active, first, last; int used = 0;
+    if (sscanf(body, "QBP1 %1u %5u %5u %40s %40s %32s %32s\n%n", &active, &first, &last,
+            b->pending.source, b->pending.target, b->pending.id, b->pending.generation, &used) != 7 ||
+        used != n || active > 1 || first > last || last >= QIHSE_CLUSTER_SLOT_COUNT) return false;
+    char canonical[256];
+    int canonical_len = snprintf(canonical, sizeof(canonical), "QBP1 %u %u %u %s %s %s %s\n",
+        active, first, last, b->pending.source, b->pending.target, b->pending.id, b->pending.generation);
+    if (canonical_len != n || memcmp(canonical, body, (size_t)n)) return false;
+    if (active && (strlen(b->pending.source) != QIHSE_CLUSTER_NODE_ID_LEN ||
+        strlen(b->pending.target) != QIHSE_CLUSTER_NODE_ID_LEN || strlen(b->pending.id) != 32 ||
+        strlen(b->pending.generation) != 32)) return false;
+    if (active) {
+        const char* fields[] = { b->pending.source, b->pending.target, b->pending.id, b->pending.generation };
+        for (size_t i = 0; i < 4u; i++)
+            for (const char* p = fields[i]; *p; p++)
+                if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return false;
+    }
+    b->pending.active = active != 0;
+    b->pending.first = (uint16_t)first; b->pending.last = (uint16_t)last;
+    return true;
+}
+
+static bool brain_current_generation(brain_t* b, char out[33]) {
+    memset(out, 0, 33);
+    if (b->transfer_generation_get) {
+        if (!b->transfer_generation_get(b->transfer_context, b->data_principal, out)) return false;
+    } else memcpy(out, b->transfer_generation, 33);
+    if (strnlen(out, 33) != 32) return false;
+    for (size_t i = 0; i < 32; i++)
+        if (!((out[i] >= '0' && out[i] <= '9') || (out[i] >= 'a' && out[i] <= 'f'))) return false;
+    return true;
+}
+
+static bool brain_pending_run(brain_t* b) {
+    if (!b->pending.active) return false;
+    if (!b->pending_ready || !brain_transfer_authorized(b) || !b->transfer) return true;
+    char generation[33];
+    if (!brain_current_generation(b, generation) || strcmp(generation, b->pending.generation)) return true;
+    qihse_cluster_node_t self;
+    if (!qihse_cluster_topology_get_node(b->topology,
+            qihse_cluster_topology_local_node(b->topology), &self) ||
+        strcmp(self.id, b->pending.source)) return true;
+    char error[160] = {0};
+    qihse_brain_transfer_result_t result = b->transfer(b->transfer_context,
+        b->control_principal, b->data_principal, b->pending.id, b->pending.generation, b->pending.target,
+        b->pending.first, b->pending.last, error, sizeof(error));
+    char evidence[256];
+    snprintf(evidence, sizeof(evidence),
+        "{\"id\":\"%s\",\"target\":\"%s\",\"first\":%u,\"last\":%u,\"result\":%u}",
+        b->pending.id, b->pending.target, b->pending.first, b->pending.last, (unsigned)result);
+    brain_journal(b, "CT2_RESULT", evidence);
+    brain_decision_record(b, "ct2-result", evidence, true);
+    if (result == QIHSE_BRAIN_TRANSFER_COMMITTED) {
+        brain_range_cooldown(b, b->pending.first, b->pending.last, brain_now_ms());
+        b->pending.active = false;
+        if (!brain_pending_save(b)) b->pending.active = true;
+    } else if (result == QIHSE_BRAIN_TRANSFER_TOO_LARGE && b->pending.first < b->pending.last) {
+        /* Adapter certifies there is no uncertain fence for this ID. Give a
+         * smaller range a NEW identity; an existing CT2 tuple is immutable. */
+        b->pending.last = (uint16_t)(b->pending.first +
+            (b->pending.last - b->pending.first) / 2u);
+        unsigned char random[16];
+        if (RAND_bytes(random, sizeof(random)) != 1) { b->pending_ready = false; return true; }
+        static const char hex[] = "0123456789abcdef";
+        for (size_t i = 0; i < sizeof(random); i++) {
+            b->pending.id[2*i] = hex[random[i] >> 4]; b->pending.id[2*i+1] = hex[random[i] & 15];
+        }
+        (void)brain_pending_save(b);
+    }
+    /* Pending/rejected/oversized-single-slot keeps blocking new work. */
+    return true;
+}
+
+static bool brain_transfer_begin(brain_t* b, uint16_t first, uint16_t last,
+                                  const char* target) {
+    if (!b->pending_ready || !brain_transfer_authorized(b) || !b->transfer || b->pending.active)
+        return false;
+    char generation[33];
+    if (!brain_current_generation(b, generation)) return false;
+    qihse_cluster_node_t self;
+    if (!qihse_cluster_topology_get_node(b->topology,
+            qihse_cluster_topology_local_node(b->topology), &self)) return false;
+    unsigned char random[16];
+    if (RAND_bytes(random, sizeof(random)) != 1) return false;
+    memset(&b->pending, 0, sizeof(b->pending));
+    b->pending.active = true; b->pending.first = first; b->pending.last = last;
+    snprintf(b->pending.generation, sizeof(b->pending.generation), "%s", generation);
+    snprintf(b->pending.source, sizeof(b->pending.source), "%s", self.id);
+    snprintf(b->pending.target, sizeof(b->pending.target), "%s", target);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); i++) {
+        b->pending.id[2*i] = hex[random[i] >> 4]; b->pending.id[2*i+1] = hex[random[i] & 15];
+    }
+    if (!brain_pending_save(b)) return false;
+    return brain_pending_run(b);
+}
+
+/* R5 — converge healthy primaries by slot count, including populated peers.
+ * Only the largest owner acts (lowest-index tie-break). It gives at most half
+ * its largest run to the least-owned primary; CT2 may subdivide oversized
+ * ranges. Bytes/capacity weighting remains a separate policy enhancement. */
 static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
     if (!brain->act || !brain->rebalance_min_slots || obs->node_count < 2u) return;
     uint16_t local = obs->local_index;
@@ -1785,19 +1953,21 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
     for (size_t i = 0; i < obs->node_count; i++)
         if (obs->nodes[i].flags & BRAIN_OBS_F_HEALTHY) healthy++;
 
-    /* Largest owner among healthy nodes (deterministic tie-break by index). */
+    /* Largest owner among healthy primaries (deterministic tie-break by index). */
     size_t best_slots = 0;
     uint16_t best_owner = QIHSE_CLUSTER_NODE_NONE;
     size_t my_slots = 0;
     for (size_t i = 0; i < obs->node_count; i++) {
-        if (!(obs->nodes[i].flags & BRAIN_OBS_F_HEALTHY)) continue;
+        if (!(obs->nodes[i].flags & BRAIN_OBS_F_HEALTHY) ||
+            obs->nodes[i].role != QIHSE_CLUSTER_NODE_PRIMARY) continue;
         size_t owned = 0;
         for (size_t r = 0; r < obs->run_count; r++) {
             if (obs->runs[r].owner != obs->nodes[i].index) continue;
             owned += (size_t)(obs->runs[r].end - obs->runs[r].start) + 1u;
         }
         if (obs->nodes[i].index == local) my_slots = owned;
-        if (best_owner == QIHSE_CLUSTER_NODE_NONE || owned > best_slots) {
+        if (best_owner == QIHSE_CLUSTER_NODE_NONE || owned > best_slots ||
+            (owned == best_slots && obs->nodes[i].index < best_owner)) {
             best_slots = owned;
             best_owner = obs->nodes[i].index;
         }
@@ -1813,7 +1983,19 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
             if (obs->runs[r].owner != joiner->index) continue;
             owned += (size_t)(obs->runs[r].end - obs->runs[r].start) + 1u;
         }
-        if (owned != 0) continue; /* not a joiner */
+        if (!brain->transfer && owned != 0) continue; /* legacy refusal fixture */
+        /* Only the least loaded healthy primary receives (index tie-break). */
+        bool least = true;
+        for (size_t j = 0; j < obs->node_count; j++) {
+            const brain_obs_node_t* peer = &obs->nodes[j];
+            if (!(peer->flags & BRAIN_OBS_F_HEALTHY) || peer->role != QIHSE_CLUSTER_NODE_PRIMARY) continue;
+            size_t peer_owned = 0;
+            for (size_t r = 0; r < obs->run_count; r++)
+                if (obs->runs[r].owner == peer->index)
+                    peer_owned += (size_t)(obs->runs[r].end - obs->runs[r].start) + 1u;
+            if (peer_owned < owned || (peer_owned == owned && peer->index < joiner->index)) least = false;
+        }
+        if (brain->transfer && (!least || my_slots <= owned + 1u)) continue;
 
         /* Evidence rule (same one R1 applies to owners): a joiner this bus
          * has never heard from directly is a stale entry, not a newcomer.
@@ -1833,8 +2015,10 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
                 pick_end = obs->runs[r].end;
             }
         }
-        size_t give = my_slots / (healthy ? healthy : 1u);
-        if (give > pick_len / 2u) give = pick_len / 2u;
+        size_t give = brain->transfer ? (my_slots - owned) / 2u :
+            my_slots / (healthy ? healthy : 1u);
+        size_t run_limit = brain->transfer ? pick_len : pick_len / 2u;
+        if (give > run_limit) give = run_limit;
         if (give == 0) return;
         uint16_t first = (uint16_t)(pick_end - give + 1u);
         uint64_t now = brain_now_ms();
@@ -1842,11 +2026,21 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
 
         char evidence[256];
         snprintf(evidence, sizeof(evidence),
-                 "{\"range\":\"%u-%u\",\"to\":\"%.12s\",\"my_slots\":%llu,\"joiner_slots\":0}",
-                 first, pick_end, joiner->id, (unsigned long long)my_slots);
+                 "{\"range\":\"%u-%u\",\"to\":\"%.12s\",\"my_slots\":%llu,\"joiner_slots\":%llu}",
+                 first, pick_end, joiner->id, (unsigned long long)my_slots, (unsigned long long)owned);
         /* No action without a journaled pre-condition. */
         if (!brain_gate(brain, "rebalance", evidence)) return;
 
+        if (brain->transfer) {
+            bool begun = brain_transfer_begin(brain, first, pick_end, joiner->id);
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                "{\"range\":\"%u-%u\",\"to\":\"%s\",\"id\":\"%s\",\"started\":%s}",
+                first, pick_end, joiner->id, brain->pending.id, begun ? "true" : "false");
+            brain_journal(brain, "REBALANCE", detail);
+            brain_decision_record(brain, "rebalance", detail, true);
+            return;
+        }
         uint64_t moved = 0, collected = 0;
         char err[160];
         int rc = qihse_cluster_handoff_range(brain->server, first, pick_end, joiner->index,
@@ -1869,26 +2063,44 @@ static void* brain_main(void* argument) {
     /* The thread owns its brain struct for its whole lifetime: stop() joins
      * the thread BEFORE freeing, so these accesses need no lock. */
     brain_t* brain = (brain_t*)argument;
-    brain_journal(brain, "BRAIN_START", brain->act ? "{\"mode\":\"act\"}" : "{\"mode\":\"observe\"}");
+    bool started = false;
     while (__atomic_load_n(&brain->running, __ATOMIC_ACQUIRE)) {
         /* ONE snapshot per cycle, published as an observation; the rules below
          * consume that record (through the watch) instead of polling the
          * topology again. */
+        bool admitted = !brain->maintenance_gate || qihse_cluster_maintenance_enter(
+            brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN);
+        if (admitted) {
+        if (!started) {
+            brain_journal(brain, "BRAIN_START", brain->act ? "{\"mode\":\"act\"}" : "{\"mode\":\"observe\"}");
+            started = true;
+        }
         brain_observe(brain);
         if (brain->obs.valid) {
             brain_check_isolation(brain, &brain->obs);
             brain_check_asymmetry(brain, &brain->obs);
-            brain_check_prune(brain, &brain->obs);
-            /* R1 and R5 both move data: at most one of them acts per cycle. */
-            if (!brain_check_rehome(brain, &brain->obs))
-                brain_check_rebalance(brain, &brain->obs);
+            /* Resume an uncertain operation before any new topology action. */
+            if (!brain_pending_run(brain)) {
+                brain_check_prune(brain, &brain->obs);
+                /* R1 and R5 both move data: at most one acts per cycle. */
+                if (!brain_check_rehome(brain, &brain->obs))
+                    brain_check_rebalance(brain, &brain->obs);
+            }
         }
         brain_check_rollback(brain, &brain->obs);
+        if (brain->maintenance_gate) qihse_cluster_maintenance_leave(
+            brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN);
+        }
         uint32_t ms = brain->interval_seconds * 1000u;
         struct timespec ts = { (time_t)(ms / 1000u), (long)((ms % 1000u) * 1000000L) };
         nanosleep(&ts, NULL);
     }
-    brain_journal(brain, "BRAIN_STOP", "{}");
+    if (started && (!brain->maintenance_gate || qihse_cluster_maintenance_enter(
+            brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN))) {
+        brain_journal(brain, "BRAIN_STOP", "{}");
+        if (brain->maintenance_gate) qihse_cluster_maintenance_leave(
+            brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN);
+    }
     return NULL;
 }
 
@@ -1904,7 +2116,16 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
         pthread_mutex_unlock(&g_brain_lock);
         return false;
     }
+    brain->pending_lock = -1;
     brain->server = config->server;
+    brain->control_principal = config->control_principal;
+    brain->data_principal = config->data_principal;
+    brain->maintenance_gate = config->maintenance_gate;
+    brain->transfer = config->transfer;
+    brain->transfer_context = config->transfer_context;
+    brain->transfer_generation_get = config->transfer_generation_get;
+    if (config->transfer_generation && strlen(config->transfer_generation) == 32u)
+        memcpy(brain->transfer_generation, config->transfer_generation, 33u);
     brain->topology = qihse_resp_server_topology(config->server);
     snprintf(brain->journal_dir, sizeof(brain->journal_dir), "%s", config->journal_dir);
     if (config->dsa_key_path && *config->dsa_key_path)
@@ -1927,6 +2148,18 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
         free(brain);
         pthread_mutex_unlock(&g_brain_lock);
         return false;
+    }
+    if (brain->transfer) {
+        brain->pending_ready = brain_transfer_authorized(brain) &&
+            (brain->transfer_generation_get || strlen(brain->transfer_generation) == 32u) && brain_pending_open(brain);
+        if (!brain->pending_ready) {
+            if (brain->pending_lock >= 0) close(brain->pending_lock);
+            qihse_event_stream_destroy(brain->journal);
+            pthread_mutex_destroy(&brain->journal_lock);
+            free(brain);
+            pthread_mutex_unlock(&g_brain_lock);
+            return false;
+        }
     }
     qihse_pqc_init_providers();
 
@@ -2020,6 +2253,7 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
         if (brain->sign_pkey) qihse_federation_node_key_free(brain->sign_pkey);
         if (brain->watch) qihse_federation_watch_destroy(brain->watch);
         if (brain->fed) qihse_federation_journal_destroy(brain->fed);
+        if (brain->pending_lock >= 0) close(brain->pending_lock);
         free(brain->obs_payload);
         free(brain->decision_payload);
         free(brain->obs.runs);
@@ -2059,5 +2293,6 @@ void qihse_cluster_brain_stop(void) {
     free(brain->node_buf); /* the rules ran on the joined thread only */
     qihse_event_stream_destroy(brain->journal);
     pthread_mutex_destroy(&brain->journal_lock);
+    if (brain->pending_lock >= 0) close(brain->pending_lock);
     free(brain);
 }

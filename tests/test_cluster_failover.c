@@ -24,7 +24,7 @@ static void make_node(qihse_cluster_node_t* node, const char* id_seed, const cha
     node->healthy = true;
 }
 
-/* Test 1: Primary fails, replica is promoted and slots are reassigned. */
+/* Test 1: an unproven replica cannot inherit a primary's slots. */
 static void test_primary_failover(void) {
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
     assert(topo);
@@ -52,30 +52,30 @@ static void test_primary_failover(void) {
     /* Mark the primary as failed */
     qihse_cluster_topology_set_node_health(topo, idx_p, false);
 
-    /* Trigger failover */
+    /* Trigger failover; health alone is not durable data proof. */
     uint16_t promoted = qihse_cluster_failover_handle(fo, idx_p);
-    assert(promoted == idx_r);
-    assert(qihse_cluster_failover_events(fo) == 1);
+    assert(promoted == QIHSE_CLUSTER_NODE_NONE);
+    assert(qihse_cluster_failover_events(fo) == 0);
 
-    /* Verify the replica is now a primary */
+    /* The replica's role and the old owner's ranges stay unchanged. */
     qihse_cluster_node_t check;
     assert(qihse_cluster_topology_get_node(topo, idx_r, &check));
-    assert(check.role == QIHSE_CLUSTER_NODE_PRIMARY);
-    assert(check.primary_index == QIHSE_CLUSTER_NODE_NONE);
+    assert(check.role == QIHSE_CLUSTER_NODE_REPLICA);
+    assert(check.primary_index == idx_p);
 
-    /* Verify slots 0-99 are now owned by the promoted replica */
+    /* Routing must not point to a successor without the preseeded data. */
     uint16_t owner;
     qihse_cluster_slot_state_t state;
     assert(qihse_cluster_topology_get_slot(topo, 0, &owner, &state, NULL));
-    assert(owner == idx_r);
+    assert(owner == idx_p);
     assert(qihse_cluster_topology_get_slot(topo, 50, &owner, &state, NULL));
-    assert(owner == idx_r);
+    assert(owner == idx_p);
     assert(qihse_cluster_topology_get_slot(topo, 99, &owner, &state, NULL));
-    assert(owner == idx_r);
+    assert(owner == idx_p);
 
     qihse_cluster_failover_destroy(fo);
     qihse_cluster_topology_destroy(topo);
-    printf("PASS primary failover\n");
+    printf("PASS unproven replica failover refused\n");
 }
 
 /* Test 2: No replica available — failover should not occur. */
@@ -220,21 +220,21 @@ static void test_bus_failover_callback(void) {
 
     assert(qihse_cluster_bus_inject(bus, datagram, 16 + payload_len, "127.0.0.1", 17001));
 
-    /* Verify failover occurred */
-    assert(qihse_cluster_failover_events(fo) == 1);
+    /* Bus failure notifications cannot bypass the durable-proof gate. */
+    assert(qihse_cluster_failover_events(fo) == 0);
     qihse_cluster_node_t check;
     assert(qihse_cluster_topology_get_node(topo, idx_r, &check));
-    assert(check.role == QIHSE_CLUSTER_NODE_PRIMARY);
+    assert(check.role == QIHSE_CLUSTER_NODE_REPLICA);
 
     uint16_t owner;
     qihse_cluster_slot_state_t state;
     assert(qihse_cluster_topology_get_slot(topo, 25, &owner, &state, NULL));
-    assert(owner == idx_r);
+    assert(owner == idx_p);
 
     qihse_cluster_bus_destroy(bus);
     qihse_cluster_failover_destroy(fo);
     qihse_cluster_topology_destroy(topo);
-    printf("PASS bus failover callback\n");
+    printf("PASS bus callback refuses unproven failover\n");
 }
 
 
@@ -282,7 +282,7 @@ static int fb_count_reached(void* a) {
     return qihse_cluster_failover_failbacks(w->fo) >= w->want_failbacks;
 }
 
-/* Three primaries. Node IDs decide the successor, not local indexes or uptime. */
+/* Different insertion orders cannot bypass the unproven-data refusal. */
 static void test_deterministic_successor(void) {
     for (int perspective = 0; perspective < 3; perspective++) {
         qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
@@ -299,18 +299,17 @@ static void test_deterministic_successor(void) {
         cfg.topology = topo; cfg.local_node_index = idx[perspective]; cfg.single_coordinator = false;
         qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&cfg);
         assert(fo);
-        /* Fail node 0 ("alpha"): the successor must be the smaller node ID of the
-         * two survivors, whichever node is asking. */
-        qihse_cluster_node_t b, c;
-        assert(qihse_cluster_topology_get_node(topo, idx[1], &b));
-        assert(qihse_cluster_topology_get_node(topo, idx[2], &c));
-        uint16_t expect = strcmp(b.id, c.id) < 0 ? idx[1] : idx[2];
+        /* Fail node 0 ("alpha"); no healthy primary proves it has its data. */
         qihse_cluster_topology_set_node_health(topo, idx[0], false);
-        assert(qihse_cluster_failover_handle(fo, idx[0]) == expect);
+        assert(qihse_cluster_failover_handle(fo, idx[0]) == QIHSE_CLUSTER_NODE_NONE);
+        assert(qihse_cluster_failover_events(fo) == 0);
+        uint16_t owner;
+        assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
+        assert(owner == idx[0]);
         qihse_cluster_failover_destroy(fo);
         qihse_cluster_topology_destroy(topo);
     }
-    printf("PASS deterministic fallback successor (same choice from every node)\n");
+    printf("PASS unproven fallback refused from every insertion order\n");
 }
 
 static void failback_fixture(qihse_cluster_topology_t** topo_out, qihse_cluster_failover_t** fo_out,
@@ -334,6 +333,14 @@ static void failback_fixture(qihse_cluster_topology_t** topo_out, qihse_cluster_
     assert(*fo_out);
     *topo_out = topo; *idx_failed = ia; *idx_succ = ib;
 }
+/* Simulate a previously completed external handoff for failback state-machine
+ * testing. This fixture does not prove durability. */
+static void seed_completed_handoff(qihse_cluster_topology_t* topo,
+                                   qihse_cluster_failover_t* fo,
+                                   uint16_t previous, uint16_t successor) {
+    assert(qihse_cluster_topology_assign_range(topo, 0, 99, successor));
+    qihse_cluster_failover_on_takeover_cb(topo, previous, 0, 99, fo);
+}
 
 static void test_failback_returns_range(void) {
     fb_probe_t probe; memset(&probe, 0, sizeof(probe));
@@ -341,7 +348,8 @@ static void test_failback_returns_range(void) {
     failback_fixture(&topo, &fo, &probe, &ia, &ib, 200);
 
     qihse_cluster_topology_set_node_health(topo, ia, false);
-    assert(qihse_cluster_failover_handle(fo, ia) == ib);          /* successor takes 0-99 */
+    assert(qihse_cluster_failover_handle(fo, ia) == QIHSE_CLUSTER_NODE_NONE);
+    seed_completed_handoff(topo, fo, ia, ib);
     assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);
     fb_wait_t w = { fo, &probe, topo, 50, ib, 0 };
     assert(fb_owner_is(&w));
@@ -373,7 +381,8 @@ static void test_failback_flap_damping(void) {
     failback_fixture(&topo, &fo, &probe, &ia, &ib, 600);
 
     qihse_cluster_topology_set_node_health(topo, ia, false);
-    assert(qihse_cluster_failover_handle(fo, ia) == ib);
+    assert(qihse_cluster_failover_handle(fo, ia) == QIHSE_CLUSTER_NODE_NONE);
+    seed_completed_handoff(topo, fo, ia, ib);
     /* Flap faster than the stability window: no transfer may start. */
     for (int i = 0; i < 6; i++) {
         qihse_cluster_topology_set_node_health(topo, ia, true);
@@ -396,7 +405,8 @@ static void test_failback_retries_after_failure(void) {
     failback_fixture(&topo, &fo, &probe, &ia, &ib, 100);
 
     qihse_cluster_topology_set_node_health(topo, ia, false);
-    assert(qihse_cluster_failover_handle(fo, ia) == ib);
+    assert(qihse_cluster_failover_handle(fo, ia) == QIHSE_CLUSTER_NODE_NONE);
+    seed_completed_handoff(topo, fo, ia, ib);
     qihse_cluster_topology_set_node_health(topo, ia, true);
 
     fb_wait_t done = { fo, &probe, topo, 50, ia, 1 };
@@ -428,14 +438,17 @@ static void test_failback_skips_dedicated_replica(void) {
     qihse_cluster_failover_t* fo = qihse_cluster_failover_create(&cfg);
     assert(fo);
     qihse_cluster_topology_set_node_health(topo, ip, false);
-    assert(qihse_cluster_failover_handle(fo, ip) == ir);
-    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);  /* replica had the data */
+    assert(qihse_cluster_failover_handle(fo, ip) == QIHSE_CLUSTER_NODE_NONE);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);
+    uint16_t owner;
+    assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
+    assert(owner == ip);
     qihse_cluster_topology_set_node_health(topo, ip, true);
     sleep_ms_fb(400);
     assert(probe.calls == 0);
     qihse_cluster_failover_destroy(fo);
     qihse_cluster_topology_destroy(topo);
-    printf("PASS dedicated-replica promotion is not failed back\n");
+    printf("PASS unproven dedicated replica neither promotes nor incurs failback debt\n");
 }
 
 static void test_failback_respects_resplit_range(void) {
@@ -443,7 +456,8 @@ static void test_failback_respects_resplit_range(void) {
     qihse_cluster_topology_t* topo; qihse_cluster_failover_t* fo; uint16_t ia, ib;
     failback_fixture(&topo, &fo, &probe, &ia, &ib, 100);
     qihse_cluster_topology_set_node_health(topo, ia, false);
-    assert(qihse_cluster_failover_handle(fo, ia) == ib);          /* ib owns 0-99 */
+    assert(qihse_cluster_failover_handle(fo, ia) == QIHSE_CLUSTER_NODE_NONE);
+    seed_completed_handoff(topo, fo, ia, ib);
     /* An operator re-homes 40-59 elsewhere while the owner is down. */
     assert(qihse_cluster_topology_assign_range(topo, 40, 59, ia));
     qihse_cluster_topology_set_node_health(topo, ia, true);
@@ -485,8 +499,7 @@ static void test_failback_on_remote_takeover(void) {
     assert(bus);
     qihse_cluster_bus_set_takeover_callback(bus, qihse_cluster_failover_on_takeover_cb, fo);
 
-    /* The owner is down, and ANOTHER node's coordinator announces that THIS node
-     * (the successor) now owns 0-99. */
+    /* The owner is down, and another node announces an unproven takeover. */
     qihse_cluster_topology_set_node_health(topo, ia, false);
     qihse_cluster_node_t self;
     assert(qihse_cluster_topology_get_node(topo, ic, &self));
@@ -502,30 +515,28 @@ static void test_failback_on_remote_takeover(void) {
     assert(qihse_cluster_bus_inject(bus, dg, sizeof(dg), "127.0.0.1", 17000));
 
     uint16_t o; qihse_cluster_slot_state_t st;
-    assert(qihse_cluster_topology_get_slot(topo, 50, &o, &st, NULL) && o == ic);
-    assert(qihse_cluster_failover_pending_failbacks(fo) == 1u);   /* ledgered via the bus */
+    assert(qihse_cluster_topology_get_slot(topo, 50, &o, &st, NULL) && o == ia);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);
 
-    /* Gossip must queue debt even under the hold, without making a late
-     * startup pause legal. Release must preserve that debt for handback. */
+    /* Refused gossip cannot create failback debt, including under the hold. */
     assert(qihse_cluster_failover_is_paused(fo));
-    assert(!qihse_cluster_failover_pause_startup(fo));
+    assert(qihse_cluster_failover_pause_startup(fo));
     assert(probe.calls == 0);
     qihse_cluster_topology_set_node_health(topo, ia, true);
     assert(qihse_cluster_failover_resume(fo));
-    fb_wait_t w = { fo, &probe, topo, 50, ia, 1 };
-    assert(wait_for(fb_owner_is, &w, 3000));
-    assert(wait_for(fb_count_reached, &w, 3000));
-    assert(probe.last_target == ia && probe.last_first == 0 && probe.last_last == 99);
+    assert(!qihse_cluster_failover_pause_startup(fo));
+    assert(qihse_cluster_topology_get_slot(topo, 50, &o, &st, NULL) && o == ia);
+    assert(qihse_cluster_failover_pending_failbacks(fo) == 0u);
+    assert(probe.calls == 0);
 
     qihse_cluster_bus_destroy(bus);
     qihse_cluster_failover_destroy(fo);
     qihse_cluster_topology_destroy(topo);
-    printf("PASS successor ledgers and fails back a takeover decided by another node\n");
+    printf("PASS remote unproven slot update leaves owner and failback debt unchanged\n");
 }
 
-/* Exercise the real bus mutex, not a stand-in: injection holds it while the
- * callback runs, and promotion takes the failover mutex before broadcasting.
- * Barriers overlap those paths repeatedly; the watchdog bounds an ABBA hang. */
+/* Race two refused ownership paths against the real bus mutex. The watchdog
+ * bounds a hang and all slot/role/debt invariants are checked afterward. */
 typedef struct {
     qihse_cluster_failover_t* fo;
     qihse_cluster_bus_t* bus;
@@ -538,22 +549,17 @@ typedef struct {
 
 static void takeover_race_cb(qihse_cluster_topology_t* topo, uint16_t previous,
                               uint16_t first, uint16_t last, void* user) {
+    (void)topo; (void)previous; (void)first; (void)last;
     takeover_race_t* race = user;
     race->callbacks++;
-    pthread_barrier_wait(&race->gate);
-    qihse_cluster_failover_on_takeover_cb(topo, previous, first, last, race->fo);
 }
 
 static void* takeover_race_inject(void* user) {
     takeover_race_t* race = user;
+    pthread_barrier_wait(&race->gate);
     for (unsigned i = 0; i < 128; i++) {
-        /* Separate ranges guarantee that promotion cannot consume the gossip
-         * range. The end-of-round barrier fences each topology reset. */
-        assert(qihse_cluster_topology_assign_range(race->topo, 0, 99, race->owner));
-        assert(qihse_cluster_topology_assign_range(race->topo, 100, 199, race->promotion_owner));
         assert(qihse_cluster_bus_inject(race->bus, race->datagram,
                                         sizeof(race->datagram), "127.0.0.1", 17000));
-        pthread_barrier_wait(&race->gate);
     }
     return NULL;
 }
@@ -573,6 +579,8 @@ static void test_takeover_promotion_lock_order(void) {
     make_node(&other, "lock-other-owner", "127.0.0.1", 7002, 17002,
               QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
     assert(qihse_cluster_topology_upsert_node(race.topo, &other, &race.promotion_owner));
+    assert(qihse_cluster_topology_assign_range(race.topo, 0, 99, race.owner));
+    assert(qihse_cluster_topology_assign_range(race.topo, 100, 199, race.promotion_owner));
     qihse_cluster_topology_set_node_health(race.topo, race.owner, false);
     qihse_cluster_topology_set_node_health(race.topo, race.promotion_owner, false);
     qihse_cluster_bus_config_t bcfg; memset(&bcfg, 0, sizeof(bcfg));
@@ -599,22 +607,30 @@ static void test_takeover_promotion_lock_order(void) {
     pthread_t injector;
     alarm(20);
     assert(pthread_create(&injector, NULL, takeover_race_inject, &race) == 0);
+    pthread_barrier_wait(&race.gate);
     for (unsigned i = 0; i < 128; i++) {
-        pthread_barrier_wait(&race.gate); /* callback now holds the real bus lock */
-        assert(qihse_cluster_failover_promote(race.fo, race.promotion_owner, self));
-        pthread_barrier_wait(&race.gate);
+        assert(!qihse_cluster_failover_promote(race.fo, race.promotion_owner, self));
+        uint16_t owner_index;
+        assert(qihse_cluster_topology_get_slot(race.topo, 150, &owner_index, NULL, NULL));
+        assert(owner_index == race.promotion_owner);
     }
     assert(pthread_join(injector, NULL) == 0);
     alarm(0);
-    assert(race.callbacks == 128);
-    assert(qihse_cluster_failover_pending_failbacks(race.fo) == 2u);
+    assert(race.callbacks == 0);
+    uint16_t owner_index;
+    assert(qihse_cluster_topology_get_slot(race.topo, 50, &owner_index, NULL, NULL));
+    assert(owner_index == race.owner);
+    assert(qihse_cluster_topology_get_slot(race.topo, 150, &owner_index, NULL, NULL));
+    assert(owner_index == race.promotion_owner);
+    assert(qihse_cluster_failover_pending_failbacks(race.fo) == 0u);
+    assert(qihse_cluster_failover_events(race.fo) == 0u);
     assert(!qihse_cluster_failover_pause_startup(race.fo));
     assert(probe.calls == 0);
     pthread_barrier_destroy(&race.gate);
     qihse_cluster_failover_destroy(race.fo);
     qihse_cluster_bus_destroy(race.bus);
     qihse_cluster_topology_destroy(race.topo);
-    printf("PASS real-bus takeover and promotion lock-order regression\n");
+    printf("PASS concurrent refused slot update and promotion leave owners unchanged\n");
 }
 
 /* When a non-coordinator (or asymmetry-deferred cycle) sees on_fail first,
@@ -631,7 +647,8 @@ static void test_non_coordinator_does_not_trip_cooldown(void) {
     assert(qihse_cluster_topology_upsert_node(topo, &n0, &i0));
     assert(qihse_cluster_topology_upsert_node(topo, &n1, &i1));
     assert(qihse_cluster_topology_upsert_node(topo, &n2, &i2));
-    assert(qihse_cluster_topology_assign_range(topo, 0, 99, i2));
+    /* The failed node owns no slots: this is a safe role-only promotion
+     * fixture for the cooldown logic, not a data-bearing takeover. */
 
     qihse_cluster_failover_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -645,8 +662,8 @@ static void test_non_coordinator_does_not_trip_cooldown(void) {
     qihse_cluster_topology_set_node_health(topo, i2, false);
     assert(qihse_cluster_failover_handle(fo, i2) == QIHSE_CLUSTER_NODE_NONE);
 
-    /* Now i0 also fails -> i1 becomes coordinator and must immediately promote
-     * without being blocked by the 30s cooldown. */
+    /* Now i0 also fails -> i1 becomes coordinator and may immediately make
+     * the slot-free role change without being blocked by the 30s cooldown. */
     qihse_cluster_topology_set_node_health(topo, i0, false);
     assert(qihse_cluster_failover_handle(fo, i2) == i1);
 
@@ -678,7 +695,8 @@ static void test_maintenance_fences_failover_callbacks(void) {
     make_node(&replica, "maint-replica", "127.0.0.1", 7001, 17001,
               QIHSE_CLUSTER_NODE_REPLICA, pi);
     assert(qihse_cluster_topology_upsert_node(topo, &replica, &ri));
-    assert(qihse_cluster_topology_assign_range(topo, 0, 99, pi));
+    /* Slot-free role change lets this test isolate the maintenance fence
+     * without claiming a data-bearing successor is ready. */
     qihse_cluster_failover_config_t cfg = {0};
     cfg.topology = topo;
     cfg.local_node_index = ri;
@@ -690,11 +708,13 @@ static void test_maintenance_fences_failover_callbacks(void) {
     uint8_t token[32];
     assert(qihse_cluster_maintenance_begin(gate, 0, 5000, &generation, token));
     assert(qihse_cluster_failover_promote(fo, pi, ri) == false);
-    uint16_t owner;
-    assert(qihse_cluster_topology_get_slot(topo, 50, &owner, NULL, NULL));
-    assert(owner == pi);
+    qihse_cluster_node_t check;
+    assert(qihse_cluster_topology_get_node(topo, ri, &check));
+    assert(check.role == QIHSE_CLUSTER_NODE_REPLICA);
     assert(qihse_cluster_maintenance_release_trusted(gate, generation, token));
     assert(qihse_cluster_failover_promote(fo, pi, ri));
+    assert(qihse_cluster_topology_get_node(topo, ri, &check));
+    assert(check.role == QIHSE_CLUSTER_NODE_PRIMARY);
     qihse_cluster_failover_destroy(fo);
     qihse_cluster_topology_destroy(topo);
     qihse_cluster_maintenance_destroy(gate);

@@ -1,5 +1,7 @@
 # QIHSE Cluster Operations Roadmap
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 Status: current as of the 2026-10-25 migration-hardening + SDK pass. Tracks the
 operational workstreams around the 3-node cluster (t420 / 730xd / t320):
 native builds, QKP-hardened access, replication, slot migration/GC, and tooling.
@@ -61,7 +63,9 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
 | 3.2 | Unify cluster scripts | Merge `cluster_rolling_restart.sh` + `cluster_replica_deploy.sh` into one coherent command set with `--status`/`--verify` modes |
 | 3.3 | CI integration coverage | Build + deploy a throwaway 3-node cluster in CI; run the replication and admin-path tests (2.1) against it |
 
-## Phase 4 — Cluster capability
+## Phase 4 — Historical cluster capability observations
+
+**Current override:** the migration, takeover and failback claims below do not establish current data-bearing transport safety. Master CT.1/CT.2 remain open, with unfenced ownership-changing paths deliberately fail-closed. Historical drill success is not successor replication proof.
 
 | # | Item | Notes |
 |---|---|---|

@@ -1,8 +1,10 @@
 # QIHSE engine roadmap: prerequisites for advanced agent memory
 
+> **Roadmap authority:** [ROADMAP.md](ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status (2026-10-20):** W10 QH-00–QH-09 are complete, including stable durable receipts, persistent authorized scoped indexing, event evidence, claim-once handoffs, QHK2 provenance/approval policy, bounded versioned query cursors, reversible maintenance, authenticated resumable streaming archives, and generation-swapped operational repair. QH-10 remains conditional and has no demonstrated consumer requirement. Integrated into the master roadmap as W10.
 > **Date:** 2026-10-20
-> **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-active-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
+> **Master sequencing:** [ROADMAP.md — W10](ROADMAP.md#w10--qihse-aimem-durable-scoped-versioned-agent-memory-complete-2026-10-20) (see W10 workstream; this document is the detailed scope and acceptance criteria).
 > **Repository:** `SWORDIntel/QIHSE` (implement in separately validated stages).  
 > **Source:** [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory), `main` at `11ab1003d9ef3788f5fc40b87fff54abf7f17dc0`.  
 > **Consumer:** [QIHSE-backed Supermemory](https://github.com/SWORDIntel/supermemory/tree/qihse-backend/qihse-backend). Its companion feature roadmap uses SM-XX items; this document uses QH-XX item numbers.  
@@ -10,7 +12,7 @@
 
 ## Intent
 
-Extend QIHSE AIMEM with the **minimum additional authenticated storage, indexing and atomic state operations** required to support cross-agent lifecycle capture, workstream continuity, scoped memory, temporal/versioned facts, and safe consolidation. QIHSE remains the only authoritative memory database; Supermemory is a client-facing MCP/adapter layer. The features below are proposals and are **not** assertions that the corresponding commands already exist.
+Extend QIHSE AIMEM with the **minimum additional authenticated storage, indexing and atomic state operations** required to support cross-agent lifecycle capture, workstream continuity, scoped memory, temporal/versioned facts, and safe consolidation. QIHSE remains the only authoritative memory database; Supermemory is a client-facing MCP/adapter layer. The text below preserves the original design and dated implementation record. Current completion is tracked exclusively under master W10; consult the wire-contract documentation for current commands.
 
 The current documented AIMEM RESP commands are:
 

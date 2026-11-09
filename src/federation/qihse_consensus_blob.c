@@ -270,10 +270,10 @@ bool qihse_consensus_blob_import_user(qihse_consensus_blob_context_t* context,
     return valid;
 }
 
-bool qihse_consensus_blob_read_committed_transaction_user(
+static bool qcb_read_transaction_user(
     qihse_consensus_blob_context_t* context,
     const qihse_consensus_t* consensus, qihse_user_t* user,
-    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len) {
+    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len, bool durable) {
     if (out_len) *out_len = 0u;
     if (!context || !context->blobs || !consensus || !out || !out_len ||
         index == 0u || !qcb_system_operator(user) ||
@@ -281,10 +281,11 @@ bool qihse_consensus_blob_read_committed_transaction_user(
 
     qihse_consensus_entry_t entry;
     size_t count = 0u;
-    if (!qihse_consensus_read_committed_exact(consensus, user, index,
-                                               &entry, 1u, &count) ||
-        count != 1u || entry.index != index ||
-        !qcb_reference_matches(context, &entry)) return false;
+    bool read = durable
+        ? qihse_consensus_read_durable_entry_user(consensus, user, index, &entry)
+        : (qihse_consensus_read_committed_exact(consensus, user, index,
+              &entry, 1u, &count) && count == 1u);
+    if (!read || entry.index != index || !qcb_reference_matches(context, &entry)) return false;
 
     const uint8_t* reference = entry.payload;
     const uint8_t* hash = reference + QCB_HASH_OFF;
@@ -334,4 +335,18 @@ bool qihse_consensus_blob_read_committed_transaction_user(
     free(complete);
     OPENSSL_cleanse(actual, sizeof(actual));
     return ok;
+}
+
+bool qihse_consensus_blob_read_committed_transaction_user(
+    qihse_consensus_blob_context_t* context,
+    const qihse_consensus_t* consensus, qihse_user_t* user,
+    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len) {
+    return qcb_read_transaction_user(context, consensus, user, index, out, out_cap, out_len, false);
+}
+
+bool qihse_consensus_blob_read_durable_transaction_user(
+    qihse_consensus_blob_context_t* context,
+    const qihse_consensus_t* consensus, qihse_user_t* user,
+    uint64_t index, uint8_t* out, size_t out_cap, size_t* out_len) {
+    return qcb_read_transaction_user(context, consensus, user, index, out, out_cap, out_len, true);
 }

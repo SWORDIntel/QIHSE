@@ -1,0 +1,78 @@
+{
+  "fixture": {
+    "nodes": 16000,
+    "edges": 48000
+  },
+  "conditions": "Synthetic shared snapshot, same libqihse and compiler; current RSS after one context query, concurrent host workloads, page cache not dropped",
+  "pairs": [
+    {
+      "before": {
+        "Rss_KiB": 317908,
+        "Pss_KiB": 307737,
+        "Private_Clean_KiB": 296,
+        "Private_Dirty_KiB": 306788
+      },
+      "after": {
+        "Rss_KiB": 66792,
+        "Pss_KiB": 56640,
+        "Private_Clean_KiB": 172,
+        "Private_Dirty_KiB": 55796
+      }
+    },
+    {
+      "after": {
+        "Rss_KiB": 66784,
+        "Pss_KiB": 56902,
+        "Private_Clean_KiB": 352,
+        "Private_Dirty_KiB": 55796
+      },
+      "before": {
+        "Rss_KiB": 317784,
+        "Pss_KiB": 307959,
+        "Private_Clean_KiB": 388,
+        "Private_Dirty_KiB": 306792
+      }
+    }
+  ],
+  "import": {
+    "wall_ms": 19524.532,
+    "cpu_ms": 19530.623,
+    "peak_rss_kib": 362656,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 227806984
+  },
+  "storage_format": "qihse-codegraph-packed-v2",
+  "cold_before": {
+    "wall_ms": 19626.589,
+    "cpu_ms": 17114.476,
+    "peak_rss_kib": 315168,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "cold_after": {
+    "wall_ms": 19158.725,
+    "cpu_ms": 16514.207,
+    "peak_rss_kib": 314228,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "refresh_invalidation_and_revocation": "passed",
+  "median_rss_KiB": {
+    "before": 317846.0,
+    "after": 66788.0
+  },
+  "cold_query_parity": true,
+  "binary_sha256": {
+    "before": "6b9ee0a96307f208f8bcab8f9ec23a48a4c827346dcf9dadfce2a2671b365903",
+    "after": "2c67abbaf936b97441d16255a963843b5357817e9c561f6343d780a1a3ac9b85"
+  },
+  "source_sha256": {
+    "before": "c70899f20c1f6bee6b20b23fb9bc5d7b446e548f910100f80900e50d76d293a2",
+    "after": "4da8e9bf2c437d91021a278df2f218125c26824802fc1b8bbf37916c95cc2a8a"
+  },
+  "patch_sha256": "21a9724a71bfe3ecaab3e96d3601fe9b5ad1bee619e76b3ceea4aa4ed523c277",
+  "measurement_order": "Both alternating measurement pairs use the same immutable packed-v2 snapshot; refresh and authorization checks run afterward.",
+  "reproduce": "python3 benchmarks/codegraph_readonly_compare.py --baseline BASELINE_BINARY --candidate CANDIDATE_BINARY --library-dir . --nodes 16000 --edges 48000 --pairs 2 --output RESULT_JSON",
+  "build_flags": "gcc -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE; same storage codec sources and libqihse",
+  "rss_reduction_percent": 78.9873083191231
+}

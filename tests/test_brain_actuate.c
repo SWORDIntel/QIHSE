@@ -2,15 +2,14 @@
  * test_brain_actuate.c — Cluster brain actuation (R1 re-home + R4 rollback).
  *
  * Runs the real brain in act mode against a synthetic topology and a fake
- * RESP peer that accepts (or refuses) the handoff:
+ * RESP peer. Handoffs currently fail closed before contacting that peer:
  *
  *   A. failed owner + local data + healthy target
- *      -> ownership flips to the target, keys move, REHOME then
- *         REHOME_CONFIRM are journaled
- *   B. target goes unhealthy inside the rollback window
- *      -> ROLLBACK is journaled and ownership returns to the local node
- *   C. target refuses the transfer (SET rejected)
- *      -> incomplete transfer is detected and rolled back
+ *      -> REHOME refusal is journaled; owner and data remain unchanged
+ *   B. target goes unhealthy after a refused handoff
+ *      -> no rollback is enrolled and ownership remains unchanged
+ *   C. target would reject SET
+ *      -> no SET is sent; refusal occurs before the wire path
  *
  * Everything binds to loopback ephemeral ports; journal dirs are relative.
  */
@@ -155,7 +154,7 @@ static void add_node(qihse_cluster_topology_t* topo, const char* seed, const cha
 }
 
 typedef struct {
-    bool rehome, confirm, rollback, skip;
+    bool rehome, rehome_refused, confirm, rollback, skip;
 } journal_kinds_t;
 
 static void journal_scan(const char* dir, journal_kinds_t* out) {
@@ -172,7 +171,11 @@ static void journal_scan(const char* dir, journal_kinds_t* out) {
         if (payload && payload_size < sizeof(text)) {
             memcpy(text, payload, payload_size);
             text[payload_size] = '\0';
-            if (strstr(text, "\"kind\":\"REHOME\"")) out->rehome = true;
+            if (strstr(text, "\"kind\":\"REHOME\"")) {
+                out->rehome = true;
+                if (strstr(text, "\"ok\":false") && strstr(text, "all-writer fence"))
+                    out->rehome_refused = true;
+            }
             else if (strstr(text, "\"kind\":\"REHOME_CONFIRM\"")) out->confirm = true;
             else if (strstr(text, "\"kind\":\"ROLLBACK\"")) out->rollback = true;
             else if (strstr(text, "\"kind\":\"REHOME_SKIP\"")) out->skip = true;
@@ -313,30 +316,27 @@ int main(void) {
     sleep_ms(3500); /* re-home + rollback window + confirm */
     qihse_cluster_brain_stop();
 
-    /* A — the range moved to the target, keys went with it, and the journal
-     * records the action and its confirmation. */
+    /* A — a failed owner's range cannot move without a safe write fence.
+     * The refusal is journaled and the target sees no protected values. */
     journal_kinds_t kinds;
     journal_scan(dir_a, &kinds);
-    assert(kinds.rehome);
-    assert(kinds.confirm);
+    assert(kinds.rehome && kinds.rehome_refused);
+    assert(!kinds.confirm && !kinds.rollback);
     uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_slot_state_t state;
     uint16_t peer_index = QIHSE_CLUSTER_NODE_NONE;
     assert(qihse_cluster_topology_get_slot(topo, 4096u, &owner, &state, &peer_index));
-    assert(owner == target);
-    assert(__atomic_load_n(&peer.set_count, __ATOMIC_RELAXED) >= (int)key_count);
+    assert(owner == failed);
+    assert(__atomic_load_n(&peer.set_count, __ATOMIC_RELAXED) == 0);
     for (size_t i = 0; i < key_count; i++) {
         char* value = qihse_kv_get_user(store, keys[i], system_user);
-        /* COPY-not-MOVE: the source keeps its copy (not routed once ownership
-         * moved); GC reclaims it later. It must not have been dropped here. */
-        assert(value != NULL);
+        assert(value && strcmp(value, "payload") == 0);
         free(value);
     }
-    printf("PASS failed-owner range re-homed to the healthy target (REHOME + confirm)\n");
+    printf("PASS failed-owner handoff refused without changing data or owner\n");
 
-    /* B — the target fails inside the rollback window: ownership returns to
-     * the local node and ROLLBACK is journaled. The target must be healthy
-     * when the re-home happens, so the failure is injected mid-window. */
+    /* B — target health changes after the refused handoff. No rollback may
+     * be enrolled because no handoff ever changed ownership. */
     assert(qihse_cluster_topology_assign_range(topo, 4096u, 12287u, failed));
     assert(qihse_cluster_topology_set_node_health(topo, failed, false));
     assert(qihse_cluster_topology_set_node_health(topo, target, true));
@@ -346,19 +346,25 @@ int main(void) {
     bcfg.act_cooldown_seconds = 1u;
     bcfg.rollback_window_seconds = 4u;
     assert(qihse_cluster_brain_start(&bcfg));
-    sleep_ms(1500); /* R1 hands the range to the healthy target */
+    sleep_ms(1500); /* allow a refused R1 attempt before target failure */
     assert(qihse_cluster_topology_set_node_health(topo, target, false));
     sleep_ms(4000); /* rollback window closes with the target down */
     qihse_cluster_brain_stop();
     journal_scan(dir_b, &kinds);
-    assert(kinds.rehome);
-    assert(kinds.rollback);
+    assert(kinds.rehome && kinds.rehome_refused);
+    assert(!kinds.rollback && !kinds.confirm);
     assert(qihse_cluster_topology_get_slot(topo, 4096u, &owner, &state, &peer_index));
-    assert(owner == local); /* rolled back */
-    printf("PASS target failure inside the window rolled the range back\n");
+    assert(owner == failed);
+    assert(__atomic_load_n(&peer.set_count, __ATOMIC_RELAXED) == 0);
+    for (size_t i = 0; i < key_count; i++) {
+        char* value = qihse_kv_get_user(store, keys[i], system_user);
+        assert(value && strcmp(value, "payload") == 0);
+        free(value);
+    }
+    printf("PASS target failure after refusal did not trigger rollback\n");
 
-    /* C — target refuses the transfer: incomplete move is detected and rolled
-     * back, and the refusal is visible in the journal. */
+    /* C — even a target configured to reject SET sees no transfer command;
+     * the source refuses before wire access. */
     __atomic_store_n(&peer.reject_sets, 1, __ATOMIC_RELAXED);
     assert(qihse_cluster_topology_set_node_health(topo, target, true));
     assert(qihse_cluster_topology_assign_range(topo, 4096u, 12287u, failed));
@@ -370,11 +376,20 @@ int main(void) {
     sleep_ms(4000);
     qihse_cluster_brain_stop();
     journal_scan(dir_c, &kinds);
-    assert(kinds.rehome);
-    assert(kinds.rollback);
+    assert(kinds.rehome && kinds.rehome_refused);
+    assert(!kinds.rollback && !kinds.confirm);
     assert(qihse_cluster_topology_get_slot(topo, 4096u, &owner, &state, &peer_index));
-    assert(owner == local); /* rolled back */
-    printf("PASS refused transfer rolled the range back (incomplete move)\n");
+    assert(owner == failed);
+    assert(__atomic_load_n(&peer.set_count, __ATOMIC_RELAXED) == 0);
+    for (size_t i = 0; i < key_count; i++) {
+        char* value = qihse_kv_get_user(store, keys[i], system_user);
+        assert(value && strcmp(value, "payload") == 0);
+        free(value);
+    }
+    char owner_journal[600];
+    snprintf(owner_journal, sizeof(owner_journal), "%s/slot-ownership.journal", data_root);
+    assert(access(owner_journal, F_OK) == -1);
+    printf("PASS target refusal configuration saw no SET or owner change\n");
 
     peer.stop = true;
     pthread_join(peer.thread, NULL);

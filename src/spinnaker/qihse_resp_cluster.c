@@ -697,6 +697,13 @@ static bool qihse_resp_reply_slot_list_error(qihse_resp_cluster_context_t* conte
     return qihse_resp_emit_string(context, "-ERR invalid slot\r\n");
 }
 
+static bool qihse_resp_reply_unfenced_owner_change(qihse_resp_cluster_context_t* context) {
+    /* This compatibility surface has no all-writer fence or destination
+     * data proof. Ownership changes must use the fenced migration path. */
+    return qihse_resp_emit_string(context,
+        "-ERR ownership transition requires fenced migration\r\n");
+}
+
 static bool qihse_resp_get_local_primary(qihse_resp_cluster_context_t* context, uint16_t* out_index,
                                           qihse_cluster_node_t* out_node) {
     uint16_t index = qihse_cluster_topology_local_node(context->topology);
@@ -731,17 +738,8 @@ static bool qihse_resp_handle_addslots(qihse_resp_cluster_context_t* context, si
             return qihse_resp_emit_string(context, "-ERR slot is already busy\r\n");
         }
     }
-    for (size_t i = 0; i < slot_count; i++) {
-        bool updated = context->set_range_owner
-                           ? context->set_range_owner(context->server, slots[i], slots[i], local_index)
-                           : qihse_cluster_topology_assign_range(context->topology, slots[i], slots[i], local_index);
-        if (!updated) {
-            free(slots);
-            return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
-        }
-    }
     free(slots);
-    return qihse_resp_emit_string(context, "+OK\r\n");
+    return qihse_resp_reply_unfenced_owner_change(context);
 }
 
 static bool qihse_resp_handle_delslots(qihse_resp_cluster_context_t* context, size_t argc, const qihse_resp_arg_t* argv) {
@@ -762,14 +760,8 @@ static bool qihse_resp_handle_delslots(qihse_resp_cluster_context_t* context, si
             return qihse_resp_emit_string(context, "-ERR slot is already unbound\r\n");
         }
     }
-    for (size_t i = 0; i < slot_count; i++) {
-        if (!qihse_cluster_topology_unassign_range(context->topology, slots[i], slots[i])) {
-            free(slots);
-            return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
-        }
-    }
     free(slots);
-    return qihse_resp_emit_string(context, "+OK\r\n");
+    return qihse_resp_reply_unfenced_owner_change(context);
 }
 
 static bool qihse_resp_handle_setslot(qihse_resp_cluster_context_t* context, size_t argc, const qihse_resp_arg_t* argv) {
@@ -783,13 +775,12 @@ static bool qihse_resp_handle_setslot(qihse_resp_cluster_context_t* context, siz
     if (qihse_resp_arg_equals(&argv[3], "STABLE")) {
         if (argc != 4) return qihse_resp_emit_string(context, "-ERR wrong number of arguments\r\n");
         uint16_t owner;
-        if (!qihse_cluster_topology_get_slot(context->topology, slot, &owner, NULL, NULL)) {
+        qihse_cluster_slot_state_t state;
+        if (!qihse_cluster_topology_get_slot(context->topology, slot, &owner, &state, NULL)) {
             return qihse_resp_reply_topology_error(context);
         }
-        bool updated = owner == QIHSE_CLUSTER_NODE_NONE
-                           ? qihse_cluster_topology_unassign_range(context->topology, slot, slot)
-                           : qihse_cluster_topology_set_stable(context->topology, slot, owner);
-        if (!updated) return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
+        if (state != QIHSE_CLUSTER_SLOT_STABLE)
+            return qihse_resp_reply_unfenced_owner_change(context);
         return qihse_resp_emit_string(context, "+OK\r\n");
     }
     if (!qihse_resp_arg_equals(&argv[3], "MIGRATING") &&
@@ -810,11 +801,13 @@ static bool qihse_resp_handle_setslot(qihse_resp_cluster_context_t* context, siz
         return qihse_resp_emit_string(context, "-ERR unknown primary node\r\n");
     }
     if (qihse_resp_arg_equals(&argv[3], "NODE")) {
-        bool updated = context->set_range_owner
-                           ? context->set_range_owner(context->server, slot, slot, target_index)
-                           : qihse_cluster_topology_assign_range(context->topology, slot, slot, target_index);
-        if (!updated) return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
-        return qihse_resp_emit_string(context, "+OK\r\n");
+        uint16_t owner;
+        qihse_cluster_slot_state_t state;
+        if (!qihse_cluster_topology_get_slot(context->topology, slot, &owner, &state, NULL))
+            return qihse_resp_reply_topology_error(context);
+        if (owner == target_index && state == QIHSE_CLUSTER_SLOT_STABLE)
+            return qihse_resp_emit_string(context, "+OK\r\n");
+        return qihse_resp_reply_unfenced_owner_change(context);
     }
     uint16_t local_index;
     qihse_cluster_node_t local;
@@ -872,46 +865,7 @@ static bool qihse_resp_handle_failover(qihse_resp_cluster_context_t* context, si
         return qihse_resp_emit_string(context, "-ERR invalid FAILOVER option\r\n");
     }
     if (!context->topology) return qihse_resp_reply_topology_error(context);
-    uint16_t local_index = qihse_cluster_topology_local_node(context->topology);
-    qihse_cluster_node_t local;
-    if (local_index == QIHSE_CLUSTER_NODE_NONE ||
-        !qihse_cluster_topology_get_node(context->topology, local_index, &local) ||
-        !qihse_resp_node_valid(&local, local_index) || local.role != QIHSE_CLUSTER_NODE_REPLICA) {
-        return qihse_resp_emit_string(context, "-ERR local node is not a replica\r\n");
-    }
-    uint16_t primary_index = local.primary_index;
-    qihse_cluster_node_t primary;
-    if (primary_index == QIHSE_CLUSTER_NODE_NONE || primary_index == local_index ||
-        !qihse_cluster_topology_get_node(context->topology, primary_index, &primary) ||
-        !qihse_resp_node_valid(&primary, primary_index) || primary.role != QIHSE_CLUSTER_NODE_PRIMARY) {
-        return qihse_resp_emit_string(context, "-ERR replica has no valid primary\r\n");
-    }
-    qihse_resp_slot_snapshot_t* slots = NULL;
-    qihse_resp_snapshot_status_t status = qihse_resp_snapshot_slots(context->topology, &slots);
-    if (status != QIHSE_RESP_SNAPSHOT_OK) return qihse_resp_handle_snapshot_error(context, status);
-    local.role = QIHSE_CLUSTER_NODE_PRIMARY;
-    local.primary_index = QIHSE_CLUSTER_NODE_NONE;
-    if (!qihse_cluster_topology_upsert_node(context->topology, &local, NULL)) {
-        free(slots);
-        return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
-    }
-    size_t slot = 0;
-    while (slot < QIHSE_CLUSTER_SLOT_COUNT) {
-        if (slots[slot].owner != primary_index) {
-            slot++;
-            continue;
-        }
-        size_t start = slot;
-        do {
-            slot++;
-        } while (slot < QIHSE_CLUSTER_SLOT_COUNT && slots[slot].owner == primary_index);
-        if (!qihse_cluster_topology_assign_range(context->topology, (uint16_t)start, (uint16_t)(slot - 1u), local_index)) {
-            free(slots);
-            return qihse_resp_emit_string(context, "-ERR topology update failed\r\n");
-        }
-    }
-    free(slots);
-    return qihse_resp_emit_string(context, "+OK\r\n");
+    return qihse_resp_reply_unfenced_owner_change(context);
 }
 
 static bool qihse_resp_handle_help(qihse_resp_cluster_context_t* context, size_t argc) {

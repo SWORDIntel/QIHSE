@@ -47,6 +47,7 @@ extern "C" {
  *   -2  QIHSE_BACKUP_EXPORT_DENIED      the principal is not live, or a
  *                                       record/container is outside its
  *                                       clearance/SCI
+ *   -4  QIHSE_BACKUP_EXPORT_CONFLICT    merge refused; retain both source containers
  *   -3  QIHSE_BACKUP_EXPORT_UNSUPPORTED this layer cannot honour the request
  * ───────────────────────────────────────────────────────────────────────── */
 
@@ -54,6 +55,7 @@ extern "C" {
 #define QIHSE_BACKUP_EXPORT_ERR         (-1)
 #define QIHSE_BACKUP_EXPORT_DENIED      (-2)
 #define QIHSE_BACKUP_EXPORT_UNSUPPORTED (-3)
+#define QIHSE_BACKUP_EXPORT_CONFLICT (-4)
 
 typedef enum {
     BACKUP_FULL = 0,
@@ -145,6 +147,25 @@ int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
  * pending intent. See docs/OPERATIONS.md for disposable-clone validation.
  * This is not principal/ACL/identity or full-cluster recovery. */
 int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path);
+
+/* Offline, bounded union of two FULL containers into a new FULL container.
+ * Both source containers remain untouched. Authorization/checksum validation
+ * precedes enumeration. Identical live records (including labels and absolute
+ * expiry, excluding independent local change sequences) deduplicate. Any
+ * conflicting key refuses the entire publication (-4): neither source version
+ * is overwritten or silently selected, and an existing output is preserved.
+ * Output must differ from both inputs. Counters are released only to an active
+ * authorized caller; no key names or payloads are reported. Limits apply to
+ * each input and to the resulting union (max 1 GiB / 2 million records).
+ * The caller retains input paths as conflict provenance and must resolve
+ * conflicts before restore. Full backups omit expired rows and tombstones;
+ * this function is not a distributed tombstone reconciliation algorithm. */
+typedef struct {
+    size_t added, identical, conflicts;
+} qihse_backup_merge_stats_t;
+int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
+    const char* incoming_path, const char* output_path, size_t max_bytes,
+    size_t max_records, qihse_backup_merge_stats_t* stats);
 
 /* List the containers in `dir` the caller may know about.  Refused whole
  * (-2) when any container's recorded bound is above the caller's

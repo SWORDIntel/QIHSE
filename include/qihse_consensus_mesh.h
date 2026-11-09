@@ -40,6 +40,8 @@ typedef struct {
     size_t peer_count;
     qihse_consensus_mesh_peer_t peers[QIHSE_CONSENSUS_MESH_MAX_PEERS];
     uint32_t tick_interval_ms; /* 0 = 10 ms */
+    /* Opt-in Operator-only QCF1 authority proposals from provisioned voters. */
+    bool authority_proposals_enabled;
 } qihse_consensus_mesh_config_t;
 
 typedef struct qihse_consensus_mesh qihse_consensus_mesh_t;
@@ -140,6 +142,21 @@ bool qihse_consensus_mesh_propose(qihse_consensus_mesh_t* mesh,
                                   const void* payload, size_t payload_len,
                                   uint32_t timeout_ms, uint64_t* out_index);
 
+/* Obtain a committed CT1 promotion decision from any member. QCF1 is exactly
+ * 164 bytes (source/target/successor IDs, old generation, durable cursor).
+ * The log stores a SHA-256 identity and exact-decision commitment. Same source
+ * and generation have one candidate/successor winner with monotonic cursors;
+ * exact retries return their index unless a higher cursor was already admitted.
+ * Requires an active system Operator, explicit opt-in and bound history.
+ * Follower success requires independently observing the exact committed entry,
+ * never merely a leader reply. Work is bounded to 4096 committed entries and
+ * 30 seconds. An uncertain append returns false; callers must retry the same
+ * tuple. Inherited uncommitted intents are checked before a current-term retry. */
+bool qihse_consensus_mesh_propose_authority(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const void* payload, size_t payload_len, uint32_t timeout_ms,
+    uint64_t* out_index);
+
 /* Stage a transaction on this node and a voter quorum, then propose its QBR1
  * reference and wait for the normal consensus commit. principal is the
  * authenticated application context and must be authorized for class/SCI;
@@ -192,6 +209,8 @@ bool qihse_consensus_mesh_read_committed_page(
     size_t out_cap, size_t* out_count, uint64_t* out_commit_index);
 
 #ifdef QIHSE_CONSENSUS_MESH_TESTING
+/* Deterministic test: keep a leader's durable suffix uncommitted. */
+bool qihse_consensus_mesh_test_hold_append_replies(qihse_consensus_mesh_t* mesh, bool hold);
 /* Exercises the production per-peer dequeue selector with interleaved jobs. */
 bool qihse_consensus_mesh_test_tx_priority(void);
 /* Test-only deterministic fault injection. After a peer imports and

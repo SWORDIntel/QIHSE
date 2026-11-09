@@ -574,6 +574,21 @@ Additional focused coverage is in `tests/test_table_store_txn.c`,
 readiness probe, not an actual application migration. Historical run counts in
 roadmaps are recorded evidence, not a rerun implied by this document.
 
+The Rust SDK exposes `client::SqlState::from_io` for database SQLSTATE codes;
+local and transport errors have no SQLSTATE. `SqlState::kind` maps `42501` to
+permission denial, `40001`/`40P01` to serialization conflict, `40003` to
+ambiguous outcome, and `25P02` to aborted transaction, while `code` retains
+the raw SQLSTATE. Only a serialization conflict is a candidate for replay of
+the entire logical transaction; an ambiguous outcome requires checking its
+durable retry receipt before deciding whether to replay. `Transaction::commit_outcome`
+separates a local refusal before send, a server SQLSTATE rejection, an
+indeterminate transport failure or server `40003`, and a server response. The
+last state does
+not prove that an already-aborted transaction committed: `tokio-postgres`
+does not expose the final COMMIT versus ROLLBACK command tag through this API.
+The disposable TLS test checks authenticated low-clearance denial through the
+Rust client and verifies `42501` without protected payload disclosure.
+
 Not established: general joins/aggregates/order/expression/CTE/window execution
 through authenticated durable SQL, SQL savepoint restoration, cross-model SQL
 atomicity, SQL WAL replay, `INSERT ... SELECT`, general COPY/RETURNING/ON CONFLICT,

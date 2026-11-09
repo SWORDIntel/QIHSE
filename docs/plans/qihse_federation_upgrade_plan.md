@@ -1,7 +1,9 @@
 # QIHSE — Federation Database Layer Upgrade Design Brief
 
-> **Status: planned.** The governing brief for the federation work: the design
-> of record for what is not yet built. The stages that are built (F0–F8 and
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
+> **Status: supporting design.** F0–F8 and follow-ups provide the implemented substrate; present transport/application gaps are tracked only under master CT.1/CT.2 and W11. This is the design
+> of record for federation acceptance criteria. The stages that are built (F0–F8 and
 > the post-F8 follow-ups) are recorded in
 > [architecture/federation_overview.md](../architecture/federation_overview.md)
 > and the [master roadmap](../../ROADMAP.md) §W1; the rest of this document

@@ -13,6 +13,9 @@
 #include "qihse_resp_cluster.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_failover.h"
+#include "qihse_cluster_ownership.h"
+#include "qihse_cluster_transfer.h"
+#include "qihse_ct_target.h"
 #include "qihse_cluster_scatter.h"
 #include "qihse_system_guard.h"
 #include "qihse_quota.h"
@@ -27,6 +30,118 @@
 #include "qihse_resp_fts_namespace.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
+/* A receipt can only be produced by the pinned-QKP CT receipt verifier. The
+ * type is opaque so callers cannot manufacture authenticated peer evidence. */
+typedef struct qihse_cluster_ct_peer_receipt qihse_cluster_ct_peer_receipt_t;
+typedef struct qihse_resp_ct_activation_request qihse_resp_ct_activation_request_t;
+typedef struct qihse_resp_ct_begin_request qihse_resp_ct_begin_request_t;
+typedef struct qihse_resp_ct_abort_request qihse_resp_ct_abort_request_t;
+typedef struct qihse_cluster_ct_activation_receipt qihse_cluster_ct_activation_receipt_t;
+typedef struct { const void* data; size_t len; } qihse_resp_ct_arg_t;
+typedef struct { unsigned char* data; size_t len; } qihse_resp_ct_reply_t;
+typedef bool (*qihse_resp_ct_activation_handler_fn)(void* context,
+    const qihse_resp_ct_activation_request_t* request, char* err, size_t err_cap);
+typedef bool (*qihse_resp_ct_begin_handler_fn)(void* context,
+    const qihse_resp_ct_begin_request_t* request, uint64_t* out_target_cut,
+    char* err, size_t err_cap);
+typedef bool (*qihse_resp_ct_abort_handler_fn)(void* context,
+    const qihse_resp_ct_abort_request_t* request, char* err, size_t err_cap);
+bool qihse_resp_server_ct_activation_handler_set(qihse_resp_server_t* server,
+    qihse_resp_ct_activation_handler_fn handler, void* context);
+bool qihse_resp_server_ct_begin_handler_set(qihse_resp_server_t* server,
+    qihse_resp_ct_begin_handler_fn handler, void* context);
+bool qihse_resp_server_ct_abort_handler_set(qihse_resp_server_t* server,
+    qihse_resp_ct_abort_handler_fn handler, void* context);
+bool qihse_resp_ct_begin_request_fields(
+    const qihse_resp_ct_begin_request_t* request,
+    const char** transfer_id, const char** topology_source_id,
+    const char** topology_target_id, const char** qkp_source_id,
+    const char** qkp_target_id, const char** generation,
+    uint16_t* first_slot, uint16_t* last_slot, uint64_t* source_lsn,
+    uint64_t* config_epoch, unsigned char canonical_range_checksum[32],
+    unsigned char image_sha256[32], uint64_t* total_bytes);
+bool qihse_resp_ct_abort_request_fields(
+    const qihse_resp_ct_abort_request_t* request,
+    const char** transfer_id, const char** topology_source_id,
+    const char** topology_target_id, const char** qkp_source_id,
+    const char** qkp_target_id, const char** generation,
+    uint16_t* first_slot, uint16_t* last_slot, uint64_t* source_lsn,
+    uint64_t* config_epoch, unsigned char canonical_range_checksum[32]);
+bool qihse_resp_ct_activation_request_fields(
+    const qihse_resp_ct_activation_request_t* request,
+    const char** transfer_id, const char** topology_source_id,
+    const char** topology_target_id, const char** qkp_source_id,
+    const char** qkp_target_id, const char** generation,
+    uint16_t* first_slot, uint16_t* last_slot, uint64_t* source_lsn,
+    uint64_t* config_epoch, uint64_t* target_lsn, unsigned char checksum[32]);
+/* Principal pointers are set only by the QKP-authenticated request parser and
+ * remain valid for the duration of the synchronous handler callback. */
+qihse_user_t* qihse_resp_ct_begin_request_principal(
+    const qihse_resp_ct_begin_request_t* request);
+qihse_user_t* qihse_resp_ct_abort_request_principal(
+    const qihse_resp_ct_abort_request_t* request);
+qihse_user_t* qihse_resp_ct_activation_request_principal(
+    const qihse_resp_ct_activation_request_t* request);
+
+/* One authenticated command to the already configured replication peer. The
+ * caller cannot supply a host, key, or identity. Reply is the exact RESP wire
+ * value (without QKP framing) and must be freed with the paired function. */
+bool qihse_resp_ct_peer_command(qihse_resp_server_t* server,
+    const qihse_resp_ct_arg_t* args, size_t argc, qihse_resp_ct_reply_t* out);
+bool qihse_resp_ct_peer_command_to(qihse_resp_server_t* server,
+    uint16_t target_topology_index, const char* expected_qkp_node_id,
+    const qihse_resp_ct_arg_t* args, size_t argc, qihse_resp_ct_reply_t* out);
+void qihse_resp_ct_reply_free(qihse_resp_ct_reply_t* reply);
+void qihse_resp_server_ct_control_only_set(qihse_resp_server_t* server,
+                                           bool control_only);
+bool qihse_resp_server_ct_ownership_set(qihse_resp_server_t* server,
+    qihse_cluster_ownership_context_t* context);
+bool qihse_resp_server_ct_target_set(qihse_resp_server_t* server,
+    qihse_ct_target_t* target);
+bool qihse_resp_server_ct_is_successor(qihse_resp_server_t* server);
+/* Trusted ownership recovery and daemon lifecycle adapters, using the explicit
+ * authenticated control principal already bound to the server. */
+bool qihse_resp_server_ct_authorize_promotion(void* context,
+    const char* source_id, const char* target_id, const char* generation, uint64_t cursor);
+bool qihse_resp_server_ct_auto_resume(qihse_resp_server_t* server,
+    qihse_user_t* principal);
+
+/* Explicit fresh-spare bootstrap: accept a generation only from its already
+ * pinned source; refuses replacing any persisted receiver generation. */
+bool qihse_resp_server_ct_bind_generation(qihse_resp_server_t* server,
+    qihse_user_t* principal, const char generation[33]);
+bool qihse_resp_ct_peer_activation_receipt_query(qihse_resp_server_t* server,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, uint64_t target_lsn, const unsigned char checksum[32],
+    qihse_cluster_ct_activation_receipt_t** out_receipt);
+bool qihse_resp_ct_peer_activation_receipt_query_to(qihse_resp_server_t* server,
+    uint16_t target_topology_index, const char* target_qkp_id,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, uint64_t target_lsn, const unsigned char checksum[32],
+    qihse_cluster_ct_activation_receipt_t** out_receipt);
+bool qihse_resp_ct_activation_receipt_query_to(qihse_resp_server_t* server,
+    uint16_t target_topology_index, const char* target_qkp_id,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, uint64_t target_lsn, const unsigned char checksum[32],
+    qihse_cluster_ct_activation_receipt_t** out_receipt);
+bool qihse_resp_ct_activation_receipt_validate(
+    const qihse_cluster_ct_activation_receipt_t* receipt,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, uint64_t* out_target_lsn, unsigned char out_checksum[32]);
+void qihse_resp_ct_activation_receipt_free(
+    qihse_cluster_ct_activation_receipt_t* receipt);
 typedef struct qihse_resp_fts_namespace_registry qihse_resp_fts_namespace_registry_t;
 typedef struct {
     uint32_t tenant_id;
@@ -36,6 +151,54 @@ typedef struct {
 /* Forward-declared: the full FTS type lives in qihse_fts.h and is only
  * dereferenced by the fusion path in the engine. */
 typedef struct qihse_fts_index qihse_fts_index_t;
+
+/* Query the server's configured CT peer only; there is intentionally no host,
+ * key, or fingerprint argument. Both topology IDs and QKP transport IDs are
+ * explicit because the namespaces are distinct. */
+bool qihse_resp_ct_peer_receipt_query(qihse_resp_server_t* server,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, qihse_cluster_ct_peer_receipt_t** out_receipt);
+bool qihse_resp_ct_peer_receipt_query_to(qihse_resp_server_t* server,
+    uint16_t target_topology_index, const char* target_qkp_id,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, qihse_cluster_ct_peer_receipt_t** out_receipt);
+bool qihse_resp_ct_peer_prepared_receipt_query_to(qihse_resp_server_t* server,
+    uint16_t source_topology_index, const char* source_qkp_id,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, const unsigned char canonical_checksum[32],
+    qihse_cluster_ct_peer_receipt_t** out_receipt);
+bool qihse_resp_ct_peer_aborted_receipt_query_to(qihse_resp_server_t* server,
+    uint16_t source_topology_index, const char* source_qkp_id,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, const unsigned char canonical_checksum[32],
+    qihse_cluster_ct_peer_receipt_t** out_receipt);
+bool qihse_resp_ct_source_receipt_validate(
+    const qihse_cluster_ct_peer_receipt_t* receipt, const char* phase,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, const unsigned char canonical_checksum[32]);
+bool qihse_resp_ct_peer_receipt_validate(
+    const qihse_cluster_ct_peer_receipt_t* receipt,
+    const char* transfer_id, const char* topology_source_id,
+    const char* topology_target_id, const char* qkp_source_id,
+    const char* qkp_target_id, const char* generation,
+    uint16_t first_slot, uint16_t last_slot, uint64_t source_lsn,
+    uint64_t config_epoch, uint64_t* out_target_lsn, unsigned char out_checksum[32]);
+void qihse_resp_ct_peer_receipt_free(qihse_cluster_ct_peer_receipt_t* receipt);
 
 typedef struct {
     qihse_kv_store_t* store;
@@ -106,6 +269,21 @@ typedef struct {
      * this identity; no password AUTH is performed. NULL disables the
      * passwordless replication data plane. */
     qihse_user_t* replication_service_principal;
+    /* CT1/CT2 certified writer protocol. A non-empty role requires an exact
+     * QKP peer pin, an explicit generation token, bounded retained log, and
+     * a finite ACK deadline. These fields are copied at create time; the
+     * caller retains ownership of all strings and the principal. */
+    const char* ct_role; /* "primary" or "successor"; NULL disables CT */
+    const char* ct_auto_successor_id; /* opt-in spare topology ID; requires consensus mesh */
+    const char* ct_peer_host;
+    uint16_t ct_peer_port;
+    const char* ct_generation_hex; /* exactly 32 lowercase hex characters */
+    uint64_t ct_log_limit_bytes;
+    uint32_t ct_ack_timeout_ms;
+    const unsigned char* ct_owner_token; /* primary capability; never on RESP */
+    qihse_user_t* ct_control_principal; /* active startup Operator, borrowed */
+    qihse_cluster_topology_qkp_id_fn ct_topology_qkp_id;
+    void* ct_topology_qkp_id_context;
     /* R4 replicated namespaces: keys matching one of these globs are
      * SOVEREIGN-LOCAL (never MOVED/CLUSTERDOWN-routed) and are expected to
      * exist on every node. Boot-time source of truth; REPL.MARK adds more
@@ -201,9 +379,9 @@ typedef struct {
     /* Password used by CLUSTER MOVESLOTS when authenticating to the target
      * node (as GODMODE_OP). NULL/empty = migration auth disabled. */
     const char* cluster_migrate_password;
-    /* Data redundancy peer: "host:port" of the node that should receive a
-     * duplicate of every committed string-KV write (fire-and-forget, async).
-     * NULL/empty = no duplication. */
+    /* Reserved legacy data-redundancy peer. Any non-NULL value is rejected
+     * by server creation until authenticated, durable QKP write replication
+     * replaces the label-dropping cleartext RESP replay path. */
     const char* redundancy_peer;
 } qihse_resp_server_config_t;
 

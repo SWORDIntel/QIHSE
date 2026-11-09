@@ -1433,11 +1433,12 @@ static void test_pg_wire_handshake_and_queries() {
            !qihse_table_store_find_table(qihse_uwp_sql_table_store(),
                                          "pg_unauthorized"));
     send_pg_msg(guest_fds[0], 'Q', status_sql, strlen(status_sql) + 1);
-    assert(read_ready_status_capture_error(guest_fds[0], error_body,
-                                           sizeof(error_body), &error_len) == 'I');
-    assert(contains_bytes(error_body, error_len, "42501"));
-    assert(!contains_bytes(error_body, error_len, "committed"));
-    puts("PASS low-clearance PG wire SELECT and retry outcome: denied without disclosure");
+    assert(read_ready_status_capture_all(guest_fds[0], catalog_wire,
+            sizeof(catalog_wire), &catalog_wire_len) == 'I');
+    assert(contains_bytes(catalog_wire, catalog_wire_len, "absent"));
+    assert(!contains_bytes(catalog_wire, catalog_wire_len, "committed"));
+    assert(!contains_bytes(catalog_wire, catalog_wire_len, "PG-WIRE-PROTECTED-MARKER"));
+    puts("PASS low-clearance PG wire SELECT denied; foreign retry receipt hidden");
 
     write_all(guest_fds[0], &term_tag, 1);
     write_all(guest_fds[0], &term_len, 4);

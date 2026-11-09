@@ -1,5 +1,7 @@
 # QIHSE application capability and guarantee map
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 **Status: working baseline, reviewed 2026-10-24.** This is a source-backed inventory for W11.0, not a product certification. “Target” budgets below are proposed acceptance gates; none are performance measurements. Revisit them with reproducible measurements in W11.2 and W11.6.
 
 ## How to read this map

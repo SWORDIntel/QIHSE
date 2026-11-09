@@ -1,5 +1,7 @@
 # QIHSE AMD Hardware Acceleration Roadmap (Zen 4 & Zen 2)
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status: planned.** Architecture specification and implementation roadmap for next-generation AMD hardware acceleration targeting the Secondary server (AMD Ryzen 9 7950X, Zen 4 Raphael) and the Relay server (AMD EPYC 7662, Zen 2 Rome), derived from `/proc/cpuinfo` hardware analysis.
 > **Role:** Master architectural blueprint for Zen 4 and Zen 2 SIMD, cryptographic, cache, and concurrency exploitation in QIHSE.
 > **Cross-reference:** Master sequencing and tracking live in [ROADMAP.md](../../ROADMAP.md) (§1 and §3 W9).
@@ -222,34 +224,44 @@ Transitions between 256-bit / 512-bit vector modes and legacy 128-bit SSE or sca
 
 ## 7. Phased Implementation Roadmap
 
-The implementation is structured across five sequential engineering phases:
+The original design scope is retained below as requirements, not delivery status. Master W9 records implemented detection, kernels and helpers; the master design index preserves the wider deferred integrations and hardware proof.
 
 ### Phase 1: Feature Detection & Dispatch Foundations
-- [ ] Extend `qihse_cpu_feature_t` bitmask in `backends/cpu/qihse_cpu_detect.h` for Zen 4/Zen 2 features: `AVX512_VPOPCNTDQ`, `AVX512_IFMA`, `AVX512_BITALG`, `AVX512_VBMI`, `AVX512_VBMI2`, `SHA_NI`, `VPCLMULQDQ`, `CLZERO`, `CLWB`, `RDPID`, `GFNI`.
-- [ ] Implement execution-testing probes in `backends/cpu/qihse_cpu_detect.c` with `SIGILL` trap recovery.
-- [ ] Add unit tests verifying feature flags on live silicon in `tests/test_cpu_detect.c`.
+
+Mapped to completed W9.1 and the W9.5 harness; the original proposed API/test names below need not match their final locations.
+- **Design requirement:** Extend `qihse_cpu_feature_t` bitmask in `backends/cpu/qihse_cpu_detect.h` for Zen 4/Zen 2 features: `AVX512_VPOPCNTDQ`, `AVX512_IFMA`, `AVX512_BITALG`, `AVX512_VBMI`, `AVX512_VBMI2`, `SHA_NI`, `VPCLMULQDQ`, `CLZERO`, `CLWB`, `RDPID`, `GFNI`.
+- **Design requirement:** Implement execution-testing probes in `backends/cpu/qihse_cpu_detect.c` with `SIGILL` trap recovery.
+- **Design requirement:** Add unit tests verifying feature flags on live silicon in `tests/test_cpu_detect.c`.
 
 ### Phase 2: Tier 1 Immediate Critical Acceleration
-- [ ] Implement `qihse_hamming_distance_avx512_vpopcntdq()` in `backends/cpu/qihse_cpu_distance.c`.
-- [ ] Implement `qihse_vdb_int8_dot_product_avx512_vnni()` in `src/broad_oak/qihse_vector_db.c`.
-- [ ] Implement hardware SHA-256 compression kernel using SHA-NI in `src/spinnaker/qihse_overlay.c` and `src/tractable/qihse_wal.c`.
-- [ ] Implement 512-bit/256-bit carryless folding using VPCLMULQDQ for CRC32 in `src/tractable/qihse_wal.c` and `persistence/qihse_persist_format.c`.
+
+Hamming/VNNI equivalents are complete under W9.2. W9.4 delivers the SHA-NI helper; the broader overlay/WAL and VPCLMUL integrations proposed here remain deferred.
+- **Design requirement:** Implement `qihse_hamming_distance_avx512_vpopcntdq()` in `backends/cpu/qihse_cpu_distance.c`.
+- **Design requirement:** Implement `qihse_vdb_int8_dot_product_avx512_vnni()` in `src/broad_oak/qihse_vector_db.c`.
+- **Design requirement:** Implement hardware SHA-256 compression kernel using SHA-NI in `src/spinnaker/qihse_overlay.c` and `src/tractable/qihse_wal.c`.
+- **Design requirement:** Implement 512-bit/256-bit carryless folding using VPCLMULQDQ for CRC32 in `src/tractable/qihse_wal.c` and `persistence/qihse_persist_format.c`.
 
 ### Phase 3: Tier 2 Cache, Memory & Concurrency Primitives
-- [ ] Implement `qihse_clzero_line()` and integrate into UMA slab arena allocation and PQC key zeroization.
-- [ ] Integrate `clwb` into the WAL segment commit path with fallback to `clflushopt`/`clflush`.
-- [ ] Integrate `rdpid` into core-aware worker thread scheduling and NUMA shard selection.
-- [ ] Validate 128-bit `cmpxchg16b` in lockless transaction freelists.
+
+W9.3 delivers cache/core helpers. The end-to-end integrations and freelists below remain deferred.
+- **Design requirement:** Implement `qihse_clzero_line()` and integrate into UMA slab arena allocation and PQC key zeroization.
+- **Design requirement:** Integrate `clwb` into the WAL segment commit path with fallback to `clflushopt`/`clflush`.
+- **Design requirement:** Integrate `rdpid` into core-aware worker thread scheduling and NUMA shard selection.
+- **Design requirement:** Validate 128-bit `cmpxchg16b` in lockless transaction freelists.
 
 ### Phase 4: Tier 3 Advanced Vector & Cryptographic Math
-- [ ] Accelerate trinary tryte encoding/decoding in `codecs/qihse_trinary_tryte_codec.c` using AVX-512 BITALG and VBMI.
-- [ ] Accelerate post-quantum lattice polynomial multiplication using AVX-512 IFMA in `persistence/qihse_pqc_crypto.c`.
-- [ ] Implement Reed-Solomon parity matrix computation using GFNI in `src/federation/qihse_federation.c`.
+
+Deferred; these kernels are not established by the completed W9 detection/helper scope.
+- **Design requirement:** Accelerate trinary tryte encoding/decoding in `codecs/qihse_trinary_tryte_codec.c` using AVX-512 BITALG and VBMI.
+- **Design requirement:** Accelerate post-quantum lattice polynomial multiplication using AVX-512 IFMA in `persistence/qihse_pqc_crypto.c`.
+- **Design requirement:** Implement Reed-Solomon parity matrix computation using GFNI in `src/federation/qihse_federation.c`.
 
 ### Phase 5: Verification, Benchmarking & Cluster Rollout
-- [ ] Run microbenchmarks on Secondary (`Ryzen 9 7950X`) and Relay (`EPYC 7662`) logging metrics to `docs/benchmarks.md`.
-- [ ] Verify 100% test pass rate across all regression suites with zero residue.
-- [ ] Verify audit continuity security gates.
+
+W9.5 records host harness coverage. Real Secondary/Relay benchmark and rollout proof below is a separate deferred gate; the historical destination `docs/benchmarks.md` was never created. New receipts belong under the existing `benchmarks/` or `docs/benchmarks/` directories.
+- **Design requirement:** Run microbenchmarks on Secondary (`Ryzen 9 7950X`) and Relay (`EPYC 7662`) logging metrics to `docs/benchmarks.md`.
+- **Design requirement:** Verify 100% test pass rate across all regression suites with zero residue.
+- **Design requirement:** Verify audit continuity security gates.
 
 ---
 

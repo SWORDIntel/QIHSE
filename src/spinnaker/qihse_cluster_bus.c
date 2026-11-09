@@ -1,5 +1,4 @@
 #include "qihse_cluster_bus.h"
-#include "qihse_cluster_ownership_journal.h"
 #include "qihse_cluster_maintenance.h"
 #include "qihse_endian.h"
 
@@ -100,6 +99,15 @@ struct qihse_cluster_bus {
     void* on_fail_user_data;
     qihse_cluster_bus_on_takeover_cb on_takeover;
     void* on_takeover_user_data;
+    qihse_cluster_bus_on_ct_slot_update_cb on_ct_slot_update;
+    void* on_ct_slot_update_user_data;
+    pthread_mutex_t ct_queue_lock;
+    pthread_cond_t ct_queue_cond;
+    pthread_t ct_worker;
+    bool ct_worker_started;
+    bool ct_worker_running;
+    qihse_cluster_bus_ct_slot_update_t ct_queue[64];
+    size_t ct_queue_head, ct_queue_count;
     void (*on_group_update)(qihse_cluster_bus_t* bus, uint64_t update_id, const char* group,
                             const uint8_t* payload, size_t payload_len,
                             uint16_t sender_index, void* user_data);
@@ -160,6 +168,28 @@ struct qihse_cluster_bus {
     char* veil_key;
     size_t veil_key_len;
 };
+
+static void* qihse_bus_ct_worker(void* opaque) {
+    qihse_cluster_bus_t* bus = (qihse_cluster_bus_t*)opaque;
+    for (;;) {
+        qihse_cluster_bus_ct_slot_update_t update;
+        pthread_mutex_lock(&bus->ct_queue_lock);
+        while (!bus->ct_queue_count && bus->ct_worker_running)
+            pthread_cond_wait(&bus->ct_queue_cond, &bus->ct_queue_lock);
+        if (!bus->ct_queue_count && !bus->ct_worker_running) {
+            pthread_mutex_unlock(&bus->ct_queue_lock);
+            break;
+        }
+        update = bus->ct_queue[bus->ct_queue_head];
+        bus->ct_queue_head = (bus->ct_queue_head + 1u) % 64u;
+        bus->ct_queue_count--;
+        pthread_mutex_unlock(&bus->ct_queue_lock);
+        if (bus->on_ct_slot_update)
+            bus->on_ct_slot_update(bus, &update, bus->on_ct_slot_update_user_data);
+        OPENSSL_cleanse(&update, sizeof(update));
+    }
+    return NULL;
+}
 
 /* Group update push handlers (defined below the broadcast helpers). */
 static void qihse_bus_handle_group_update(qihse_cluster_bus_t* bus, uint16_t sender,
@@ -737,70 +767,93 @@ static void qihse_bus_handle_fail(qihse_cluster_bus_t* bus, uint16_t sender_inde
 }
 
 static void qihse_bus_handle_slot_update_unfenced(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
-    if (payload_len < sizeof(qihse_cluster_bus_slot_update_t)) return;
+    if (payload_len != sizeof(qihse_cluster_bus_slot_update_t)) return;
     qihse_cluster_bus_slot_update_t upd;
     memcpy(&upd, payload, sizeof(upd));
-    /* Resolve the owner by node ID in the local topology */
+    if (upd.start > upd.end || upd.end >= QIHSE_CLUSTER_SLOT_COUNT ||
+        upd.owner_id[0] == '\0' ||
+        !memchr(upd.owner_id, '\0', sizeof(upd.owner_id))) return;
+    /* Slot gossip may confirm an existing map, but it cannot publish an
+     * ownership change until migration/failover has durable data proof and
+     * a fence covering every KV writer. The maintenance gate is not that
+     * fence. Reject the entire range if even one slot differs. */
     uint16_t local_owner = QIHSE_CLUSTER_NODE_NONE;
-    if (upd.owner_id[0] != '\0') {
-        qihse_cluster_topology_find_node(bus->topology, upd.owner_id, &local_owner);
-    }
-    if (local_owner == QIHSE_CLUSTER_NODE_NONE) {
-        qihse_cluster_topology_unassign_range(bus->topology, upd.start, upd.end);
-        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+    if (!qihse_cluster_topology_find_node(bus->topology, upd.owner_id, &local_owner))
         return;
+    for (uint32_t slot = upd.start; slot <= upd.end; slot++) {
+        uint16_t prior_owner = QIHSE_CLUSTER_NODE_NONE;
+        if (!qihse_cluster_topology_get_slot(bus->topology, (uint16_t)slot,
+                                             &prior_owner, NULL, NULL) ||
+            prior_owner != local_owner) return;
     }
-    /* Journal only a genuine ownership change (this slot's owner moves to a
-     * different node). Static re-announcements keep the same owner but carry a
-     * drifting per-node epoch; journaling them accumulates conflicting records
-     * that replay into divergence. */
-    qihse_cluster_node_t owner;
-    bool owner_known = qihse_cluster_topology_get_node(bus->topology, local_owner, &owner);
-    /* Reject a stale re-announcement for the SAME owner (a lower epoch than we
-     * already hold). This is what stops a slow/duplicated update from flapping
-     * ownership. A node's OWN range is always authoritative; epoch 0 (static)
-     * is never treated as stale. */
-    uint16_t prior_owner = QIHSE_CLUSTER_NODE_NONE;
-    qihse_cluster_topology_get_slot(bus->topology, upd.start, &prior_owner, NULL, NULL);
-    bool owner_changed = prior_owner != local_owner;
-    if (owner_known && upd.config_epoch != 0u && upd.config_epoch < owner.config_epoch) {
-        if (owner_changed)
-            fprintf(stderr, "qihse-cluster-bus: REJECTED stale slot update %u-%u -> %.8s "
-                    "(epoch %llu < held %llu); keeping owner idx %u\n",
-                    upd.start, upd.end, upd.owner_id, (unsigned long long)upd.config_epoch,
-                    (unsigned long long)owner.config_epoch, (unsigned)prior_owner);
-        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
-        return;
-    }
-    if (owner_changed)
-        fprintf(stderr, "qihse-cluster-bus: slot update %u-%u idx %u -> %.8s (epoch %llu)\n",
-                upd.start, upd.end, (unsigned)prior_owner, upd.owner_id,
-                (unsigned long long)upd.config_epoch);
-    /* A range moving TO this node FROM another node while that node is not
-     * healthy is a failover takeover decided elsewhere (the failover coordinator
-     * on whichever node noticed the failure picks the successor, not
-     * necessarily us). We are the one who holds the debt, so tell the failover
-     * layer to ledger it for failback. */
-    if (owner_changed && local_owner == bus->local_node_index &&
-        prior_owner != QIHSE_CLUSTER_NODE_NONE && bus->on_takeover) {
-        qihse_cluster_node_t prior;
-        if (qihse_cluster_topology_get_node(bus->topology, prior_owner, &prior) && !prior.healthy)
-            bus->on_takeover(bus->topology, prior_owner, upd.start, upd.end, bus->on_takeover_user_data);
-    }
-    qihse_cluster_topology_adopt_range(bus->topology, upd.start, upd.end,
-                                       local_owner, upd.config_epoch);
-    /* Persist a genuine ownership change on the receiving side too, so both
-     * ends of a migration record it and the GC can reclaim once converged. */
-    if (owner_changed) {
-        const char* dir = getenv("QIHSE_DATA_DIR");
-        if (dir && *dir)
-            qihse_cluster_ownership_journal_append(dir, upd.start, upd.end,
-                                                   upd.owner_id, upd.config_epoch);
-    }
+    /* An identical owner announcement carries no authority and changes no
+     * topology epoch/state; count it only as a received confirmation. */
     __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
 }
 
+static bool qihse_bus_valid_ct_slot_update(
+    const qihse_cluster_bus_ct_slot_update_t* u) {
+    if (!u || u->magic != QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC || u->reserved ||
+        u->start > u->end || u->end >= QIHSE_CLUSTER_SLOT_COUNT ||
+        !memchr(u->transfer_id, '\0', sizeof(u->transfer_id)) || !u->transfer_id[0] ||
+        !memchr(u->source_id, '\0', sizeof(u->source_id)) || !u->source_id[0] ||
+        !memchr(u->target_id, '\0', sizeof(u->target_id)) || !u->target_id[0] ||
+        !memchr(u->source_qkp_id, '\0', sizeof(u->source_qkp_id)) || !u->source_qkp_id[0] ||
+        !memchr(u->target_qkp_id, '\0', sizeof(u->target_qkp_id)) || !u->target_qkp_id[0] ||
+        !memchr(u->generation, '\0', sizeof(u->generation)) || !u->generation[0] ||
+        !memchr(u->owner_id, '\0', sizeof(u->owner_id)) || !u->owner_id[0] ||
+        strcmp(u->source_id, u->target_id) == 0 ||
+        strcmp(u->source_qkp_id, u->target_qkp_id) == 0 ||
+        strcmp(u->owner_id, u->target_id) != 0) return false;
+    uint8_t any = 0;
+    for (size_t i = 0; i < sizeof(u->checksum); ++i) any |= u->checksum[i];
+    return any != 0;
+}
+
+static void qihse_bus_handle_ct_slot_update(qihse_cluster_bus_t* bus,
+        const uint8_t* payload, size_t payload_len) {
+    if (payload_len != sizeof(qihse_cluster_bus_ct_slot_update_t) ||
+        !bus->on_ct_slot_update || !bus->ct_worker_started) return;
+    qihse_cluster_bus_ct_slot_update_t update;
+    memcpy(&update, payload, sizeof(update));
+    if (!qihse_bus_valid_ct_slot_update(&update)) return;
+    uint16_t source_index, target_index;
+    if (!qihse_cluster_topology_find_node(bus->topology, update.source_id, &source_index) ||
+        !qihse_cluster_topology_find_node(bus->topology, update.target_id, &target_index) ||
+        source_index == target_index || update.config_epoch == 0) return;
+    uint16_t current_owner = QIHSE_CLUSTER_NODE_NONE;
+    for (uint32_t slot = update.start; slot <= update.end; ++slot) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        if (!qihse_cluster_topology_get_slot(bus->topology, (uint16_t)slot,
+                &owner, NULL, NULL)) return;
+        if (slot == update.start) current_owner = owner;
+        if (owner != current_owner || owner != source_index) return;
+    }
+    pthread_mutex_lock(&bus->ct_queue_lock);
+    if (!bus->ct_worker_running || bus->ct_queue_count >= 64u) {
+        pthread_mutex_unlock(&bus->ct_queue_lock);
+        OPENSSL_cleanse(&update, sizeof(update));
+        return;
+    }
+    size_t tail = (bus->ct_queue_head + bus->ct_queue_count) % 64u;
+    bus->ct_queue[tail] = update;
+    bus->ct_queue_count++;
+    pthread_cond_signal(&bus->ct_queue_cond);
+    pthread_mutex_unlock(&bus->ct_queue_lock);
+    __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+    OPENSSL_cleanse(&update, sizeof(update));
+}
+
 static void qihse_bus_handle_slot_update(qihse_cluster_bus_t* bus, const uint8_t* payload, size_t payload_len) {
+    if (payload_len == sizeof(qihse_cluster_bus_ct_slot_update_t)) {
+        if (!bus->maintenance_gate || qihse_cluster_maintenance_enter(
+                bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT)) {
+            qihse_bus_handle_ct_slot_update(bus, payload, payload_len);
+            if (bus->maintenance_gate)
+                qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT);
+        }
+        return;
+    }
     if (!bus->maintenance_gate) {
         qihse_bus_handle_slot_update_unfenced(bus, payload, payload_len);
         return;
@@ -1392,6 +1445,8 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->timeout_ms = config->timeout_ms ? config->timeout_ms : QIHSE_CLUSTER_BUS_TIMEOUT_MS;
     bus->on_fail = config->on_fail;
     bus->on_fail_user_data = config->on_fail_user_data;
+    bus->on_ct_slot_update = config->on_ct_slot_update;
+    bus->on_ct_slot_update_user_data = config->on_ct_slot_update_user_data;
     bus->on_group_update = config->on_group_update;
     bus->on_group_update_user_data = config->on_group_update_user_data;
     bus->on_group_ack = config->on_group_ack;
@@ -1450,6 +1505,19 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         free(bus);
         return NULL;
     }
+    if (pthread_mutex_init(&bus->ct_queue_lock, NULL) != 0) {
+        pthread_mutex_destroy(&bus->lock);
+        OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        free(bus);
+        return NULL;
+    }
+    if (pthread_cond_init(&bus->ct_queue_cond, NULL) != 0) {
+        pthread_mutex_destroy(&bus->ct_queue_lock);
+        pthread_mutex_destroy(&bus->lock);
+        OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        free(bus);
+        return NULL;
+    }
     return bus;
 }
 
@@ -1503,8 +1571,27 @@ bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
     (void)qihse_bus_send_fed_statement(bus);
     bus->started_ms = qihse_bus_now_ms();
     bus->running = true;
+    if (bus->on_ct_slot_update) {
+        bus->ct_worker_running = true;
+        if (pthread_create(&bus->ct_worker, NULL, qihse_bus_ct_worker, bus) != 0) {
+            bus->ct_worker_running = false;
+            bus->running = false;
+            close(bus->sock_fd);
+            bus->sock_fd = -1;
+            return false;
+        }
+        bus->ct_worker_started = true;
+    }
     if (pthread_create(&bus->thread, NULL, qihse_bus_thread, bus) != 0) {
         bus->running = false;
+        if (bus->ct_worker_started) {
+            pthread_mutex_lock(&bus->ct_queue_lock);
+            bus->ct_worker_running = false;
+            pthread_cond_broadcast(&bus->ct_queue_cond);
+            pthread_mutex_unlock(&bus->ct_queue_lock);
+            pthread_join(bus->ct_worker, NULL);
+            bus->ct_worker_started = false;
+        }
         close(bus->sock_fd);
         bus->sock_fd = -1;
         return false;
@@ -1515,7 +1602,17 @@ bool qihse_cluster_bus_start(qihse_cluster_bus_t* bus) {
 void qihse_cluster_bus_stop(qihse_cluster_bus_t* bus) {
     if (!bus || !bus->running) return;
     __atomic_store_n(&bus->running, false, __ATOMIC_RELEASE);
+    if (bus->ct_worker_started) {
+        pthread_mutex_lock(&bus->ct_queue_lock);
+        bus->ct_worker_running = false;
+        pthread_cond_broadcast(&bus->ct_queue_cond);
+        pthread_mutex_unlock(&bus->ct_queue_lock);
+    }
     pthread_join(bus->thread, NULL);
+    if (bus->ct_worker_started) {
+        pthread_join(bus->ct_worker, NULL);
+        bus->ct_worker_started = false;
+    }
     if (bus->sock_fd >= 0) {
         close(bus->sock_fd);
         bus->sock_fd = -1;
@@ -1525,6 +1622,8 @@ void qihse_cluster_bus_stop(qihse_cluster_bus_t* bus) {
 void qihse_cluster_bus_destroy(qihse_cluster_bus_t* bus) {
     if (!bus) return;
     qihse_cluster_bus_stop(bus);
+    pthread_cond_destroy(&bus->ct_queue_cond);
+    pthread_mutex_destroy(&bus->ct_queue_lock);
     pthread_mutex_destroy(&bus->lock);
     free(bus->last_seen_ms);
     free(bus->first_seen_ms);
@@ -1554,6 +1653,20 @@ bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
     upd.config_epoch = owner.config_epoch;
     return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
                                        (const uint8_t*)&upd, sizeof(upd));
+}
+
+bool qihse_cluster_bus_broadcast_ct_slot_update(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct_slot_update_t* update) {
+    if (!bus || !update || !qihse_bus_valid_ct_slot_update(update) ||
+        !bus->running) return false;
+    qihse_cluster_node_t owner;
+    uint16_t owner_index = QIHSE_CLUSTER_NODE_NONE;
+    if (!qihse_cluster_topology_find_node(bus->topology, update->owner_id, &owner_index) ||
+        !qihse_cluster_topology_get_node(bus->topology, owner_index, &owner) ||
+        owner.config_epoch != update->config_epoch) return false;
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+        (const uint8_t*)update, sizeof(*update));
 }
 
 void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
@@ -1597,6 +1710,14 @@ void qihse_cluster_bus_set_takeover_callback(qihse_cluster_bus_t* bus,
     if (!bus) return;
     bus->on_takeover = cb;
     bus->on_takeover_user_data = user_data;
+}
+
+void qihse_cluster_bus_set_ct_slot_update_callback(
+    qihse_cluster_bus_t* bus, qihse_cluster_bus_on_ct_slot_update_cb cb,
+    void* user_data) {
+    if (!bus || bus->running) return;
+    bus->on_ct_slot_update = cb;
+    bus->on_ct_slot_update_user_data = user_data;
 }
 
 void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,

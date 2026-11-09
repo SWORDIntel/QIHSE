@@ -1719,7 +1719,7 @@ static int uwp_sql_txn_commit(void* opaque) {
         memcpy(identity.digest, resource->retry_digest, sizeof(identity.digest));
         *resource->committed_outcome = resource->retry_outcome;
         *resource->retry_status_out = qihse_table_txn_commit_group_retry(txns,
-            resource->table_count, &identity, resource->committed_outcome);
+            resource->table_count, principal, &identity, resource->committed_outcome);
         committed = *resource->retry_status_out == QIHSE_TS_RETRY_COMMITTED;
     } else {
         bool wrote = false;

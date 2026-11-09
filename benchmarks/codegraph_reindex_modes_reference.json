@@ -1,0 +1,37 @@
+{
+  "cases": [
+    {
+      "name": "git-cold",
+      "seconds": 11.818026502005523,
+      "encoded_bytes": 968,
+      "actual_progress": true,
+      "query_fresh": true,
+      "private_export_removed": true
+    },
+    {
+      "name": "git-incremental-unchanged",
+      "seconds": 18.0046062170004,
+      "encoded_bytes": 968,
+      "actual_progress": true,
+      "query_fresh": true,
+      "private_export_removed": true
+    },
+    {
+      "name": "filesystem",
+      "seconds": 11.542113458010135,
+      "actual_progress": true,
+      "query_fresh": true,
+      "disk_edit_rejected": true,
+      "no_git": true
+    },
+    {
+      "name": "unsaved-overlay",
+      "seconds": 11.591897077014437,
+      "actual_progress": true,
+      "query_fresh": true,
+      "overlay_change_rejected": true,
+      "disk_unchanged": true
+    }
+  ],
+  "status": "passed"
+}

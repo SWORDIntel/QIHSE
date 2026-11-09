@@ -1,9 +1,12 @@
 # QIHSE Automated Zero-Downtime Cluster Rebalancing & Live Dynamic Migration
 
-> **Status: implemented** — the imbalance planner and migration state machine in
-> `src/spinnaker/qihse_cluster_rebalance.c` are verified by
-> `tests/test_cluster_rebalance.c` (`make test-cluster-rebalance`; the target
-> exists but is not part of the default `make test` list).
+> **Status: historical planner design; automatic runtime integration pending.**
+> The planner/state-machine unit tests do not establish automatic data-bearing
+> movement. The old runtime handoff is disabled; CT2 is the authenticated,
+> fenced transfer implementation. See the
+> [recovery and integration plan](../plans/cluster_recovery_20261109.md) and
+> [CT1/CT2 contract](../plans/ct_transport_runtime.md). The guarantees below
+> describe the earlier design, not live deployment evidence.
 
 ## 1. Executive Summary
 

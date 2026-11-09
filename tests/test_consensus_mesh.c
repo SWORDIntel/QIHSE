@@ -20,6 +20,26 @@
 
 #define NODE_COUNT 3u
 
+/* Elections continue while the RESP checks run. Never infer that a member
+ * remains leader from an earlier assertion in this long crash/restart test. */
+static size_t current_test_leader(qihse_consensus_mesh_t* meshes[NODE_COUNT]) {
+    for (size_t i = 0; i < NODE_COUNT; ++i)
+        if (meshes[i] &&
+            qihse_consensus_mesh_role(meshes[i]) == QIHSE_CONSENSUS_LEADER)
+            return i;
+    return NODE_COUNT;
+}
+
+static void log_test_leader_change(const char* phase, size_t previous,
+                                   size_t next,
+                                   qihse_consensus_mesh_t* meshes[NODE_COUNT]) {
+    fprintf(stderr, "mesh %s leader transition: %zu -> %zu", phase, previous, next);
+    if (next < NODE_COUNT)
+        fprintf(stderr, " term=%llu", (unsigned long long)
+                qihse_consensus_mesh_term(meshes[next]));
+    fputc('\n', stderr);
+}
+
 extern char** environ;
 
 static bool build_member_ids(qihse_uuid_t members[NODE_COUNT]) {
@@ -766,7 +786,9 @@ int main(int argc, char** argv) {
     static const char protected_payload[] = "protected-no-leak-marker";
     const char* protected_propose[] = {"QIHSE.TXN.PROPOSE", "3", "8", "34",
                                        protected_payload};
-    assert(qihse_consensus_mesh_role(meshes[leader_index]) == QIHSE_CONSENSUS_LEADER);
+    /* Node 0's recovered leadership was proved above. A later election may
+     * move the role before the independent RESP redirect checks start. */
+    assert(current_test_leader(meshes) < NODE_COUNT);
     size_t follower_index = (size_t)((leader_index + 1) % (int)NODE_COUNT);
     qihse_resp_server_config_t follower_config;
     qihse_resp_server_config_init(&follower_config);
@@ -780,6 +802,17 @@ int main(int argc, char** argv) {
                                       "redirect-check"};
     bool redirected = false;
     for (unsigned attempt = 0; attempt < 500u && !redirected; attempt++) {
+        size_t live_leader = current_test_leader(meshes);
+        if (live_leader < NODE_COUNT && follower_index == live_leader) {
+            size_t next_follower = (live_leader + 1u) % NODE_COUNT;
+            log_test_leader_change("propose redirect", leader_index, live_leader, meshes);
+            qihse_resp_server_destroy(follower_resp);
+            follower_index = next_follower;
+            follower_config.consensus_mesh = meshes[follower_index];
+            follower_config.consensus_blob_context = &blob_contexts[follower_index];
+            follower_resp = qihse_resp_server_create(&follower_config);
+            assert(follower_resp);
+        }
         char* wire_reply = run_resp(follower_resp, operator_user, redirect_propose, 5u);
         redirected = strstr(wire_reply, "MOVED ") != NULL &&
                      strstr(wire_reply, "redirect-check") == NULL;
@@ -790,6 +823,17 @@ int main(int argc, char** argv) {
     const char* redirect_read[] = {"QIHSE.TXN.READ", "1", "16"};
     bool read_redirected = false;
     for (unsigned attempt = 0; attempt < 500u && !read_redirected; attempt++) {
+        size_t live_leader = current_test_leader(meshes);
+        if (live_leader < NODE_COUNT && follower_index == live_leader) {
+            size_t next_follower = (live_leader + 1u) % NODE_COUNT;
+            log_test_leader_change("read redirect", leader_index, live_leader, meshes);
+            qihse_resp_server_destroy(follower_resp);
+            follower_index = next_follower;
+            follower_config.consensus_mesh = meshes[follower_index];
+            follower_config.consensus_blob_context = &blob_contexts[follower_index];
+            follower_resp = qihse_resp_server_create(&follower_config);
+            assert(follower_resp);
+        }
         char* wire_reply = run_resp(follower_resp, operator_user, redirect_read, 3u);
         read_redirected = strstr(wire_reply, "MOVED ") != NULL &&
                           strstr(wire_reply, protected_payload) == NULL;
@@ -801,8 +845,9 @@ int main(int argc, char** argv) {
     qihse_resp_server_config_t relay_readonly_config;
     qihse_resp_server_config_init(&relay_readonly_config);
     relay_readonly_config.enable_uwp_bridge = true;
-    relay_readonly_config.consensus_mesh = meshes[1u];
-    relay_readonly_config.consensus_blob_context = &blob_contexts[1u];
+    size_t relay_index = 1u;
+    relay_readonly_config.consensus_mesh = meshes[relay_index];
+    relay_readonly_config.consensus_blob_context = &blob_contexts[relay_index];
     qihse_resp_server_t* relay_readonly_resp =
         qihse_resp_server_create(&relay_readonly_config);
     assert(relay_readonly_resp);
@@ -815,6 +860,18 @@ int main(int argc, char** argv) {
     const char* relay_read[] = {"QIHSE.TXN.READ", "1", "16"};
     bool relay_redirected = false;
     for (unsigned attempt = 0; attempt < 500u && !relay_redirected; attempt++) {
+        size_t live_leader = current_test_leader(meshes);
+        if (live_leader < NODE_COUNT && relay_index == live_leader) {
+            size_t next_relay = (live_leader + 1u) % NODE_COUNT;
+            log_test_leader_change("read-only relay redirect", leader_index,
+                                   live_leader, meshes);
+            qihse_resp_server_destroy(relay_readonly_resp);
+            relay_index = next_relay;
+            relay_readonly_config.consensus_mesh = meshes[relay_index];
+            relay_readonly_config.consensus_blob_context = &blob_contexts[relay_index];
+            relay_readonly_resp = qihse_resp_server_create(&relay_readonly_config);
+            assert(relay_readonly_resp);
+        }
         char* wire_reply = run_resp(relay_readonly_resp, operator_user, relay_read, 3u);
         relay_redirected = strstr(wire_reply, "MOVED ") != NULL &&
                            strstr(wire_reply, protected_payload) == NULL;
@@ -841,13 +898,27 @@ int main(int argc, char** argv) {
     assert(strstr(wire_reply, "NOPERM") &&
            !strstr(wire_reply, protected_payload));
     free(wire_reply);
-    for (unsigned attempt = 0; attempt < 500u && qihse_consensus_mesh_role(meshes[leader_index]) != QIHSE_CONSENSUS_LEADER; attempt++) {
-        usleep(10000u);
+    size_t active_leader = NODE_COUNT;
+    for (unsigned attempt = 0; attempt < 500u && active_leader == NODE_COUNT; attempt++) {
+        active_leader = current_test_leader(meshes);
+        if (active_leader == NODE_COUNT) usleep(10000u);
     }
-    assert(qihse_consensus_mesh_role(meshes[leader_index]) == QIHSE_CONSENSUS_LEADER);
+    assert(active_leader < NODE_COUNT);
     bool proposed = false;
     char last_proposal_error[160] = {0};
     for (unsigned attempt = 0; attempt < 500u && !proposed; attempt++) {
+        active_leader = current_test_leader(meshes);
+        if (active_leader == NODE_COUNT) { usleep(10000u); continue; }
+        if (active_leader != (size_t)leader_index) {
+            log_test_leader_change("protected proposal", (size_t)leader_index,
+                                   active_leader, meshes);
+            qihse_resp_server_destroy(resp);
+            leader_index = (int)active_leader;
+            resp_config.consensus_mesh = meshes[leader_index];
+            resp_config.consensus_blob_context = &blob_contexts[leader_index];
+            resp = qihse_resp_server_create(&resp_config);
+            assert(resp);
+        }
         char* wire_reply = run_resp(resp, operator_user, protected_propose, 5u);
         proposed = strstr(wire_reply, "*4\r\n") != NULL &&
                    strstr(wire_reply, ":35\r\n") != NULL;
@@ -869,8 +940,8 @@ int main(int argc, char** argv) {
     assert(proposed);
     bool protected_committed = false;
     for (unsigned attempt = 0; attempt < 1500u && !protected_committed; attempt++) {
-        protected_committed =
-            qihse_consensus_mesh_commit_index(meshes[leader_index]) >= 35u;
+        for (size_t i = 0; i < NODE_COUNT; ++i)
+            protected_committed |= qihse_consensus_mesh_commit_index(meshes[i]) >= 35u;
         if (!protected_committed) usleep(10000u);
     }
     assert(protected_committed);
@@ -916,7 +987,7 @@ int main(int argc, char** argv) {
     qihse_consensus_mesh_destroy(meshes[0u]);
     meshes[0u] = NULL;
     bool secondary_leader = false;
-    for (unsigned attempt = 0; attempt < 600u && !secondary_leader; attempt++) {
+    for (unsigned attempt = 0; attempt < 1500u && !secondary_leader; attempt++) {
         qihse_uuid_t leader;
         secondary_leader =
             qihse_consensus_mesh_role(meshes[2u]) == QIHSE_CONSENSUS_LEADER &&
@@ -924,6 +995,22 @@ int main(int argc, char** argv) {
             qihse_consensus_mesh_leader_id(meshes[1u], &leader) &&
             qihse_uuid_equal(&leader, &members[2u]);
         if (!secondary_leader) usleep(10000u);
+    }
+    if (!secondary_leader) {
+        qihse_uuid_t leader1 = {{0}}, leader2 = {{0}};
+        bool known1 = qihse_consensus_mesh_leader_id(meshes[1u], &leader1);
+        bool known2 = qihse_consensus_mesh_leader_id(meshes[2u], &leader2);
+        fprintf(stderr, "mesh node-0 loss election diagnostic: "
+                "node1 role=%d term=%llu commit=%llu known=%d id=%02x%02x "
+                "node2 role=%d term=%llu commit=%llu known=%d id=%02x%02x\n",
+                (int)qihse_consensus_mesh_role(meshes[1u]),
+                (unsigned long long)qihse_consensus_mesh_term(meshes[1u]),
+                (unsigned long long)qihse_consensus_mesh_commit_index(meshes[1u]),
+                known1 ? 1 : 0, leader1.bytes[0], leader1.bytes[1],
+                (int)qihse_consensus_mesh_role(meshes[2u]),
+                (unsigned long long)qihse_consensus_mesh_term(meshes[2u]),
+                (unsigned long long)qihse_consensus_mesh_commit_index(meshes[2u]),
+                known2 ? 1 : 0, leader2.bytes[0], leader2.bytes[1]);
     }
     assert(secondary_leader);
     leader_index = 2;

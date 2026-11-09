@@ -1,6 +1,8 @@
 # QIHSE Studio: Next-Gen Real-Time Display & Control Architecture
 
-> **Status: planned & in-flight.** Architecture specification for the next-generation QIHSE operations, telemetry, and vector exploration studio.
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
+> **Status:** supporting architecture; implemented scope is tracked under master W6, broader coverage under W11.5. Architecture specification for the next-generation QIHSE operations, telemetry, and vector exploration studio.
 > **Role:** Master architectural blueprint for the ASP.NET Core 8 SignalR backend and modern React (TypeScript/Tailwind/shadcn) SPA frontend.
 > **Cross-reference:** Complements [ROADMAP.md](../../ROADMAP.md) and [docs/plans/ZEN4_ZEN2_HARDWARE_ROADMAP.md](ZEN4_ZEN2_HARDWARE_ROADMAP.md).
 

@@ -1,7 +1,10 @@
 #include "qihse_cluster_failover.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_maintenance.h"
+#include "qihse_cluster_ownership_journal.h"
 #include "qihse_platform.h"
+#include <openssl/rand.h>
+#include <openssl/evp.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +40,18 @@ struct qihse_cluster_failover {
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
     qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
+    qihse_kv_store_t* ct_store; /* borrowed */
+    qihse_user_t* ct_principal; /* borrowed */
+    char ct_local_qkp_id[QIHSE_QKP_NODE_ID_LEN + 1u];
+    qihse_cluster_topology_qkp_id_fn topology_qkp_id;
+    void* topology_qkp_id_context;
+    qihse_cluster_ct_election_authorized_fn ct_election_authorized;
+    void* ct_election_context;
+    char ct_auto_successor_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    qihse_cluster_ct_complete_fn ct_complete;
+    void* ct_complete_context;
+    uint16_t ct_pending_successor;
+    char ct_pending_generation[33];
     uint16_t local_node_index;
     bool single_coordinator;
     bool startup_paused;
@@ -66,12 +81,34 @@ static void* fo_failback_main(void* arg);
 static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t* config,
                                             bool paused) {
     if (!config || !config->topology) return NULL;
+    if (strnlen(config->ct_local_qkp_id, sizeof(config->ct_local_qkp_id)) >=
+        sizeof(config->ct_local_qkp_id)) return NULL;
     qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)calloc(1, sizeof(*fo));
     if (!fo) return NULL;
     fo->startup_paused = paused;
     fo->topology = config->topology;
     fo->bus = config->bus;
     fo->maintenance_gate = config->maintenance_gate;
+    fo->ct_store = config->ct_store;
+    fo->ct_principal = config->ct_principal;
+    memcpy(fo->ct_local_qkp_id, config->ct_local_qkp_id,
+           strnlen(config->ct_local_qkp_id, sizeof(config->ct_local_qkp_id)) + 1u);
+    fo->topology_qkp_id = config->topology_qkp_id;
+    fo->topology_qkp_id_context = config->topology_qkp_id_context;
+    fo->ct_election_authorized = config->ct_election_authorized;
+    fo->ct_election_context = config->ct_election_context;
+    if (config->ct_auto_successor_id) {
+        if (!config->ct_complete || !config->ct_election_authorized ||
+            !config->ct_store || !config->ct_principal ||
+            !*config->ct_auto_successor_id ||
+            strlen(config->ct_auto_successor_id) > QIHSE_CLUSTER_NODE_ID_LEN) {
+            free(fo); return NULL;
+        }
+        snprintf(fo->ct_auto_successor_id, sizeof(fo->ct_auto_successor_id),
+                 "%s", config->ct_auto_successor_id);
+    }
+    fo->ct_complete = config->ct_complete;
+    fo->ct_complete_context = config->ct_complete_context;
     fo->local_node_index = config->local_node_index;
     fo->single_coordinator = config->single_coordinator;
     fo->failback_fn = config->failback_fn;
@@ -89,7 +126,7 @@ static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t
         free(fo);
         return NULL;
     }
-    if (fo->failback_fn) {
+    if (fo->failback_fn || fo->ct_auto_successor_id[0]) {
         fo->ledger = (fo_ledger_entry_t*)calloc(FO_LEDGER_MAX, sizeof(*fo->ledger));
         if (!fo->ledger) {
             pthread_mutex_destroy(&fo->ledger_lock);
@@ -294,39 +331,334 @@ static bool fo_promote_locked(qihse_cluster_failover_t* fo,
     if (replica.role != QIHSE_CLUSTER_NODE_REPLICA && replica.role != QIHSE_CLUSTER_NODE_PRIMARY) return false;
     if (!replica.healthy) return false;
 
-    /* A successor that was ALREADY a primary is the sharded fallback (no
-     * replica held this data): that takeover is the one failback undoes. A
-     * dedicated replica promoted here carries the data and the old primary
-     * rejoins as its replica, so it is not ledgered. */
-    bool fallback_takeover = replica.role == QIHSE_CLUSTER_NODE_PRIMARY;
-
-    /* Promote the successor to primary */
-    replica.role = QIHSE_CLUSTER_NODE_PRIMARY;
-    replica.primary_index = QIHSE_CLUSTER_NODE_NONE;
-    replica.healthy = true;
-    qihse_cluster_topology_upsert_node(fo->topology, &replica, NULL);
-
-    /* Reassign all slot ranges owned by the failed primary to the promoted
-     * replica. Heap, not a QIHSE_CLUSTER_SLOT_COUNT array on the stack: that
-     * was ~96 KB of frame, the same defect the brain carried. */
+    /* CT.1/CT.2: health and replica role do not prove that the successor has
+     * a durable, replayed copy of the failed primary's writes. Check BEFORE
+     * changing either its role or any slot owner. No pinned durable cursor or
+     * data-availability proof is wired into this coordinator yet, so a
+     * data-bearing takeover must fail closed. Explicit topology assignment
+     * during initialization does not use this failover path. */
     qihse_cluster_slot_range_t* ranges = (qihse_cluster_slot_range_t*)malloc(
         QIHSE_CLUSTER_SLOT_COUNT * sizeof(qihse_cluster_slot_range_t));
     if (!ranges) return false;
     size_t range_count = qihse_cluster_topology_ranges(fo->topology, ranges, QIHSE_CLUSTER_SLOT_COUNT);
     for (size_t i = 0; i < range_count; i++) {
         if (ranges[i].owner_index == failed_primary_index) {
-            qihse_cluster_topology_assign_range(fo->topology, ranges[i].start, ranges[i].end, replica_index);
-            if (fo->bus) qihse_cluster_bus_broadcast_slot_update(fo->bus, ranges[i].start, ranges[i].end, replica_index);
-            if (fallback_takeover && fo->failback_fn && replica_index == fo->local_node_index)
-                fo_ledger_record(fo, failed_primary_index, ranges[i].start, ranges[i].end);
+            fprintf(stderr, "qihse-cluster-failover: refusing unproven takeover of slots %u-%u from node %u by node %u\n",
+                    (unsigned)ranges[i].start, (unsigned)ranges[i].end,
+                    (unsigned)failed_primary_index, (unsigned)replica_index);
+            free(ranges);
+            return false;
         }
     }
     free(ranges);
+
+    /* With no slot range to inherit, promoting the role cannot redirect data. */
+    replica.role = QIHSE_CLUSTER_NODE_PRIMARY;
+    replica.primary_index = QIHSE_CLUSTER_NODE_NONE;
+    replica.healthy = true;
+    if (!qihse_cluster_topology_upsert_node(fo->topology, &replica, NULL))
+        return false;
 
     /* Broadcast the node role update */
     if (fo->bus) qihse_cluster_bus_broadcast_node_update(fo->bus, replica_index);
 
     return true;
+}
+
+static void fo_set_err(char* err, size_t cap, const char* message) {
+    if (err && cap) snprintf(err, cap, "%s", message ? message : "CT1 promotion failed");
+}
+
+static bool fo_qkp_id(qihse_cluster_failover_t* fo, const char* topology_id,
+                      char out[QIHSE_QKP_NODE_ID_LEN + 1u]) {
+    if (!fo || !fo->topology_qkp_id || !topology_id || !out) return false;
+    memset(out, 0, QIHSE_QKP_NODE_ID_LEN + 1u);
+    if (!fo->topology_qkp_id(fo->topology_qkp_id_context, topology_id, out)) return false;
+    size_t n = strnlen(out, QIHSE_QKP_NODE_ID_LEN + 1u);
+    return n > 0 && n <= QIHSE_QKP_NODE_ID_LEN;
+}
+
+bool qihse_cluster_failover_ct_successor_slotless(
+    const qihse_cluster_topology_t* topology,
+    uint16_t failed_primary_index, uint16_t promoted_local_index,
+    uint16_t new_successor_index, char* err, size_t err_cap) {
+    if (!topology || failed_primary_index == QIHSE_CLUSTER_NODE_NONE ||
+        promoted_local_index == QIHSE_CLUSTER_NODE_NONE ||
+        new_successor_index == QIHSE_CLUSTER_NODE_NONE ||
+        new_successor_index == failed_primary_index ||
+        new_successor_index == promoted_local_index) {
+        fo_set_err(err, err_cap, "CT1 successor must be a distinct configured node");
+        return false;
+    }
+    qihse_cluster_node_t successor;
+    if (!qihse_cluster_topology_get_node(topology, new_successor_index, &successor) ||
+        !successor.healthy) {
+        fo_set_err(err, err_cap, "CT1 successor must be healthy and configured");
+        return false;
+    }
+    qihse_cluster_slot_range_t* ranges = calloc(QIHSE_CLUSTER_SLOT_COUNT,
+                                                 sizeof(*ranges));
+    if (!ranges) {
+        fo_set_err(err, err_cap, "could not inspect CT1 successor slot ownership");
+        return false;
+    }
+    size_t count = qihse_cluster_topology_ranges(topology, ranges,
+                                                  QIHSE_CLUSTER_SLOT_COUNT);
+    bool owns = false;
+    for (size_t i = 0; i < count && i < QIHSE_CLUSTER_SLOT_COUNT; ++i)
+        if (ranges[i].owner_index == new_successor_index) { owns = true; break; }
+    free(ranges);
+    if (owns) {
+        fo_set_err(err, err_cap, "CT1 successor owns slots; a full baseline could overwrite unrelated data");
+        return false;
+    }
+    fo_set_err(err, err_cap, "");
+    return true;
+}
+
+/* This explicit path is invoked only after the embedding's consensus/election
+ * gate has selected the local replica. Health-only and bus-only callers still
+ * use fo_promote_locked(), which refuses data-bearing ownership changes. */
+static bool fo_promote_ct_locked(qihse_cluster_failover_t* fo,
+                                 uint16_t failed_primary_index,
+                                 uint16_t replica_index,
+                                 uint16_t new_successor_index,
+                                 char out_new_generation[33],
+                                 char* err, size_t err_cap) {
+    if (!fo || !fo->ct_store || !fo->ct_principal || !fo->ct_election_authorized ||
+        replica_index != fo->local_node_index || !fo->ct_local_qkp_id[0]) {
+        fo_set_err(err, err_cap, "CT1 proof, authenticated store, or election context is not configured for the local candidate");
+        return false;
+    }
+    qihse_cluster_node_t failed, replica, successor;
+    if (!qihse_cluster_topology_get_node(fo->topology, failed_primary_index, &failed) ||
+        !qihse_cluster_topology_get_node(fo->topology, replica_index, &replica) ||
+        failed.role != QIHSE_CLUSTER_NODE_PRIMARY || failed.healthy || !replica.healthy ||
+        replica.role != QIHSE_CLUSTER_NODE_REPLICA || replica.primary_index != failed_primary_index) {
+        fo_set_err(err, err_cap, "candidate is not the healthy dedicated replica of the failed primary");
+        return false;
+    }
+    if (!qihse_cluster_failover_ct_successor_slotless(fo->topology,
+            failed_primary_index, replica_index, new_successor_index, err, err_cap) ||
+        !qihse_cluster_topology_get_node(fo->topology, new_successor_index, &successor))
+        return false;
+    char failed_qkp[QIHSE_QKP_NODE_ID_LEN + 1u];
+    if (!fo_qkp_id(fo, failed.id, failed_qkp)) {
+        fo_set_err(err, err_cap, "failed topology node has no configured QKP identity mapping");
+        return false;
+    }
+    char local_qkp_mapping[QIHSE_QKP_NODE_ID_LEN + 1u];
+    if (!fo_qkp_id(fo, replica.id, local_qkp_mapping) ||
+        strcmp(local_qkp_mapping, fo->ct_local_qkp_id) != 0) {
+        /* The spelling is intentionally not compared to the topology ID: this
+         * mapping callback is the trusted bridge between identity namespaces. */
+        fo_set_err(err, err_cap, "local topology-to-QKP pin mapping does not match the configured endpoint");
+        return false;
+    }
+    if (!strcmp(failed_qkp, fo->ct_local_qkp_id)) {
+        fo_set_err(err, err_cap, "source and local successor resolve to the same QKP identity");
+        return false;
+    }
+    char successor_qkp[QIHSE_QKP_NODE_ID_LEN + 1u];
+    if (!fo_qkp_id(fo, successor.id, successor_qkp) ||
+        !strcmp(successor_qkp, failed_qkp) ||
+        !strcmp(successor_qkp, fo->ct_local_qkp_id)) {
+        fo_set_err(err, err_cap, "new successor is missing a trusted distinct QKP pin mapping");
+        return false;
+    }
+    qihse_kv_ct_receiver_status_t receiver;
+    memset(&receiver, 0, sizeof(receiver));
+    if (!qihse_kv_ct_receiver_status(fo->ct_store, fo->ct_principal, &receiver) ||
+        strcmp(receiver.source_id, failed_qkp) != 0 ||
+        !receiver.generation[0]) {
+        fo_set_err(err, err_cap, "persisted receiver identity or generation does not match the configured peers");
+        return false;
+    }
+    qihse_kv_ct_proof_t* proof = qihse_kv_ct_promotion_proof_create(
+        fo->ct_store, fo->ct_principal, failed_qkp, fo->ct_local_qkp_id,
+        receiver.generation, receiver.durable_cursor);
+    if (!proof) {
+        fo_set_err(err, err_cap, "could not create persisted receiver promotion proof");
+        return false;
+    }
+    bool ok = false;
+    const char *proof_source = NULL, *proof_target = NULL, *proof_generation = NULL;
+    const char *proof_transfer = NULL;
+    uint16_t proof_first = 0, proof_last = 0;
+    uint64_t proof_source_lsn = 0, proof_target_lsn = 0;
+    uint8_t proof_checksum[32] = {0}, owner_token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
+    uint8_t random[16] = {0};
+    qihse_cluster_slot_range_t* ranges = NULL;
+    size_t range_count = 0;
+    char new_generation[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    const char* data_dir = qihse_kv_store_data_directory(fo->ct_store);
+    if (!data_dir || !qihse_kv_ct_proof_validate(fo->ct_store, fo->ct_principal, NULL, proof) ||
+        !qihse_kv_ct_proof_fields(fo->ct_store, fo->ct_principal, NULL, proof,
+            &proof_transfer, &proof_source, &proof_target,
+            &proof_generation, &proof_first, &proof_last, &proof_source_lsn,
+            &proof_target_lsn, proof_checksum) ||
+        !proof_source || !proof_target || !proof_generation ||
+        strcmp(proof_source, failed_qkp) || strcmp(proof_target, fo->ct_local_qkp_id) ||
+        strcmp(proof_generation, receiver.generation) ||
+        proof_source_lsn != receiver.durable_cursor || proof_target_lsn != proof_source_lsn ||
+        !qihse_kv_ct_owner_token_get(fo->ct_store, fo->ct_principal, owner_token)) {
+        fo_set_err(err, err_cap, "receiver proof, QKP identity, durable cursor, or owner authorization did not validate");
+        goto done;
+    }
+    if (!fo->ct_election_authorized(fo->ct_election_context, failed.id, replica.id,
+            receiver.generation, receiver.durable_cursor)) {
+        fo_set_err(err, err_cap, "cluster consensus lease/quorum did not authorize this promotion");
+        goto done;
+    }
+    ranges = calloc(QIHSE_CLUSTER_SLOT_COUNT, sizeof(*ranges));
+    if (!ranges) { fo_set_err(err, err_cap, "out of memory reading owned slot ranges"); goto done; }
+    range_count = qihse_cluster_topology_ranges(fo->topology, ranges, QIHSE_CLUSTER_SLOT_COUNT);
+    size_t owned = 0;
+    for (size_t i = 0; i < range_count; ++i) owned += ranges[i].owner_index == failed_primary_index;
+    if (!owned) { fo_set_err(err, err_cap, "failed primary owns no slot ranges"); goto done; }
+    static const char hex[] = "0123456789abcdef";
+    if (RAND_bytes(random, sizeof(random)) != 1) { fo_set_err(err, err_cap, "secure generation allocation failed"); goto done; }
+    for (size_t i = 0; i < sizeof(random); ++i) {
+        new_generation[i * 2u] = hex[random[i] >> 4];
+        new_generation[i * 2u + 1u] = hex[random[i] & 15u];
+    }
+    new_generation[32] = '\0';
+    char source_lsn_text[32];
+    snprintf(source_lsn_text, sizeof(source_lsn_text), "%llu",
+             (unsigned long long)proof_source_lsn);
+    const uint8_t* digest_data[9] = {
+        (const uint8_t*)failed.id, (const uint8_t*)replica.id,
+        (const uint8_t*)failed_qkp, (const uint8_t*)fo->ct_local_qkp_id,
+        (const uint8_t*)successor.id, (const uint8_t*)successor_qkp,
+        (const uint8_t*)receiver.generation, (const uint8_t*)new_generation,
+        (const uint8_t*)source_lsn_text
+    };
+    size_t digest_len[9] = {strlen(failed.id), strlen(replica.id), strlen(failed_qkp),
+                            strlen(fo->ct_local_qkp_id), strlen(successor.id),
+                            strlen(successor_qkp), strlen(receiver.generation),
+                            strlen(new_generation), strlen(source_lsn_text)};
+    uint8_t audit_digest[32]; unsigned int digest_n = 0;
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    bool digest_ok = md && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1;
+    for (size_t i = 0; digest_ok && i < 9; ++i)
+        digest_ok = EVP_DigestUpdate(md, digest_data[i], digest_len[i]) == 1;
+    if (digest_ok) digest_ok = EVP_DigestFinal_ex(md, audit_digest, &digest_n) == 1 && digest_n == 32;
+    EVP_MD_CTX_free(md);
+    if (!digest_ok) { fo_set_err(err, err_cap, "failed to fingerprint the validated proof for the journal"); goto done; }
+    uint64_t epoch = qihse_cluster_topology_epoch(fo->topology);
+    if (epoch == UINT64_MAX) { fo_set_err(err, err_cap, "topology config epoch exhausted"); goto done; }
+    qihse_cluster_ownership_txn_t txn;
+    memset(&txn, 0, sizeof(txn));
+    txn.phase = QIHSE_OWNERSHIP_PREPARED;
+    txn.start = QIHSE_CLUSTER_SLOT_COUNT;
+    txn.end = 0;
+    snprintf(txn.transfer_id, sizeof(txn.transfer_id), "ct1-%.24s-%llu", new_generation,
+             (unsigned long long)epoch);
+    snprintf(txn.source_id, sizeof(txn.source_id), "%s", failed.id);
+    snprintf(txn.target_id, sizeof(txn.target_id), "%s", replica.id);
+    snprintf(txn.source_qkp_id, sizeof(txn.source_qkp_id), "%s", failed_qkp);
+    snprintf(txn.target_qkp_id, sizeof(txn.target_qkp_id), "%s", fo->ct_local_qkp_id);
+    snprintf(txn.generation, sizeof(txn.generation), "%s", receiver.generation);
+    snprintf(txn.next_generation, sizeof(txn.next_generation), "%s", new_generation);
+    /* The existing owner field binds the selected successor for CT1. This
+     * preserves the fixed v2 frame while making recovery deterministic. */
+    snprintf(txn.owner_id, sizeof(txn.owner_id), "%s", successor.id);
+    txn.config_epoch = ++epoch;
+    txn.source_lsn = proof_source_lsn;
+    for (size_t i = 0; i < range_count; ++i) {
+        if (ranges[i].owner_index != failed_primary_index) continue;
+        if (ranges[i].end >= QIHSE_CLUSTER_SLOT_COUNT || ranges[i].start > ranges[i].end) {
+            fo_set_err(err, err_cap, "topology contains an invalid owned range"); goto done;
+        }
+        for (uint32_t slot = ranges[i].start; slot <= ranges[i].end; ++slot) {
+            txn.slot_bitmap[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+            if (slot < txn.start) txn.start = (uint16_t)slot;
+            if (slot > txn.end) txn.end = (uint16_t)slot;
+        }
+    }
+    if (txn.start >= QIHSE_CLUSTER_SLOT_COUNT ||
+        qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+        fo_set_err(err, err_cap, "could not persist complete CT1 ownership prepare manifest"); goto done;
+    }
+    /* A single complete manifest precedes the generation switch. This closes
+     * the crash window where only some disjoint ranges had been journaled. */
+    if (!qihse_kv_ct_receiver_promote(fo->ct_store, fo->ct_principal, proof,
+            new_generation, successor_qkp, owner_token)) {
+        fo_set_err(err, err_cap, "receiver refused durable generation promotion");
+        goto done;
+    }
+    /* Expose the durable generation even if a later journal/bus operation
+     * fails. Runtime recovery must not abandon an already switched receiver. */
+    if (out_new_generation) memcpy(out_new_generation, new_generation, 33u);
+    txn.phase = QIHSE_OWNERSHIP_COMMITTED;
+    txn.target_lsn = proof_target_lsn;
+    memcpy(txn.proof_digest, audit_digest, sizeof(txn.proof_digest));
+    if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+        fo_set_err(err, err_cap, "could not persist CT1 ownership commit record"); goto done;
+    }
+    /* All proof, receiver generation and journal commits are durable before
+     * changing the in-memory route. Existing gossip adoption remains denied. */
+    replica.role = QIHSE_CLUSTER_NODE_PRIMARY;
+    replica.primary_index = QIHSE_CLUSTER_NODE_NONE;
+    replica.healthy = true;
+    replica.config_epoch = epoch;
+    if (!qihse_cluster_topology_upsert_node(fo->topology, &replica, NULL)) {
+        fo_set_err(err, err_cap, "durable promotion is pending topology recovery"); goto done;
+    }
+    successor.role = QIHSE_CLUSTER_NODE_REPLICA;
+    successor.primary_index = replica_index;
+    successor.config_epoch = epoch;
+    if (!qihse_cluster_topology_upsert_node(fo->topology, &successor, NULL)) {
+        fo_set_err(err, err_cap, "promoted source is durable; successor role update needs recovery"); goto done;
+    }
+    for (size_t i = 0; i < range_count; ++i) {
+        if (ranges[i].owner_index != failed_primary_index) continue;
+        if (!qihse_cluster_topology_adopt_range(fo->topology, ranges[i].start,
+                ranges[i].end, replica_index, epoch) ||
+            (fo->bus && !qihse_cluster_bus_broadcast_slot_update(
+                fo->bus, ranges[i].start, ranges[i].end, replica_index))) {
+            fo_set_err(err, err_cap, "durable promotion is pending topology recovery"); goto done;
+        }
+    }
+    if (fo->bus) qihse_cluster_bus_broadcast_node_update(fo->bus, replica_index);
+    if (fo->bus) qihse_cluster_bus_broadcast_node_update(fo->bus, new_successor_index);
+    if (out_new_generation) memcpy(out_new_generation, new_generation, 33u);
+    ok = true;
+done:
+    if (ranges) free(ranges);
+    qihse_kv_ct_proof_destroy(proof);
+    OPENSSL_cleanse(owner_token, sizeof(owner_token));
+    OPENSSL_cleanse(random, sizeof(random));
+    if (ok) fo_set_err(err, err_cap, "");
+    return ok;
+}
+
+bool qihse_cluster_failover_promote_ct(qihse_cluster_failover_t* fo,
+                                       uint16_t failed_primary_index,
+                                       uint16_t replica_index,
+                                       uint16_t new_successor_index,
+                                       char out_new_generation[33],
+                                       char* err, size_t err_cap) {
+    if (out_new_generation) out_new_generation[0] = '\0';
+    if (!fo || !out_new_generation) {
+        fo_set_err(err, err_cap, "failover coordinator and generation output are required");
+        return false;
+    }
+    if (fo->maintenance_gate && !qihse_cluster_maintenance_enter(
+            fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER)) {
+        fo_set_err(err, err_cap, "cluster maintenance gate refused failover"); return false;
+    }
+    pthread_mutex_lock(&fo->lock);
+    fo->activity_started = true;
+    bool ok = !fo->startup_paused && fo_promote_ct_locked(
+        fo, failed_primary_index, replica_index, new_successor_index,
+        out_new_generation, err, err_cap);
+    if (ok) fo->failover_events++;
+    if (!ok && fo->startup_paused) fo_set_err(err, err_cap, "failover is paused during startup");
+    pthread_mutex_unlock(&fo->lock);
+    if (fo->maintenance_gate)
+        qihse_cluster_maintenance_leave(fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER);
+    return ok;
 }
 
 static bool qihse_cluster_failover_promote_inner(qihse_cluster_failover_t* fo,
@@ -385,8 +717,16 @@ static uint16_t qihse_cluster_failover_handle_inner(qihse_cluster_failover_t* fo
 
     /* In single-coordinator mode, only the local node performs failover */
     if (fo->single_coordinator && failed_node_index != fo->local_node_index) {
-        /* Check if the local node is the coordinator (lowest-index healthy primary) */
-        uint16_t coordinator = fo_find_coordinator(fo->topology);
+        /* The ordinary coordinator path is a healthy primary. A configured CT1
+         * successor is a replica instead; let it reach the proof path only
+         * when it is the unique configured successor. The consensus callback
+         * in fo_promote_ct_locked still has to approve the live lease/quorum. */
+        bool local_ct_successor = fo->ct_store && fo->ct_principal &&
+            fo->ct_election_authorized &&
+            qihse_cluster_failover_best_replica(fo->topology, failed_node_index) ==
+                fo->local_node_index;
+        uint16_t coordinator = local_ct_successor ? fo->local_node_index :
+            fo_find_coordinator(fo->topology);
         if (coordinator != fo->local_node_index) {
             pthread_mutex_unlock(&fo->lock);
             return QIHSE_CLUSTER_NODE_NONE;
@@ -420,7 +760,24 @@ static uint16_t qihse_cluster_failover_handle_inner(qihse_cluster_failover_t* fo
     }
 
     fo->last_attempt_ms = fo_now_ms();
-    bool promoted = fo_promote_locked(fo, failed_node_index, replica);
+    bool promoted = false;
+    if (fo->ct_auto_successor_id[0]) {
+        uint16_t successor = QIHSE_CLUSTER_NODE_NONE;
+        char generation[33] = {0}, error[256] = {0};
+        /* Only the local dedicated receiver may consume the persisted proof.
+         * Election authorization below requires a committed quorum decision. */
+        if (replica == fo->local_node_index &&
+            qihse_cluster_topology_find_node(fo->topology,
+                fo->ct_auto_successor_id, &successor) &&
+            (promoted = fo_promote_ct_locked(fo, failed_node_index, replica, successor,
+                generation, error, sizeof(error)), generation[0])) {
+            memcpy(fo->ct_pending_generation, generation, sizeof(generation));
+            fo->ct_pending_successor = successor;
+        }
+        if (error[0]) fprintf(stderr, "qihse-cluster-failover: automatic CT1 deferred: %s\n", error);
+    } else {
+        promoted = fo_promote_locked(fo, failed_node_index, replica);
+    }
     if (promoted) {
         fo->failover_events++;
         fprintf(stderr, "qihse-cluster-failover: node %u failed; node %u takes its slots%s\n",
@@ -448,6 +805,7 @@ void qihse_cluster_failover_on_fail_cb(qihse_cluster_topology_t* topology,
     (void)topology;
     qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)user_data;
     if (!fo) return;
+    if (fo->ct_auto_successor_id[0]) return; /* worker reads current topology */
     qihse_cluster_failover_handle(fo, failed_node_index);
 }
 
@@ -560,7 +918,37 @@ static void fo_failback_pass(qihse_cluster_failover_t* fo) {
 static void* fo_failback_main(void* arg) {
     qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)arg;
     while (!__atomic_load_n(&fo->stop, __ATOMIC_ACQUIRE)) {
-        fo_failback_pass(fo);
+        if (fo->ct_auto_successor_id[0]) {
+            char generation[33]; uint16_t successor;
+            pthread_mutex_lock(&fo->lock);
+            memcpy(generation, fo->ct_pending_generation, sizeof(generation));
+            successor = fo->ct_pending_successor;
+            bool paused = fo->startup_paused;
+            pthread_mutex_unlock(&fo->lock);
+            if (!paused && generation[0]) {
+                bool admitted = !fo->maintenance_gate || qihse_cluster_maintenance_enter(
+                    fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER);
+                if (admitted) {
+                    bool complete = fo->ct_complete(fo->ct_complete_context,
+                        successor, generation);
+                    if (complete) {
+                        pthread_mutex_lock(&fo->lock);
+                        if (!strcmp(generation, fo->ct_pending_generation))
+                            fo->ct_pending_generation[0] = '\0';
+                        pthread_mutex_unlock(&fo->lock);
+                    }
+                    if (fo->maintenance_gate) qihse_cluster_maintenance_leave(
+                        fo->maintenance_gate, QIHSE_MAINT_WRITER_FAILOVER);
+                }
+            } else if (!paused) {
+                qihse_cluster_node_t local;
+                if (qihse_cluster_topology_get_node(fo->topology, fo->local_node_index,
+                        &local) && local.role == QIHSE_CLUSTER_NODE_REPLICA &&
+                    local.primary_index != QIHSE_CLUSTER_NODE_NONE)
+                    qihse_cluster_failover_handle(fo, local.primary_index);
+            }
+        }
+        if (fo->failback_fn) fo_failback_pass(fo);
         /* Sleep in short slices so destroy() never waits a full poll interval. */
         for (uint32_t slept = 0; slept < fo->poll_ms &&
                                  !__atomic_load_n(&fo->stop, __ATOMIC_ACQUIRE); slept += 20u) {

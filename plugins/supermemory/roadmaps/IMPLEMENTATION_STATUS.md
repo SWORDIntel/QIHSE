@@ -1,5 +1,7 @@
 # Supermemory QIHSE-backend implementation status
 
+> **Roadmap authority:** [ROADMAP.md](../../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > Vendored bridge update: pinned QKP is the default in this directory. The
 > standalone service is QKP-only and the default recall mode is BM25; explicit
 > semantic/hybrid projection is not enabled on the live service. The historical
@@ -8,8 +10,8 @@
 
 > Date: 2026-10-21. Tracks the bridge implementation on `main` of
 > SWORDIntel/supermemory (single branch — the former `qihse-backend` and
-> `roadmap/*` branches were consolidated and deleted). Canonical work
-> proposals: [Supermemory roadmap](SUPERMEMORY_AI_MEMORY_ROADMAP.md).
+> `roadmap/*` branches were consolidated and deleted). Supporting design
+> proposals: [Supermemory specification](SUPERMEMORY_AI_MEMORY_ROADMAP.md); current delivery status is in the root roadmap.
 > The QIHSE engine prerequisites (QH-00 … QH-08) are implemented **and
 > deployed** engine-side (SWORDIntel/QIHSE; deployed aimem release
 > `~/.local/lib/qihse-aimem/20261020-41a3bc7`). Remaining work items are

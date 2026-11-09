@@ -31,6 +31,19 @@ int main(void) {
     qihse_user_t* operator_user = qihse_auth_get_user(0);
     assert(operator_user != NULL);
 
+    /* The unconfigured system Operator is the default full-authority
+     * principal. Extra users and an explicit password are optional setup. */
+    assert(qihse_user_get_role(operator_user) == QIHSE_ROLE_OPERATOR);
+    assert(qihse_user_get_classification(operator_user) == UINT16_MAX);
+    assert(qihse_user_get_sci(operator_user) == UINT16_MAX);
+    assert(qihse_user_get_tenant_id(operator_user) == QIHSE_TENANT_SYSTEM);
+    assert(qihse_user_can_create_users(operator_user));
+    assert(qihse_auth_can_access(operator_user, UINT16_MAX, UINT16_MAX));
+    assert(qihse_auth_can_access_object(operator_user, UINT32_MAX, UINT64_MAX,
+                                        QIHSE_ACL_READ | QIHSE_ACL_WRITE |
+                                            QIHSE_ACL_ADMIN));
+    assert(qihse_auth_is_operator_password_default());
+
     /* Bootstrap operator password */
     assert(qihse_auth_bootstrap_operator("SecureOpPass1!"));
 

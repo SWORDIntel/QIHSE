@@ -18,7 +18,12 @@ lib/
 /fuzzer
 /tests/qihse_*_test
 /tests/test_*
+!/tests/test_codegraph_*.c
+!/tests/test_codegraph_*.py
 !/tests/*.c
+!/tests/test_codegraph_auto.py
+!/tests/test_codegraph_projection.py
+!/tests/test_codegraph_ids128.py
 !/tests/test_admin_cli.py
 !/tests/test_aimem_projection_qkp.py
 !/tests/test_pgwire_app_compat.py
@@ -181,3 +186,7 @@ tools/test_i2p_qkp_diag
 
 # local operator credentials — never commit
 .qihse.env
+
+!/tests/test_codegraph_snapshot_xxh3.py
+
+!/tests/test_codegraph_retention_bound.py

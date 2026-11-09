@@ -27,7 +27,23 @@ typedef struct {
     size_t deleted;
 } reclaim_ctx_t;
 
-static bool reclaim_key_is_node_local(const char* key) {
+bool qihse_cluster_key_is_node_local(const char* key) {
+    if (!key) return false;
+    const char* scoped = key;
+    if (key[0] == 't' && key[1] == ':') {
+        scoped = key + 2;
+        if (*scoped < '0' || *scoped > '9') return false;
+        while (*scoped >= '0' && *scoped <= '9') scoped++;
+        if (*scoped++ != '/') return false;
+        static const char* const families[] = {
+            "aimem:", "aimemv:", "aimem-knowledge:", "aimem-grant:",
+            "aimem-forget:", "aimem-index-state:", "aimem-handoff:",
+            "aimem-maint:", "aimem-index-gen:",
+        };
+        for (size_t i = 0; i < sizeof(families)/sizeof(families[0]); i++)
+            if (!strncmp(scoped, families[i], strlen(families[i]))) return true;
+        return false;
+    }
     static const char* const prefixes[] = {
         "aimem:",
         "aimemv:",
@@ -46,7 +62,7 @@ static bool reclaim_key_is_node_local(const char* key) {
 
 static bool reclaim_iter(const char* key, void* user_data) {
     reclaim_ctx_t* c = (reclaim_ctx_t*)user_data;
-    if (reclaim_key_is_node_local(key)) return true;
+    if (qihse_cluster_key_is_node_local(key)) return true;
     uint16_t slot = qihse_cluster_key_slot(key, strlen(key));
     uint16_t owner = slot < c->owners_count ? c->owners[slot] : QIHSE_CLUSTER_NODE_NONE;
     if (owner == QIHSE_CLUSTER_NODE_NONE || owner == c->local_index) return true;

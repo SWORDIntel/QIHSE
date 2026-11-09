@@ -20,8 +20,7 @@
  *       follows the command, `qihse_backend_available` follows the engines
  *       actually attached to the server (0 -> 1 when a tsdb is attached).
  *   6.  Cluster/replication status: topology gauges sampled at scrape, and
- *       `qihse_replication_attempts_total` / `_failures_total` moving when a
- *       write to a redundancy peer fails.
+ *       the unsafe legacy redundancy peer rejected before a write attempt.
  *   7.  XDP counters: `qihse_xdp_ingest_denied_total` moves on a refusal and
  *       `qihse_xdp_artifacts_ingested_total` moves on an accepted frame.
  *
@@ -385,24 +384,8 @@ static void test_cluster_and_replication(void) {
     assert(sum == 1.0);
     free(text);
 
-    /* Replication status moves when a duplicate write cannot reach the peer.
-     * The peer is a port bound and immediately released, so the connect is
-     * refused rather than hanging. */
-    int probe = socket(AF_INET, SOCK_STREAM, 0);
-    assert(probe >= 0);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    assert(bind(probe, (struct sockaddr*)&addr, sizeof(addr)) == 0);
-    socklen_t addr_len = sizeof(addr);
-    assert(getsockname(probe, (struct sockaddr*)&addr, &addr_len) == 0);
-    uint16_t dead_port = ntohs(addr.sin_port);
-    close(probe);
-
-    char peer[64];
-    snprintf(peer, sizeof(peer), "127.0.0.1:%u", (unsigned)dead_port);
+    /* The old cleartext redundancy path must be rejected at the API boundary;
+     * its counters cannot represent successful protected replication. */
     qihse_resp_server_config_t config;
     qihse_resp_server_config_init(&config);
     config.store = qihse_resp_server_store(g_server);
@@ -413,23 +396,10 @@ static void test_cluster_and_replication(void) {
     config.enable_task_workers = false;
     config.enable_task_scheduler = false;
     config.enable_uwp_bridge = true;
-    config.redundancy_peer = peer;
+    config.redundancy_peer = "127.0.0.1:1";
     qihse_resp_server_t* peer_server = qihse_resp_server_create(&config);
-    assert(peer_server != NULL);
-
-    qihse_resp_server_t* previous = g_server;
-    g_server = peer_server;
-    const char* set[] = { "SET", "w52:replicated", "value" };
-    char* reply = exec_command(3, set);
-    assert(strcmp(reply, "+OK\r\n") == 0); /* local commit stands regardless */
-    free(reply);
-    char* peer_metrics = render_metrics();
-    assert(require_metric(peer_metrics, "qihse_replication_attempts_total") == 1.0);
-    assert(require_metric(peer_metrics, "qihse_replication_failures_total") == 1.0);
-    free(peer_metrics);
-    g_server = previous;
-    qihse_resp_server_destroy(peer_server);
-    printf("PASS cluster/replication: topology gauges sampled, replication counters move\n");
+    assert(peer_server == NULL);
+    printf("PASS cluster/replication: topology gauges sampled, unsafe redundancy rejected\n");
 }
 
 /* ── 7. XDP counters ────────────────────────────────────────────────────── */

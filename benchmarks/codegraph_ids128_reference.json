@@ -1,0 +1,88 @@
+{
+  "method": "one shared-host run per width, same graph facts, inverse-ID semantic check, exact authenticated export roundtrip and low-clearance denial; synthetic SHA256 prefixes, not a rebuild performance benchmark",
+  "dictionary_sha256": "403fc6f67f80c7d843cee9edbd776fd2447a8ca176a5e8d1fcd2560176d451bc",
+  "fixtures": [
+    {
+      "nodes": 800,
+      "edges": 2400,
+      "runs": {
+        "256": {
+          "backend": "dictionary",
+          "selected_format": "dictionary",
+          "record_count": 3202,
+          "fingerprint": "3f4428751048dc206b3f5e0e9a1328e5cae73a04b0361f79ad536c6258b8e0c9",
+          "raw_export_ms": 20.577,
+          "encode_ms": 117.011,
+          "encode_cpu_ms": 117.011,
+          "load_ms": 114.679,
+          "load_cpu_ms": 114.592,
+          "snapshot_apparent_bytes": 168845,
+          "snapshot_allocated_bytes": 172032,
+          "peak_rss_kib": 39464,
+          "low_clearance_denied": true,
+          "raw_roundtrip": true,
+          "input_sha256": "54e52bbb893bc02a62107422cd91285425b39b03eb5d7a9ef33e34217f2f5e0d"
+        },
+        "128": {
+          "backend": "dictionary",
+          "selected_format": "dictionary",
+          "record_count": 3202,
+          "fingerprint": "3984fb80459912431263b1978e608144a2b1df7ad2c5f7ad891ccc3bacaafd1c",
+          "raw_export_ms": 39.903,
+          "encode_ms": 235.798,
+          "encode_cpu_ms": 180.436,
+          "load_ms": 182.479,
+          "load_cpu_ms": 130.349,
+          "snapshot_apparent_bytes": 118722,
+          "snapshot_allocated_bytes": 118784,
+          "peak_rss_kib": 37136,
+          "low_clearance_denied": true,
+          "raw_roundtrip": true,
+          "input_sha256": "4bb5ec78cd4841d802053804de2188cb3bd39909ac655ed19dda84a8ea1b8888"
+        }
+      },
+      "smaller_percent": 29.6858065089283
+    },
+    {
+      "nodes": 8000,
+      "edges": 24000,
+      "runs": {
+        "256": {
+          "backend": "dictionary",
+          "selected_format": "dictionary",
+          "record_count": 32002,
+          "fingerprint": "6dd113a96e5dba23f8cc8ea988caff0021aeb8013af5a2edf5d7ebf404353252",
+          "raw_export_ms": 222.801,
+          "encode_ms": 1166.488,
+          "encode_cpu_ms": 1166.24,
+          "load_ms": 1165.589,
+          "load_cpu_ms": 1163.698,
+          "snapshot_apparent_bytes": 1686194,
+          "snapshot_allocated_bytes": 1687552,
+          "peak_rss_kib": 144764,
+          "low_clearance_denied": true,
+          "raw_roundtrip": true,
+          "input_sha256": "88923f15e7eb9a5d4a9e7c5cde931c06138165f1b16ad64e95a44aaff8f07102"
+        },
+        "128": {
+          "backend": "dictionary",
+          "selected_format": "dictionary",
+          "record_count": 32002,
+          "fingerprint": "8ee31a434fbd634d248b5f989ff1dd7f3d0d2b5bc4aafb038c2522495a8b31cc",
+          "raw_export_ms": 222.589,
+          "encode_ms": 1063.495,
+          "encode_cpu_ms": 1063.389,
+          "load_ms": 871.841,
+          "load_cpu_ms": 870.343,
+          "snapshot_apparent_bytes": 1163785,
+          "snapshot_allocated_bytes": 1167360,
+          "peak_rss_kib": 144764,
+          "low_clearance_denied": true,
+          "raw_roundtrip": true,
+          "input_sha256": "311e3fbdfc9387163dd2643549bf07b21292e8b9223e22b0de7dd04d42b1720e"
+        }
+      },
+      "smaller_percent": 30.981547793433016
+    }
+  ]
+}

@@ -10,6 +10,8 @@
  * immediately after the ACK path returns, before any destructor or flush.
  * Verifier children reopen the snapshot independently. */
 #include "qihse_table_store.h"
+#include "qihse_auth.h"
+#include "qihse_audit.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -24,6 +26,7 @@
 
 static char crash_dir[64];
 static char crash_path[80];
+static qihse_user_t* retry_user;
 
 static const qihse_col_def_t* item_defs(void) {
     static qihse_col_def_t defs[3];
@@ -74,8 +77,8 @@ static void seed_store(void) {
 }
 
 static qihse_ts_retry_identity_t retry_id(const char* key) {
-    qihse_ts_retry_identity_t id = {.key = key, .principal = "crash-user",
-                                    .tenant = "crash-tenant"};
+    qihse_ts_retry_identity_t id = {.key = key, .principal = "user:0",
+                                    .tenant = "tenant:0"};
     for (size_t i = 0; i < QIHSE_TS_RETRY_DIGEST_SIZE; ++i) id.digest[i] = 7;
     return id;
 }
@@ -102,7 +105,7 @@ static void ack_then_kill(void) {
     qihse_ts_retry_identity_t id = retry_id("crash-ack-1");
     qihse_ts_retry_outcome_t outcome = {.affected_rows = 1,
                                         .command_count = 1};
-    if (qihse_table_txn_commit_group_retry(group, 1, &id, &outcome) !=
+    if (qihse_table_txn_commit_group_retry(group, 1, retry_user, &id, &outcome) !=
         QIHSE_TS_RETRY_COMMITTED)
         _exit(63); /* the ACK itself failed: not a crash subject */
     kill(getpid(), SIGKILL); /* durable fence already crossed at ACK */
@@ -139,7 +142,7 @@ static void multi_table_ack_then_kill(void) {
     qihse_ts_retry_identity_t id = retry_id("crash-ack-multi");
     qihse_ts_retry_outcome_t outcome = {.affected_rows = 2,
                                         .command_count = 2};
-    if (qihse_table_txn_commit_group_retry(group, 2, &id, &outcome) !=
+    if (qihse_table_txn_commit_group_retry(group, 2, retry_user, &id, &outcome) !=
         QIHSE_TS_RETRY_COMMITTED)
         _exit(63);
     kill(getpid(), SIGKILL);
@@ -159,7 +162,7 @@ static void verify_and_retry_idempotent(void) {
     assert_row(t, 1, "acked");
     qihse_ts_retry_identity_t id = retry_id("crash-ack-1");
     qihse_ts_retry_outcome_t looked = {0};
-    if (qihse_table_store_retry_lookup(s, &id, &looked) !=
+    if (qihse_table_store_retry_lookup(s, retry_user, &id, &looked) !=
         QIHSE_TS_RETRY_COMMITTED)
         _exit(72);
     if (looked.affected_rows != 1 || looked.command_count != 1) _exit(73);
@@ -167,15 +170,24 @@ static void verify_and_retry_idempotent(void) {
     /* Case 2 state: the unacknowledged shadow left nothing behind. */
     if (qihse_table_row_count(t) != 2) _exit(74); /* acked row + group row */
     qihse_ts_retry_identity_t ghost = retry_id("crash-ghost");
-    if (qihse_table_store_retry_lookup(s, &ghost, &looked) !=
+    looked = (qihse_ts_retry_outcome_t){.affected_rows = 99, .command_count = 99};
+    if (qihse_table_store_retry_lookup(s, retry_user, &ghost, &looked) !=
         QIHSE_TS_RETRY_ABSENT)
         _exit(75);
+    if (looked.affected_rows || looked.command_count) _exit(81);
+
+    qihse_ts_retry_identity_t foreign = retry_id("crash-ack-1");
+    foreign.principal = "user:12345";
+    looked = (qihse_ts_retry_outcome_t){.affected_rows = 99, .command_count = 99};
+    if (qihse_table_store_retry_lookup(s, retry_user, &foreign, &looked) !=
+        QIHSE_TS_RETRY_ERROR || looked.affected_rows || looked.command_count)
+        _exit(82);
 
     /* Case 3 state: both tables of the group survived together. */
     assert_row(t, 3, "paired");
     assert_row(u, 9, "paired-audit");
     qihse_ts_retry_identity_t multi = retry_id("crash-ack-multi");
-    if (qihse_table_store_retry_lookup(s, &multi, &looked) !=
+    if (qihse_table_store_retry_lookup(s, retry_user, &multi, &looked) !=
         QIHSE_TS_RETRY_COMMITTED)
         _exit(76);
     if (looked.affected_rows != 2 || looked.command_count != 2) _exit(77);
@@ -188,10 +200,51 @@ static void verify_and_retry_idempotent(void) {
     qihse_table_txn_t* group[] = {tx};
     qihse_ts_retry_outcome_t retry_outcome = {.affected_rows = 1,
                                               .command_count = 1};
-    if (qihse_table_txn_commit_group_retry(group, 1, &id, &retry_outcome) !=
+    if (qihse_table_txn_commit_group_retry(group, 1, retry_user, &id, &retry_outcome) !=
         QIHSE_TS_RETRY_COMMITTED)
         _exit(79);
     if (qihse_table_row_count(t) != 2) _exit(80); /* not reapplied */
+
+    qihse_ts_retry_identity_t wrong = retry_id("crash-ack-1");
+    wrong.digest[0]++;
+    tx = qihse_table_txn_begin(t);
+    if (!tx) _exit(83);
+    insert_row(tx, 4, "wrong-digest");
+    group[0] = tx;
+    retry_outcome = (qihse_ts_retry_outcome_t){.affected_rows = 99,
+                                               .command_count = 99};
+    if (qihse_table_txn_commit_group_retry(group, 1, retry_user, &wrong, &retry_outcome) !=
+        QIHSE_TS_RETRY_MISMATCH || retry_outcome.affected_rows ||
+        retry_outcome.command_count || qihse_table_row_count(t) != 2)
+        _exit(84);
+
+    qihse_ts_retry_identity_t invalid = retry_id("");
+    looked = (qihse_ts_retry_outcome_t){.affected_rows = 99, .command_count = 99};
+    if (qihse_table_store_retry_lookup(s, retry_user, &invalid, &looked) !=
+        QIHSE_TS_RETRY_ERROR || looked.affected_rows || looked.command_count)
+        _exit(85);
+    tx = qihse_table_txn_begin(t);
+    if (!tx) _exit(86);
+    insert_row(tx, 5, "invalid-key");
+    group[0] = tx;
+    retry_outcome = (qihse_ts_retry_outcome_t){.affected_rows = 99,
+                                               .command_count = 99};
+    if (qihse_table_txn_commit_group_retry(group, 1, retry_user, &invalid, &retry_outcome) !=
+        QIHSE_TS_RETRY_ERROR || retry_outcome.affected_rows ||
+        retry_outcome.command_count || qihse_table_row_count(t) != 2)
+        _exit(87);
+
+    tx = qihse_table_txn_begin(t);
+    if (!tx || !qihse_table_txn_commit(qihse_table_txn_begin(t))) _exit(88);
+    insert_row(tx, 6, "stale-generation");
+    group[0] = tx;
+    qihse_ts_retry_identity_t stale = retry_id("crash-stale");
+    retry_outcome = (qihse_ts_retry_outcome_t){.affected_rows = 99,
+                                               .command_count = 99};
+    if (qihse_table_txn_commit_group_retry(group, 1, retry_user, &stale, &retry_outcome) !=
+        QIHSE_TS_RETRY_ABSENT || retry_outcome.affected_rows ||
+        retry_outcome.command_count || qihse_table_row_count(t) != 2)
+        _exit(89);
     qihse_table_store_destroy(s);
     _exit(0);
 }
@@ -220,6 +273,11 @@ int main(void) {
     assert(snprintf(crash_path, sizeof crash_path, "%s/store", crash_dir) <
            (int)sizeof crash_path);
 
+    assert(setenv("QIHSE_DATA_DIR", crash_dir, 1) == 0);
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("TableStoreCrashOperator1!"));
+    retry_user = qihse_auth_get_user(0);
+    assert(retry_user);
     seed_store();
 
     pid_t pid = fork();
@@ -247,6 +305,15 @@ int main(void) {
     assert(snprintf(lock_path, sizeof lock_path, "%s.lock", crash_path) <
            (int)sizeof lock_path);
     assert(unlink(lock_path) == 0);
+    qihse_audit_shutdown();
+    const char* auth_files[] = {"qihse_audit.log", "qihse_audit.writer.lock",
+                                "qihse_integrity.chain"};
+    for (size_t i = 0; i < sizeof auth_files / sizeof *auth_files; ++i) {
+        char file[sizeof crash_dir + 40];
+        assert(snprintf(file, sizeof file, "%s/%s", crash_dir, auth_files[i]) < (int)sizeof file);
+        int rc = unlink(file);
+        assert(rc == 0 || errno == ENOENT);
+    }
     assert(rmdir(crash_dir) == 0);
     puts("PASS durable table store ACK/SIGKILL: rows, receipts and group "
          "atomicity survive kill; unacknowledged shadows leave no state");

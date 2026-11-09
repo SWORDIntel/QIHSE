@@ -1407,7 +1407,7 @@ static int pg_retry_query_status(int fd, const char* query, qihse_user_t* user,
     identity.tenant = tenant;
     qihse_ts_retry_outcome_t outcome = {0};
     qihse_ts_retry_status_t status = qihse_table_store_retry_lookup(
-        qihse_uwp_sql_table_store(), &identity, &outcome);
+        qihse_uwp_sql_table_store(), user, &identity, &outcome);
     if (status == QIHSE_TS_RETRY_ERROR)
         return pg_send_error_ready(fd, session, "40003", "retry outcome requires recovery", false);
     if (status == QIHSE_TS_RETRY_MISMATCH)

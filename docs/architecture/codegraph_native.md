@@ -6,10 +6,12 @@ See [measured performance and limitations](codegraph_search_performance.md) for 
 This is an **optional, offline** native C extension to QIHSE. It receives
 canonical structural relations from code-review-graph's multi-language
 Tree-sitter index, stores complete immutable generations in QIHSE KV snapshots,
-and reconstructs an indexed QIHSE property graph for bounded impact analysis.
+and reconstructs an authenticated immutable CSR query view for bounded impact
+analysis. The private view interns strings and uses contiguous incoming/outgoing
+edge indexes; it does not duplicate general property-graph indexes.
 
-The primary graph subsystem's vertex/edge store remains in-memory.
-CodeGraph supplies the previously missing persistence layer using QIHSE KV.
+The general graph subsystem is separate. CodeGraph persists the complete original
+records using QIHSE KV, including unknown metadata and unresolved relationships.
 No CRG SQLite database or raw source-file bodies are copied into QIHSE.
 
 ## Native build
@@ -60,7 +62,7 @@ The CRG exporter produces format qihse-codegraph-v1:
 
 * Header: format/version, repository, HEAD revision, legacy worktree digest, and the explicit
   `git-status-diff-index-untracked-v2` freshness policy with its `worktree_v2` digest.
-* Nodes: stable SHA-256 IDs, repository-relative path, symbol/kind/line span.
+* Nodes: stable 128-bit public IDs under an explicit identity profile, repository-relative path, symbol/kind/line span.
 * Edges: exact original source/target IDs, relation and source evidence,
   confidence/tier/resolution, and explicit traversable boolean.
 * Trailer: record counts and SHA-256 of every preceding JSONL line.
@@ -72,7 +74,7 @@ An importer never promotes such records to authoritative graph edges.
 This does NOT establish dynamic call coverage or absence of vulnerabilities.
 
 Importer validations: bounded JSONL records, SHA-256, count reconciliation,
-repo-relative paths, UUID-style 64-hex identities, no duplicate keys, no
+repo-relative paths, declared 32-hex public identities (64-hex for older fixtures), no duplicate keys, no
 dangling trusted endpoints, and QIHSE graph construction before publish.
 
 Native persistence stores QIHSE KV records under n:<nodeid> and e:<edgeid>,
@@ -160,15 +162,21 @@ qihse-codegraph context --repo . --symbol GraphStore --match exact \
 
 The reader is optional; no service is automatically installed. It uses four fixed workers by
 default (`serve --workers 1..4`) and a bounded pending queue of 16. Independent freshness checks
-can overlap, but native graph API calls remain serialized because iterator thread safety is not
-promised. Requests pin the immutable generation with a read lease; replacement takes an exclusive
+can overlap. Projection reads use immutable arrays and inherit the authenticated
+principal; capability and generation synchronization remains in place. Requests
+pin the immutable generation with a read lease; replacement takes an exclusive
 lease and retires old memory only after readers finish. It retains one loaded generation and
 refreshes it at request boundaries. Missing or invalid replacement manifests drop
 access to the cached graph for that request and return an error, rather than serving an older
-generation. A failed replacement does not destroy the previously validated in-memory generation;
-restoring its manifest makes it usable again. Every data request checks Git freshness before
+generation. Replacement clears the old resident view before validating the new
+one; restoring a valid manifest permits it to be loaded again. Every data request checks Git freshness before
 querying and rechecks the manifest, freshness and principal before releasing the response. This
 detects changes across those checks; it does not lock Git or the publisher against subsequent changes.
+
+Each graph walk inspects at most 65,536 edges, including filtered edges. Exhaustion
+sets `truncated` and suppresses unverified test-gap hints. A batch contains at most
+32 walks and is therefore bounded to 2,097,152 inspected edges. The established
+2,048 matched-neighbor limit and response node/token limits still apply.
 
 If a socket was requested, the default is `--fallback error`. Explicit `--fallback oneshot`
 permits local reconstruction only for a missing/refused reader, not authentication, permission,
@@ -296,8 +304,13 @@ Do not label uncertain relationships as verified.
 
 ## Compact storage and lifecycle maintenance
 
-New imports write `qihse-codegraph-zstd-v1` storage containers (Zstandard level 9; the
-optional CLI now requires libzstd development headers). The logical CRG format
+New imports default to `--storage-format auto`: one authenticated KV export is
+encoded as `qihse-codegraph-zstd-v1`, `qihse-codegraph-packed-v2`, and
+`qihse-codegraph-packed-v3`, and the
+smaller complete file is selected (Zstandard wins ties). Packed encoding is skipped
+above its 64 MiB decoded limit; streaming Zstandard remains available for larger
+graphs. All codecs use Zstandard level 9; the optional CLI requires libzstd
+development headers. The logical CRG format
 remains `qihse-codegraph-v1`. Legacy KV snapshots remain readable. Reimporting
 identical validated records reuses the current snapshot instead of appending a
 new generation; a damaged current file is not reused.
@@ -336,16 +349,23 @@ are not all rewritten. A failure before manifest publication leaves the old
 snapshot current. If directory fsync fails after rename, inspect the manifest
 before retrying; the potentially published file is retained.
 
-An opt-in packed-v2 pilot uses `--storage-format packed-v2` on `import` or
-`migrate`. The reindex wrapper accepts the same option. Its versioned frame
+Explicit `--storage-format packed-v3`, `--storage-format packed-v2` or `--storage-format zstd-v1` on `import` or
+`migrate` forces a format. The reindex wrapper accepts these options and `auto`.
+When authenticated current-generation byte accounting is available, automatic
+migration keeps it if the candidate would be equal or larger, including changes
+caused by reserialization order. Large legacy snapshots using the old path-based
+loader lack that accounting and retain the existing verified conversion path.
+Automatic selection spends additional encoding CPU and temporary space on three
+candidates; use explicit Zstandard when those costs matter more than stored size.
+The packed versioned frame
 reconstructs the authorized live KV export exactly, including classification,
 SCI, expiry, flags, sequence numbers and opaque JSON values. Before decoding,
-the loader checks the manifest SHA-256 against the same open descriptor and
+the loader checks the manifest-declared snapshot checksum against the same open descriptor and
 checks the reader's clearance against every record label; the decoded stream
 then passes through QIHSE's authenticated KV loader. Migration compares full
 record metadata without depending on export order. The packed codec currently
-accepts at most 64 MiB of decoded KV data; larger graphs keep the default
-Zstandard path. Packed-v2 is not the default because its measured size depends
+accepts at most 64 MiB of decoded KV data; larger graphs use the streaming
+Zstandard path. Packed-v2 is selected only when smaller because its measured size depends
 on graph shape and can exceed Zstandard on small graphs.
 In the three-pair authenticated 800-node/2,400-edge synthetic comparison,
 packed-v2 used 182,355 apparent bytes versus 187,857 for the current level-9
@@ -360,17 +380,25 @@ On the selected fresh Angryier graph, packed-v2 was 7,798,284 bytes against
 the existing 7,534,503-byte Zstandard snapshot (3.50% larger). Four
 authenticated query responses matched apart from generation IDs. The graph
 was migrated back to Zstandard; the newly serialized snapshot was 8,043,696
-bytes. Conversion keeps previous generations until garbage collection.
+bytes.
 
-To reclaim historical generations after reviewing retention needs:
+Each successful import or migration prunes older managed snapshots and abandoned
+leased runtime directories under the exclusive storage lock, after durable
+manifest publication. The current and `previous_snapshot` generations remain
+for rollback. A failed publication does not prune anything; an interrupted
+cleanup can leave older files, and a successful publication then reports
+`retention_warning`. Repeating the command or running GC can finish cleanup.
+Active runtimes, unleased legacy directories, and unknown files remain untouched.
+
+To collect orphan generations and inactive leased runtime directories:
 
 ```sh
 qihse-codegraph gc --repo .
 ```
 
-This explicitly deletes historical managed snapshots except the current and
+GC deletes historical managed snapshots except the current and
 `previous_snapshot` generations. It is not an archive-preserving operation.
-Imports do not automatically prune history. GC first authenticates and validates
+GC first authenticates and validates
 the current graph. New readers, publishers, converters and GC coordinate through
 a permanent `.storage.lock`; runtime scratch directories hold a `.lease` lock.
 GC skips active scratch and old scratch without a lease. Before migration or the first GC,
@@ -471,7 +499,13 @@ progress bar, run from the QIHSE checkout:
 
 The bar reports three completed stages: rebuild, export, and authenticated
 compact import. On a terminal, an elapsed-time activity indicator runs while each
-stage is working; the bar does not estimate progress within a stage. The wrapper
+stage is working. After a successful run for the same repository, it also shows
+an approximate ETA based on up to three completed stage timings, scaled by the
+authenticated current-generation size (capped to avoid extreme extrapolation).
+The first run shows "ETA calibrating"; a failed or interrupted run is never used.
+The ETA does not measure progress within a stage and can change when the source
+or workload changes. Timing history is kept separately under the XDG state directory.
+The wrapper
 uses the exporter's reported path, including custom CRG data directories.
 
 The wrapper checks HEAD, staged entries and tracked/untracked source state before
@@ -492,3 +526,33 @@ the CRG index. An already compact graph returns `unchanged`.
 For the bounded packed-v2 pilot, append `--storage-format packed-v2`. The
 stage bar still reports completion only after the new generation is verified
 and published; the previous generation remains available as rollback.
+
+### Dense dictionary references
+
+Packed-v3 stores exact full IDs and repeated strings in a shared dictionary and
+encodes occurrences as dense varints. It preserves unknown metadata and the exact
+export; IDs sharing 128-bit prefixes remain distinct. SHA-256 snapshot verification
+and authenticated label checks remain mandatory. The 64 MiB decoded bound remains.
+See [compact references](../plans/codegraph_compact_references.md) for identity,
+compatibility and validation details.
+
+### Fresh-build 128-bit public IDs
+
+New exports declare `qihse-semantic-xxh3-128-v1`, `xxh3-128`, seed zero,
+canonical xxHash byte encoding and the bounded `counter-xxh3-128-v1` collision policy. Nodes and edges use 32 lowercase hex
+characters; packed-v3 stores them as 16-byte dictionary entries under an explicit
+feature bit. Source/snapshot SHA-256 and capability widths retain their cryptographic
+contracts. All previous live graphs were lost; fresh builds use this profile by
+default. See [the format and validation](../plans/codegraph_public_ids128.md).
+
+The producer uses bounded native XXH3 batches with one cached backend selection.
+See [tuned hashing and measured results](../plans/codegraph_xxh3_tuned.md).
+
+### Snapshot checksum and bounded retention
+
+New CodeGraph snapshots use tuned `xxh3-128` checksums, explicitly stored as
+`snapshot_hash_algorithm` and a 32-hex `snapshot_hash`. Source/trailer hashes remain
+SHA-256. Per repository, durable publication retains current and one previous
+snapshot; validated no-op operations and GC apply the same retention. Failed
+pre-commit publication removes its unreferenced candidate. See
+[implementation and tests](../plans/codegraph_snapshot_xxh3.md).

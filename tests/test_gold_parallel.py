@@ -15,7 +15,7 @@ class GoldParallelTests(unittest.TestCase):
     def test_complete_pack_is_partitioned_without_loss(self):
         areas, workloads, gaps = read_pack((ROOT / PACK).read_text())
         self.assertEqual(len(areas), 11)
-        self.assertEqual(len(workloads), 72)
+        self.assertEqual(len(workloads), 74)
         self.assertEqual(gaps, [])
         self.assertEqual(len({w[0] for w in workloads}), len(workloads))
         self.assertTrue(GOLD_SAFE.issubset({w[0] for w in workloads}))
@@ -24,6 +24,11 @@ class GoldParallelTests(unittest.TestCase):
         self.assertGreater(len(fast), 10)
         self.assertEqual(len(fast) + len(slow), len(workloads))
         self.assertTrue(any(w[0] == "cluster-loadshift-smoke" for w in slow))
+        serial = {w[0]: w[1]["run"] for w in slow}
+        self.assertEqual(serial["ct1-pinned-write-replication"],
+                         "make -s test-ct-transport-protocol test-ct-transport-daemon")
+        self.assertEqual(serial["ct2-fenced-slot-transfer"],
+                         "make -s test-ct-slot-transfer")
 
     def test_unknown_workload_is_serial(self):
         unknown = ("new-unknown", {"run": "make -s test-new-unknown"}, "")

@@ -17,18 +17,14 @@ typedef struct qihse_resp_server qihse_resp_server_t;
 
 /* Slot-range handoff — the CLUSTER MOVESLOTS core.
  *
- * Enumerates with the live system principal and validates the target
- * connection/authentication before changing ownership. Empty ranges may be
- * reassigned without connecting. For a data-bearing range, ownership flips
- * before the authenticated MIGRATE wire flow (ASKING, SET [PX]) so the target
- * accepts incoming writes. A mid-transfer failure can still leave partial
- * data on each node; callers detect this via *out_moved < *out_collected and
- * must reconcile the records before restoring service.
+ * Currently fails closed for every range, including apparently empty ranges.
+ * No records are read or sent, no journal is appended, and ownership is not
+ * changed. Data-bearing transfer requires an atomic value/label snapshot and
+ * a write fence covering every KV mutation path; empty-range reassignment
+ * needs the same fence to rule out concurrent insertion.
  *
- * Runs as the system-domain principal. Returns 0 when the range moved
- * completely (or there was nothing to move), -1 on failure — err, when
- * non-NULL, receives a short reason. *out_moved / *out_collected report the
- * transfer counts on both paths. */
+ * Returns -1 with a short reason in err when non-NULL. Both transfer counts
+ * are zero. The API shape is retained for a future safe handoff protocol. */
 int qihse_cluster_handoff_range(qihse_resp_server_t* server,
                                 uint16_t first, uint16_t last,
                                 uint16_t target_index,

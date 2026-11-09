@@ -27,6 +27,8 @@
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_bus.h"
 #include "qihse_cluster_ownership_journal.h"
+#include "qihse_cluster_ownership.h"
+#include "qihse_cluster_transfer.h"
 #include "qihse_cluster_reclaim.h"
 #include "qihse_cluster_brain.h"
 #include "qihse_overlay.h"
@@ -301,6 +303,30 @@ typedef struct {
     uint16_t slot_last;
 } peer_spec_t;
 
+typedef struct {
+    char topology_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char qkp_node_id[QIHSE_QKP_NODE_ID_LEN + 1u];
+} ct_identity_map_t;
+
+typedef struct {
+    ct_identity_map_t entries[QIHSE_QKP_MAX_REPLICATION_PEERS + 1u];
+    size_t count;
+} ct_identity_map_set_t;
+
+static bool ct_identity_map_lookup(void* context, const char* topology_id,
+        char out_qkp[QIHSE_QKP_NODE_ID_LEN + 1u]) {
+    ct_identity_map_set_t* maps = context;
+    if (!maps || !topology_id || !out_qkp) return false;
+    for (size_t i = 0; i < maps->count; ++i) {
+        if (strcmp(maps->entries[i].topology_id, topology_id) == 0) {
+            snprintf(out_qkp, QIHSE_QKP_NODE_ID_LEN + 1u, "%s",
+                     maps->entries[i].qkp_node_id);
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Recursive mkdir -p (parents must be writable). */
 static bool mkdirs(const char* path) {
     if (!path || !*path) return false;
@@ -472,7 +498,8 @@ static void operator_credential_clear_environment(void) {
 }
 
 static qihse_user_t* replication_service_principal_create(
-        qihse_user_t* startup_operator, uint32_t user_id) {
+        qihse_user_t* startup_operator, uint32_t user_id,
+        uint16_t classification, uint16_t sci) {
     if (!startup_operator || !qihse_auth_user_is_active(startup_operator) ||
         qihse_user_get_role(startup_operator) != QIHSE_ROLE_OPERATOR)
         return NULL;
@@ -481,8 +508,8 @@ static qihse_user_t* replication_service_principal_create(
         return qihse_auth_user_is_active(existing) &&
             qihse_user_get_role(existing) == QIHSE_ROLE_ANALYST &&
             qihse_user_get_tenant_id(existing) == QIHSE_TENANT_SYSTEM &&
-            qihse_user_get_classification(existing) == UINT16_MAX &&
-            qihse_user_get_sci(existing) == UINT16_MAX &&
+            qihse_user_get_classification(existing) == classification &&
+            qihse_user_get_sci(existing) == sci &&
             !qihse_user_requires_hardware_token(existing) &&
             !qihse_user_can_create_users(existing) ? existing : NULL;
     unsigned char random_secret[32];
@@ -498,7 +525,7 @@ static qihse_user_t* replication_service_principal_create(
     one_time_password[sizeof(one_time_password) - 1u] = '\0';
     principal = qihse_auth_create_user(
         startup_operator, user_id, QIHSE_ROLE_ANALYST,
-        UINT16_MAX, UINT16_MAX, one_time_password, false);
+        classification, sci, one_time_password, false);
 
 done:
     OPENSSL_cleanse(one_time_password, sizeof(one_time_password));
@@ -615,6 +642,12 @@ static void usage(const char* argv0) {
         "          [--redundancy-peer HOST:PORT]\n"
         "          [--replication-principal-id N] (default 65535)\n"
         "          [--replication-allowed-peer NODE_ID PUB_FILE] (repeatable, max 16; startup Operator required)\n"
+        "          [--topology-qkp-map TOPOLOGY_ID QKP_NODE_ID] (repeatable; exact explicit identity mapping)\n"
+        "          [--ct-role primary|successor --ct-peer HOST:PORT]\n"
+        "          [--ct-auto-successor TOPOLOGY_ID --consensus-authority-proposals]\n"
+        "          [--replica-of REPLICA_INDEX:PRIMARY_INDEX] (repeat global CT pair map)\n"
+        "          [--ct-learn-generation] (fresh spare: exact pinned source only)\n"
+        "          [--ct-generation HEX32 --ct-log-limit BYTES --ct-ack-timeout-ms N]\n"
         "          [--max-clients N]\n"
         "          (each daemon owns a BM25 index over its LOCAL KV:\n"
         "           FTS.BUILD <pattern> indexes matching keys, FTS.SEARCH <query>\n"
@@ -725,11 +758,54 @@ static bool consensus_history_id_parse(const char* value, uint8_t out[32]) {
     return true;
 }
 
+/* The brain and Operator command share the same fenced CT2 engine. */
+static bool daemon_brain_generation(void* context, qihse_user_t* data,
+                                    char generation[33]) {
+    qihse_cluster_ownership_context_t* ownership = context;
+    qihse_kv_ct_source_status_t status;
+    if (!ownership || !ownership->store || !data ||
+        !qihse_kv_ct_source_status(ownership->store, data, &status) || !status.admitted)
+        return false;
+    memcpy(generation, status.generation, 33u);
+    return true;
+}
+
+static qihse_brain_transfer_result_t daemon_brain_transfer(void* context,
+        qihse_user_t* control, qihse_user_t* data, const char* transfer_id,
+        const char* expected_generation, const char* target_id,
+        uint16_t first, uint16_t last, char* error, size_t error_cap) {
+    qihse_cluster_ownership_context_t* ownership = context;
+    char current_generation[33]; uint16_t target = QIHSE_CLUSTER_NODE_NONE;
+    if (!ownership || !ownership->topology || !ownership->resp_server ||
+        !control || !qihse_auth_user_is_active(control) ||
+        qihse_user_get_role(control) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_tenant_id(control) != QIHSE_TENANT_SYSTEM ||
+        !expected_generation || !daemon_brain_generation(context, data, current_generation) ||
+        strcmp(current_generation, expected_generation) ||
+        !qihse_cluster_topology_find_node(ownership->topology, target_id, &target)) {
+        if (error && error_cap) snprintf(error, error_cap, "CT2 adapter requires admitted exact generation and authenticated principals");
+        return QIHSE_BRAIN_TRANSFER_REJECTED;
+    }
+    qihse_cluster_ownership_context_t request = *ownership;
+    request.principal = control;
+    request.data_principal = data;
+    qihse_cluster_transfer_context_t transfer = {.ownership = &request, .chunk_bytes = 12u * 1024u};
+    qihse_cluster_transfer_result_t result = qihse_cluster_transfer_range(&transfer,
+        transfer_id, qihse_cluster_topology_local_node(ownership->topology), target,
+        first, last, error, error_cap);
+    switch (result) {
+        case QIHSE_CLUSTER_TRANSFER_COMMITTED: return QIHSE_BRAIN_TRANSFER_COMMITTED;
+        case QIHSE_CLUSTER_TRANSFER_PENDING: return QIHSE_BRAIN_TRANSFER_PENDING;
+        case QIHSE_CLUSTER_TRANSFER_TOO_LARGE: return QIHSE_BRAIN_TRANSFER_TOO_LARGE;
+        default: return QIHSE_BRAIN_TRANSFER_REJECTED;
+    }
+}
+
 static bool consensus_ipv4_private(const char* value) {
     struct in_addr address;
     if (!value || inet_pton(AF_INET, value, &address) != 1) return false;
     uint32_t host = ntohl(address.s_addr);
-    return (host >> 24) == 10u ||
+    return (host >> 24) == 127u || (host >> 24) == 10u ||
            (host >> 20) == ((172u << 4) | 1u) ||
            (host >> 16) == ((192u << 8) | 168u);
 }
@@ -1043,6 +1119,7 @@ static bool mini_resp_read_exact(mini_resp_t* c, char* out, size_t len) {
 #define MINI_REP_BULK   2
 #define MINI_REP_ARRAY  3
 #define MINI_REP_ERROR  4
+#define MINI_RESP_ARRAY_MAX_WIRE ((size_t)128u << 20)
 
 static void mini_resp_free_array(char** items, size_t count) {
     if (!items) return;
@@ -1094,6 +1171,7 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
         if (count < 0 || count > 100000) { snprintf(c->err, sizeof(c->err), "bad array"); return MINI_REP_ERROR; }
         char** items = calloc(count ? (size_t)count : 1u, sizeof(char*));
         if (!items) { snprintf(c->err, sizeof(c->err), "oom"); return MINI_REP_ERROR; }
+        size_t array_bytes = 0u;
         for (long long i = 0; i < count; i++) {
             char sub[64];
             if (mini_resp_read_line(c, sub, sizeof(sub)) < 0 || sub[0] != '$') {
@@ -1102,11 +1180,13 @@ static int mini_resp_do(mini_resp_t* c, size_t argc, const char* const* argv,
                 return MINI_REP_ERROR;
             }
             long long len = strtoll(sub + 1, NULL, 10);
-            if (len < 0 || len > REPL_AE_VALUE_MAX) {
+            if (len < 0 || len > REPL_AE_VALUE_MAX ||
+                (size_t)len > MINI_RESP_ARRAY_MAX_WIRE - array_bytes) {
                 mini_resp_free_array(items, (size_t)i);
                 snprintf(c->err, sizeof(c->err), "bad item length");
                 return MINI_REP_ERROR;
             }
+            array_bytes += (size_t)len;
             items[i] = malloc((size_t)len + 1u);
             if (!items[i]) { mini_resp_free_array(items, (size_t)i); snprintf(c->err, sizeof(c->err), "oom"); return MINI_REP_ERROR; }
             if (!mini_resp_read_exact(c, items[i], (size_t)len)) {
@@ -1372,6 +1452,404 @@ static void* ae_main(void* argument) {
 }
 
 typedef struct {
+    qihse_kv_store_t* store;
+    qihse_resp_server_t* server;
+    qihse_user_t* operator_user;
+    qihse_user_t* replication_user;
+    const qihse_qkp_config_t* qkp;
+    const char* source_host;
+    uint16_t source_port;
+    const char* generation;
+    char generation_runtime[33];
+    bool learn_generation;
+    volatile sig_atomic_t* stop;
+    unsigned char ct_owner_token[QIHSE_KV_CT_TOKEN_BYTES];
+    const char* failure_stage;
+} ct1_pull_ctx_t;
+
+static bool ct1_parse_hex32(const char* text, unsigned char out[32]) {
+    if (!text || strlen(text) != 64u) return false;
+    for (size_t i = 0u; i < 32u; ++i) {
+        unsigned char a = (unsigned char)text[2u * i];
+        unsigned char b = (unsigned char)text[2u * i + 1u];
+        unsigned hi = a >= '0' && a <= '9' ? a - '0' :
+            (a >= 'a' && a <= 'f' ? a - 'a' + 10u : 255u);
+        unsigned lo = b >= '0' && b <= '9' ? b - '0' :
+            (b >= 'a' && b <= 'f' ? b - 'a' + 10u : 255u);
+        if (hi > 15u || lo > 15u) return false;
+        out[i] = (unsigned char)((hi << 4u) | lo);
+    }
+    return true;
+}
+
+static bool ct1_write_all(int fd, const void* data, size_t len) {
+    const unsigned char* p = data;
+    size_t done = 0u;
+    while (done < len) {
+        ssize_t n = write(fd, p + done, len - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+
+static bool ct1_simple_ok(mini_resp_t* peer, size_t argc,
+                          const char* const* argv) {
+    return mini_resp_do(peer, argc, argv, NULL, NULL, NULL, NULL) ==
+        MINI_REP_SIMPLE && peer->last[0] == '+';
+}
+
+/* Pull one authenticated source session. A target only becomes readable after
+ * the digest-checked QFS baseline is installed and its atomic group cursor is
+ * caught up. The source opens write admission only after our durable cursor is
+ * returned through RECONCILE. */
+static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
+    ctx->failure_stage = "connect";
+    mini_resp_t source;
+    if (mini_resp_connect_mode(&source, ctx->source_host, ctx->source_port,
+                               ctx->qkp, false, 0u) < 0) return false;
+    ctx->failure_stage = "peer pin/status";
+    bool ok = qihse_qkp_client_session_is_replication_peer(source.qkp,
+        ctx->qkp->replication_peer_node_id,
+        ctx->qkp->replication_peer_dsa_pub_path);
+    char** fields = NULL;
+    size_t nfields = 0u;
+    const char* status_argv[] = {"REPL.CT1", "STATUS"};
+    int reply = ok ? mini_resp_do(&source, 2u, status_argv, NULL, NULL,
+                                  &fields, &nfields) : MINI_REP_ERROR;
+    uint64_t source_durable = 0u, baseline_row_seq = 0u;
+    unsigned char baseline_digest[32] = {0};
+    if (reply == MINI_REP_ARRAY && nfields == 10u && ctx->learn_generation &&
+        !strcmp(fields[0], ctx->qkp->replication_peer_node_id) &&
+        !strcmp(fields[2], ctx->qkp->node_id) && strlen(fields[1]) == 32u) {
+        memcpy(ctx->generation_runtime, fields[1], 33u);
+        ctx->generation = ctx->generation_runtime;
+    }
+    if (reply != MINI_REP_ARRAY || nfields != 10u ||
+        strcmp(fields[0], ctx->qkp->replication_peer_node_id) != 0 ||
+        strcmp(fields[1], ctx->generation) != 0 ||
+        strcmp(fields[2], ctx->qkp->node_id) != 0 ||
+        !parse_u64_decimal(fields[3], &source_durable) ||
+        !parse_u64_decimal(fields[8], &baseline_row_seq) ||
+        !ct1_parse_hex32(fields[9], baseline_digest)) {
+        mini_resp_free_array(fields, nfields);
+        mini_resp_close(&source);
+        return false;
+    }
+    mini_resp_free_array(fields, nfields);
+    fields = NULL;
+    fields = NULL;
+
+    qihse_kv_ct_receiver_status_t receiver;
+    ctx->failure_stage = "receiver bind/status";
+    bool receiver_bound = qihse_kv_ct_receiver_status(ctx->store,
+        ctx->replication_user, &receiver);
+    if (!receiver_bound) {
+        if (!qihse_kv_ct_receiver_bind(ctx->store, ctx->operator_user,
+                ctx->qkp->replication_peer_node_id, ctx->qkp->node_id,
+                ctx->generation, QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+                baseline_row_seq, NULL)) {
+            mini_resp_close(&source);
+            return false;
+        }
+        receiver_bound = qihse_kv_ct_receiver_status(ctx->store,
+            ctx->replication_user, &receiver);
+    }
+    if (receiver_bound && ctx->learn_generation &&
+        !qihse_resp_server_ct_bind_generation(ctx->server, ctx->operator_user, ctx->generation)) {
+        mini_resp_close(&source); return false;
+    }
+    if (!receiver_bound || strcmp(receiver.source_id,
+            ctx->qkp->replication_peer_node_id) != 0 ||
+        strcmp(receiver.generation, ctx->generation) != 0 ||
+        receiver.tenant_policy != QIHSE_KV_CT_TENANT_SYSTEM_ALL) {
+        mini_resp_close(&source);
+        return false;
+    }
+    if (!receiver.baseline_sealed) {
+        ctx->failure_stage = "baseline status";
+        const char* base_status_argv[] = {"REPL.CT1", "BASELINE", "STATUS"};
+        reply = mini_resp_do(&source, 3u, base_status_argv, NULL, NULL,
+                             &fields, &nfields);
+        uint64_t total_bytes = 0u, remote_row_seq = 0u;
+        unsigned char remote_digest[32] = {0};
+        if (reply != MINI_REP_ARRAY || nfields != 5u ||
+            strcmp(fields[0], ctx->qkp->replication_peer_node_id) != 0 ||
+            strcmp(fields[1], ctx->generation) != 0 ||
+            !parse_u64_decimal(fields[2], &remote_row_seq) ||
+            remote_row_seq != baseline_row_seq ||
+            !ct1_parse_hex32(fields[3], remote_digest) ||
+            memcmp(remote_digest, baseline_digest, 32u) != 0 ||
+            !parse_u64_decimal(fields[4], &total_bytes) ||
+            total_bytes > (uint64_t)INT64_MAX) {
+            mini_resp_free_array(fields, nfields);
+            mini_resp_close(&source);
+            return false;
+        }
+        mini_resp_free_array(fields, nfields);
+        fields = NULL;
+
+        const char* data_dir = qihse_kv_store_data_directory(ctx->store);
+        char path[PATH_MAX];
+        int n = data_dir ? snprintf(path, sizeof(path), "%s/.qihse-ct-base-XXXXXX",
+                                    data_dir) : -1;
+        if (n <= 0 || (size_t)n >= sizeof(path)) {
+            mini_resp_close(&source);
+            return false;
+        }
+        int fd = mkstemp(path);
+        if (fd < 0 || fchmod(fd, 0600) != 0) {
+            if (fd >= 0) { close(fd); unlink(path); }
+            mini_resp_close(&source);
+            return false;
+        }
+        uint64_t offset = 0u;
+        ctx->failure_stage = "baseline read/write";
+        while (offset < total_bytes && !*ctx->stop) {
+            size_t amount = total_bytes - offset > (1u << 20)
+                ? (1u << 20) : (size_t)(total_bytes - offset);
+            char offset_text[32], amount_text[32];
+            snprintf(offset_text, sizeof(offset_text), "%llu", (unsigned long long)offset);
+            snprintf(amount_text, sizeof(amount_text), "%zu", amount);
+            const char* read_argv[] = {"REPL.CT1", "BASELINE", "READ",
+                                       offset_text, amount_text};
+            char* chunk = NULL;
+            size_t chunk_len = 0u;
+            reply = mini_resp_do(&source, 5u, read_argv, &chunk, &chunk_len,
+                                 NULL, NULL);
+            bool chunk_ok = reply == MINI_REP_BULK && chunk &&
+                chunk_len == amount && ct1_write_all(fd, chunk, chunk_len);
+            free(chunk);
+            if (!chunk_ok) { ok = false; break; }
+            offset += amount;
+        }
+        if (ok && fsync(fd) != 0) ok = false;
+        if (close(fd) != 0) ok = false;
+        if (ok) {
+            ctx->failure_stage = "baseline validate";
+            FILE* validation_stream = fopen(path, "rb");
+            qihse_kv_store_t* validation = validation_stream
+                ? qihse_kv_open_snapshot_user(validation_stream,
+                    ctx->replication_user,
+                    (size_t)(total_bytes ? total_bytes : 1u), 50000000u)
+                : NULL;
+            if (validation_stream) fclose(validation_stream);
+            if (!validation) ok = false;
+            else qihse_kv_store_destroy(validation);
+        }
+        if (ok && !qihse_kv_ct_owner_token_get(ctx->store,
+                ctx->operator_user, ctx->ct_owner_token)) ok = false;
+        ctx->failure_stage = "baseline install";
+        if (ok && !qihse_kv_ct_receiver_install_baseline(ctx->store,
+                ctx->operator_user, ctx->replication_user,
+                ctx->qkp->replication_peer_node_id,
+                ctx->generation, path, baseline_row_seq, baseline_digest,
+                ctx->ct_owner_token)) ok = false;
+        (void)unlink(path);
+        if (!ok) { mini_resp_close(&source); return false; }
+        receiver_bound = qihse_kv_ct_receiver_status(ctx->store,
+            ctx->replication_user, &receiver);
+        if (!receiver_bound || !receiver.baseline_sealed ||
+            memcmp(receiver.baseline_digest, baseline_digest, 32u) != 0) {
+            mini_resp_close(&source);
+            return false;
+        }
+    }
+    if (memcmp(receiver.baseline_digest, baseline_digest, 32u) != 0) {
+        mini_resp_close(&source);
+        return false;
+    }
+
+    uint64_t cursor = receiver.durable_cursor;
+    while (cursor < source_durable && !*ctx->stop) {
+        ctx->failure_stage = "group read/parse";
+        char cursor_text[32];
+        snprintf(cursor_text, sizeof(cursor_text), "%llu", (unsigned long long)cursor);
+        const char* read_argv[] = {"REPL.CT1", "READ", ctx->generation,
+                                   cursor_text, "1", "67108864", "v1"};
+        reply = mini_resp_do(&source, 7u, read_argv, NULL, NULL,
+                             &fields, &nfields);
+        if (reply != MINI_REP_ARRAY || nfields < 5u ||
+            strcmp(fields[0], ctx->qkp->replication_peer_node_id) != 0 ||
+            strcmp(fields[1], ctx->generation) != 0 ||
+            strcmp(fields[2], ctx->qkp->node_id) != 0) {
+            mini_resp_free_array(fields, nfields);
+            mini_resp_close(&source);
+            return false;
+        }
+        uint64_t resume = 0u, groups = 0u;
+        bool valid = parse_u64_decimal(fields[3], &resume) &&
+            parse_u64_decimal(fields[4], &groups) && groups <= 1u;
+        if (!valid || groups == 0u) {
+            valid = valid && groups == 0u && resume == cursor;
+            mini_resp_free_array(fields, nfields);
+            if (!valid) { mini_resp_close(&source); return false; }
+            break;
+        }
+        uint64_t position = 0u, first_seq = 0u, last_seq = 0u, count_u64 = 0u;
+        valid = nfields >= 9u && parse_u64_decimal(fields[5], &position) &&
+            parse_u64_decimal(fields[6], &first_seq) &&
+            parse_u64_decimal(fields[7], &last_seq) &&
+            parse_u64_decimal(fields[8], &count_u64) &&
+            count_u64 <= QIHSE_KV_CT_MAX_GROUP_RECORDS &&
+            nfields == 9u + (size_t)count_u64 * 11u && position == cursor + 1u;
+        qihse_kv_ct_group_t group;
+        memset(&group, 0, sizeof(group));
+        if (valid) {
+            snprintf(group.source_id, sizeof(group.source_id), "%s", fields[0]);
+            snprintf(group.generation, sizeof(group.generation), "%s", fields[1]);
+            group.stream_position = position;
+            group.first_seq = first_seq;
+            group.last_seq = last_seq;
+            group.count = (size_t)count_u64;
+            group.records = calloc(group.count ? group.count : 1u,
+                                   sizeof(*group.records));
+            valid = group.records != NULL;
+        }
+        for (size_t i = 0u; valid && i < group.count; ++i) {
+            size_t b = 9u + i * 11u;
+            qihse_kv_ct_record_t* rec = &group.records[i];
+            uint64_t values[9] = {0};
+            for (size_t k = 0u; k < 9u; ++k)
+                if (!parse_u64_decimal(fields[b + 2u + k], &values[k])) valid = false;
+            if (!valid || values[0] == 0u || values[2] > UINT32_MAX ||
+                values[3] > UINT32_MAX || values[4] > UINT32_MAX ||
+                values[5] > UINT16_MAX || values[6] > UINT16_MAX ||
+                values[7] < QIHSE_KV_CT_ACTOR_USER ||
+                values[7] > QIHSE_KV_CT_ACTOR_REPLICA || values[8] > 1u) {
+                valid = false;
+                break;
+            }
+            rec->key = strdup(fields[b]);
+            rec->value = values[8] ? NULL : strdup(fields[b + 1u]);
+            rec->change_seq = values[0];
+            rec->expire_time_ms = values[1];
+            rec->actor_id = (uint32_t)values[2];
+            rec->actor_tenant_id = (uint32_t)values[3];
+            rec->resource_tenant_id = (uint32_t)values[4];
+            rec->classification = (uint16_t)values[5];
+            rec->sci_compartment = (uint16_t)values[6];
+            rec->actor_kind = (qihse_kv_ct_actor_t)values[7];
+            rec->tombstone = values[8] != 0u;
+            if (!rec->key || (!rec->tombstone && !rec->value)) valid = false;
+        }
+        uint64_t durable_cursor = 0u;
+        ctx->failure_stage = "group apply";
+        if (valid) valid = qihse_kv_ct_receiver_apply(ctx->store,
+            ctx->replication_user, &group, &durable_cursor) &&
+            durable_cursor == position;
+        for (size_t i = 0u; i < group.count; ++i) {
+            free(group.records[i].key);
+            free(group.records[i].value);
+        }
+        free(group.records);
+        mini_resp_free_array(fields, nfields);
+        fields = NULL;
+        if (!valid) { mini_resp_close(&source); return false; }
+        char pos_text[32];
+        snprintf(pos_text, sizeof(pos_text), "%llu", (unsigned long long)durable_cursor);
+        ctx->failure_stage = "successor ACK";
+        const char* ack_argv[] = {"REPL.CT1", "ACK", ctx->generation, pos_text};
+        if (!ct1_simple_ok(&source, 4u, ack_argv)) {
+            mini_resp_close(&source);
+            return false;
+        }
+        cursor = durable_cursor;
+    }
+    if (cursor >= source_durable) {
+        ctx->failure_stage = "source reconcile";
+        char cursor_text[32], digest_text[65];
+        snprintf(cursor_text, sizeof(cursor_text), "%llu", (unsigned long long)cursor);
+        static const char hex[] = "0123456789abcdef";
+        for (size_t i = 0u; i < 32u; ++i) {
+            digest_text[2u * i] = hex[baseline_digest[i] >> 4u];
+            digest_text[2u * i + 1u] = hex[baseline_digest[i] & 15u];
+        }
+        digest_text[64] = '\0';
+        const char* reconcile_argv[] = {"REPL.CT1", "RECONCILE",
+            ctx->generation, digest_text, cursor_text};
+        ok = ct1_simple_ok(&source, 5u, reconcile_argv);
+        if (!ok) fprintf(stderr,
+            "qihse-cluster-daemon: CT1 reconcile rejected cursor=%llu source_status_lsn=%llu reply=%s transport=%s\n",
+            (unsigned long long)cursor, (unsigned long long)source_durable,
+            source.last[0] ? source.last : "(no RESP reply)",
+            source.err[0] ? source.err : "none");
+    } else ok = false;
+    mini_resp_close(&source);
+    OPENSSL_cleanse(baseline_digest, sizeof(baseline_digest));
+    if (ok) ctx->failure_stage = "";
+    return ok;
+}
+
+static void* ct1_pull_main(void* argument) {
+    ct1_pull_ctx_t* ctx = argument;
+    while (!*ctx->stop && qihse_resp_server_ct_is_successor(ctx->server)) {
+        unsigned delay_ms = 250u;
+        if (ct1_pull_once(ctx)) {
+            delay_ms = 250u;
+        } else {
+            if (!qihse_resp_server_ct_is_successor(ctx->server)) break;
+            fprintf(stderr, "qihse-cluster-daemon: CT1 pinned pull/reconcile failed at %s; successor remains fenced\n",
+                ctx->failure_stage && *ctx->failure_stage ? ctx->failure_stage : "unknown stage");
+            /* A pending source write may be waiting on ACK. Keep the retry
+             * delay below the configured ACK timeout; only a failed TCP
+             * connect gets a modest backoff to avoid a hot reconnect loop. */
+            delay_ms = ctx->failure_stage &&
+                strcmp(ctx->failure_stage, "connect") == 0 ? 1000u : 250u;
+        }
+        struct timespec ts = {(time_t)(delay_ms / 1000u),
+                              (long)(delay_ms % 1000u) * 1000000L};
+        while (!*ctx->stop && nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+    }
+    return NULL;
+}
+
+static bool ct1_primary_peer_preflight(const char* host, uint16_t port,
+        const qihse_qkp_config_t* qkp, const char* generation,
+        uint64_t source_durable_position,
+        const unsigned char expected_baseline_digest[32]) {
+    mini_resp_t peer;
+    if (mini_resp_connect_mode(&peer, host, port, qkp, false, 0u) < 0)
+        return false;
+    struct timeval timeout = {5, 0};
+    (void)setsockopt(peer.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(peer.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    char** fields = NULL;
+    size_t count = 0u;
+    const char* argv[] = {"REPL.CT1", "TARGET", "STATUS"};
+    int reply = mini_resp_do(&peer, 3u, argv, NULL, NULL, &fields, &count);
+    uint64_t target_cursor = 0u, sealed = 0u, tenant_policy = 0u;
+    unsigned char target_digest[32] = {0};
+    if (reply == MINI_REP_ARRAY && count == 7u) {
+        char* end = NULL; errno = 0; target_cursor = strtoull(fields[3], &end, 10);
+        bool cursor_ok = !errno && end && !*end;
+        errno = 0; sealed = strtoull(fields[4], &end, 10);
+        cursor_ok = cursor_ok && !errno && end && !*end && sealed <= 1u;
+        errno = 0; tenant_policy = strtoull(fields[6], &end, 10);
+        cursor_ok = cursor_ok && !errno && end && !*end && tenant_policy <= QIHSE_KV_CT_TENANT_SYSTEM_ALL;
+        if (sealed && (!ct1_parse_hex32(fields[5], target_digest) ||
+            !expected_baseline_digest ||
+            memcmp(target_digest, expected_baseline_digest, 32u) != 0)) cursor_ok = false;
+        if (tenant_policy != 0u &&
+            tenant_policy != QIHSE_KV_CT_TENANT_SYSTEM_ALL) cursor_ok = false;
+        if (!cursor_ok) reply = MINI_REP_ERROR;
+    }
+    bool ok = reply == MINI_REP_ARRAY && count == 7u &&
+        qihse_qkp_client_session_is_replication_peer(peer.qkp,
+            qkp->replication_peer_node_id, qkp->replication_peer_dsa_pub_path) &&
+        strcmp(fields[0], qkp->node_id) == 0 &&
+        strcmp(fields[1], qkp->replication_peer_node_id) == 0 &&
+        strcmp(fields[2], generation) == 0 &&
+        (source_durable_position == 0u || (sealed == 1u &&
+            tenant_policy == QIHSE_KV_CT_TENANT_SYSTEM_ALL &&
+            target_cursor >= source_durable_position));
+    mini_resp_free_array(fields, count);
+    mini_resp_close(&peer);
+    return ok;
+}
+
+typedef struct {
     qihse_resp_server_t* server;
     char seeds[8][QIHSE_CLUSTER_HOST_LEN + 8u];
     size_t seed_count;
@@ -1423,21 +1901,6 @@ static void* join_main(void* argument) {
     return NULL; /* shutdown requested: stop probing a server being torn down */
 }
 
-static bool is_lan_host(const char* host) {
-    if (!host || !*host) return false;
-    struct in_addr address;
-    if (inet_pton(AF_INET, host, &address) == 1) {
-        uint32_t host_addr = ntohl(address.s_addr);
-        if ((host_addr >> 16) == ((192u << 8) | 168u) ||
-            (host_addr >> 24) == 127u ||
-            (host_addr >> 24) == 10u ||
-            (host_addr >> 20) == ((172u << 4) | 1u)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 int main(int argc, char** argv) {
 
     /* Signed ops frames (hybrid bus upgrade): load this node's ML-DSA
@@ -1452,6 +1915,8 @@ int main(int argc, char** argv) {
     const char* operator_password = NULL;
     char* operator_password_arg = NULL;
     uint32_t replication_principal_id = 65535u;
+    uint16_t replication_principal_clearance = UINT16_MAX;
+    uint16_t replication_principal_sci = UINT16_MAX;
     uint32_t machine_principal_id = 0u;      /* 0 = no machine principal */
     uint32_t machine_principal_tenant = 0u;
     const char* admin_peer_node_id = NULL;
@@ -1465,6 +1930,8 @@ int main(int argc, char** argv) {
     bool startup_maintenance_held = false;
     size_t max_clients = 4096u;
     peer_spec_t peers[MAX_PEERS];
+    uint16_t replica_primary[MAX_PEERS];
+    memset(replica_primary, 0xFF, sizeof(replica_primary));
     size_t peer_count = 0;
     /* Dynamic discovery seeds (--join HOST:BUSPORT). When present, the static
      * peer list is optional: membership is learned over the bus via MEET. */
@@ -1489,7 +1956,6 @@ int main(int argc, char** argv) {
     char repl_globs[16][128];
     const char* repl_glob_ptrs[16];
     size_t repl_glob_count = 0;
-    bool replicate_disabled = false;
     uint32_t repl_interval = 60;          /* anti-entropy tick (0 = disabled) */
     uint32_t kv_sweep_interval = 30;      /* expiry sweep + sstable compaction cadence (0 = disabled) */
     const char* pqc_identity_dir = NULL;  /* --pqc-identity-dir */
@@ -1501,8 +1967,22 @@ int main(int argc, char** argv) {
     bool replica_read_only = false;
     const char* replication_peer_node_id = NULL;
     const char* replication_peer_dsa_pub = NULL;
+    const char* ct_role = NULL;
+    const char* ct_auto_successor_id = NULL;
+    bool ct_learn_generation = false;
+    char ct_recovered_generation[33] = {0};
+    bool consensus_authority_proposals = false;
+    const char* ct_peer_host = NULL;
+    char ct_peer_host_storage[256];
+    memset(ct_peer_host_storage, 0, sizeof(ct_peer_host_storage));
+    const char* ct_generation_hex = NULL;
+    uint16_t ct_peer_port = 0u;
+    uint64_t ct_log_limit_bytes = 0u;
+    uint32_t ct_ack_timeout_ms = 0u;
     qihse_qkp_replication_peer_t replication_allowed_peers[QIHSE_QKP_MAX_REPLICATION_PEERS];
     size_t replication_allowed_peer_count = 0u;
+    ct_identity_map_t ct_identity_map_options[QIHSE_QKP_MAX_REPLICATION_PEERS];
+    size_t ct_identity_map_option_count = 0u;
     const char* pqc_trusted[16];
     size_t pqc_trusted_count = 0;
     bool pqc_require = false;
@@ -1597,12 +2077,10 @@ int main(int argc, char** argv) {
             if (errno != 0 || !end || *end || v > QIHSE_CLUSTER_SLOT_COUNT) return usage(argv[0]), 2;
             brain_rebalance_min = (uint32_t)v;
         } else if (strcmp(a, "--no-replicate") == 0 || strcmp(a, "--replicate-none") == 0) {
-            replicate_disabled = true;
             repl_glob_count = 0;
         } else if (strcmp(a, "--replicate") == 0 && i + 1 < argc) {
             const char* val = argv[++i];
             if (strcmp(val, "none") == 0) {
-                replicate_disabled = true;
                 repl_glob_count = 0;
             } else {
                 if (repl_glob_count >= sizeof(repl_globs) / sizeof(repl_globs[0])) return usage(argv[0]), 2;
@@ -1628,6 +2106,16 @@ int main(int argc, char** argv) {
             if (errno != 0 || !end || *end || v == 0u || v > 65535u)
                 return usage(argv[0]), 2;
             replication_principal_id = (uint32_t)v;
+        } else if (strcmp(a, "--replication-principal-clearance") == 0 && i + 1 < argc) {
+            uint64_t v = 0u;
+            if (!parse_u64_decimal(argv[++i], &v) || v > UINT16_MAX)
+                return usage(argv[0]), 2;
+            replication_principal_clearance = (uint16_t)v;
+        } else if (strcmp(a, "--replication-principal-sci") == 0 && i + 1 < argc) {
+            uint64_t v = 0u;
+            if (!parse_u64_decimal(argv[++i], &v) || v > UINT16_MAX)
+                return usage(argv[0]), 2;
+            replication_principal_sci = (uint16_t)v;
         } else if (strcmp(a, "--machine-principal-id") == 0 && i + 1 < argc) {
             char* end = NULL; errno = 0;
             unsigned long v = strtoul(argv[++i], &end, 10);
@@ -1677,12 +2165,79 @@ int main(int argc, char** argv) {
                 strlen(pub) >= PATH_MAX) return usage(argv[0]), 2;
             replication_allowed_peers[replication_allowed_peer_count++] =
                 (qihse_qkp_replication_peer_t){id, pub};
+        } else if (strcmp(a, "--topology-qkp-map") == 0 && i + 2 < argc) {
+            if (ct_identity_map_option_count == QIHSE_QKP_MAX_REPLICATION_PEERS)
+                return usage(argv[0]), 2;
+            const char* topology_id = argv[++i];
+            const char* qkp_id = argv[++i];
+            if (strlen(topology_id) != QIHSE_CLUSTER_NODE_ID_LEN || !*qkp_id ||
+                strlen(qkp_id) > QIHSE_QKP_NODE_ID_LEN)
+                return usage(argv[0]), 2;
+            for (size_t k = 0; k < QIHSE_CLUSTER_NODE_ID_LEN; ++k)
+                if (!((topology_id[k] >= '0' && topology_id[k] <= '9') ||
+                      (topology_id[k] >= 'a' && topology_id[k] <= 'f')))
+                    return usage(argv[0]), 2;
+            for (size_t k = 0; k < ct_identity_map_option_count; ++k)
+                if (strcmp(ct_identity_map_options[k].topology_id, topology_id) == 0)
+                    return usage(argv[0]), 2;
+            snprintf(ct_identity_map_options[ct_identity_map_option_count].topology_id,
+                     sizeof(ct_identity_map_options[0].topology_id), "%s", topology_id);
+            snprintf(ct_identity_map_options[ct_identity_map_option_count].qkp_node_id,
+                     sizeof(ct_identity_map_options[0].qkp_node_id), "%s", qkp_id);
+            ++ct_identity_map_option_count;
         } else if (strcmp(a, "--replication-peer-node-id") == 0 && i + 1 < argc) {
             replication_peer_node_id = argv[++i];
             if (!*replication_peer_node_id || strlen(replication_peer_node_id) > QIHSE_QKP_NODE_ID_LEN) return usage(argv[0]), 2;
         } else if (strcmp(a, "--replication-peer-dsa-pub") == 0 && i + 1 < argc) {
             replication_peer_dsa_pub = argv[++i];
             if (!*replication_peer_dsa_pub) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--replica-of") == 0 && i + 1 < argc) {
+            char pair[32]; const char* option = argv[++i];
+            if (strlen(option) >= sizeof(pair)) return usage(argv[0]), 2;
+            snprintf(pair, sizeof(pair), "%s", option);
+            char* colon = strchr(pair, ':'); uint16_t replica, primary;
+            if (!colon || strchr(colon + 1, ':')) return usage(argv[0]), 2;
+            *colon = '\0';
+            if (!parse_u16(pair, &replica) || !parse_u16(colon + 1, &primary) ||
+                replica >= MAX_PEERS || primary >= MAX_PEERS || replica == primary ||
+                replica_primary[replica] != QIHSE_CLUSTER_NODE_NONE)
+                return usage(argv[0]), 2;
+            replica_primary[replica] = primary;
+        } else if (strcmp(a, "--ct-auto-successor") == 0 && i + 1 < argc) {
+            ct_auto_successor_id = argv[++i];
+            if (!*ct_auto_successor_id || strlen(ct_auto_successor_id) > QIHSE_CLUSTER_NODE_ID_LEN)
+                return usage(argv[0]), 2;
+        } else if (strcmp(a, "--ct-learn-generation") == 0) {
+            ct_learn_generation = true;
+        } else if (strcmp(a, "--consensus-authority-proposals") == 0) {
+            consensus_authority_proposals = true;
+        } else if (strcmp(a, "--ct-role") == 0 && i + 1 < argc) {
+            ct_role = argv[++i];
+            if (strcmp(ct_role, "primary") != 0 && strcmp(ct_role, "successor") != 0)
+                return usage(argv[0]), 2;
+        } else if (strcmp(a, "--ct-peer") == 0 && i + 1 < argc) {
+            const char* spec = argv[++i];
+            const char* colon = strrchr(spec, ':');
+            if (!colon || colon == spec || (size_t)(colon - spec) >= sizeof(ct_peer_host_storage) ||
+                !parse_u16(colon + 1, &ct_peer_port) || !ct_peer_port)
+                return usage(argv[0]), 2;
+            memcpy(ct_peer_host_storage, spec, (size_t)(colon - spec));
+            ct_peer_host = ct_peer_host_storage;
+        } else if (strcmp(a, "--ct-generation") == 0 && i + 1 < argc) {
+            ct_generation_hex = argv[++i];
+            if (strlen(ct_generation_hex) != 32u) return usage(argv[0]), 2;
+            for (size_t k = 0; k < 32u; ++k)
+                if (!((ct_generation_hex[k] >= '0' && ct_generation_hex[k] <= '9') ||
+                      (ct_generation_hex[k] >= 'a' && ct_generation_hex[k] <= 'f')))
+                    return usage(argv[0]), 2;
+        } else if (strcmp(a, "--ct-log-limit") == 0 && i + 1 < argc) {
+            if (!parse_u64_decimal(argv[++i], &ct_log_limit_bytes) || !ct_log_limit_bytes)
+                return usage(argv[0]), 2;
+        } else if (strcmp(a, "--ct-ack-timeout-ms") == 0 && i + 1 < argc) {
+            uint64_t timeout = 0u;
+            if (!parse_u64_decimal(argv[++i], &timeout) || !timeout || timeout > 300000u)
+                return usage(argv[0]), 2;
+            ct_ack_timeout_ms = (uint32_t)timeout;
         } else if (strcmp(a, "--pqc-require") == 0) {
             pqc_require = true;
         } else if (strcmp(a, "--kv-sweep-interval") == 0 && i + 1 < argc) {
@@ -1986,6 +2541,25 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: replica pull requires --replica-read-only, exactly one dedicated --replicate namespace, nonzero interval, operator password, stable --pqc-node-id, and a pinned upstream identity\n");
         return 2;
     }
+    const bool ct_configured = ct_role != NULL || ct_peer_host != NULL ||
+        ct_generation_hex != NULL || ct_log_limit_bytes != 0u || ct_ack_timeout_ms != 0u;
+    if (ct_configured && (!ct_role || !ct_peer_host || !ct_peer_port ||
+            !ct_generation_hex || !ct_log_limit_bytes || !ct_ack_timeout_ms ||
+            !operator_password || !pqc_node_id || !pqc_identity_dir ||
+            !replication_peer_node_id || !replication_peer_dsa_pub)) {
+        fprintf(stderr, "qihse-cluster-daemon: CT requires role, peer, generation, log limit, ACK timeout, Operator startup, QKP identity, and exact peer pin\n");
+        return 2;
+    }
+    if ((ct_auto_successor_id && (!ct_configured || !consensus_configured ||
+             !consensus_authority_proposals)) ||
+        (ct_learn_generation && (!ct_configured || strcmp(ct_role, "successor")))) {
+        fprintf(stderr, "qihse-cluster-daemon: automatic CT requires a configured consensus authority; generation learning requires a pinned successor\n");
+        return 2;
+    }
+    if (ct_configured && replica_read_only) {
+        fprintf(stderr, "qihse-cluster-daemon: CT successor is promotable; --replica-read-only is not a CT substitute\n");
+        return 2;
+    }
     if (replication_allowed_peer_count && !operator_password) {
         fprintf(stderr, "qihse-cluster-daemon: --replication-allowed-peer requires startup Operator authentication\n");
         return 2;
@@ -2075,7 +2649,8 @@ int main(int argc, char** argv) {
     }
 
     qihse_user_t* replication_service_principal = replication_configured
-        ? replication_service_principal_create(startup_operator, replication_principal_id) : NULL;
+        ? replication_service_principal_create(startup_operator, replication_principal_id,
+            replication_principal_clearance, replication_principal_sci) : NULL;
     if (replication_configured && !replication_service_principal) {
         fprintf(stderr, "qihse-cluster-daemon: could not provision replication service principal %u\n",
                 (unsigned)replication_principal_id);
@@ -2119,6 +2694,109 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: kv store create failed (data dir unusable?)\n");
         return 1;
     }
+    if (replication_service_principal)
+        qihse_kv_store_set_replication_principal_id(store,
+            qihse_user_get_id(replication_service_principal));
+    unsigned char ct_owner_token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
+    uint64_t ct_source_durable_position = 0u;
+    unsigned char ct_source_baseline_digest[32] = {0};
+    if (ct_configured && !startup_operator) {
+        fprintf(stderr, "qihse-cluster-daemon: CT requires an authenticated startup Operator\n");
+        qihse_kv_store_destroy(store);
+        return 1;
+    }
+    if (ct_configured && ct_auto_successor_id && !strcmp(ct_role, "successor")) {
+        qihse_kv_ct_source_status_t promoted;
+        if (qihse_kv_ct_source_status(store, replication_service_principal, &promoted)) {
+            const char* successor_qkp = NULL;
+            const char* successor_pub = NULL;
+            for (size_t i = 0; i < ct_identity_map_option_count; ++i)
+                if (!strcmp(ct_identity_map_options[i].topology_id, ct_auto_successor_id))
+                    successor_qkp = ct_identity_map_options[i].qkp_node_id;
+            if (successor_qkp)
+                for (size_t i = 0; i < replication_allowed_peer_count; ++i)
+                    if (!strcmp(replication_allowed_peers[i].node_id, successor_qkp))
+                        successor_pub = replication_allowed_peers[i].dsa_pub_path;
+            bool found_endpoint = false;
+            for (size_t i = 0; i < peer_count; ++i) {
+                qihse_cluster_node_t candidate;
+                fill_node(peers[i].host, peers[i].port, peers[i].bus_port, &candidate);
+                if (strcmp(candidate.id, ct_auto_successor_id)) continue;
+                snprintf(ct_peer_host_storage, sizeof(ct_peer_host_storage), "%s", candidate.host);
+                ct_peer_host = ct_peer_host_storage;
+                ct_peer_port = candidate.port;
+                found_endpoint = true;
+            }
+            if (!successor_pub || !found_endpoint || strcmp(promoted.source_id, pqc_node_id) ||
+                strcmp(promoted.successor_id, successor_qkp)) {
+                fprintf(stderr, "qihse-cluster-daemon: durable promoted source no longer matches provisioned spare; refusing restart\n");
+                qihse_kv_store_destroy(store); return 1;
+            }
+            memcpy(ct_recovered_generation, promoted.generation, sizeof(ct_recovered_generation));
+            ct_generation_hex = ct_recovered_generation;
+            replication_peer_node_id = successor_qkp;
+            replication_peer_dsa_pub = successor_pub;
+            ct_role = "primary";
+        }
+    }
+    if (ct_configured && strcmp(ct_role, "primary") == 0) {
+        qihse_kv_ct_source_status_t ct_status;
+        bool configured = qihse_kv_ct_source_status(store,
+            replication_service_principal, &ct_status);
+        if (!configured) {
+            configured = qihse_kv_ct_source_enable(store, startup_operator,
+                pqc_node_id, replication_peer_node_id, ct_generation_hex,
+                NULL, ct_log_limit_bytes);
+            if (!configured) {
+                fprintf(stderr, "qihse-cluster-daemon: CT source initialization failed; refusing to start\n");
+                qihse_kv_store_destroy(store);
+                return 1;
+            }
+            configured = qihse_kv_ct_source_status(store,
+                replication_service_principal, &ct_status);
+            if (!configured) {
+                fprintf(stderr, "qihse-cluster-daemon: CT source status unavailable after initialization\n");
+                qihse_kv_store_destroy(store);
+                return 1;
+            }
+        } else if (strcmp(ct_status.source_id, pqc_node_id) != 0 ||
+                   strcmp(ct_status.successor_id, replication_peer_node_id) != 0 ||
+                   strcmp(ct_status.generation, ct_generation_hex) != 0) {
+            fprintf(stderr, "qihse-cluster-daemon: persisted CT source identity differs from configuration\n");
+            qihse_kv_store_destroy(store);
+            return 1;
+        }
+        if (configured) {
+            ct_source_durable_position = ct_status.durable_lsn;
+            memcpy(ct_source_baseline_digest, ct_status.baseline_digest,
+                   sizeof(ct_source_baseline_digest));
+        }
+        if (!qihse_kv_ct_owner_token_get(store, startup_operator, ct_owner_token)) {
+            fprintf(stderr, "qihse-cluster-daemon: CT source capability unavailable; refusing to start\n");
+            qihse_kv_store_destroy(store);
+            return 1;
+        }
+    } else if (ct_configured && strcmp(ct_role, "successor") == 0) {
+        qihse_kv_ct_receiver_status_t receiver_status;
+        if (qihse_kv_ct_receiver_status(store, replication_service_principal,
+                                       &receiver_status)) {
+            if (ct_learn_generation && !strcmp(receiver_status.source_id, replication_peer_node_id)) {
+                memcpy(ct_recovered_generation, receiver_status.generation, sizeof(ct_recovered_generation));
+                ct_generation_hex = ct_recovered_generation;
+            }
+            if (strcmp(receiver_status.source_id, replication_peer_node_id) != 0 ||
+                strcmp(receiver_status.generation, ct_generation_hex) != 0) {
+                fprintf(stderr, "qihse-cluster-daemon: persisted CT receiver identity differs from configuration\n");
+                qihse_kv_store_destroy(store);
+                return 1;
+            }
+            if (!qihse_kv_ct_owner_token_get(store, startup_operator, ct_owner_token)) {
+                fprintf(stderr, "qihse-cluster-daemon: CT receiver capability unavailable; refusing to start\n");
+                qihse_kv_store_destroy(store);
+                return 1;
+            }
+        }
+    }
     if (replica_read_only && !qihse_kv_store_enable_replica_read_only(store)) {
         fprintf(stderr, "qihse-cluster-daemon: could not enable replica read-only fence\n");
         return 1;
@@ -2148,6 +2826,133 @@ int main(int argc, char** argv) {
     }
     if (!qihse_cluster_topology_set_local_node(topology, indexes[self_index])) return 1;
 
+    ct_identity_map_set_t ct_identity_maps;
+    memset(&ct_identity_maps, 0, sizeof(ct_identity_maps));
+    for (size_t i = 0; i < ct_identity_map_option_count; ++i) {
+        uint16_t mapped_index = QIHSE_CLUSTER_NODE_NONE;
+        bool known_pin = false;
+        if (!qihse_cluster_topology_find_node(topology,
+                ct_identity_map_options[i].topology_id, &mapped_index)) {
+            fprintf(stderr, "qihse-cluster-daemon: topology/QKP map names unknown topology node %s\n",
+                    ct_identity_map_options[i].topology_id);
+            return 2;
+        }
+        if (strcmp(ct_identity_map_options[i].qkp_node_id,
+                   pqc_node_id ? pqc_node_id : bind) == 0) known_pin = true;
+        if (replication_peer_node_id &&
+            strcmp(ct_identity_map_options[i].qkp_node_id,
+                   replication_peer_node_id) == 0) known_pin = true;
+        for (size_t k = 0; k < replication_allowed_peer_count; ++k)
+            if (strcmp(ct_identity_map_options[i].qkp_node_id,
+                       replication_allowed_peers[k].node_id) == 0) known_pin = true;
+        if (!known_pin) {
+            fprintf(stderr, "qihse-cluster-daemon: topology/QKP map targets an identity without a configured QKP pin: %s\n",
+                    ct_identity_map_options[i].qkp_node_id);
+            return 2;
+        }
+        ct_identity_maps.entries[ct_identity_maps.count++] =
+            ct_identity_map_options[i];
+    }
+    qihse_cluster_node_t self_topology_node;
+    if (!qihse_cluster_topology_get_node(topology, indexes[self_index],
+            &self_topology_node)) return 1;
+    bool self_map_found = false;
+    for (size_t i = 0; i < ct_identity_maps.count; ++i) {
+        if (strcmp(ct_identity_maps.entries[i].topology_id,
+                   self_topology_node.id) == 0) {
+            if (strcmp(ct_identity_maps.entries[i].qkp_node_id,
+                       pqc_node_id ? pqc_node_id : bind) != 0) {
+                fprintf(stderr, "qihse-cluster-daemon: local topology/QKP mapping disagrees with --pqc-node-id\n");
+                return 2;
+            }
+            self_map_found = true;
+        }
+    }
+    if (!self_map_found) {
+        if (ct_identity_maps.count >= sizeof(ct_identity_maps.entries) /
+                                      sizeof(ct_identity_maps.entries[0])) return 2;
+        ct_identity_map_t* self_map = &ct_identity_maps.entries[ct_identity_maps.count++];
+        snprintf(self_map->topology_id, sizeof(self_map->topology_id), "%s",
+                 self_topology_node.id);
+        snprintf(self_map->qkp_node_id, sizeof(self_map->qkp_node_id), "%s",
+                 pqc_node_id ? pqc_node_id : bind);
+    }
+    /* Replica relationships are provisioned consistently on every process.
+     * Foreign replicas must not masquerade as empty primary placement targets. */
+    for (size_t i = 0; i < MAX_PEERS; ++i) {
+        if (replica_primary[i] == QIHSE_CLUSTER_NODE_NONE) continue;
+        if (indexes[i] == QIHSE_CLUSTER_NODE_NONE ||
+            indexes[replica_primary[i]] == QIHSE_CLUSTER_NODE_NONE) {
+            fprintf(stderr, "qihse-cluster-daemon: --replica-of references an unconfigured node\n");
+            return 2;
+        }
+        qihse_cluster_node_t replica;
+        if (!qihse_cluster_topology_get_node(topology, indexes[i], &replica)) return 2;
+        replica.role = QIHSE_CLUSTER_NODE_REPLICA;
+        replica.primary_index = indexes[replica_primary[i]];
+        if (!qihse_cluster_topology_upsert_node(topology, &replica, NULL)) return 2;
+    }
+    uint16_t ct_peer_index = QIHSE_CLUSTER_NODE_NONE;
+    if (ct_configured) {
+        size_t mapped_matches = 0u;
+        for (size_t i = 0; i < ct_identity_maps.count; ++i) {
+            if (strcmp(ct_identity_maps.entries[i].qkp_node_id,
+                       replication_peer_node_id) != 0) continue;
+            uint16_t candidate = QIHSE_CLUSTER_NODE_NONE;
+            if (!qihse_cluster_topology_find_node(topology,
+                    ct_identity_maps.entries[i].topology_id, &candidate)) continue;
+            ct_peer_index = candidate;
+            mapped_matches++;
+        }
+        if (mapped_matches != 1u || ct_peer_index == QIHSE_CLUSTER_NODE_NONE ||
+            ct_peer_index == indexes[self_index]) {
+            fprintf(stderr, "qihse-cluster-daemon: CT requires an explicit --topology-qkp-map for its pinned peer\n");
+            return 2;
+        }
+
+        /* Derive the replication topology role only from the exact configured
+         * CT role and trusted topology↔QKP identity map. Never infer replica
+         * relationships from an IP address, bus announcement, or peer order. */
+        qihse_cluster_node_t ct_peer_node, local_node;
+        if (!qihse_cluster_topology_get_node(topology, ct_peer_index, &ct_peer_node) ||
+            !qihse_cluster_topology_get_node(topology, indexes[self_index], &local_node))
+            return 2;
+        for (size_t i = 0; i < MAX_PEERS; ++i) {
+            if (replica_primary[i] == QIHSE_CLUSTER_NODE_NONE) continue;
+            uint16_t replica_index = strcmp(ct_role, "primary") == 0
+                ? ct_peer_index : indexes[self_index];
+            uint16_t primary_index = strcmp(ct_role, "primary") == 0
+                ? indexes[self_index] : ct_peer_index;
+            if ((indexes[i] == replica_index && indexes[replica_primary[i]] != primary_index) ||
+                indexes[i] == primary_index) {
+                /* A durable promoted source legitimately replaces its old
+                 * local replica role; the persisted journal is replayed below. */
+                bool recovered = ct_auto_successor_id && ct_recovered_generation[0] &&
+                    !strcmp(ct_role, "primary") && indexes[i] == indexes[self_index];
+                if (!recovered) {
+                    fprintf(stderr, "qihse-cluster-daemon: --replica-of conflicts with pinned CT role\n");
+                    return 2;
+                }
+            }
+        }
+        if (strcmp(ct_role, "primary") == 0) {
+            ct_peer_node.role = QIHSE_CLUSTER_NODE_REPLICA;
+            ct_peer_node.primary_index = indexes[self_index];
+            local_node.role = QIHSE_CLUSTER_NODE_PRIMARY;
+            local_node.primary_index = QIHSE_CLUSTER_NODE_NONE;
+        } else {
+            local_node.role = QIHSE_CLUSTER_NODE_REPLICA;
+            local_node.primary_index = ct_peer_index;
+            ct_peer_node.role = QIHSE_CLUSTER_NODE_PRIMARY;
+            ct_peer_node.primary_index = QIHSE_CLUSTER_NODE_NONE;
+        }
+        if (!qihse_cluster_topology_upsert_node(topology, &ct_peer_node, NULL) ||
+            !qihse_cluster_topology_upsert_node(topology, &local_node, NULL)) {
+            fprintf(stderr, "qihse-cluster-daemon: could not install CT primary/successor topology roles\n");
+            return 2;
+        }
+    }
+
     /* Slot assignment: explicit ranges; anything unassigned falls to self so a
      * single-node deployment owns all slots. */
     bool assigned_any_to_self = self_has_slots;
@@ -2172,6 +2977,21 @@ int main(int argc, char** argv) {
             return 1;
     }
 
+    for (size_t i = 0; i < MAX_PEERS; ++i) {
+        if (replica_primary[i] == QIHSE_CLUSTER_NODE_NONE) continue;
+        qihse_cluster_node_t replica;
+        if (!qihse_cluster_topology_get_node(topology, indexes[i], &replica)) return 2;
+        if (replica.role != QIHSE_CLUSTER_NODE_REPLICA) continue;
+        for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+            uint16_t owner;
+            if (qihse_cluster_topology_get_slot(topology, (uint16_t)slot, &owner, NULL, NULL) &&
+                owner == indexes[i]) {
+                fprintf(stderr, "qihse-cluster-daemon: configured replica owns slots\n");
+                return 2;
+            }
+        }
+    }
+
     /* Replay the durable slot-ownership journal so a migration's ownership
      * survives THIS node's restart (adopt-if-newer). Reclaim/GC is not run
      * before listener bind: stale source copies are reclaimed in bounded
@@ -2181,6 +3001,28 @@ int main(int argc, char** argv) {
     if (data_dir && *data_dir) {
         replayed_journal_entries = qihse_cluster_ownership_journal_replay(
             data_dir, ownership_journal_replay_cb, topology);
+    }
+
+    if (ct_configured) {
+        const uint16_t successor_index = strcmp(ct_role, "primary") == 0
+            ? ct_peer_index : indexes[self_index];
+        size_t range_count = qihse_cluster_topology_ranges(topology, NULL, 0u);
+        qihse_cluster_slot_range_t* ranges = range_count
+            ? calloc(range_count, sizeof(*ranges)) : NULL;
+        if (range_count && !ranges) return 1;
+        (void)qihse_cluster_topology_ranges(topology, ranges, range_count);
+        bool successor_slotless = true;
+        for (size_t i = 0; i < range_count; ++i) {
+            if (ranges[i].owner_index == successor_index) {
+                successor_slotless = false;
+                break;
+            }
+        }
+        free(ranges);
+        if (!successor_slotless) {
+            fprintf(stderr, "qihse-cluster-daemon: CT successor must be slotless before replication/promotion\n");
+            return 2;
+        }
     }
 
     /* R4c QKP1: resolve identity/trust from --pqc-* flags.
@@ -2314,6 +3156,7 @@ int main(int argc, char** argv) {
             if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
             return 1;
         }
+        mesh_cfg.authority_proposals_enabled = consensus_authority_proposals;
         mesh_cfg.qkp = pqc;
         mesh_cfg.qkp.require = true;
         mesh_cfg.qkp.node_id = pqc_node_id;
@@ -2396,13 +3239,22 @@ int main(int argc, char** argv) {
     config.redundancy_peer = NULL;
     config.replication_service_principal = replication_configured
         ? replication_service_principal : NULL;
-    /* Replicate all by default in LAN cluster (when in cluster mesh and bind is private/LAN) */
-    if (repl_glob_count == 0 && !replicate_disabled && (peer_count > 0 || seed_count > 0) && is_lan_host(bind)) {
-        snprintf(repl_globs[0], sizeof(repl_globs[0]), "*");
-        repl_glob_ptrs[0] = repl_globs[0];
-        repl_glob_count = 1;
-        fprintf(stderr, "qihse-cluster-daemon: LAN cluster default: replicating all namespaces ('*')\n");
-    }
+    config.ct_role = ct_role;
+    config.ct_auto_successor_id = ct_auto_successor_id;
+    config.ct_peer_host = ct_peer_host;
+    config.ct_peer_port = ct_peer_port;
+    config.ct_generation_hex = ct_generation_hex;
+    config.ct_log_limit_bytes = ct_log_limit_bytes;
+    config.ct_ack_timeout_ms = ct_ack_timeout_ms;
+    config.ct_owner_token = ct_configured && strcmp(ct_role, "primary") == 0
+        ? ct_owner_token : NULL;
+    config.ct_control_principal = ct_configured ? startup_operator : NULL;
+    config.ct_topology_qkp_id = ct_identity_map_lookup;
+    config.ct_topology_qkp_id_context = &ct_identity_maps;
+    /* A LAN address and a cluster peer do not establish a replicated copy.
+     * Mark only namespaces explicitly selected by the operator; otherwise
+     * the routing exemption would expose local, unproven data after a lead
+     * failure. */
     if (repl_interval > 0u && repl_glob_count > 0u && !replication_source_host) {
         fprintf(stderr, "qihse-cluster-daemon: outbound anti-entropy disabled; configure an exact pinned --replication-source-host and peer identity\n");
     }
@@ -2503,9 +3355,10 @@ int main(int argc, char** argv) {
     (void)qihse_cluster_maintenance_register(maintenance_gate,
         QIHSE_MAINT_WRITER_REPLICA, true);
     (void)qihse_cluster_maintenance_register(maintenance_gate,
-        QIHSE_MAINT_WRITER_BRAIN, !brain_enabled);
+        QIHSE_MAINT_WRITER_BRAIN, true);
     config.maintenance_gate = maintenance_gate;
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
+    OPENSSL_cleanse(ct_owner_token, sizeof(ct_owner_token));
     OPENSSL_cleanse(g_transport_keys.bus_veil,
                     sizeof(g_transport_keys.bus_veil));
     config.veil_key = NULL;
@@ -2516,6 +3369,48 @@ int main(int argc, char** argv) {
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
         if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
         return 1;
+    }
+    qihse_cluster_ownership_context_t ct_ownership;
+    memset(&ct_ownership, 0, sizeof(ct_ownership));
+    bool ct_ownership_ready = false;
+    if (startup_operator && qihse_auth_user_is_active(startup_operator) &&
+        qihse_user_get_role(startup_operator) == QIHSE_ROLE_OPERATOR &&
+        qihse_user_get_tenant_id(startup_operator) == QIHSE_TENANT_SYSTEM) {
+        ct_ownership.topology = qihse_resp_server_topology(server);
+        ct_ownership.bus = qihse_resp_server_bus(server);
+        ct_ownership.store = store;
+        ct_ownership.principal = startup_operator;
+        ct_ownership.data_principal = replication_service_principal;
+        ct_ownership.resp_server = server;
+        if (ct_auto_successor_id) {
+            ct_ownership.promotion_authorized = qihse_resp_server_ct_authorize_promotion;
+            ct_ownership.promotion_context = server;
+        }
+        ct_ownership.peer_id = ct_identity_map_lookup;
+        ct_ownership.peer_id_context = &ct_identity_maps;
+        if (ct_ownership.topology && ct_ownership.bus &&
+            qihse_resp_server_ct_ownership_set(server, &ct_ownership)) {
+            ct_ownership_ready = true;
+            qihse_resp_server_ct_control_only_set(server, true);
+            const char* store_dir = qihse_kv_store_data_directory(store);
+            char staging_dir[PATH_MAX];
+            char target_error[256] = {0};
+            int stage_len = store_dir ? snprintf(staging_dir, sizeof(staging_dir),
+                "%s/ct2-staging", store_dir) : -1;
+            qihse_ct_target_t* target = NULL;
+            if (stage_len > 0 && (size_t)stage_len < sizeof(staging_dir) &&
+                mkdirs(staging_dir) && pqc_node_id && *pqc_node_id) {
+                target = qihse_ct_target_create(&ct_ownership, staging_dir,
+                    pqc_node_id, target_error, sizeof(target_error));
+            }
+            if (!target || !qihse_resp_server_ct_target_set(server, target)) {
+                if (target) qihse_ct_target_destroy(target);
+                fprintf(stderr, "qihse-cluster-daemon: CT2 target staging disabled: %s\n",
+                    target_error[0] ? target_error : "cannot initialize private stage directory");
+            }
+        } else {
+            fprintf(stderr, "qihse-cluster-daemon: ownership recovery context unavailable; CT2 stays disabled\n");
+        }
     }
     if (startup_maintenance_held) {
         uint64_t startup_generation = 0;
@@ -2556,9 +3451,9 @@ int main(int argc, char** argv) {
     }
     if (consensus_mesh && !qihse_consensus_mesh_start(consensus_mesh)) {
         fprintf(stderr, "qihse-cluster-daemon: consensus mesh listener/start failed\n");
+        qihse_resp_server_destroy(server);
         qihse_consensus_mesh_destroy(consensus_mesh);
         qihse_blob_store_destroy(consensus_blobs);
-        qihse_resp_server_destroy(server);
         qihse_cluster_maintenance_destroy(maintenance_gate);
         return 1;
     }
@@ -2629,7 +3524,13 @@ int main(int argc, char** argv) {
             .prune_timeout_seconds = brain_prune_timeout,
             .rebalance_min_slots = brain_rebalance_min,
             .federation_journal_dir = brain_fed_dir,
-            .node_key_handle = brain_node_key
+            .node_key_handle = brain_node_key,
+            .control_principal = startup_operator,
+            .data_principal = replication_service_principal,
+            .maintenance_gate = maintenance_gate,
+            .transfer = ct_ownership_ready ? daemon_brain_transfer : NULL,
+            .transfer_context = &ct_ownership,
+            .transfer_generation_get = ct_ownership_ready ? daemon_brain_generation : NULL
         };
         if (!qihse_cluster_brain_start(&brain_cfg)) {
             fprintf(stderr, "qihse-cluster-daemon: brain failed to start (continuing without it)\n");
@@ -2638,9 +3539,12 @@ int main(int argc, char** argv) {
         }
     }
     pthread_t ae_thread;
+    pthread_t ct1_thread;
     static volatile sig_atomic_t ae_stop = 0;
     ae_ctx_t ae_ctx;
+    ct1_pull_ctx_t ct1_ctx;
     bool ae_started = false;
+    bool ct1_started = false;
     bool ok = false;
     pthread_t join_thread;
     bool join_started = false;
@@ -2674,14 +3578,70 @@ int main(int argc, char** argv) {
      * handler can drive an orderly stop. qihse_resp_server_run() owns its
      * blocking accept loop and does not observe this process's g_stop flag,
      * which otherwise makes systemd wait for SIGKILL at TimeoutStopSec. */
+    if (ct_configured && strcmp(ct_role, "primary") == 0 &&
+        !ct1_primary_peer_preflight(ct_peer_host, ct_peer_port, &pqc,
+                                    ct_generation_hex, ct_source_durable_position,
+                                    ct_source_baseline_digest)) {
+        fprintf(stderr, "qihse-cluster-daemon: CT primary refused startup; pinned successor STATUS preflight failed\n");
+        goto shutdown;
+    }
+    bool ownership_recovery_pending = ct_ownership_ready;
+    unsigned ownership_retry_ticks = 0u;
     ok = qihse_resp_server_start(server);
     if (ok) {
+        if (ownership_recovery_pending) {
+            bool unresolved = false;
+            char recovery_error[256] = {0};
+            if (qihse_cluster_ownership_replay_control(&ct_ownership, &unresolved,
+                    recovery_error, sizeof(recovery_error)) && !unresolved) {
+                ownership_recovery_pending = false;
+                qihse_resp_server_ct_control_only_set(server, false);
+                if (ct_auto_successor_id && !failover_start_paused)
+                    (void)qihse_resp_server_ct_auto_resume(server, startup_operator);
+            } else if (recovery_error[0]) {
+                fprintf(stderr, "qihse-cluster-daemon: ownership recovery remains fenced: %s\n",
+                        recovery_error);
+            }
+        }
+        if (ct_configured && strcmp(ct_role, "successor") == 0) {
+            memset(&ct1_ctx, 0, sizeof(ct1_ctx));
+            ct1_ctx.store = store;
+            ct1_ctx.server = server;
+            ct1_ctx.operator_user = startup_operator;
+            ct1_ctx.replication_user = replication_service_principal;
+            ct1_ctx.qkp = &pqc;
+            ct1_ctx.source_host = ct_peer_host;
+            ct1_ctx.source_port = ct_peer_port;
+            ct1_ctx.generation = ct_generation_hex;
+            ct1_ctx.learn_generation = ct_learn_generation;
+            ct1_ctx.stop = &ae_stop;
+            if (!ct1_ctx.replication_user ||
+                pthread_create(&ct1_thread, NULL, ct1_pull_main, &ct1_ctx) != 0) {
+                fprintf(stderr, "qihse-cluster-daemon: CT1 successor pull worker failed to start; node remains fenced\n");
+                ok = false;
+                goto shutdown;
+            }
+            ct1_started = true;
+        }
         bool gc_pending = replayed_journal_entries > 0;
         bool gc_defer_reported = false;
         size_t gc_ticks = 0u;
         struct timespec wait = {0, 100000000L};
         while (!g_stop) {
             if (nanosleep(&wait, &wait) == 0) wait = (struct timespec){0, 100000000L};
+            if (ownership_recovery_pending && !g_stop && ++ownership_retry_ticks >= 10u) {
+                ownership_retry_ticks = 0u;
+                bool unresolved = false;
+                char recovery_error[256] = {0};
+                if (qihse_cluster_ownership_replay_control(&ct_ownership, &unresolved,
+                        recovery_error, sizeof(recovery_error)) && !unresolved) {
+                    ownership_recovery_pending = false;
+                    qihse_resp_server_ct_control_only_set(server, false);
+                    if (ct_auto_successor_id && !failover_start_paused)
+                        (void)qihse_resp_server_ct_auto_resume(server, startup_operator);
+                    fprintf(stderr, "qihse-cluster-daemon: ownership recovery complete; data listener enabled\n");
+                }
+            }
             if (gc_pending && !g_stop) {
                 gc_ticks++;
                 if (gc_ticks >= 50u) { /* 5 s settle after listener bind */
@@ -2735,15 +3695,29 @@ shutdown:
             for (;;) pause(); /* the watchdog owns the exit from here */
         }
     }
+    if (ct1_started) {
+        unsigned int join_wait = shutdown_grace_seconds();
+        if (join_wait > 15u) join_wait = 15u;
+        struct timespec join_deadline;
+        clock_gettime(CLOCK_REALTIME, &join_deadline);
+        join_deadline.tv_sec += (time_t)join_wait;
+        int joined = pthread_timedjoin_np(ct1_thread, NULL, &join_deadline);
+        if (joined != 0) {
+            fprintf(stderr, "qihse-cluster-daemon: CT1 pull thread did not stop within %u s; leaving teardown to shutdown watchdog\n", join_wait);
+            for (;;) pause();
+        }
+    }
     qihse_cluster_brain_stop(); /* before destroy: the brain reads the topology every cycle */
     qihse_overlay_stop(); /* The bootstrap thread borrows the server's bus. */
+    /* Server-owned failover workers borrow the mesh and blob context. Join
+     * them before stopping or destroying those dependencies. */
+    qihse_resp_server_stop(server);
+    qihse_resp_server_destroy(server);
     if (consensus_mesh) {
         qihse_consensus_mesh_stop(consensus_mesh);
         qihse_consensus_mesh_destroy(consensus_mesh);
         qihse_blob_store_destroy(consensus_blobs);
     }
-    qihse_resp_server_stop(server);
-    qihse_resp_server_destroy(server);
     qihse_cluster_maintenance_destroy(maintenance_gate);
     /* config.store is borrowed. Destroy drains server-owned writers (including
      * BGSAVE); only then may the data owner fence and release the caller's KV.

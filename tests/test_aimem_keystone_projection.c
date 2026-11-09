@@ -39,6 +39,37 @@ static size_t recall(qihse_resp_server_t* server, qihse_user_t* reader,
         QIHSE_AIMEM_KIND_ANY, scope, hits, 8u);
 }
 
+typedef struct {
+    qihse_kv_store_t* kv;
+    qihse_user_t* user;
+    unsigned calls;
+    bool injected;
+} interrupted_embed_t;
+
+static bool interrupted_embed(const char* text, float* out, size_t dim, void* opaque) {
+    interrupted_embed_t* state = opaque;
+    if (!text || !out || !dim || !state) return false;
+    unsigned call = __atomic_add_fetch(&state->calls, 1u, __ATOMIC_RELAXED);
+    if (call == 3u) {
+        /* Mutate an unrelated durable key during a cold generation. The
+         * global marker must invalidate publication, then a retry must reuse
+         * the completed vectors after fresh authorized canonical reads. */
+        state->injected = qihse_kv_set_user(state->kv,
+            "t:17/unrelated:cold-rebuild-interruption", "v1", 0u, 0u,
+            state->user);
+        if (!state->injected) return false;
+    }
+    memset(out, 0, dim * sizeof(*out));
+    out[0] = 1.0f;
+    return true;
+}
+
+static bool count_aimem_key(const char* key, void* opaque) {
+    size_t* count = opaque;
+    if (strncmp(key, "t:17/aimem:", 11u) == 0) (*count)++;
+    return true;
+}
+
 int main(void) {
     char dir[] = "./aimem_keystone_test_XXXXXX";
     assert(mkdtemp(dir) && chmod(dir, 0700) == 0);
@@ -156,9 +187,38 @@ int main(void) {
     for (size_t i = 0; i < n; i++) assert(strcmp(hits[i].id, cat));
     qihse_ai_memory_hits_free(hits, n);
     assert(qihse_ai_memory_projection_wait_ready(server, reader, 30000u));
+    qihse_ai_memory_projection_shutdown(server);
+    /* Use an instrumented provider with the installed ONNX model identity to
+     * make a marker change deterministic without a slow inference fixture. */
+    uint8_t model_digest[32];
+    assert(qihse_ai_memory_embedder_fingerprint(model_digest));
+    char model_name[64];
+    assert(snprintf(model_name, sizeof model_name, "%s",
+        qihse_ai_memory_embedder_name()) < (int)sizeof model_name);
+    size_t model_dim = qihse_ai_memory_embedding_dim();
+    interrupted_embed_t interrupted = {.kv = kv, .user = reader};
+    qihse_ai_memory_embedder_t fake = {
+        .name = model_name, .dim = model_dim,
+        .embed = interrupted_embed, .ctx = &interrupted
+    };
+    assert(qihse_ai_memory_set_embedder(&fake));
+    assert(qihse_ai_memory_set_embedder_fingerprint(model_digest));
+    char cold_dir[512];
+    assert(snprintf(cold_dir, sizeof cold_dir, "%s/cold-interrupted", dir) <
+        (int)sizeof cold_dir);
+    assert(mkdir(cold_dir, 0700) == 0);
+    size_t expected_inferences = 0u;
+    assert(qihse_kv_foreach_key_user(kv, reader, count_aimem_key,
+        &expected_inferences));
+    assert(expected_inferences > 3u);
+    assert(qihse_ai_memory_projection_enable(server, reader, lib, cold_dir));
+    assert(qihse_ai_memory_projection_wait_ready(server, reader, 60000u));
+    assert(interrupted.injected &&
+        __atomic_load_n(&interrupted.calls, __ATOMIC_RELAXED) == expected_inferences);
     assert(qihse_ai_memory_set_embedder(NULL));
     assert(recall(server, reader, &scope, "cat", QIHSE_AIMEM_MODE_SEMANTIC, hits) == 0u);
     assert(errno == ESTALE);
+    qihse_ai_memory_projection_shutdown(server);
     qihse_resp_server_destroy(server); qihse_kv_store_destroy(kv);
     qihse_audit_shutdown();
     assert(nftw(dir, remove_fixture, 16, FTW_DEPTH | FTW_PHYS) == 0);

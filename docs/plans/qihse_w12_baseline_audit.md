@@ -1,14 +1,79 @@
-# W12.0 first increment: substrate audit and synthetic FP32 baseline
+# W12.0 baseline audit: kernels and full-engine synthetic comparison
 
-Status: **in progress, not a completed W12.0 gate** (2026-10-22).
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
+Status: **in progress, not a completed W12.0 gate** (2026-11-06).
 Source audit pinned to `d298f725278d35be4279506f5753b163ee8eb904`.
 Parent design: [TurboQuant plan](qihse_turboquant_vector_index_plan.md).
 
-This increment changes no production query mode, public C structure, default,
+The first increment changed no production query mode, public C structure, default,
 credential, persistence format, or authorization behavior. It adds a reproducible
 benchmark-only exhaustive search loop over generated fixtures, using the actual
-production scalar and runtime-dispatched FP32 distance kernels. It is **not** a
-full VectorDB/AIMEM benchmark, an authorization test, or a TurboQuant codec.
+production scalar and runtime-dispatched FP32 distance kernels. That kernel
+run was **not** a full VectorDB/AIMEM benchmark, an authorization test, or a
+TurboQuant codec. The second increment below adds a synthetic full VectorDB run.
+
+## Second increment: full VectorDB synthetic baseline
+
+The new engine driver in benchmarks/scripts/qihse_w12_engine_baseline.py
+builds a benchmark-only C probe and calls the public VectorDB create, add,
+flush, sidecar build, and search APIs. Every search has an explicit authenticated
+operator principal. The driver creates a fresh private QIHSE_DATA_DIR per
+route and only inserts generated unclassified vectors; it does not read the
+configured QIHSE store. It compares returned IDs against a separate binary64
+exhaustive oracle over the same binary32 values.
+
+Reproduce after building libqihse.so in this checkout:
+
+    make -j16 libqihse.so
+    python3 benchmarks/scripts/qihse_w12_engine_baseline_test.py
+    python3 benchmarks/scripts/qihse_w12_engine_baseline.py --rows 256 --dimensions 128 --queries 8 --repeats 3 --output build/w12/engine-baseline.json
+
+The default fixture is xorshift32 seed 0x1200, isotropic, 256 rows x 128
+dimensions, 8 queries, top 10, candidate pool 64, all three metrics, one
+warmup plus three timed repetitions. The checked-in artifact at
+benchmarks/scripts/qihse_w12_engine_pilot.json includes fixture SHA-256,
+library/probe hashes, compiler command, host CPU flags/allowed CPUs, raw latency
+samples, first-repeat result IDs, recall, build time, FP32 resident bytes,
+graph topology bytes, and complete qdb container bytes. It marks total
+allocator RAM, sidecar disk bytes, AIMEM, real corpus, PQ and TurboQuant as
+unmeasured. The C probe requires little-endian IEEE binary32.
+
+Observed first full-engine run on the current host (2026-11-06, 8 queries x
+3 repeats per metric, p50 from 24 warm samples):
+
+| Wired route | Cosine recall@10 vs FP64 | Cosine p50 (us) | qdb bytes |
+| --- | ---: | ---: | ---: |
+| Exact FP32 | 1.000 | 97 | 191,516 |
+| Trinary scalar + rerank | 0.925 | 141 | 191,516 |
+| Trinary magnitude + rerank | 1.000 | 155 | 191,516 |
+| Trinary magnitude bypass | 0.900 | 141 | 191,516 |
+| Graph traversal + rerank | 0.975 | 128 | 228,432 |
+| INT8 candidates + rerank | 0.888 | 51 | 225,344 |
+| FP16 selector (FP32 alias) | 1.000 | 56 | 191,516 |
+| Explicit FP32 selector (FP32 alias) | 1.000 | 57 | 191,516 |
+| FP8 selector (FP32 alias) | 1.000 | 58 | 191,516 |
+| FP4 selector (FP32 alias) | 1.000 | 57 | 191,516 |
+| INT4 selector (FP32 alias) | 1.000 | 57 | 191,516 |
+| Binary candidates + rerank | 0.300 | 35 | 191,516 |
+
+The FP32 resident count was 131,072 bytes for every mode. Graph reported
+114,352 additional in-process topology bytes; index_bytes reports graph
+topology only. Container size is measured after post-build flush and is not
+the byte size of every in-memory sidecar. In particular, binary and trinary
+container sizes were unchanged from exact FP32 here. The five FP16/FP32/FP8/
+FP4/INT4 selectors are exact FP32 scan aliases, so their timings are repeated
+FP32 measurements, not evidence of compressed scoring. The current candidate
+routes select globally before complete authorization, as audited below; these
+unclassified results do not qualify a classified deployment. The sample is
+too small and process ordering too variable for speedup claims.
+
+Remaining W12.0 gate: run a declared real, authorized corpus and multiple
+dimensions/seeds with controlled CPU affinity and order; capture total
+sidecar/storage RAM and disk, build/update costs, latency distributions and
+recall; establish scope-first candidate authorization and low-clearance
+high-data negative tests before any approximate route is promoted. TurboQuant
+is still a standalone codec, not a VectorDB search route.
 
 ## Actual wired alternatives
 

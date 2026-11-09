@@ -371,7 +371,9 @@ class AdminTests(unittest.TestCase):
                             with os.fdopen(fd, 'w') as client_env:
                                 client_env.write(''.join(f'{k}={v}\n' for k, v in cfg_values.items()))
                             hax_env = {**env, **cfg_values, 'QIHSE_AIMEM_ENV': str(cfg_path)}
-                            client_test = subprocess.run([str(Path(hax_dir) / 'build/tests/test_memory_client'),
+                            client_binary = Path(os.environ.get('QIHSE_HAX_TEST_BINARY') or
+                                Path(hax_dir) / 'build/tests/test_memory_client')
+                            client_test = subprocess.run([str(client_binary),
                                 '--qkp-integration'], env={**hax_env, 'HAX_MEMORY_DEBUG': '1'},
                                 capture_output=True, timeout=20)
                             self.assertEqual(client_test.returncode, 0, client_test.stderr)
@@ -382,6 +384,36 @@ class AdminTests(unittest.TestCase):
                                 capture_output=True, timeout=20)
                             self.assertEqual(hook.returncode, 0, hook.stderr)
                             self.assertEqual(hook.stderr, b'')
+                            large_store = subprocess.run(
+                                ['python3', '-I', '-c', '''
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location('hax_memory_qkp_fixture', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+client = module.Aimem()
+try:
+    text = 'HAX QKP large store ' + 'x' * (262144 - len('HAX QKP large store '))
+    scope = ('qihse', '', '', '')
+    memory_id = client.store(text, 2, 'hax-qkp-large-fixture', scope)
+    record = client._command('AIMEM', 'GET-SCOPED', memory_id, *scope)
+    assert isinstance(record, list) and len(record) == 7 and record[6] == text
+    knowledge_id, version_id = client.propose_knowledge(
+        scope, 1, 'HAX QKP knowledge fixture',
+        'hax-qkp-knowledge-event', 'hax-qkp-knowledge-retry')
+    version = client.get_knowledge(scope, 'get', version_id)
+    assert version is not None and version['knowledge_id'] == knowledge_id
+    assert version['content'] == 'HAX QKP knowledge fixture'
+    assert any(row['version'] == version_id for row in client.current_knowledge(scope, 1))
+    assert any(row['version_id'] == version_id for row in
+               client.query_history(scope, 'HAX QKP knowledge fixture', 0, 0))
+finally:
+    client.close()
+''', str(Path(hax_dir) / 'scripts/memory_hooks.py')],
+                                env={**hax_env, 'HAX_MEMORY_DEBUG': '1'}, cwd=ROOT,
+                                capture_output=True, timeout=30)
+                            self.assertEqual(large_store.returncode, 0, large_store.stderr)
                             self.assertGreaterEqual(session.execute('AIMEM', 'COUNT-SCOPED', 'qihse', '', '', ''), 2)
                         finally:
                             cfg_path.unlink(missing_ok=True)

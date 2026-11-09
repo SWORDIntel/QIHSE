@@ -676,6 +676,13 @@ bool qihse_consensus_read_committed_exact(const qihse_consensus_t* cs,
                                           qihse_consensus_entry_t* out_entries,
                                           size_t out_cap, size_t* out_count);
 
+/* Operator recovery read of one locally durable entry, including an
+ * uncommitted suffix. This is not commit authority. The active system
+ * Operator must also cover the entry's classification/SCI. Failure clears
+ * out_entry. Serialize with all consensus mutation and snapshot installation. */
+bool qihse_consensus_read_durable_entry_user(const qihse_consensus_t* cs,
+    const qihse_user_t* user, uint64_t index, qihse_consensus_entry_t* out_entry);
+
 /* Compute a SHA-256 commitment to exactly the local committed entries at
  * indices 1..through_index, including entries retained in a snapshot.
  * through_index must be <= the commit index; zero yields an all-zero digest.

@@ -1,5 +1,7 @@
 # QIHSE Task Queue Engine — Celery-Equivalent Distributed Task Dispatch
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status: partial.** The task lifecycle layer this document describes exists
 > and is tested: `include/qihse_task_queue.h`, `include/qihse_task_scheduler.h`,
 > `include/qihse_task_worker.h` and the matching sources under

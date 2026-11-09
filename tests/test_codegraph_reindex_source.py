@@ -116,6 +116,46 @@ class SourceTests(unittest.TestCase):
         self.export.write_bytes(self.destination.read_bytes())
         bridge.prepare_export(self.export, self.destination, identity)
 
+    def test_128_bit_graph_identity_preserved_with_sha256_source_checks(self):
+        identity = bridge.source_identity(self.repo)
+        node_id = hashlib.sha256(b'target').hexdigest()[:32]
+        profiles = (
+            dict(identity='qihse-semantic-128-v1', id_algorithm='sha256-128',
+                 id_bits=128, id_collision='counter-sha256-128-v1', id_collision_attempts=256),
+            dict(identity='qihse-semantic-xxh3-128-v1', id_algorithm='xxh3-128',
+                 id_bits=128, id_seed=0, id_encoding='xxh128-canonical',
+                 id_collision='counter-xxh3-128-v1', id_collision_attempts=256),
+        )
+        for profile in profiles:
+            header = dict(t='h', format='qihse-codegraph-v1', version=1,
+                          identity='qihse-semantic-128-v1', id_algorithm='sha256-128',
+                          id_bits=128, id_collision='counter-sha256-128-v1',
+                          id_collision_attempts=256, head=identity['head'],
+                          worktree=identity['worktree'])
+            header.update(profile)
+            record = (json.dumps(dict(t='n', id=node_id, file='tracked.c', name='target',
+                                      kind='Function', line_start=1, line_end=1, is_test=False))
+                      + '\n').encode()
+            body = json.dumps(header).encode() + b'\n' + record
+            trailer = dict(t='end', nodes=1, edges=0, unresolved_edges=0,
+                           sha256=hashlib.sha256(body).hexdigest())
+            self.export.write_bytes(body + json.dumps(trailer).encode() + b'\n')
+            for prepared_again in (False, True):
+                if prepared_again:
+                    self.export.write_bytes(self.destination.read_bytes())
+                bridge.prepare_export(self.export, self.destination, identity)
+                lines = self.destination.read_bytes().splitlines(keepends=True)
+                actual_header, actual_node, actual_end = map(json.loads, lines)
+                self.assertEqual(lines[1], record)
+                self.assertEqual(actual_node['id'], node_id)
+                self.assertEqual(len(actual_node['id']), 32)
+                for key in profile:
+                    self.assertEqual(actual_header[key], header[key])
+                self.assertEqual(actual_header['worktree_v2'], identity['worktree_v2'])
+                self.assertEqual(len(actual_header['worktree_v2']), 64)
+                self.assertEqual(actual_end['sha256'], hashlib.sha256(b''.join(lines[:-1])).hexdigest())
+                self.assertEqual(len(actual_end['sha256']), 64)
+
     def assert_failed_preserves_destination(self, identity):
         self.destination.write_bytes(b'preserve')
         with self.assertRaises((ValueError, OSError)):

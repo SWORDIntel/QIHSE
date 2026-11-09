@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <assert.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -191,6 +192,13 @@ int main(void) {
     const char* marked_globs[] = {"vendor:7:*"};
     config.replicate_globs = marked_globs;
     config.replicate_glob_count = 1u;
+    config.redundancy_peer = "127.0.0.1:1";
+    errno = 0;
+    assert(qihse_resp_server_create(&config) == NULL && errno == ENOTSUP);
+    config.redundancy_peer = "";
+    errno = 0;
+    assert(qihse_resp_server_create(&config) == NULL && errno == ENOTSUP);
+    config.redundancy_peer = NULL;
     qihse_resp_server_t* server = qihse_resp_server_create(&config);
     assert(server && qihse_resp_server_start(server));
 

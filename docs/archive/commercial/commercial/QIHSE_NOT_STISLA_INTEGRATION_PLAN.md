@@ -1,4 +1,8 @@
-# QIHSE-NOT_STISLA Integration Plan
+# QIHSE–KEYSTONE integration design (historical)
+
+> **Naming:** KEYSTONE was formerly named NOT_STISLA. The historical filename is retained for link compatibility. Optimization percentages and completion claims below are dated, unverified design history; current status belongs to the master roadmap.
+
+> **Roadmap authority:** [ROADMAP.md](../../../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
 
 > **Status: superseded** — retained for design history. This document
 > describes an earlier revision, name or direction and is not maintained
@@ -7,9 +11,9 @@
 > `docs/archive/` inherit `superseded` by the convention stated in
 > `docs/archive/README.md`.
 
-**Integrating NOT_STISLA Optimizations into QIHSE**
+**Integrating KEYSTONE Optimizations into QIHSE**
 
-**Objective:** Ensure QIHSE incorporates all NOT_STISLA optimizations while maintaining its full feature set. NOT_STISLA serves as lightweight alternative for simpler use cases.
+**Objective:** Ensure QIHSE incorporates all KEYSTONE optimizations while maintaining its full feature set. KEYSTONE serves as lightweight alternative for simpler use cases.
 
 **✅ COMPLETED:** Full integration implemented across all phases. QIHSE now includes anchor-based search, memory-bounded tables, runtime CPU detection, SIMD optimizations, workload classification, anchor learning, statistics integration, intelligent algorithm selection, and quantum-classical hybrid approaches.
 
@@ -19,49 +23,49 @@
 
 **Current State:**
 - **QIHSE**: Full-featured quantum-inspired search with heterogeneous parallel execution, ML optimization, distributed coherence
-- **NOT_STISLA**: Lightweight anchor-based interpolation search with memory-bounded optimizations
+- **KEYSTONE**: Lightweight anchor-based interpolation search with memory-bounded optimizations
 
 **Goal:**
-- **QIHSE adopts NOT_STISLA's proven optimizations** (anchor learning, SIMD efficiency, workload tuning)
-- **NOT_STISLA remains clean lightweight implementation** for simple use cases
+- **QIHSE adopts KEYSTONE's proven optimizations** (anchor learning, SIMD efficiency, workload tuning)
+- **KEYSTONE remains clean lightweight implementation** for simple use cases
 - **Performance improvement**: 15-25% speedup for sorted data workloads
 
 ---
 
-## 🔍 **ANALYSIS: NOT_STISLA OPTIMIZATIONS QIHSE NEEDS**
+## 🔍 **ANALYSIS: KEYSTONE OPTIMIZATIONS QIHSE NEEDS**
 
 ### **1. Anchor-Based Interpolation Search**
-**NOT_STISLA Feature:** Learns optimal interpolation points, predicts positions using high-precision interpolation
+**KEYSTONE Feature:** Learns optimal interpolation points, predicts positions using high-precision interpolation
 **QIHSE Gap:** Uses quantum-inspired algorithms but lacks classical interpolation optimization
 **Impact:** 20-30% performance improvement for sorted data
 
 ### **2. Smart Anchor Learning**
-**NOT_STISLA Feature:** Adaptive anchor learning with usage tracking, LRU pruning, workload-specific limits
+**KEYSTONE Feature:** Adaptive anchor learning with usage tracking, LRU pruning, workload-specific limits
 **QIHSE Gap:** No anchor management in quantum algorithms
 **Impact:** Memory efficiency, better long-term performance
 
 ### **3. Memory-Bounded Anchor Tables**
-**NOT_STISLA Feature:** Hard memory limits (16 anchors max), intelligent pruning, no memory ballooning
+**KEYSTONE Feature:** Hard memory limits (16 anchors max), intelligent pruning, no memory ballooning
 **QIHSE Gap:** Quantum structures can grow unbounded
 **Impact:** Predictable memory usage, better resource management
 
 ### **4. Runtime CPU Feature Detection**
-**NOT_STISLA Feature:** Signal-based SIMD detection (AVX2/AVX512/AMX), graceful fallbacks
+**KEYSTONE Feature:** Signal-based SIMD detection (AVX2/AVX512/AMX), graceful fallbacks
 **QIHSE Gap:** Compile-time assumptions about SIMD availability
 **Impact:** Better hardware utilization across different systems
 
 ### **5. Enhanced SIMD Utilization**
-**NOT_STISLA Feature:** Chunked processing (4/8 elements per SIMD register), runtime SIMD selection
+**KEYSTONE Feature:** Chunked processing (4/8 elements per SIMD register), runtime SIMD selection
 **QIHSE Gap:** Basic SIMD usage without optimization
 **Impact:** 2-3x SIMD performance improvement
 
 ### **6. Workload-Specific Tuning**
-**NOT_STISLA Feature:** Different algorithms/parameters for telemetry/IDs/offsets/events
+**KEYSTONE Feature:** Different algorithms/parameters for telemetry/IDs/offsets/events
 **QIHSE Gap:** Single algorithm for all workloads
 **Impact:** 10-15% performance improvement per workload type
 
 ### **7. Comprehensive Statistics**
-**NOT_STISLA Feature:** Detailed performance tracking, success rates, anchor metrics
+**KEYSTONE Feature:** Detailed performance tracking, success rates, anchor metrics
 **QIHSE Gap:** Basic performance monitoring
 **Impact:** Better observability, optimization opportunities
 
@@ -72,7 +76,7 @@
 ### **Architecture Decision**
 **QIHSE will maintain dual search paths:**
 1. **Quantum-Inspired Path**: Full QIHSE with RFF, superposition, Grover (default)
-2. **Classical Interpolation Path**: NOT_STISLA-style anchor search (when applicable)
+2. **Classical Interpolation Path**: KEYSTONE-style anchor search (when applicable)
 
 **Selection Criteria:**
 - **Use interpolation path for:** Sorted data, uniform distributions, predictable patterns
@@ -81,8 +85,8 @@
 ### **Integration Points**
 1. **Algorithm Selection**: Add anchor-based search as QIHSE search mode
 2. **Memory Management**: Integrate bounded anchor tables into QIHSE memory system
-3. **SIMD Optimization**: Enhance QIHSE backends with NOT_STISLA SIMD patterns
-4. **Statistics**: Merge NOT_STISLA statistics into QIHSE monitoring
+3. **SIMD Optimization**: Enhance QIHSE backends with KEYSTONE SIMD patterns
+4. **Statistics**: Merge KEYSTONE statistics into QIHSE monitoring
 5. **Workload Detection**: Add automatic workload classification
 
 ---
@@ -102,13 +106,13 @@
 ```c
 typedef enum qihse_search_mode_e {
     QIHSE_SEARCH_QUANTUM,      // Default quantum-inspired
-    QIHSE_SEARCH_ANCHOR,       // NOT_STISLA-style interpolation
+    QIHSE_SEARCH_ANCHOR,       // KEYSTONE-style interpolation
     QIHSE_SEARCH_HYBRID        // Adaptive selection
 } qihse_search_mode_t;
 ```
 
 #### **1.2 Memory-Bounded Anchor Tables**
-**Objective:** Integrate NOT_STISLA's memory management into QIHSE
+**Objective:** Integrate KEYSTONE's memory management into QIHSE
 **Files to Modify:**
 - `qihse/memory/include/qihse_memory.h` - Add anchor table support
 - `qihse/memory/src/qihse_memory.c` - Bounded allocation functions
@@ -169,7 +173,7 @@ typedef enum qihse_search_mode_e {
 ### **Phase 3: Statistics and Monitoring (Week 5-6)**
 
 #### **3.1 Comprehensive Statistics**
-**Objective:** Merge NOT_STISLA statistics into QIHSE monitoring
+**Objective:** Merge KEYSTONE statistics into QIHSE monitoring
 **Files to Modify:**
 - `qihse/include/qihse.h` - Enhanced statistics structures
 - `qihse/core/qihse.c` - Statistics collection
@@ -372,7 +376,7 @@ make docs
 ### **Architecture Integrity**
 - **QIHSE remains primary**: Anchor search is optimization, not replacement
 - **Feature compatibility**: All QIHSE features work with anchor search
-- **Clean separation**: NOT_STISLA remains independent lightweight implementation
+- **Clean separation**: KEYSTONE remains independent lightweight implementation
 
 ### **Performance Balance**
 - **No performance regression**: Quantum path performance unchanged
@@ -386,4 +390,4 @@ make docs
 
 ---
 
-**This plan provides a systematic approach to integrating NOT_STISLA's proven optimizations into QIHSE while maintaining architectural integrity and performance guarantees.**
+**This plan provides a systematic approach to integrating KEYSTONE's proven optimizations into QIHSE while maintaining architectural integrity and performance guarantees.**

@@ -394,14 +394,42 @@ static bool ts_retry_valid(const qihse_ts_retry_identity_t* id) {
         strnlen(id->tenant, QIHSE_TS_RETRY_MAX_TEXT + 1) <= QIHSE_TS_RETRY_MAX_TEXT;
 }
 
+static bool ts_retry_user_matches(const qihse_user_t* user,
+    const qihse_ts_retry_identity_t* id) {
+    if (!user || !qihse_auth_user_is_active(user) || !ts_retry_valid(id))
+        return false;
+    char principal[32], tenant[32];
+    snprintf(principal, sizeof principal, "user:%u", qihse_user_get_id(user));
+    snprintf(tenant, sizeof tenant, "tenant:%u", qihse_user_get_tenant_id(user));
+    return strcmp(id->principal, principal) == 0 &&
+        strcmp(id->tenant, tenant) == 0;
+}
+
+static qihse_user_t* ts_retry_borrow_user(const qihse_user_t* user,
+    const qihse_ts_retry_identity_t* id, uint64_t* generation) {
+    if (!user || !ts_retry_valid(id)) return NULL;
+    uint32_t user_id = qihse_user_get_id(user);
+    if (user_id == UINT32_MAX) return NULL;
+    qihse_user_t* borrowed = qihse_auth_borrow_principal_scoped(user_id, generation);
+    if (borrowed != user || !ts_retry_user_matches(borrowed, id)) {
+        if (borrowed) qihse_auth_release_principal_scoped(borrowed);
+        return NULL;
+    }
+    return borrowed;
+}
+
 static qihse_ts_retry_status_t ts_retry_find(qihse_table_store_t* s,
-    const qihse_ts_retry_identity_t* id, qihse_ts_retry_outcome_t* outcome) {
+    const qihse_user_t* user, const qihse_ts_retry_identity_t* id,
+    qihse_ts_retry_outcome_t* outcome) {
+    /* Public callers authenticate and bind this context before the store
+     * lock; lookup revalidates its generation after releasing that lock. */
+    if (!user || !id) return QIHSE_TS_RETRY_ERROR;
     for (size_t i = 0; i < s->num_retries; ++i) {
         ts_retry_entry_t* e = &s->retries[i];
-        if (strcmp(e->key, id->key)) continue;
-        if (strcmp(e->principal, id->principal) ||
-            strcmp(e->tenant, id->tenant) ||
-            memcmp(e->digest, id->digest, sizeof e->digest))
+        if (strcmp(e->key, id->key) ||
+            strcmp(e->principal, id->principal) ||
+            strcmp(e->tenant, id->tenant)) continue;
+        if (memcmp(e->digest, id->digest, sizeof e->digest))
             return QIHSE_TS_RETRY_MISMATCH;
         *outcome = e->outcome;
         return QIHSE_TS_RETRY_COMMITTED;
@@ -410,14 +438,25 @@ static qihse_ts_retry_status_t ts_retry_find(qihse_table_store_t* s,
 }
 
 qihse_ts_retry_status_t qihse_table_store_retry_lookup(
-    qihse_table_store_t* s, const qihse_ts_retry_identity_t* id,
+    qihse_table_store_t* s, const qihse_user_t* user,
+    const qihse_ts_retry_identity_t* id,
     qihse_ts_retry_outcome_t* outcome) {
-    if (!s || !outcome || !ts_retry_valid(id)) return QIHSE_TS_RETRY_ERROR;
+    if (!outcome) return QIHSE_TS_RETRY_ERROR;
+    *outcome = (qihse_ts_retry_outcome_t){0};
+    if (!s) return QIHSE_TS_RETRY_ERROR;
+    uint64_t generation = 0;
+    qihse_user_t* borrowed = ts_retry_borrow_user(user, id, &generation);
+    if (!borrowed) return QIHSE_TS_RETRY_ERROR;
     pthread_mutex_lock(&s->mutex);
     qihse_ts_retry_status_t status = s->path && !s->poisoned &&
-        s->owner_pid == getpid() ? ts_retry_find(s, id, outcome) :
+        s->owner_pid == getpid() ? ts_retry_find(s, borrowed, id, outcome) :
         QIHSE_TS_RETRY_ERROR;
     pthread_mutex_unlock(&s->mutex);
+    if (!qihse_auth_validate_handle_generation(borrowed, generation))
+        status = QIHSE_TS_RETRY_ERROR;
+    if (status != QIHSE_TS_RETRY_COMMITTED)
+        *outcome = (qihse_ts_retry_outcome_t){0};
+    qihse_auth_release_principal_scoped(borrowed);
     return status;
 }
 
@@ -704,7 +743,9 @@ static bool ts_decode(qihse_table_store_t* s, ts_buf_t* b, bool catalog,
                     .principal = principal, .tenant = tenant };
                 ok = ts_retry_valid(&id);
                 for (size_t j = 0; ok && j < s->num_retries; ++j)
-                    if (!strcmp(s->retries[j].key, key)) ok = false;
+                    if (!strcmp(s->retries[j].key, key) &&
+                        !strcmp(s->retries[j].principal, principal) &&
+                        !strcmp(s->retries[j].tenant, tenant)) ok = false;
                 if (ok) {
                     memcpy(e->key, key, strlen(key) + 1);
                     memcpy(e->principal, principal, strlen(principal) + 1);
@@ -1926,10 +1967,10 @@ static void ts_group_destroy_unique(qihse_table_txn_t** txns, size_t count) {
 }
 
 static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
-    size_t count, const qihse_ts_retry_identity_t* id,
+    size_t count, const qihse_user_t* user, const qihse_ts_retry_identity_t* id,
     qihse_ts_retry_outcome_t* outcome, bool read_only) {
     if (!txns || count == 0 || count > SIZE_MAX / sizeof(ts_group_item_t) ||
-        (id && (!outcome || !ts_retry_valid(id))) || (read_only && id))
+        (id && (!outcome || !ts_retry_user_matches(user, id))) || (read_only && id))
         return QIHSE_TS_RETRY_ERROR;
     ts_group_item_t* items = (ts_group_item_t*)calloc(count, sizeof(*items));
     if (!items) {
@@ -1982,7 +2023,7 @@ static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
     /* Schema creation holds mutex but never waits on table locks. */
     if (durable) pthread_mutex_lock(&store->mutex);
     qihse_ts_retry_status_t existing = QIHSE_TS_RETRY_ABSENT;
-    if (id && !store->poisoned) existing = ts_retry_find(store, id, outcome);
+    if (id && !store->poisoned) existing = ts_retry_find(store, user, id, outcome);
     if (id && (store->poisoned || existing != QIHSE_TS_RETRY_ABSENT)) {
         for (size_t j = count; j > 0; --j)
             pthread_rwlock_unlock(&items[j - 1].table->lock);
@@ -2080,21 +2121,26 @@ static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
 }
 
 bool qihse_table_txn_commit_group(qihse_table_txn_t** txns, size_t count) {
-    return ts_commit_group(txns, count, NULL, NULL, false) == QIHSE_TS_RETRY_COMMITTED;
+    return ts_commit_group(txns, count, NULL, NULL, NULL, false) == QIHSE_TS_RETRY_COMMITTED;
 }
 
 bool qihse_table_txn_validate_group(qihse_table_txn_t** txns, size_t count) {
-    return ts_commit_group(txns, count, NULL, NULL, true) == QIHSE_TS_RETRY_COMMITTED;
+    return ts_commit_group(txns, count, NULL, NULL, NULL, true) == QIHSE_TS_RETRY_COMMITTED;
 }
 
 qihse_ts_retry_status_t qihse_table_txn_commit_group_retry(
-    qihse_table_txn_t** txns, size_t count,
+    qihse_table_txn_t** txns, size_t count, const qihse_user_t* user,
     const qihse_ts_retry_identity_t* id, qihse_ts_retry_outcome_t* outcome) {
-    if (!ts_retry_valid(id) || !outcome) {
+    qihse_ts_retry_outcome_t requested = outcome ? *outcome : (qihse_ts_retry_outcome_t){0};
+    if (!ts_retry_user_matches(user, id) || !outcome) {
+        if (outcome) *outcome = (qihse_ts_retry_outcome_t){0};
         if (txns && count) ts_group_destroy_unique(txns, count);
         return QIHSE_TS_RETRY_ERROR;
     }
-    return ts_commit_group(txns, count, id, outcome, false);
+    qihse_ts_retry_status_t status = ts_commit_group(txns, count, user, id, &requested, false);
+    *outcome = status == QIHSE_TS_RETRY_COMMITTED ? requested :
+        (qihse_ts_retry_outcome_t){0};
+    return status;
 }
 
 bool qihse_table_txn_commit(qihse_table_txn_t* txn) {

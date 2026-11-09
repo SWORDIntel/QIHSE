@@ -1,0 +1,421 @@
+{
+  "baseline_snapshot_commit": "6ee93fc2b1e5891cc247d53165eaa52d802fdb6e",
+  "baseline_sources": {
+    "qihse_codegraph_packed.c": "5fcacc3832f5182faba80e4dba6971a1c5a177f0c88968030f6305e422867c60",
+    "qihse_codegraph_storage.c": "defda4d794a113dd7116acbbaa12cbe1f0140015c49412d1fe514dfc0a21ef1a"
+  },
+  "candidate_all_sources": {
+    "benchmarks/codegraph_zip_storage_compare.py": "a6d2fff8e91df69f72009344f98d5fc7641e0eaa59a68691dd8a5d446b1b2d3b",
+    "tests/test_codegraph_packed.c": "4f63fd05670026757d71025c9ba77742ec9ca4f7af796619b987d7b401d633fa",
+    "tests/test_codegraph_storage.c": "c906def03e273ba0993dbdc511be3345a95be5456a64ea88c833d40c25fc6cc1",
+    "tools/qihse_codegraph_packed.c": "7dd7d920fd50766fc5542e031e85e0dafd944d6fa60a78a86e4a682c28fb511e",
+    "tools/qihse_codegraph_packed.h": "7ece0851e9445a7f090de712510985f2e5ba03a48d949ae7e14410fda2eeed70",
+    "tools/qihse_codegraph_storage.c": "a8b362c2ce1fc84c2f70d3d34fc94ffdc252fea807b42c0e3cc502d9ffe58149",
+    "tools/qihse_codegraph_storage.h": "13d3f67ec531aeb4b3c38db648489f7bdaf7737c29a3f1e336f2491430d5e096"
+  },
+  "candidate_sources": {
+    "qihse_codegraph_packed.c": "7dd7d920fd50766fc5542e031e85e0dafd944d6fa60a78a86e4a682c28fb511e",
+    "qihse_codegraph_storage.c": "a8b362c2ce1fc84c2f70d3d34fc94ffdc252fea807b42c0e3cc502d9ffe58149"
+  },
+  "cpu_note": "Packed encode CPU excludes separately measured raw export; complete_encode_wall_ms includes that export. Zstd includes export in encode CPU.",
+  "fixtures": [
+    {
+      "edges": 2400,
+      "fixture_sha256": "bdcbbbe998b72c39cdb92a95349ab997d53d386256f723cf8a7e8ab83fb2976e",
+      "medians": {
+        "baseline9": {
+          "packed": {
+            "complete_encode_wall_ms": 313.71,
+            "encode_cpu_ms": 226.318,
+            "load_cpu_ms": 91.462,
+            "load_ms": 99.667,
+            "peak_rss_kib": 37664,
+            "snapshot_allocated_bytes": 184320,
+            "snapshot_apparent_bytes": 182355
+          },
+          "zstd": {
+            "complete_encode_wall_ms": 217.17,
+            "encode_cpu_ms": 204.435,
+            "load_cpu_ms": 66.725,
+            "load_ms": 66.807,
+            "peak_rss_kib": 37832,
+            "snapshot_allocated_bytes": 188416,
+            "snapshot_apparent_bytes": 187857
+          }
+        },
+        "candidate3": {
+          "packed": {
+            "complete_encode_wall_ms": 44.331,
+            "encode_cpu_ms": 24.314,
+            "load_cpu_ms": 47.023,
+            "load_ms": 47.038,
+            "peak_rss_kib": 36908,
+            "snapshot_allocated_bytes": 200704,
+            "snapshot_apparent_bytes": 196829
+          },
+          "zstd": {
+            "complete_encode_wall_ms": 65.192,
+            "encode_cpu_ms": 65.17,
+            "load_cpu_ms": 59.314,
+            "load_ms": 59.311,
+            "peak_rss_kib": 37200,
+            "snapshot_allocated_bytes": 200704,
+            "snapshot_apparent_bytes": 199229
+          }
+        },
+        "candidate9": {
+          "packed": {
+            "complete_encode_wall_ms": 141.011,
+            "encode_cpu_ms": 118.789,
+            "load_cpu_ms": 48.83,
+            "load_ms": 48.827,
+            "peak_rss_kib": 38124,
+            "snapshot_allocated_bytes": 184320,
+            "snapshot_apparent_bytes": 182355
+          },
+          "zstd": {
+            "complete_encode_wall_ms": 212.15,
+            "encode_cpu_ms": 212.028,
+            "load_cpu_ms": 66.991,
+            "load_ms": 72.304,
+            "peak_rss_kib": 38196,
+            "snapshot_allocated_bytes": 188416,
+            "snapshot_apparent_bytes": 187857
+          }
+        }
+      },
+      "nodes": 800,
+      "runs": [
+        {
+          "backend": "zstd",
+          "complete_encode_wall_ms": 217.17,
+          "encode_cpu_ms": 204.435,
+          "encode_ms": 217.17,
+          "fingerprint": "7f6e132b119c73d13ea07c9703856815a5cc0d60ffc8c434be62f84e204b0f53",
+          "load_cpu_ms": 66.725,
+          "load_ms": 66.807,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 37832,
+          "process_wall_ms": 10394.366,
+          "raw_export_ms": 50.626,
+          "raw_roundtrip": true,
+          "raw_sha256": "0a1e7e90d3b5a921eeb2ef7d46e89430a1aa6ea5f886891213799c424446c398",
+          "record_count": 3202,
+          "repeat": 0,
+          "selected_format": "zstd",
+          "snapshot_allocated_bytes": 188416,
+          "snapshot_apparent_bytes": 187857,
+          "variant": "baseline9"
+        },
+        {
+          "backend": "packed",
+          "complete_encode_wall_ms": 313.71,
+          "encode_cpu_ms": 226.318,
+          "encode_ms": 254.132,
+          "fingerprint": "7f6e132b119c73d13ea07c9703856815a5cc0d60ffc8c434be62f84e204b0f53",
+          "load_cpu_ms": 91.462,
+          "load_ms": 99.667,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 37664,
+          "process_wall_ms": 16356.909,
+          "raw_export_ms": 59.578,
+          "raw_roundtrip": true,
+          "raw_sha256": "0a1e7e90d3b5a921eeb2ef7d46e89430a1aa6ea5f886891213799c424446c398",
+          "record_count": 3202,
+          "repeat": 0,
+          "selected_format": "packed",
+          "snapshot_allocated_bytes": 184320,
+          "snapshot_apparent_bytes": 182355,
+          "variant": "baseline9"
+        },
+        {
+          "backend": "zstd",
+          "complete_encode_wall_ms": 212.15,
+          "encode_cpu_ms": 212.028,
+          "encode_ms": 212.15,
+          "fingerprint": "7f6e132b119c73d13ea07c9703856815a5cc0d60ffc8c434be62f84e204b0f53",
+          "load_cpu_ms": 66.991,
+          "load_ms": 72.304,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 38196,
+          "process_wall_ms": 14582.712,
+          "raw_export_ms": 36.246,
+          "raw_roundtrip": true,
+          "raw_sha256": "0a1e7e90d3b5a921eeb2ef7d46e89430a1aa6ea5f886891213799c424446c398",
+          "record_count": 3202,
+          "repeat": 0,
+          "selected_format": "zstd",
+          "snapshot_allocated_bytes": 188416,
+          "snapshot_apparent_bytes": 187857,
+          "variant": "candidate9"
+        },
+        {
+          "backend": "packed",
+          "complete_encode_wall_ms": 141.011,
+          "encode_cpu_ms": 118.789,
+          "encode_ms": 118.821,
+          "fingerprint": "7f6e132b119c73d13ea07c9703856815a5cc0d60ffc8c434be62f84e204b0f53",
+          "load_cpu_ms": 48.83,
+          "load_ms": 48.827,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 38124,
+          "process_wall_ms": 6926.661,
+          "raw_export_ms": 22.19,
+          "raw_roundtrip": true,
+          "raw_sha256": "0a1e7e90d3b5a921eeb2ef7d46e89430a1aa6ea5f886891213799c424446c398",
+          "record_count": 3202,
+          "repeat": 0,
+          "selected_format": "packed",
+          "snapshot_allocated_bytes": 184320,
+          "snapshot_apparent_bytes": 182355,
+          "variant": "candidate9"
+        },
+        {
+          "backend": "zstd",
+          "complete_encode_wall_ms": 65.192,
+          "encode_cpu_ms": 65.17,
+          "encode_ms": 65.192,
+          "fingerprint": "7f6e132b119c73d13ea07c9703856815a5cc0d60ffc8c434be62f84e204b0f53",
+          "load_cpu_ms": 59.314,
+          "load_ms": 59.311,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 37200,
+          "process_wall_ms": 6810.989,
+          "raw_export_ms": 26.345,
+          "raw_roundtrip": true,
+          "raw_sha256": "0a1e7e90d3b5a921eeb2ef7d46e89430a1aa6ea5f886891213799c424446c398",
+          "record_count": 3202,
+          "repeat": 0,
+          "selected_format": "zstd",
+          "snapshot_allocated_bytes": 200704,
+          "snapshot_apparent_bytes": 199229,
+          "variant": "candidate3"
+        },
+        {
+          "backend": "packed",
+          "complete_encode_wall_ms": 44.331,
+          "encode_cpu_ms": 24.314,
+          "encode_ms": 24.314,
+          "fingerprint": "7f6e132b119c73d13ea07c9703856815a5cc0d60ffc8c434be62f84e204b0f53",
+          "load_cpu_ms": 47.023,
+          "load_ms": 47.038,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 36908,
+          "process_wall_ms": 6759.055,
+          "raw_export_ms": 20.017,
+          "raw_roundtrip": true,
+          "raw_sha256": "0a1e7e90d3b5a921eeb2ef7d46e89430a1aa6ea5f886891213799c424446c398",
+          "record_count": 3202,
+          "repeat": 0,
+          "selected_format": "packed",
+          "snapshot_allocated_bytes": 200704,
+          "snapshot_apparent_bytes": 196829,
+          "variant": "candidate3"
+        }
+      ]
+    },
+    {
+      "edges": 24000,
+      "fixture_sha256": "6c76fa5552392b4c99219c63e16992112b7f0688743be2819e0a3c6d2046cdc0",
+      "medians": {
+        "baseline9": {
+          "packed": {
+            "complete_encode_wall_ms": 2709.565,
+            "encode_cpu_ms": 1754.089,
+            "load_cpu_ms": 1034.112,
+            "load_ms": 1258.475,
+            "peak_rss_kib": 153756,
+            "snapshot_allocated_bytes": 1974272,
+            "snapshot_apparent_bytes": 1974079
+          },
+          "zstd": {
+            "complete_encode_wall_ms": 1370.901,
+            "encode_cpu_ms": 1370.848,
+            "load_cpu_ms": 467.896,
+            "load_ms": 467.872,
+            "peak_rss_kib": 145336,
+            "snapshot_allocated_bytes": 2035712,
+            "snapshot_apparent_bytes": 2033183
+          }
+        },
+        "candidate3": {
+          "packed": {
+            "complete_encode_wall_ms": 533.575,
+            "encode_cpu_ms": 321.961,
+            "load_cpu_ms": 514.404,
+            "load_ms": 514.494,
+            "peak_rss_kib": 153548,
+            "snapshot_allocated_bytes": 2822144,
+            "snapshot_apparent_bytes": 2820788
+          },
+          "zstd": {
+            "complete_encode_wall_ms": 687.619,
+            "encode_cpu_ms": 664.449,
+            "load_cpu_ms": 485.463,
+            "load_ms": 485.562,
+            "peak_rss_kib": 144424,
+            "snapshot_allocated_bytes": 2904064,
+            "snapshot_apparent_bytes": 2901490
+          }
+        },
+        "candidate9": {
+          "packed": {
+            "complete_encode_wall_ms": 1482.008,
+            "encode_cpu_ms": 1255.242,
+            "load_cpu_ms": 504.757,
+            "load_ms": 504.783,
+            "peak_rss_kib": 153684,
+            "snapshot_allocated_bytes": 1974272,
+            "snapshot_apparent_bytes": 1974079
+          },
+          "zstd": {
+            "complete_encode_wall_ms": 1688.419,
+            "encode_cpu_ms": 1687.891,
+            "load_cpu_ms": 519.868,
+            "load_ms": 519.878,
+            "peak_rss_kib": 144904,
+            "snapshot_allocated_bytes": 2035712,
+            "snapshot_apparent_bytes": 2033183
+          }
+        }
+      },
+      "nodes": 8000,
+      "runs": [
+        {
+          "backend": "zstd",
+          "complete_encode_wall_ms": 1370.901,
+          "encode_cpu_ms": 1370.848,
+          "encode_ms": 1370.901,
+          "fingerprint": "c58aa8a5fc64c5c4e40c76079cdc3af30eb20f44b75c95f23752c19d571bfe6d",
+          "load_cpu_ms": 467.896,
+          "load_ms": 467.872,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 145336,
+          "process_wall_ms": 13091.729,
+          "raw_export_ms": 205.287,
+          "raw_roundtrip": true,
+          "raw_sha256": "fd288b496885085ba7a28f1ac553b7bb9a29466f2470872e0ff515d8f7f72929",
+          "record_count": 32002,
+          "repeat": 0,
+          "selected_format": "zstd",
+          "snapshot_allocated_bytes": 2035712,
+          "snapshot_apparent_bytes": 2033183,
+          "variant": "baseline9"
+        },
+        {
+          "backend": "packed",
+          "complete_encode_wall_ms": 2709.565,
+          "encode_cpu_ms": 1754.089,
+          "encode_ms": 2059.235,
+          "fingerprint": "c58aa8a5fc64c5c4e40c76079cdc3af30eb20f44b75c95f23752c19d571bfe6d",
+          "load_cpu_ms": 1034.112,
+          "load_ms": 1258.475,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 153756,
+          "process_wall_ms": 21621.439,
+          "raw_export_ms": 650.33,
+          "raw_roundtrip": true,
+          "raw_sha256": "fd288b496885085ba7a28f1ac553b7bb9a29466f2470872e0ff515d8f7f72929",
+          "record_count": 32002,
+          "repeat": 0,
+          "selected_format": "packed",
+          "snapshot_allocated_bytes": 1974272,
+          "snapshot_apparent_bytes": 1974079,
+          "variant": "baseline9"
+        },
+        {
+          "backend": "zstd",
+          "complete_encode_wall_ms": 1688.419,
+          "encode_cpu_ms": 1687.891,
+          "encode_ms": 1688.419,
+          "fingerprint": "c58aa8a5fc64c5c4e40c76079cdc3af30eb20f44b75c95f23752c19d571bfe6d",
+          "load_cpu_ms": 519.868,
+          "load_ms": 519.878,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 144904,
+          "process_wall_ms": 15654.327,
+          "raw_export_ms": 263.382,
+          "raw_roundtrip": true,
+          "raw_sha256": "fd288b496885085ba7a28f1ac553b7bb9a29466f2470872e0ff515d8f7f72929",
+          "record_count": 32002,
+          "repeat": 0,
+          "selected_format": "zstd",
+          "snapshot_allocated_bytes": 2035712,
+          "snapshot_apparent_bytes": 2033183,
+          "variant": "candidate9"
+        },
+        {
+          "backend": "packed",
+          "complete_encode_wall_ms": 1482.008,
+          "encode_cpu_ms": 1255.242,
+          "encode_ms": 1255.439,
+          "fingerprint": "c58aa8a5fc64c5c4e40c76079cdc3af30eb20f44b75c95f23752c19d571bfe6d",
+          "load_cpu_ms": 504.757,
+          "load_ms": 504.783,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 153684,
+          "process_wall_ms": 13437.093,
+          "raw_export_ms": 226.569,
+          "raw_roundtrip": true,
+          "raw_sha256": "fd288b496885085ba7a28f1ac553b7bb9a29466f2470872e0ff515d8f7f72929",
+          "record_count": 32002,
+          "repeat": 0,
+          "selected_format": "packed",
+          "snapshot_allocated_bytes": 1974272,
+          "snapshot_apparent_bytes": 1974079,
+          "variant": "candidate9"
+        },
+        {
+          "backend": "zstd",
+          "complete_encode_wall_ms": 687.619,
+          "encode_cpu_ms": 664.449,
+          "encode_ms": 687.619,
+          "fingerprint": "c58aa8a5fc64c5c4e40c76079cdc3af30eb20f44b75c95f23752c19d571bfe6d",
+          "load_cpu_ms": 485.463,
+          "load_ms": 485.562,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 144424,
+          "process_wall_ms": 12429.5,
+          "raw_export_ms": 228.193,
+          "raw_roundtrip": true,
+          "raw_sha256": "fd288b496885085ba7a28f1ac553b7bb9a29466f2470872e0ff515d8f7f72929",
+          "record_count": 32002,
+          "repeat": 0,
+          "selected_format": "zstd",
+          "snapshot_allocated_bytes": 2904064,
+          "snapshot_apparent_bytes": 2901490,
+          "variant": "candidate3"
+        },
+        {
+          "backend": "packed",
+          "complete_encode_wall_ms": 533.575,
+          "encode_cpu_ms": 321.961,
+          "encode_ms": 321.959,
+          "fingerprint": "c58aa8a5fc64c5c4e40c76079cdc3af30eb20f44b75c95f23752c19d571bfe6d",
+          "load_cpu_ms": 514.404,
+          "load_ms": 514.494,
+          "low_clearance_denied": true,
+          "peak_rss_kib": 153548,
+          "process_wall_ms": 11265.556,
+          "raw_export_ms": 211.616,
+          "raw_roundtrip": true,
+          "raw_sha256": "fd288b496885085ba7a28f1ac553b7bb9a29466f2470872e0ff515d8f7f72929",
+          "record_count": 32002,
+          "repeat": 0,
+          "selected_format": "packed",
+          "snapshot_allocated_bytes": 2822144,
+          "snapshot_apparent_bytes": 2820788,
+          "variant": "candidate3"
+        }
+      ]
+    }
+  ],
+  "library_sha256": "8ead12e45e4fc434dbf1e1b4d4e2787b0210603fe4b3cb05b84d3c78ba9e4841",
+  "method": "Real authenticated SDK snapshot-open path; same synthetic exports; exact standalone codec roundtrip and full metadata fingerprints; low-clearance native load+codec denial; fresh process per case; peak RSS includes fixture construction and source store, captured before separate codec roundtrip; shared host, no OS cache dropping",
+  "supplied_archive_sources": {
+    "tools/qihse_codegraph_packed.c": "9342478e4d18e6b22981e3f6963fec9d66c01fefd71641dbcad3dbdfa19ca1fc",
+    "tools/qihse_codegraph_packed.h": "07fed915b390b17d7d6b72d246ca719f8f1f56d733504f79cb65b3465fba640b",
+    "tools/qihse_codegraph_storage.c": "20f37e23493f77a56ff8813af20052c0a479a04d97e912a195683113ea2dd105",
+    "tools/qihse_codegraph_storage.h": "fafea004668d605a34bb2d1fea08e9b758c135ef8179534ce3cf00dfa0c8c143"
+  }
+}

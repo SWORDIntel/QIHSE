@@ -11,6 +11,8 @@ ranking, and record visibility. A missing or revoked principal fails closed.
 ## Commands
 
 ```text
+AIMEM VERSION
+AIMEM CAPABILITIES [feature]
 AIMEM STORE <kind> <text> [idempotency-key]
 AIMEM STORE-DURABLE <kind> <text> [idempotency-key]
 AIMEM STORE-RECEIPT <kind> <text> <idempotency-key>
@@ -21,9 +23,11 @@ AIMEM FORGET-DURABLE <uuid>
 AIMEM FORGET-RECEIPT <uuid>
 AIMEM COUNT [kind]
 AIMEM STORE-SCOPED[-DURABLE] <kind> <text> <project> <worktree> <workstream> <session> [idempotency-key]
+AIMEM STORE-SCOPED-RECEIPT <kind> <text> <project> <worktree> <workstream> <session> <idempotency-key>
 AIMEM RECALL-SCOPED <query> <limit> [bm25|semantic|hybrid] <kind> <project> <worktree> <workstream> <session>
 AIMEM GET-SCOPED <uuid> <project> <worktree> <workstream> <session>
 AIMEM FORGET-SCOPED[-DURABLE] <uuid> <project> <worktree> <workstream> <session>
+AIMEM FORGET-SCOPED-RECEIPT <uuid> <project> <worktree> <workstream> <session> <retry-key>
 AIMEM COUNT-SCOPED <project> <worktree> <workstream> <session> [kind]
 AIMEM MIGRATE-LEGACY <uuid> <project> <worktree> <workstream> <session>
 AIMEM LEGACY SCAN <cursor> <count>
@@ -37,18 +41,48 @@ AIMEM HANDOFF ACCEPT <uuid> <expected-revision>
 AIMEM HANDOFF CANCEL <uuid> <expected-revision>
 AIMEM KNOWLEDGE CREATE <type> <status> <content> <project> <worktree> <workstream> <session>
 AIMEM KNOWLEDGE REVISE <knowledge-id> <expected-version-id> <expected-revision> <status> <content>
+AIMEM KNOWLEDGE CREATE-EX <type> <status> <content> <project> <worktree> <workstream> <session> <confidence-ppm> <retry-key> <source-count> <source-event-uuid>... <relation-count> (<relation-type> <target-version-uuid> <target-project> <target-worktree> <target-workstream> <target-session>)...
+AIMEM KNOWLEDGE CREATE-EX-SOURCE <type> <status> <content> <project> <worktree> <workstream> <session> <confidence-ppm> <retry-key> <source-count> <source-event-uuid>... <relation-count> (<relation-six-fields>)... <source-system> <source-id> <revision-id> <line-start> <line-end>
+AIMEM KNOWLEDGE REVISE-EX <knowledge-id> <expected-version-id> <expected-revision> <status> <content> <confidence-ppm> <retry-key> <source-count> <source-event-uuid>... <relation-count> (<relation-type> <target-version-uuid> <target-project> <target-worktree> <target-workstream> <target-session>)...
+AIMEM KNOWLEDGE REVISE-EX-SOURCE <knowledge-id> <expected-version-id> <expected-revision> <status> <content> <confidence-ppm> <retry-key> <source-count> <source-event-uuid>... <relation-count> (<relation-six-fields>)... <source-system> <source-id> <revision-id> <line-start> <line-end>
 AIMEM KNOWLEDGE GET <version-id> <project> <worktree> <workstream> <session>
+AIMEM KNOWLEDGE GET-SOURCE <version-id> <project> <worktree> <workstream> <session>
 AIMEM KNOWLEDGE LATEST <knowledge-id> <project> <worktree> <workstream> <session>
 AIMEM KNOWLEDGE AS-OF <knowledge-id> <ingestion-time-ms> <project> <worktree> <workstream> <session>
+AIMEM KNOWLEDGE WALK <version-id> <project> <worktree> <workstream> <session> <max-depth> <max-nodes>
+AIMEM KNOWLEDGE WALK-V2 <version-id> <project> <worktree> <workstream> <session> <max-depth> <max-nodes>
+AIMEM KNOWLEDGE WALK-IN <version-id> <project> <worktree> <workstream> <session> <max-depth> <max-nodes>
 AIMEM QUERY V1 BEGIN <project> <worktree> <workstream> <session> <type> <status> <current:0|1> <from-ms> <to-ms> <changed-since-ms> <as-of-ms> <bm25|semantic|hybrid> <text> <max-rows>
+AIMEM QUERY V2 BEGIN <project> <worktree> <workstream> <session> <type> <status> <current:0|1> <from-ms> <to-ms> <changed-since-ms> <as-of-ms> <bm25|semantic|hybrid> <text> <max-rows> <source-event-uuid>
+AIMEM QUERY V3 BEGIN <project> <worktree> <workstream> <session> <type> <status> <current:0|1> <from-ms> <to-ms> <changed-since-ms> <as-of-ms> <bm25|semantic|hybrid> <text> <max-rows> <source-system> <source-id> <revision-id> <line-start> <line-end>
+AIMEM QUERY V2 NEXT <cursor-uuid> <page-size>
+AIMEM QUERY V2 END <cursor-uuid>
 AIMEM QUERY V1 NEXT <cursor-uuid> <page-size>
 AIMEM QUERY V1 END <cursor-uuid>
 ```
+
+`VERSION` returns the authenticated AIMEM wire contract version as a bulk
+string (`1`). `CAPABILITIES` returns a bounded array of content-free feature
+tokens: `scoped-memory-v1`, `scoped-durable-ack-v1`,
+`scoped-local-fsync-receipts-v1`, `scoped-forget-local-fsync-receipts-v1`,
+`system-receipts-v1`, `events-v1`,
+`project-grants-v1`, `handoffs-v1`, `knowledge-v1`,
+`knowledge-provenance-v1`, `query-cursors-v1`,
+`bm25-v1`, and `semantic-conditional-v1`. Passing a feature token returns
+integer `1` if it is advertised, or `-ERR UNSUPPORTED AIMEM capability` if
+it is absent. Semantic support is conditional on the configured projection
+provider and index readiness; use the authorized health operation and handle
+an unavailable or stale projection at query time. Both discovery commands
+require an active authenticated principal and disclose no memory content.
 
 `kind` is `1` for episodic or `2` for semantic; `0` selects either kind for
 reads. Recall returns bounded nested arrays containing the UUID, creation time,
 kind, classification, SCI, score, and text. Text is transported as a RESP bulk
 string, so delimiters inside memory content are preserved.
+Memory `STORE` and `STORE-SCOPED` bodies are limited to 256 KiB of UTF-8 bytes,
+matching HAX's native capture client. A 256 KiB body is admitted; one byte more
+is rejected before mutation. Knowledge version content has a separate 64 KiB
+limit.
 
 Replies: `STORE` returns the new (or replayed) UUID as a bulk string; `GET`
 returns the same 7-field nested array as a recall hit; `FORGET` returns a
@@ -72,6 +106,31 @@ persist their mutation sequence while legacy frames remain readable.
 `make test-aimem-idem-migration` covers old-map recovery, and
 `make bench-aimem-durability ARGS="100 256"` compares ordinary and fsync-fenced
 store/delete pairs on the selected data filesystem.
+
+`STORE-SCOPED-RECEIPT` requires an explicit scope and idempotency key. It
+returns `[STORE-SCOPED, uuid, receipt, local-fsync]` after the native scoped
+row and its retry identity pass the local fsync fence. An exact retry returns
+the original UUID and receipt, including after a lost reply; a changed
+payload or kind returns `ERR CONFLICT`. The receipt binds the authenticated
+tenant, principal, scope, UUID and canonical row sequence without exposing
+that sequence. It does not certify remote replication or quorum. A failed
+fence returns `ERR NOT_DURABLE`; retry the same key and payload to determine
+whether the row survived. Other principals cannot retrieve the receipt by
+reusing the key because retry identity includes the principal.
+
+`FORGET-SCOPED-RECEIPT` returns `[FORGET-SCOPED, uuid, receipt, local-fsync]`
+only after a scoped delete and its receipt ledger pass the local fsync fence.
+The retry key is bound to the authenticated tenant and principal, exact UUID,
+and all four scope fields. The server persists a preparation record before
+deleting the row. An exact retry returns the same receipt, including after a
+lost reply or restart. Reusing the key for a different UUID or scope returns
+`ERR CONFLICT`; an unknown or unauthorized UUID has the same unavailable
+response. If the server cannot establish the delete outcome from its durable
+ledger and authorized tombstone metadata, it returns `ERR UNRESOLVED` rather
+than claiming success. `ERR NOT_DURABLE` means the local fence failed and the
+caller should retry the identical request. The receipt does not assert remote
+replication or quorum. The older integer `FORGET-SCOPED-DURABLE` remains
+available for clients that do not need retry reconciliation.
 
 `EVENT APPEND` accepts the registered kinds `session_start`, `session_end`,
 `task_started`, `task_completed`, `observation`, `decision`, `blocker`, and
@@ -100,7 +159,12 @@ clients should retry a closed/failed request with the same producer/event ID.
 <workstream> <session> <summary> [evidence-uuid ...]` creates a tenant-local, durable `QHH2`
 record and returns its UUID. QHH1 records remain readable. Up to eight evidence IDs may be attached; each must resolve to a visible memory record in the exact scope, and the IDs are returned as a nested array. The offering principal must own an in-project
 record (or be an Operator), the named recipient must be active in the same
-tenant, and that recipient must hold an active project-reader grant. The scope
+tenant, hold an active project-reader grant, and have clearance and SCI access
+to the offering principal's label. The grant must come from the handoff owner;
+a grant from another owner in the project does not authorize this offer.
+Offers that the recipient could not read
+are rejected before publication. The project is required; empty worktree,
+workstream and session fields are valid project-only scope. The scope
 and summary are bounded tokens/text; the server binds the owner, labels, SCI
 compartment, creation time, expiry and revision.
 
@@ -120,9 +184,12 @@ processes. The regression races 100 in-process callers and forked TCP clients,
 verifying that the authorized recipient receives the durable accepted result
 while a competing principal is denied. The crash regression kills the server after durable
 acceptance but before delivering the simulated reply; restart returns the same
-`ACCEPTED` result to the recipient's retry and hides the record from a
+`ACCEPTED` result to the recipient's retry while that owner's grant remains
+current, and hides the record from a
 competitor. Handoff evidence pointers are bounded and authorization-checked;
 expiry is persisted with a revision increment before the state is returned.
+After revocation, recipient GET is null and ACCEPT cannot replay success;
+the owner and Operator retain their authorized GET path.
 
 ## Curated knowledge lineage (QH-04)
 
@@ -140,6 +207,28 @@ native extended create/revise surfaces add deterministic, principal-bound
 retry identity: a durable retry returns the original version receipt and a
 same-key payload change conflicts. All reads require an explicit principal and
 scope and recheck project membership and record labels.
+
+`CREATE-EX` and `REVISE-EX` expose that native provenance contract over RESP.
+They require a retry key, a confidence integer from `0` to `1000000`, up to
+32 source event UUIDs, and up to 32 relation tuples. Each tuple has a type
+(`1` fixes, `2` causes, `3` contradicts), an exact target version UUID, and
+four scope fields. Counts are decimal and determine the exact argument count;
+malformed fields fail before mutation. Source events must be visible in the
+knowledge scope and relation targets must pass an authorized exact-version
+read. The server binds generator and reviewer IDs to the authenticated actor;
+clients cannot supply them. `supersedes` is generated by the server.
+
+The extended write reply is a six-element array: the original 15-field
+knowledge array, generator ID, reviewer ID, confidence, source-event UUID
+array, and relation tuple array. The legacy `CREATE` and `REVISE` reply shape
+remains unchanged. Exact retries return the same version identity after
+a local durability fence; a changed retry payload or stale CAS returns
+`ERR CONFLICT`. Source IDs and relation targets in an extended reply are
+rechecked against the current principal before serialization, so a later
+grant or label change can redact them on retry without changing the version
+identity. Denied evidence or a hidden relation target at admission returns a
+content-free `NOPERM` response. `QUERY V1` exposes authorized evidence and
+relation lineage for later reads.
 
 The `QHK2` parser validates UUID lineage, consecutive revisions, predecessor
 closure, SHA-256 content hashes, evidence-event UUIDs, confidence bounds,
@@ -295,29 +384,95 @@ idempotency-map write, a retry locates the original document, verifies its
 content and repairs the missing map. Legacy random UUIDs with existing
 idempotency mappings retain their original IDs; no migration rewrites them.
 
-**Remaining QH-00 work:** this is **recoverable identity**, not atomic
-multi-key commit. Durable ACK still certifies only the local KV fence, not
-remote replication. Complete WAL-phase fault injection (including partial
-I/O errors and fsync faults), receipt/LSN design, idempotency-map migration
-behaviour, and measured P50/P95 fsync overhead remain required before
-declaring QH-00 complete. A failed admission may already have left a primary
-record; the caller must retry with the same key, not invent a new key.
+**QH-00 limit:** this is **recoverable identity**, not atomic
+multi-key commit. Durable ACK certifies only the local KV fence, not
+remote replication. WAL fault injection, receipt stability, legacy
+idempotency-map migration and measured P50/P95 fsync overhead are covered by
+the focused durability suite and benchmark; they do not expand the ACK's
+guarantee. A failed admission may already have left a primary record; the
+caller must retry with the same key, not invent a new key.
 Deterministic identity binds to the authenticated numeric tenant/principal
 IDs, which must be restored consistently across process restarts.
 
 Index rebuild is derived from authoritative KV documents; a durable ACK
 does not certify semantic-index freshness if embedding/indexing fails.
-QH-01 through QH-05 are implemented; QH-06 through QH-08 retain the remaining
-gates tracked in `ROADMAP.md` and `QIHSE_ENGINE_ROADMAP.md`.
+QH-01 through QH-08 are implemented in the native engine; deployment remains
+subject to the separate operational gates in `docs/AIMEM_CURRENT_ISSUES.md`.
 
 ## Native QH-05 through QH-08 contracts
+
+`AIMEM QUERY V2` applies an exact source event UUID filter before ranking and
+the row cap. The event must be readable when the cursor begins and on every
+page. Event provenance does not identify an external document revision or
+authorize a document citation. `AIMEM KNOWLEDGE WALK` follows only typed
+outbound relations, with depth at most 4 and at most 64 returned versions.
+It de-duplicates version IDs and rechecks scope and authorization for each
+target. A denied root returns an empty array. HAX resolves document revisions
+through its authenticated source provider.
+
+`knowledge-walk-v2` adds `WALK-V2` without changing the `WALK` v1 reply. Each
+V2 hit is `[depth, target-knowledge, traversed-edge]`. The root edge is `[]`;
+each other edge is `[source-version-id, type, target-version-id, project,
+worktree, workstream, session]`. The engine records the exact relation chosen
+during traversal, then rechecks both endpoint versions and the relation in
+the authorized source before returning any hit. A failed recheck returns an
+empty array. The same depth and node bounds apply. No extra graph index or
+repository-wide scan is required for outgoing traversal.
+
+`knowledge-walk-in-v2` traverses typed relations in the incoming direction:
+each returned version has a relation targeting a version in the prior hop.
+The reply is `[depth, source-knowledge, traversed-relation]` per hit. The root
+has an empty relation array; each other hit has the exact six-field edge
+`[type, target-version-id, project, worktree, workstream, session]` used to
+reach the prior hop. WALK retains its `[depth, knowledge]` reply. Both use the
+same depth (0..4) and node (1..64) limits. Each incoming hop scans at most
+4,096 authorized, in-scope
+versions; exceeding that bound returns an empty array with no partial data.
+The starting version, each incoming version, its traversed edge, and every emitted relation are
+checked against the caller's current principal, project grant, scope,
+classification, and SCI. This is an on-demand reverse scan, not a stored
+reverse index; callers should expect cost proportional to authorized versions
+at each hop.
+
+`knowledge-source-v1` adds an optional typed external source to each immutable
+knowledge version: `(source-system, source-id, revision-id, line-start,
+line-end)`. The three strings are bounded to 32, 256 and 128 bytes; line
+coordinates are 1-based inclusive and must form a nonempty range. CREATE and
+REVISE append the five fields after ordinary EX provenance and keep the EX
+six-element receipt. GET-SOURCE returns `[knowledge, source-five-fields]`, or
+nil for a missing, denied or legacy version without a typed source. `query-
+source-v3` filters the exact five-field tuple within the authenticated scope
+before ranking and the row cap; NEXT and END use the existing principal-bound
+cursor. QHK3 carries the typed fields in each version; QHK1/QHK2 remain
+readable, and both logical export/import paths preserve QHK3 bytes. The source
+tuple is caller supplied. HAX must authenticate and resolve the exact revision
+and line range through its source provider before showing a citation or excerpt;
+QIHSE does not assert that external source bytes still exist or are current.
+
+`knowledge-url-source-v1` is a constrained typed source within the existing
+five-field tuple and verbs. Set `source-system` to `https-url`, `source-id` to a
+canonical HTTPS URL (at most 256 bytes), and `revision-id` to
+`sha256:<64 lowercase hex digits>`. QIHSE requires lowercase scheme and DNS
+host, an explicit absolute path, no credentials, fragment, default `:443`
+port, dot path segments, or noncanonical percent escapes. Query V3 compares
+the entire tuple exactly before ranking; GET-SOURCE returns it only to an
+authorized principal. Older source systems and QHK1/QHK2 rows remain readable.
+The SHA-256 revision hashes the exact HTTPS response body bytes before text
+decoding. Line coordinates refer to the source provider's deterministic UTF-8
+text extraction, split on LF, and are 1-based inclusive. The authenticated C
+citation verifier checks the exact stored tuple, supplied body digest, and
+extracted-text line bounds. HAX must refetch the URL, check text MIME, rerun
+its extractor, and compare the excerpt at those lines before rendering. QIHSE
+does not fetch URLs or prove that a caller supplied current response bytes.
 
 `AIMEM QUERY V1` adds a typed RESP cursor without changing legacy verbs. BEGIN
 accepts exact scope, type/status/current filters, inclusive ingestion bounds,
 an exclusive changed-since watermark, an optional ingestion-time as-of view,
 ranking mode and a maximum of 4,096 rows. NEXT accepts 1..128 rows. Cursor
 tokens are random UUIDs bound to the active principal and server, expire after
-five minutes, and are removed when the server is destroyed. Cursor lookup
+five minutes, and are removed on network client disconnect or server
+destruction. Embedded stateless callers must explicitly issue `END`; their
+cursors still expire after five minutes. Cursor lookup
 errors do not distinguish an unknown token from a token owned by another
 principal. Results are process-local; restart requires a new query.
 

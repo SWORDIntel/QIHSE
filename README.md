@@ -17,7 +17,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)
 ![Security Review](https://img.shields.io/badge/Security-Internal%20Review%20(2026--08)-yellow?logo=shield)
 
-[Getting Started](docs/GETTING_STARTED.md) · [Features](docs/FEATURES.md) · [Compatibility](docs/COMPATIBILITY.md) · [Architecture](docs/architecture/) · [Benchmarks](docs/benchmarks/) · [Security](docs/security/)
+[Roadmap](ROADMAP.md) · [Getting Started](docs/GETTING_STARTED.md) · [Features](docs/FEATURES.md) · [Compatibility](docs/COMPATIBILITY.md) · [Architecture](docs/architecture/) · [Benchmarks](docs/benchmarks/) · [Security](docs/security/)
 
 </div>
 

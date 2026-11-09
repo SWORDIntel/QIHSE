@@ -28,7 +28,8 @@ typedef enum {
     QIHSE_BACKUP_CLI_NONE = 0,
     QIHSE_BACKUP_CLI_CREATE,
     QIHSE_BACKUP_CLI_VERIFY,
-    QIHSE_BACKUP_CLI_RESTORE
+    QIHSE_BACKUP_CLI_RESTORE,
+    QIHSE_BACKUP_CLI_MERGE
 } qihse_backup_cli_command_t;
 
 typedef struct {
@@ -36,6 +37,10 @@ typedef struct {
     const char* data_dir;
     const char* path;
     const char* password_file;
+    const char* base_path;
+    const char* incoming_path;
+    size_t max_bytes;
+    size_t max_records;
 } qihse_backup_cli_options_t;
 
 enum {
@@ -53,6 +58,8 @@ static void qihse_backup_cli_usage(FILE* stream, const char* program) {
             "  %s backup --data-dir DIR --output FILE [--password-file FILE]\n"
             "  %s verify --data-dir DIR --input FILE [--password-file FILE]\n"
             "  %s restore --data-dir DIR --input FILE [--password-file FILE]\n"
+            "  %s merge --data-dir AUTH_DIR --base FILE --incoming FILE --output FILE [--password-file FILE] [--max-bytes N] [--max-records N]\n"
+            "Merge defaults/ceilings: 1073741824 encoded bytes, 2000000 records; each input and union.\n"
             "\n"
             "Environment fallbacks:\n"
             "  QIHSE_DATA_DIR          store and authentication directory\n"
@@ -62,7 +69,7 @@ static void qihse_backup_cli_usage(FILE* stream, const char* program) {
             "The service using DIR must be stopped while creating a backup.\n"
             "Use --password-file or QIHSE_OPERATOR_PASSWORD; passwords are\n"
             "never accepted as command-line values or emitted in output.\n",
-            program, program, program);
+            program, program, program, program);
 }
 #endif
 
@@ -77,12 +84,16 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
                                    qihse_backup_cli_options_t* options) {
     if (!options || argc < 2) return false;
     memset(options, 0, sizeof(*options));
+    options->max_bytes = (size_t)1 << 30;
+    options->max_records = 2000000u;
     if (strcmp(argv[1], "backup") == 0) {
         options->command = QIHSE_BACKUP_CLI_CREATE;
     } else if (strcmp(argv[1], "verify") == 0) {
         options->command = QIHSE_BACKUP_CLI_VERIFY;
     } else if (strcmp(argv[1], "restore") == 0) {
         options->command = QIHSE_BACKUP_CLI_RESTORE;
+    } else if (strcmp(argv[1], "merge") == 0) {
+        options->command = QIHSE_BACKUP_CLI_MERGE;
     } else {
         return false;
     }
@@ -93,7 +104,8 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
             if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
             options->data_dir = value;
         } else if (strcmp(argv[i], "--output") == 0 &&
-                   options->command == QIHSE_BACKUP_CLI_CREATE) {
+                   (options->command == QIHSE_BACKUP_CLI_CREATE ||
+                    options->command == QIHSE_BACKUP_CLI_MERGE)) {
             if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
             options->path = value;
         } else if (strcmp(argv[i], "--input") == 0 &&
@@ -101,6 +113,28 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
                     options->command == QIHSE_BACKUP_CLI_RESTORE)) {
             if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
             options->path = value;
+        } else if (strcmp(argv[i], "--base") == 0 && options->command == QIHSE_BACKUP_CLI_MERGE) {
+            if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
+            options->base_path = value;
+        } else if (strcmp(argv[i], "--incoming") == 0 && options->command == QIHSE_BACKUP_CLI_MERGE) {
+            if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
+            options->incoming_path = value;
+        } else if ((strcmp(argv[i], "--max-bytes") == 0 ||
+                    strcmp(argv[i], "--max-records") == 0) &&
+                   options->command == QIHSE_BACKUP_CLI_MERGE) {
+            bool bytes = strcmp(argv[i], "--max-bytes") == 0;
+            if (!qihse_backup_cli_next_value(argc, argv, &i, &value) ||
+                !*value) return false;
+            size_t n = 0;
+            for (const char* p = value; *p; p++) {
+                if (*p < '0' || *p > '9' || n > (SIZE_MAX - (size_t)(*p - '0'))/10)
+                    return false;
+                n = n*10 + (size_t)(*p - '0');
+            }
+            if (!n || (bytes && n > ((size_t)1 << 30)) ||
+                (!bytes && n > 2000000u)) return false;
+            if (bytes) options->max_bytes = n;
+            else options->max_records = n;
         } else if (strcmp(argv[i], "--password-file") == 0) {
             if (!qihse_backup_cli_next_value(argc, argv, &i, &value)) return false;
             options->password_file = value;
@@ -111,6 +145,8 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
 
     if (!options->data_dir) options->data_dir = getenv("QIHSE_DATA_DIR");
     if (!options->path) options->path = getenv("QIHSE_BACKUP_PATH");
+    if (options->command == QIHSE_BACKUP_CLI_MERGE &&
+        (!options->base_path || !options->incoming_path)) return false;
     return options->data_dir && options->data_dir[0] != '\0' &&
            options->path && options->path[0] != '\0';
 }
@@ -195,6 +231,7 @@ static const char* qihse_backup_cli_result_name(int result) {
         case QIHSE_BACKUP_EXPORT_ERR: return "error";
         case QIHSE_BACKUP_EXPORT_DENIED: return "denied";
         case QIHSE_BACKUP_EXPORT_UNSUPPORTED: return "unsupported";
+        case QIHSE_BACKUP_EXPORT_CONFLICT: return "conflict";
         default: return "unknown";
     }
 }
@@ -221,13 +258,24 @@ static int qihse_backup_cli_execute(const qihse_backup_cli_options_t* options,
     const char* operation = options && options->command == QIHSE_BACKUP_CLI_VERIFY
                                 ? "verify"
                                 : options && options->command == QIHSE_BACKUP_CLI_RESTORE
-                                ? "restore" : "backup";
+                                ? "restore" : options && options->command == QIHSE_BACKUP_CLI_MERGE
+                                ? "merge" : "backup";
     if (!options || !output || !qihse_backup_cli_operator_allowed(principal)) {
         if (output) qihse_backup_cli_emit_failure(output, operation,
                                                   "operator_required",
                                                   QIHSE_BACKUP_EXPORT_DENIED);
         errno = EACCES;
         return QIHSE_BACKUP_CLI_AUTH_FAILED;
+    }
+
+    if (options->command == QIHSE_BACKUP_CLI_MERGE) {
+        qihse_backup_merge_stats_t stats;
+        int rc = qihse_backup_merge_user(principal, options->base_path,
+            options->incoming_path, options->path, options->max_bytes, options->max_records, &stats);
+        fprintf(output, "{\"ok\":%s,\"operation\":\"merge\",\"api_code\":%d,"
+            "\"added\":%zu,\"identical\":%zu,\"conflicts\":%zu}\n",
+            rc == 0 ? "true" : "false", rc, stats.added, stats.identical, stats.conflicts);
+        return rc == 0 ? QIHSE_BACKUP_CLI_OK : QIHSE_BACKUP_CLI_OPERATION_FAILED;
     }
 
     if (options->command == QIHSE_BACKUP_CLI_CREATE) {

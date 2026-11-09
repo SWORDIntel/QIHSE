@@ -1,5 +1,7 @@
 # Slot Migration over Pinned QKP — Implementation Plan (4.1)
 
+> **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > Corrects the roadmap premise. The "pinned QKP replication" that landed is
 > the **one-way read-only replica pull**; the `--brain-act` gate names a
 > *different* path — **data-bearing slot push between masters**. The gate is

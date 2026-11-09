@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zstd.h>
 
 #define PASSWORD "CodegraphPackedStream1!"
 static int clean_test(const char *path, const struct stat *st, int type, struct FTW *walk) {
@@ -46,6 +47,41 @@ static void set_byte(FILE *f, off_t offset, unsigned char value) {
     assert(fputc(value, f) != EOF);
     assert(fflush(f) == 0); rewind(f);
 }
+static void number(unsigned char *p, uint64_t n, size_t length) {
+    for (size_t i = 0; i < length; ++i) p[length-i-1] = (unsigned char)(n >> (8*i));
+}
+static size_t frame(const unsigned char *input, size_t length,
+                     unsigned char *output, size_t capacity) {
+    ZSTD_CCtx *ctx = ZSTD_createCCtx(); assert(ctx);
+    assert(!ZSTD_isError(ZSTD_CCtx_setParameter(ctx, ZSTD_c_checksumFlag, 1)));
+    assert(!ZSTD_isError(ZSTD_CCtx_setParameter(ctx, ZSTD_c_windowLog, 23)));
+    size_t n = ZSTD_compress2(ctx, output, capacity, input, length);
+    assert(!ZSTD_isError(n)); ZSTD_freeCCtx(ctx); return n;
+}
+static FILE *legacy_digest_fixture(bool duplicate) {
+    unsigned char table[128], body[160], meta_zip[256], body_zip[256];
+    size_t tn = 0, bn = 0, raw = 0;
+    for (size_t i = 0; i < 2; ++i) {
+        char header[64]; int n = snprintf(header, sizeof(header), "66 4 0 0 0 0 %zu\n", i+1);
+        assert(n > 0); number(table+tn, (size_t)n, 2); tn += 2;
+        memcpy(table+tn, header, (size_t)n); tn += (size_t)n;
+        unsigned char tag = duplicate ? (i ? 1 : 0) : (unsigned char)(i+1);
+        table[tn++] = tag;
+        if (!tag) { body[bn++] = 'n'; body[bn++] = ':'; memset(body+bn, 'a', 64); bn += 64; }
+        else { memset(body+bn, 0xaa, 32); bn += 32; }
+        memcpy(body+bn, i ? "edge" : "node", 4); bn += 4;
+        raw += (size_t)n + 66 + 4 + 1;
+    }
+    size_t mn = frame(table, tn, meta_zip, sizeof(meta_zip));
+    size_t en = frame(body, bn, body_zip, sizeof(body_zip));
+    unsigned char outer[48] = {0}; memcpy(outer, "QCGP0002", 8);
+    number(outer+8, raw, 8); number(outer+16, tn, 8); number(outer+24, bn, 8);
+    number(outer+32, 2, 4); number(outer+36, mn, 4); number(outer+40, en, 4);
+    FILE *out = tmpfile(); assert(out);
+    assert(fwrite(outer, 1, sizeof(outer), out) == sizeof(outer));
+    assert(fwrite(meta_zip, 1, mn, out) == mn && fwrite(body_zip, 1, en, out) == en);
+    assert(fflush(out) == 0); rewind(out); return out;
+}
 int main(void) {
     char root[] = "./qihse-codegraph-packed-test-XXXXXX";
     assert(mkdtemp(root));
@@ -61,6 +97,22 @@ int main(void) {
     assert(qihse_auth_create_user(op, 622, QIHSE_ROLE_ANALYST, 4, 0, PASSWORD, false));
     qihse_user_t *low = qihse_auth_authenticate_id(621, PASSWORD); assert(low);
     qihse_user_t *wrong_sci = qihse_auth_authenticate_id(622, PASSWORD); assert(wrong_sci);
+    FILE *legacy_tagged = legacy_digest_fixture(false);
+    qihse_kv_store_t *legacy_view = cg_packed_open_snapshot_user(legacy_tagged, low,
+                                                               64u << 20, 200000, NULL);
+    assert(legacy_view);
+    char legacy_key[67] = "n:"; memset(legacy_key+2, 'a', 64); legacy_key[66] = 0;
+    char *legacy_value = qihse_kv_get_user(legacy_view, legacy_key, low);
+    assert(legacy_value && !strcmp(legacy_value, "node")); free(legacy_value);
+    legacy_key[0] = 'e'; legacy_value = qihse_kv_get_user(legacy_view, legacy_key, low);
+    assert(legacy_value && !strcmp(legacy_value, "edge")); free(legacy_value);
+    qihse_kv_store_destroy(legacy_view); fclose(legacy_tagged);
+    legacy_tagged = legacy_digest_fixture(true);
+    assert(!cg_packed_open_snapshot_user(legacy_tagged, op, 64u << 20, 200000, NULL));
+    rewind(legacy_tagged);
+    FILE *duplicate_output = tmpfile(); assert(duplicate_output);
+    assert(!cg_packed_decode_snapshot(legacy_tagged, duplicate_output, op, 64u << 20, 200000));
+    assert(file_size(duplicate_output) == 0); fclose(duplicate_output); fclose(legacy_tagged);
     qihse_kv_store_t *store = qihse_kv_store_create_user(op); assert(store);
     char node[67] = "n:", edge[67] = "e:";
     memset(node + 2, 'a', 64); node[66] = 0;
@@ -82,6 +134,41 @@ int main(void) {
     rewind(raw);
     assert(cg_packed_encode_snapshot(raw, packed, op, 64u << 20, 200000));
     assert(file_size(packed) > 48);
+    /* New low-copy reader returns only an authenticated detached KV store. */
+    assert(!cg_packed_open_snapshot_user(packed, NULL, 64u << 20, 200000, NULL));
+    rewind(packed);
+    assert(!cg_packed_open_snapshot_user(packed, low, 64u << 20, 200000, NULL));
+    assert(errno == EACCES); rewind(packed);
+    assert(!cg_packed_open_snapshot_user(packed, wrong_sci, 64u << 20, 200000, NULL));
+    assert(errno == EACCES); rewind(packed);
+    size_t stream_raw_bytes = 0;
+    qihse_kv_store_t *view = cg_packed_open_snapshot_user(packed, op, 64u << 20, 200000,
+                                                        &stream_raw_bytes);
+    assert(view && stream_raw_bytes == file_size(raw));
+    char *view_value = qihse_kv_get_user(view, "_meta", op);
+    assert(view_value && !strcmp(view_value, unknown)); free(view_value);
+    view_value = qihse_kv_get_user(view, edge, op);
+    assert(view_value && !strcmp(view_value, "CLASSIFIED-PAYLOAD")); free(view_value);
+    assert(qihse_kv_get_user(view, edge, low) == NULL);
+    qihse_kv_record_meta_t before, after;
+    assert(qihse_kv_meta_user(store, edge, op, &before));
+    assert(qihse_kv_meta_user(view, edge, op, &after));
+    assert(before.classification == after.classification &&
+           before.sci_compartment == after.sci_compartment &&
+           before.expire_time_ms == after.expire_time_ms &&
+           before.change_seq == after.change_seq && before.flags == after.flags);
+    qihse_kv_store_destroy(view); rewind(packed);
+    assert(qihse_auth_create_user(op, 623, QIHSE_ROLE_ANALYST, 4, 2, PASSWORD, false));
+    qihse_user_t *cleared = qihse_auth_authenticate_id(623, PASSWORD); assert(cleared);
+    view = cg_packed_open_snapshot_user(packed, cleared, 64u << 20, 200000, NULL);
+    assert(view);
+    view_value = qihse_kv_get_user(view, edge, cleared);
+    assert(view_value && !strcmp(view_value, "CLASSIFIED-PAYLOAD")); free(view_value);
+    assert(qihse_auth_destroy_user(op, 623));
+    assert(qihse_kv_get_user(view, edge, cleared) == NULL);
+    qihse_kv_store_destroy(view); rewind(packed);
+    assert(!cg_packed_open_snapshot_user(packed, cleared, 64u << 20, 200000, NULL));
+    assert(errno == EACCES); rewind(packed);
     assert(!cg_packed_decode_snapshot(packed, decoded, NULL, 64u << 20, 200000));
     assert(file_size(decoded) == 0);
     rewind(packed);
@@ -194,6 +281,15 @@ int main(void) {
     actual = qihse_kv_get_user(opened, node, low);
     assert(actual && strcmp(actual, "public node") == 0); free(actual);
     qihse_kv_store_destroy(opened);
+    rewind(public_packed);
+    view = cg_packed_open_snapshot_user(public_packed, low, 64u << 20, 200000, NULL);
+    assert(view);
+    assert(qihse_auth_destroy_user(op, 621));
+    /* Public-data access has a separate existing auth fast path. Revocation
+     * of protected data and new opens is checked below/above. */
+    qihse_kv_store_destroy(view); rewind(public_packed);
+    assert(!cg_packed_open_snapshot_user(public_packed, low, 64u << 20, 200000, NULL));
+    assert(errno == EACCES);
     fclose(public_raw); fclose(public_packed); fclose(public_decoded);
     qihse_kv_store_destroy(public_store);
     qihse_audit_shutdown();

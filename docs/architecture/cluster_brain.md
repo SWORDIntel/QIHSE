@@ -1,12 +1,12 @@
 # Cluster Brain — Decision Making for QIHSE Clusters
 
-> **Status: implemented** — phase 1 (observe / journal / decide) and actuation
-> are verified by `tests/test_cluster_brain.c` (phase 1),
-> `tests/test_brain_actuate.c` (R1/R4), `tests/test_brain_rebalance.c`
-> (R5/R6), and `tests/test_brain_fed_journal.c` (W3.4: observations and signed
-> decisions on the federation journal, the no-action-without-a-pre-condition
-> gate, and triage-output determinism). Acting runs only under `--brain-act` in
-> `src/spinnaker/qihse_cluster_brain.c`.
+> **Status: observation/journaling and populated-owner CT2 rebalance are
+> implemented and exercised by the four-daemon `test-ct-brain-balance` drill.**
+> The drill moves a range between two primary processes, each with its own
+> successor, and verifies convergence, data/TTL preservation, writes and donor
+> restart. CT2 failed-owner re-home and automatic-promotion restart recovery
+> remain incomplete. See the
+> [recovery and integration plan](../plans/cluster_recovery_20261109.md).
 
 ## Why
 
@@ -107,11 +107,11 @@ and journals in that state; it simply cannot act on inputs it did not record.
 
 | Rule | State |
 |---|---|
-| **R1 — failed-owner re-home.** | **Implemented** (`--brain-act`). Evidence-gated like the failover coordinator: while any peer recently observed the owner healthy the brain only journals (asymmetry, not death). Acts only on a range the local node actually holds data for, hands it to the healthy target with the most headroom (NODE_CAP free RAM minus a load penalty, uptime tie-break), journals `REHOME` with the target's capability evidence, and refuses when it would split the cluster. |
+| **R1 — failed-owner re-home.** | **Partial.** The legacy path is disabled in CT2 mode; `qihse_cluster_handoff_range()` refuses because it has no safe writer fence. CT1 failover/recovery owns promotion. Do not treat the legacy R1 simulation as production re-home. |
 | **R2 — quarantine asymmetry.** | **Implemented** (phase 1, journal-only). |
 | **R3 — split-brain guard.** | **Implemented**: with no healthy peer the brain neither re-homes nor rebalances. |
 | **R4 — rollback.** | **Implemented**: each re-home is evaluated when its window closes — `transfer-incomplete` (moved < collected) or `target-unhealthy` moves ownership back to the local node and journals `ROLLBACK`; otherwise `REHOME_CONFIRM`. |
-| **R5 — rebalance on join.** | **Implemented** (`--brain-rebalance-min-slots N`): a healthy slotless primary receives a proportional share of the largest owner's largest range (never more than half of it). Deterministic — only the largest owner acts. |
+| **R5 — populated-owner rebalance.** | **Implemented for CT2-enabled primaries** (`--brain-rebalance-min-slots N`): the brain selects a healthy primary and starts the same durable `qihse_cluster_transfer_range()` operation used by `CLUSTER CT2 TRANSFER`. A four-daemon drill verifies an 8,192/8,192 split between populated owners. Replica relationships are logical process roles; no host is a cluster-wide primary. |
 | **R6 — stale-node prune.** | **Implemented** (`--brain-prune-timeout S`): a node unhealthy past the timeout with no peer reporting it healthy is pruned from this node's view. Nodes that still own slots are refused until their ranges are re-homed. |
 
 ### Safety posture
@@ -126,8 +126,9 @@ and journals in that state; it simply cannot act on inputs it did not record.
   watch and round-tripped. A decision cites that record's sequence, journal
   offset, chain hash, payload digest and HLC, so the reasoning can be replayed
   from recorded inputs.
-- All actions reuse the audited MOVESLOTS machinery — the brain introduces no
-  new data-path code.
+- Populated-owner rebalance calls the existing CT2 range-transfer engine.
+  The legacy `MOVESLOTS`/`qihse_cluster_handoff_range()` path remains fenced
+  off; it is not the implementation used by the CT2 brain adapter.
 - Local decision records: `{timestamp, node id, rule, inputs
   (health/owners/stats), action, result}`. Federation decision records: the
   authenticated envelope described above, signed with the node identity key
@@ -179,6 +180,11 @@ would benefit every federation consumer, not just the brain).
 - `tests/test_brain_rebalance.c` (`make test-brain-rebalance`): R5/R6 — a
   slotless joiner receives a proportional range (`REBALANCE`); a stale slotless
   node is pruned (`PRUNE`); a stale node that still owns slots is refused.
+- `tests/ct_brain_drill.py` (`make test-ct-brain-balance`): four daemon
+  processes form two independent CT1 groups; automatic CT2 rebalance moves
+  part of a populated owner's range to the other populated owner, while both
+  successors remain in service. Checks all-peer ownership convergence,
+  retained values/TTL, post-move writes and donor restart.
 - `tests/test_brain_fed_journal.c` (`make test-brain-fed-journal`): W3.4 —
   observations carry HLC stamps, chain to the previous record and embed the
   same detail the local journal holds; `prune` and `quarantine` decisions

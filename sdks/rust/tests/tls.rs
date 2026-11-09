@@ -1,6 +1,7 @@
 //! Real-server test is launched by tests/test_tls.py with a disposable fixture.
 use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
+use qihse_rust::client::{CommitOutcome, SqlErrorKind, SqlState};
 use qihse_rust::{Config, NoTls, SimpleQueryMessage};
 use std::{env, fs, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,6 +18,9 @@ fn connector(ca: Option<&str>) -> MakeTlsConnector {
 
 fn assert_authorization_denial(error: std::io::Error) {
     assert!(!error.to_string().contains("DIRECTEYE-HIGH-SECRET-MARKER"));
+    let state = SqlState::from_io(&error).unwrap();
+    assert_eq!(state.code(), "42501");
+    assert_eq!(state.kind(), SqlErrorKind::PermissionDenied);
     let pg = error.get_ref().unwrap().downcast_ref::<tokio_postgres::Error>().unwrap();
     assert_eq!(pg.as_db_error().unwrap().code().code(), "42501");
 }
@@ -103,6 +107,10 @@ async fn verified_tls_and_principal_authorization() {
         let rows = client.simple_query("SELECT note FROM protected_records WHERE id = 7").await.unwrap();
         assert!(rows.iter().any(|row| matches!(row, SimpleQueryMessage::Row(row)
             if row.get(0) == Some("DIRECTEYE-HIGH-SECRET-MARKER"))));
+        match client.transaction().await.unwrap().commit_outcome().await {
+            CommitOutcome::ServerResponded => {},
+            other => panic!("unexpected commit outcome: {other:?}"),
+        }
         drop(client);
         driver.await.unwrap().unwrap();
 

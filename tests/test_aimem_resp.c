@@ -21,8 +21,8 @@ static qihse_resp_server_t* server;
 
 static size_t run(qihse_user_t* user, size_t argc, const char* const* argv,
                   uint8_t** out) {
-    qihse_resp_arg_t args[20];
-    assert(argc <= 20u);
+    qihse_resp_arg_t args[64];
+    assert(argc <= 64u);
     for (size_t i = 0; i < argc; i++) {
         args[i].data = (const uint8_t*)argv[i];
         args[i].len = strlen(argv[i]);
@@ -202,6 +202,33 @@ static bool fd_send3(int fd, const char* a, const char* b, const char* c) {
     return true;
 }
 
+static bool fd_send_args(int fd, size_t count, const char* const* values) {
+    char line[64];
+    int n = snprintf(line, sizeof line, "*%zu\r\n", count);
+    if (n <= 0 || !fd_write_all(fd, line, (size_t)n)) return false;
+    for (size_t i = 0; i < count; i++) {
+        n = snprintf(line, sizeof line, "$%zu\r\n", strlen(values[i]));
+        if (n <= 0 || !fd_write_all(fd, line, (size_t)n) ||
+            !fd_write_all(fd, values[i], strlen(values[i])) ||
+            !fd_write_all(fd, "\r\n", 2u)) return false;
+    }
+    return true;
+}
+
+static char* fd_read_bulk_id(int fd) {
+    char line[64];
+    if (!fd_read_line(fd, line, sizeof line) ||
+        strcmp(line, "$36\r\n") != 0) return NULL;
+    char id[QIHSE_AIMEM_ID_LEN + 3u];
+    for (size_t i = 0; i < sizeof id - 1u; i++)
+        if (read(fd, &id[i], 1u) != 1) return NULL;
+    id[sizeof id - 1u] = '\0';
+    if (id[QIHSE_AIMEM_ID_LEN] != '\r' ||
+        id[QIHSE_AIMEM_ID_LEN + 1u] != '\n') return NULL;
+    id[QIHSE_AIMEM_ID_LEN] = '\0';
+    return strdup(id);
+}
+
 static int network_claim_child(uint16_t port, const char* username,
         const char* password, const char* handoff_id, bool recipient) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -303,6 +330,40 @@ int main(void) {
                                           { (const uint8_t*)unauth[0], strlen(unauth[0]) },
                                           { (const uint8_t*)unauth[1], strlen(unauth[1]) }
                                       }, &unauth_reply, &unauth_len));
+    const char* version[] = { "AIMEM", "VERSION" };
+    assert(!qihse_resp_server_execute(server, NULL, 2u,
+                                      (const qihse_resp_arg_t[]) {
+                                          { (const uint8_t*)version[0], strlen(version[0]) },
+                                          { (const uint8_t*)version[1], strlen(version[1]) }
+                                      }, &unauth_reply, &unauth_len));
+    expect_contains(tenant7, 2u, version, "$1\r\n1\r\n");
+    const char* capabilities[] = { "AIMEM", "CAPABILITIES" };
+    expect_contains(tenant7, 2u, capabilities, "query-cursors-v1");
+    expect_contains(tenant7, 2u, capabilities, "query-source-event-v2");
+    expect_contains(tenant7, 2u, capabilities, "knowledge-walk-v1");
+    const char* source_filter_capability[] = { "AIMEM", "CAPABILITIES", "query-source-event-v2" };
+    expect_contains(tenant7, 3u, source_filter_capability, ":1\r\n");
+    const char* walk_capability[] = { "AIMEM", "CAPABILITIES", "knowledge-walk-v1" };
+    expect_contains(tenant7, 3u, walk_capability, ":1\r\n");
+    const char* walk_v2_capability[] = { "AIMEM", "CAPABILITIES", "knowledge-walk-v2" };
+    expect_contains(tenant7, 3u, walk_v2_capability, ":1\r\n");
+    const char* walk_in_capability[] = { "AIMEM", "CAPABILITIES", "knowledge-walk-in-v2" };
+    expect_contains(tenant7, 3u, walk_in_capability, ":1\r\n");
+    const char* source_capability[] = { "AIMEM", "CAPABILITIES", "knowledge-source-v1" };
+    expect_contains(tenant7, 3u, source_capability, ":1\r\n");
+    const char* url_capability[] = { "AIMEM", "CAPABILITIES", "knowledge-url-source-v1" };
+    expect_contains(tenant7, 3u, url_capability, ":1\r\n");
+    const char* query_source_capability[] = { "AIMEM", "CAPABILITIES", "query-source-v3" };
+    expect_contains(tenant7, 3u, query_source_capability, ":1\r\n");
+    const char* supported[] = { "AIMEM", "CAPABILITIES", "events-v1" };
+    expect_contains(tenant7, 3u, supported, ":1\r\n");
+    const char* scoped_receipt_feature[] = { "AIMEM", "CAPABILITIES",
+        "scoped-local-fsync-receipts-v1" };
+    expect_contains(tenant7, 3u, scoped_receipt_feature, ":1\r\n");
+    const char* unsupported[] = { "AIMEM", "CAPABILITIES", "raw-storage-v1" };
+    expect_contains(tenant7, 3u, unsupported, "ERR UNSUPPORTED AIMEM capability");
+    const char* invalid_version[] = { "AIMEM", "VERSION", "extra" };
+    expect_contains(tenant7, 3u, invalid_version, "wrong number of arguments");
 
     const char* store_public[] = { "AIMEM", "STORE", "1", "public memory", "public-1" };
     uint8_t* reply = NULL;
@@ -323,6 +384,11 @@ int main(void) {
     reply = NULL;
     reply_len = run(op, 5u, store_secret, &reply);
     char* secret_id = extract_bulk_id(reply, reply_len);
+    free(reply);
+    reply = NULL;
+    reply_len = run(tenant7, 2u, capabilities, &reply);
+    assert(!memmem(reply, reply_len, "classified memory", strlen("classified memory")));
+    assert(!memmem(reply, reply_len, secret_id, strlen(secret_id)));
     free(reply);
 
     const char* count[] = { "AIMEM", "COUNT" };
@@ -511,6 +577,55 @@ int main(void) {
     const char* high_recall[] = { "AIMEM", "RECALL-SCOPED", "QH01_HIGH_SCOPE_MARKER",
         "8", "bm25", "0", "project-high", "", "", "" };
     expect_contains(guest, 10u, high_recall, "*0\r\n");
+
+    /* QH-HAX scoped receipt: discard the first durable reply, then recover
+     * the same principal-bound UUID and receipt by exact retry. */
+    const char* receipt_store[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "2",
+        "QHHAX_HIGH_RECEIPT_MARKER", "project-receipt", "", "", "", "receipt-key-1" };
+    const char* receipt_missing_key[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "2",
+        "QHHAX_HIGH_RECEIPT_MARKER", "project-receipt", "", "", "" };
+    expect_contains(op, 8u, receipt_missing_key, "requires an idempotency-key");
+    reply = NULL;
+    reply_len = run(op, 9u, receipt_store, &reply);
+    assert(reply_len > 0u && reply[0] == '*');
+    free(reply); /* simulated lost reply after the durable write */
+    reply = NULL;
+    reply_len = run(op, 9u, receipt_store, &reply);
+    char* receipt_operation = extract_array_bulk(reply, reply_len, 0u);
+    char* receipt_id = extract_array_bulk(reply, reply_len, 1u);
+    char* receipt_token = extract_array_bulk(reply, reply_len, 2u);
+    char* receipt_durability = extract_array_bulk(reply, reply_len, 3u);
+    assert(strcmp(receipt_operation, "STORE-SCOPED") == 0);
+    assert(strcmp(receipt_durability, "local-fsync") == 0);
+    assert(strlen(receipt_id) == QIHSE_AIMEM_ID_LEN &&
+           strlen(receipt_token) == QIHSE_AIMEM_ID_LEN);
+    free(receipt_operation); free(receipt_durability); free(reply);
+    reply = NULL;
+    reply_len = run(op, 9u, receipt_store, &reply);
+    char* receipt_retry_id = extract_array_bulk(reply, reply_len, 1u);
+    char* receipt_retry_token = extract_array_bulk(reply, reply_len, 2u);
+    assert(strcmp(receipt_id, receipt_retry_id) == 0 &&
+           strcmp(receipt_token, receipt_retry_token) == 0);
+    free(receipt_retry_id); free(receipt_retry_token); free(reply);
+    const char* receipt_conflict[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "2",
+        "changed protected bytes", "project-receipt", "", "", "", "receipt-key-1" };
+    expect_contains(op, 9u, receipt_conflict, "ERR CONFLICT");
+    const char* receipt_high_get[] = { "AIMEM", "GET-SCOPED", "placeholder",
+        "project-receipt", "", "", "" };
+    receipt_high_get[2] = receipt_id;
+    expect_contains(guest, 7u, receipt_high_get, "$-1\r\n");
+    const char* low_same_receipt_key[] = { "AIMEM", "STORE-SCOPED-RECEIPT", "1",
+        "low receipt row", "project-receipt", "", "", "", "receipt-key-1" };
+    reply = NULL;
+    reply_len = run(guest, 9u, low_same_receipt_key, &reply);
+    char* low_receipt_id = extract_array_bulk(reply, reply_len, 1u);
+    char* low_receipt_token = extract_array_bulk(reply, reply_len, 2u);
+    assert(strcmp(receipt_id, low_receipt_id) != 0 &&
+           strcmp(receipt_token, low_receipt_token) != 0);
+    assert(!memmem(reply, reply_len, receipt_id, strlen(receipt_id)));
+    assert(!memmem(reply, reply_len, "QHHAX_HIGH_RECEIPT_MARKER", 25u));
+    free(low_receipt_id); free(low_receipt_token); free(reply);
+    free(receipt_id); free(receipt_token);
     const char* high_forget[] = { "AIMEM", "FORGET-SCOPED", "placeholder",
         "project-high", "", "", "" };
     high_forget[2] = high_scoped_id;
@@ -714,6 +829,206 @@ int main(void) {
         "project-events", "checkout-a", "stream-a", "session-1" };
     knowledge_latest[3] = knowledge_id;
     expect_contains(tenant7_reader, 8u, knowledge_latest, "curated lineage v2");
+    const char* doc_create[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX-SOURCE",
+        "4", "1", "document-backed candidate", "project-events", "checkout-a",
+        "stream-a", "session-1", "900000", "doc-source-create-1", "0", "0",
+        "hax-file", "src/example.c", "sha384-revision-a", "10", "20" };
+    reply = NULL;
+    reply_len = run(tenant7, 19u, doc_create, &reply);
+    assert(reply_len > 0u && reply[0] == '*');
+    const char* doc_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* doc_knowledge = extract_array_bulk((const uint8_t*)doc_inner,
+        reply_len - (size_t)(doc_inner - (const char*)reply), 0u);
+    char* doc_version = extract_array_bulk((const uint8_t*)doc_inner,
+        reply_len - (size_t)(doc_inner - (const char*)reply), 1u);
+    free(reply);
+    const char* doc_get[] = { "AIMEM", "KNOWLEDGE", "GET-SOURCE", "placeholder",
+        "project-events", "checkout-a", "stream-a", "session-1" };
+    doc_get[3] = doc_version;
+    expect_contains(tenant7_reader, 8u, doc_get, "sha384-revision-a");
+    doc_get[3] = knowledge_v1;
+    expect_contains(tenant7_reader, 8u, doc_get, "$-1\r\n");
+    doc_get[3] = doc_version;
+    const char* doc_query[] = { "AIMEM", "QUERY", "V3", "BEGIN",
+        "project-events", "checkout-a", "stream-a", "session-1", "0", "0",
+        "0", "0", "0", "0", "0", "bm25", "", "8",
+        "hax-file", "src/example.c", "sha384-revision-a", "10", "20" };
+    reply = NULL;
+    reply_len = run(tenant7_reader, 23u, doc_query, &reply);
+    char* doc_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    const char* doc_next[] = { "AIMEM", "QUERY", "V3", "NEXT", "placeholder", "8" };
+    doc_next[4] = doc_cursor;
+    expect_contains(tenant7_reader, 6u, doc_next, "document-backed candidate");
+    const char* doc_end[] = { "AIMEM", "QUERY", "V3", "END", "placeholder" };
+    doc_end[4] = doc_cursor;
+    expect_contains(tenant7_reader, 5u, doc_end, "+OK");
+    free(doc_cursor);
+    const char* url_create[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX-SOURCE",
+        "4", "1", "URL_WIRE_LOW_MARKER", "project-events", "checkout-a",
+        "stream-a", "session-1", "900000", "url-source-create-1", "0", "0",
+        "https-url", "https://example.com/guide?edition=2",
+        "sha256:20044dfdde9c2681fcde44a4cb3350920fb3a7ace75284626addfeec460a0755",
+        "1", "2" };
+    reply = NULL;
+    reply_len = run(tenant7, 19u, url_create, &reply);
+    assert(reply_len > 0u && reply[0] == '*');
+    const char* url_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* url_version = extract_array_bulk((const uint8_t*)url_inner,
+        reply_len - (size_t)(url_inner - (const char*)reply), 1u);
+    free(reply);
+    doc_get[3] = url_version;
+    expect_contains(tenant7_reader, 8u, doc_get,
+        "https://example.com/guide?edition=2");
+    const char* url_query[] = { "AIMEM", "QUERY", "V3", "BEGIN",
+        "project-events", "checkout-a", "stream-a", "session-1", "0", "0",
+        "0", "0", "0", "0", "0", "bm25", "", "8",
+        "https-url", "https://example.com/guide?edition=2",
+        "sha256:20044dfdde9c2681fcde44a4cb3350920fb3a7ace75284626addfeec460a0755",
+        "1", "2" };
+    reply = NULL;
+    reply_len = run(tenant7_reader, 23u, url_query, &reply);
+    char* url_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    const char* url_next[] = { "AIMEM", "QUERY", "V3", "NEXT", "placeholder", "8" };
+    url_next[4] = url_cursor;
+    expect_contains(tenant7_reader, 6u, url_next, "URL_WIRE_LOW_MARKER");
+    doc_end[4] = url_cursor;
+    expect_contains(tenant7_reader, 5u, doc_end, "+OK");
+    free(url_cursor);
+    url_query[20] = "sha256:20044dfdde9c2681fcde44a4cb3350920fb3a7ace75284626addfeec460a0750";
+    reply = NULL;
+    reply_len = run(tenant7_reader, 23u, url_query, &reply);
+    url_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    url_next[4] = url_cursor;
+    expect_contains(tenant7_reader, 6u, url_next, "*0\r\n");
+    doc_end[4] = url_cursor;
+    expect_contains(tenant7_reader, 5u, doc_end, "+OK");
+    free(url_cursor);
+    url_query[20] = url_create[16];
+    url_query[19] = "HTTPS://Example.com/guide";
+    expect_contains(tenant7_reader, 23u, url_query, "ERR invalid source identity");
+    const char* url_bad_create[19];
+    memcpy(url_bad_create, url_create, sizeof url_bad_create);
+    url_bad_create[11] = "url-source-invalid-1";
+    url_bad_create[15] = "https://example.com/guide/../x";
+    expect_contains(tenant7, 19u, url_bad_create, "ERR invalid AIMEM knowledge provenance fields");
+    doc_get[3] = doc_version;
+    free(url_version);
+    doc_query[20] = "sha384-stale";
+    reply = NULL;
+    reply_len = run(tenant7_reader, 23u, doc_query, &reply);
+    doc_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    doc_next[4] = doc_cursor;
+    expect_contains(tenant7_reader, 6u, doc_next, "*0\r\n");
+    doc_end[4] = doc_cursor;
+    expect_contains(tenant7_reader, 5u, doc_end, "+OK");
+    free(doc_cursor);
+    const char* doc_revise[] = { "AIMEM", "KNOWLEDGE", "REVISE-EX-SOURCE",
+        "placeholder", "placeholder", "1", "1", "document-backed revision",
+        "910000", "doc-source-revise-1", "0", "0", "hax-file",
+        "src/example.c", "sha384-revision-b", "10", "20" };
+    doc_revise[3] = doc_knowledge;
+    doc_revise[4] = doc_version;
+    reply = NULL;
+    reply_len = run(tenant7, 17u, doc_revise, &reply);
+    assert(reply_len > 0u && reply[0] == '*');
+    const char* revised_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* revised_version = extract_array_bulk((const uint8_t*)revised_inner,
+        reply_len - (size_t)(revised_inner - (const char*)reply), 1u);
+    free(reply);
+    doc_get[3] = revised_version;
+    expect_contains(tenant7_reader, 8u, doc_get, "sha384-revision-b");
+    free(revised_version); free(doc_knowledge);
+    free(doc_version);
+
+    const char* knowledge_create_ex[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX",
+        "1", "1", "evidence-linked candidate", "project-events", "checkout-a",
+        "stream-a", "session-1", "870000", "wire-create-ex-1", "1",
+        "placeholder", "1", "1", "placeholder", "project-events",
+        "checkout-a", "stream-a", "session-1" };
+    knowledge_create_ex[13] = event_doc_id;
+    knowledge_create_ex[16] = knowledge_v1;
+    reply = NULL;
+    reply_len = run(tenant7, 21u, knowledge_create_ex, &reply);
+    assert(reply_len > 0u && reply[0] == '*' &&
+           memmem(reply, reply_len, "evidence-linked candidate", 25u) &&
+           memmem(reply, reply_len, event_doc_id, strlen(event_doc_id)));
+    const char* ex_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* ex_knowledge_id = extract_array_bulk((const uint8_t*)ex_inner,
+        reply_len - (size_t)(ex_inner - (const char*)reply), 0u);
+    char* ex_version_id = extract_array_bulk((const uint8_t*)ex_inner,
+        reply_len - (size_t)(ex_inner - (const char*)reply), 1u);
+    uint8_t* first_ex_reply = malloc(reply_len);
+    assert(first_ex_reply);
+    memcpy(first_ex_reply, reply, reply_len);
+    size_t first_ex_len = reply_len;
+    free(reply);
+    const char* outbound_walk[] = { "AIMEM", "KNOWLEDGE", "WALK", "placeholder",
+        "project-events", "checkout-a", "stream-a", "session-1", "1", "8" };
+    outbound_walk[3] = ex_version_id;
+    reply = NULL;
+    reply_len = run(tenant7, 10u, outbound_walk, &reply);
+    assert(reply_len > 0u && memmem(reply, reply_len, "*2\r\n", 4u) == reply &&
+           !memmem(reply, reply_len, "*7\r\n", 4u));
+    free(reply);
+    const char* outbound_walk_v2[10];
+    memcpy(outbound_walk_v2, outbound_walk, sizeof outbound_walk_v2);
+    outbound_walk_v2[2] = "WALK-V2";
+    reply = NULL;
+    reply_len = run(tenant7, 10u, outbound_walk_v2, &reply);
+    assert(reply_len > 0u && memmem(reply, reply_len, "*2\r\n", 4u) == reply &&
+           memmem(reply, reply_len, "*3\r\n", 4u) &&
+           memmem(reply, reply_len, "*0\r\n", 4u) &&
+           memmem(reply, reply_len, "*7\r\n", 4u) &&
+           memmem(reply, reply_len, ex_version_id, strlen(ex_version_id)) &&
+           memmem(reply, reply_len, knowledge_v1, strlen(knowledge_v1)));
+    free(reply);
+    reply = NULL;
+    reply_len = run(tenant7, 21u, knowledge_create_ex, &reply);
+    assert(reply_len == first_ex_len && memcmp(reply, first_ex_reply, reply_len) == 0);
+    free(first_ex_reply); free(reply);
+    const char* knowledge_create_ex_changed[21];
+    memcpy(knowledge_create_ex_changed, knowledge_create_ex, sizeof knowledge_create_ex_changed);
+    knowledge_create_ex_changed[5] = "changed candidate bytes";
+    expect_contains(tenant7, 21u, knowledge_create_ex_changed, "ERR CONFLICT");
+    const char* knowledge_create_ex_bad[21];
+    memcpy(knowledge_create_ex_bad, knowledge_create_ex, sizeof knowledge_create_ex_bad);
+    knowledge_create_ex_bad[11] = "wire-create-ex-bad";
+    knowledge_create_ex_bad[13] = "not-an-event-id";
+    expect_contains(tenant7, 21u, knowledge_create_ex_bad,
+                    "ERR invalid AIMEM knowledge provenance fields");
+    knowledge_create_ex_bad[13] = tenant8_id;
+    expect_contains(tenant7, 21u, knowledge_create_ex_bad,
+                    "NOPERM AIMEM knowledge creation denied");
+
+    const char* knowledge_revise_ex[] = { "AIMEM", "KNOWLEDGE", "REVISE-EX",
+        "placeholder", "placeholder", "1", "1", "reviewed candidate revision",
+        "920000", "wire-revise-ex-1", "1", "placeholder", "0" };
+    knowledge_revise_ex[3] = ex_knowledge_id;
+    knowledge_revise_ex[4] = ex_version_id;
+    knowledge_revise_ex[11] = event_doc_id;
+    reply = NULL;
+    reply_len = run(tenant7, 13u, knowledge_revise_ex, &reply);
+    assert(reply_len > 0u && reply[0] == '*' &&
+           memmem(reply, reply_len, "reviewed candidate revision", 27u));
+    uint8_t* first_revision_reply = malloc(reply_len);
+    assert(first_revision_reply);
+    memcpy(first_revision_reply, reply, reply_len);
+    size_t first_revision_len = reply_len;
+    free(reply);
+    reply = NULL;
+    reply_len = run(tenant7, 13u, knowledge_revise_ex, &reply);
+    assert(reply_len == first_revision_len &&
+           memcmp(reply, first_revision_reply, reply_len) == 0);
+    free(first_revision_reply); free(reply);
+    const char* knowledge_revise_ex_stale[13];
+    memcpy(knowledge_revise_ex_stale, knowledge_revise_ex, sizeof knowledge_revise_ex_stale);
+    knowledge_revise_ex_stale[9] = "wire-revise-ex-stale";
+    expect_contains(tenant7, 13u, knowledge_revise_ex_stale, "ERR CONFLICT");
+    free(ex_knowledge_id); free(ex_version_id);
 
     /* QH-05 V1 cursor is principal-bound and pages a stable authorized query. */
     const char* query_begin[] = { "AIMEM", "QUERY", "V1", "BEGIN", "project-events",
@@ -765,6 +1080,127 @@ int main(void) {
         "project-high", "", "", "" };
     high_knowledge_get[3] = high_knowledge_v1;
     expect_contains(system_low_reader, 8u, high_knowledge_get, "$-1\r\n");
+    const char* high_walk[] = { "AIMEM", "KNOWLEDGE", "WALK", "placeholder",
+        "project-high", "", "", "", "2", "8" };
+    high_walk[3] = high_knowledge_v1;
+    expect_contains(system_low_reader, 10u, high_walk, "*0\r\n");
+    expect_contains(op, 10u, high_walk, "QH04_WIRE_HIGH_MARKER");
+    const char* high_walk_v2[10];
+    memcpy(high_walk_v2, high_walk, sizeof high_walk_v2);
+    high_walk_v2[2] = "WALK-V2";
+    reply = NULL;
+    reply_len = run(system_low_reader, 10u, high_walk_v2, &reply);
+    assert(reply_len == 4u && memcmp(reply, "*0\r\n", 4u) == 0);
+    free(reply);
+    const char* high_doc_create[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX-SOURCE",
+        "4", "1", "QH04_HIGH_DOCUMENT_SOURCE_MARKER", "project-high", "", "", "",
+        "0", "high-doc-source-1", "0", "0",
+        "hax-file", "src/high.c", "sha384-high-revision", "3", "7" };
+    reply = NULL;
+    reply_len = run(op, 19u, high_doc_create, &reply);
+    const char* high_doc_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* high_doc_version = extract_array_bulk((const uint8_t*)high_doc_inner,
+        reply_len - (size_t)(high_doc_inner - (const char*)reply), 1u);
+    free(reply);
+    const char* high_doc_get[] = { "AIMEM", "KNOWLEDGE", "GET-SOURCE", "placeholder",
+        "project-high", "", "", "" };
+    high_doc_get[3] = high_doc_version;
+    expect_contains(system_low_reader, 8u, high_doc_get, "$-1\r\n");
+    const char* high_url_create[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX-SOURCE",
+        "4", "1", "URL_WIRE_HIGH_MARKER", "project-high", "", "", "",
+        "0", "url-source-high-1", "0", "0", "https-url",
+        "https://example.com/guide?edition=2",
+        "sha256:20044dfdde9c2681fcde44a4cb3350920fb3a7ace75284626addfeec460a0755",
+        "1", "2" };
+    reply = NULL;
+    reply_len = run(op, 19u, high_url_create, &reply);
+    const char* high_url_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* high_url_version = extract_array_bulk((const uint8_t*)high_url_inner,
+        reply_len - (size_t)(high_url_inner - (const char*)reply), 1u);
+    free(reply);
+    high_doc_get[3] = high_url_version;
+    expect_contains(system_low_reader, 8u, high_doc_get, "$-1\r\n");
+    const char* high_url_query[] = { "AIMEM", "QUERY", "V3", "BEGIN",
+        "project-high", "", "", "", "0", "0", "0", "0", "0", "0", "0",
+        "bm25", "", "8", "https-url", "https://example.com/guide?edition=2",
+        "sha256:20044dfdde9c2681fcde44a4cb3350920fb3a7ace75284626addfeec460a0755",
+        "1", "2" };
+    reply = NULL;
+    reply_len = run(system_low_reader, 23u, high_url_query, &reply);
+    char* high_url_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    url_next[4] = high_url_cursor;
+    expect_contains(system_low_reader, 6u, url_next, "*0\r\n");
+    doc_end[4] = high_url_cursor;
+    expect_contains(system_low_reader, 5u, doc_end, "+OK");
+    free(high_url_cursor);
+    free(high_url_version);
+    high_doc_get[3] = high_doc_version;
+    expect_contains(op, 8u, high_doc_get, "sha384-high-revision");
+    const char* high_doc_query[] = { "AIMEM", "QUERY", "V3", "BEGIN",
+        "project-high", "", "", "", "0", "0", "0", "0", "0", "0", "0",
+        "bm25", "", "8", "hax-file", "src/high.c", "sha384-high-revision", "3", "7" };
+    reply = NULL;
+    reply_len = run(system_low_reader, 23u, high_doc_query, &reply);
+    char* high_doc_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    const char* high_doc_next[] = { "AIMEM", "QUERY", "V3", "NEXT", "placeholder", "8" };
+    high_doc_next[4] = high_doc_cursor;
+    expect_contains(system_low_reader, 6u, high_doc_next, "*0\r\n");
+    const char* high_doc_end[] = { "AIMEM", "QUERY", "V3", "END", "placeholder" };
+    high_doc_end[4] = high_doc_cursor;
+    expect_contains(system_low_reader, 5u, high_doc_end, "+OK");
+    free(high_doc_cursor); free(high_doc_version);
+    const char* low_root_create[] = { "AIMEM", "KNOWLEDGE", "CREATE",
+        "1", "1", "LOW_INCOMING_ROOT", "project-high", "", "", "" };
+    reply = NULL;
+    reply_len = run(guest, 10u, low_root_create, &reply);
+    char* low_root_version = extract_array_bulk(reply, reply_len, 1u);
+    free(reply);
+    const char* high_incoming_create[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX",
+        "1", "1", "HIGH_INCOMING_WIRE_MARKER", "project-high", "", "", "",
+        "0", "high-incoming-wire-1", "0", "1", "2", "placeholder",
+        "project-high", "", "", "" };
+    high_incoming_create[15] = low_root_version;
+    expect_contains(op, 20u, high_incoming_create, "HIGH_INCOMING_WIRE_MARKER");
+    const char* incoming_walk[] = { "AIMEM", "KNOWLEDGE", "WALK-IN", "placeholder",
+        "project-high", "", "", "", "1", "8" };
+    incoming_walk[3] = low_root_version;
+    reply = NULL;
+    reply_len = run(system_low_reader, 10u, incoming_walk, &reply);
+    assert(reply_len > 0u && memmem(reply, reply_len, "*1\r\n", 4u) == reply);
+    assert(memmem(reply, reply_len, "*3\r\n", 4u));
+    assert(memmem(reply, reply_len, "*0\r\n", 4u));
+    assert(!memmem(reply, reply_len, "*6\r\n", 4u));
+    assert(!memmem(reply, reply_len, "HIGH_INCOMING_WIRE_MARKER", 25u));
+    free(reply);
+    reply = NULL;
+    reply_len = run(op, 10u, incoming_walk, &reply);
+    assert(reply_len > 0u && memmem(reply, reply_len, "*2\r\n", 4u) == reply);
+    assert(memmem(reply, reply_len, "HIGH_INCOMING_WIRE_MARKER", 25u));
+    assert(memmem(reply, reply_len, "*6\r\n$1\r\n2\r\n", strlen("*6\r\n$1\r\n2\r\n")));
+    assert(memmem(reply, reply_len, low_root_version, strlen(low_root_version)));
+    free(reply);
+    incoming_walk[3] = high_knowledge_v1;
+    reply = NULL;
+    reply_len = run(system_low_reader, 10u, incoming_walk, &reply);
+    assert(reply_len == 4u && memcmp(reply, "*0\r\n", 4u) == 0);
+    free(reply);
+    incoming_walk[3] = low_root_version;
+    incoming_walk[8] = "5";
+    expect_contains(system_low_reader, 10u, incoming_walk, "ERR invalid AIMEM KNOWLEDGE WALK fields");
+    free(low_root_version);
+    const char* low_relation_ex[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX",
+        "1", "1", "low candidate", "project-high", "", "", "",
+        "100000", "wire-low-high-relation", "0", "1", "1", "placeholder",
+        "project-high", "", "", "" };
+    low_relation_ex[15] = high_knowledge_v1;
+    reply = NULL;
+    reply_len = run(guest, 20u, low_relation_ex, &reply);
+    assert(memmem(reply, reply_len, "NOPERM", 6u));
+    assert(!memmem(reply, reply_len, "QH04_WIRE_HIGH_MARKER", 21u));
+    assert(!memmem(reply, reply_len, high_knowledge_v1, strlen(high_knowledge_v1)));
+    free(reply);
     free(high_knowledge_v1); free(knowledge_v1); free(knowledge_id);
 
     const char* event_conflict[] = { "AIMEM", "EVENT", "APPEND", "project-events",
@@ -826,6 +1262,23 @@ int main(void) {
     reply_len = run(op, 12u, high_event, &reply);
     char* high_event_id = extract_bulk_id(reply, reply_len);
     free(reply);
+    const char* source_query_v2[] = { "AIMEM", "QUERY", "V2", "BEGIN",
+        "project-events", "checkout-a", "stream-a", "session-1",
+        "0", "0", "0", "0", "0", "0", "0", "bm25", "", "8",
+        "placeholder" };
+    source_query_v2[18] = event_doc_id;
+    reply = NULL;
+    reply_len = run(tenant7, 19u, source_query_v2, &reply);
+    char* source_cursor = extract_bulk_id(reply, reply_len);
+    free(reply);
+    const char* source_query_end[] = { "AIMEM", "QUERY", "V2", "END", "placeholder" };
+    source_query_end[4] = source_cursor;
+    expect_contains(tenant7, 5u, source_query_end, "+OK");
+    free(source_cursor);
+    source_query_v2[4] = "project-high-events";
+    source_query_v2[5] = ""; source_query_v2[6] = ""; source_query_v2[7] = "";
+    source_query_v2[18] = high_event_id;
+    expect_contains(guest, 19u, source_query_v2, "ERR AIMEM query unavailable or invalid");
     const char* low_event_read[] = { "AIMEM", "EVENT", "READ", "placeholder",
         "project-high-events", "", "", "" };
     low_event_read[3] = high_event_id;
@@ -867,6 +1320,43 @@ int main(void) {
     assert(WIFEXITED(recipient_status) && WEXITSTATUS(recipient_status) == 0);
     assert(WIFEXITED(competitor_status) && WEXITSTATUS(competitor_status) == 0);
     free(process_handoff_id);
+
+    /* A network cursor belongs to the connection and is released when that
+     * client disconnects, even if its authenticated principal stays active. */
+    int cursor_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(cursor_fd >= 0);
+    struct sockaddr_in cursor_addr;
+    memset(&cursor_addr, 0, sizeof cursor_addr);
+    cursor_addr.sin_family = AF_INET;
+    cursor_addr.sin_port = htons(listener_port);
+    cursor_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(connect(cursor_fd, (struct sockaddr*)&cursor_addr, sizeof cursor_addr) == 0);
+    assert(fd_send_args(cursor_fd, 2u, version));
+    char auth_line[64];
+    assert(fd_read_line(cursor_fd, auth_line, sizeof auth_line));
+    assert(strstr(auth_line, "NOAUTH") != NULL);
+    assert(fd_send3(cursor_fd, "AUTH", qihse_user_get_username(tenant7_reader),
+                    "Tenant7Reader123!"));
+    assert(fd_read_line(cursor_fd, auth_line, sizeof auth_line));
+    assert(strcmp(auth_line, "+OK\r\n") == 0);
+    assert(fd_send_args(cursor_fd, 18u, query_begin));
+    char* disconnected_cursor = fd_read_bulk_id(cursor_fd);
+    assert(disconnected_cursor);
+    close(cursor_fd);
+    const char* disconnected_next[] = { "AIMEM", "QUERY", "V1", "NEXT",
+                                        disconnected_cursor, "1" };
+    bool cleaned = false;
+    for (size_t attempt = 0; attempt < 100u; attempt++) {
+        uint8_t* next_reply = NULL;
+        size_t next_len = run(tenant7_reader, 6u, disconnected_next, &next_reply);
+        cleaned = next_len > 0u &&
+                  memmem(next_reply, next_len, "cursor expired or unknown", 25u) != NULL;
+        free(next_reply);
+        if (cleaned) break;
+        usleep(10000u);
+    }
+    assert(cleaned);
+    free(disconnected_cursor);
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(store);
     aimem_fixture_cleanup(data_root);

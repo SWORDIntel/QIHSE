@@ -1,0 +1,82 @@
+{
+  "fixture": {
+    "nodes": 16000,
+    "edges": 48000
+  },
+  "conditions": "Synthetic shared snapshot, same libqihse and compiler; current RSS after one context query, concurrent host workloads, page cache not dropped",
+  "pairs": [
+    {
+      "before": {
+        "Rss_KiB": 66736,
+        "Pss_KiB": 56411,
+        "Private_Clean_KiB": 192,
+        "Private_Dirty_KiB": 55796
+      },
+      "after": {
+        "Rss_KiB": 28964,
+        "Pss_KiB": 18418,
+        "Private_Clean_KiB": 124,
+        "Private_Dirty_KiB": 17780
+      }
+    },
+    {
+      "after": {
+        "Rss_KiB": 28892,
+        "Pss_KiB": 18620,
+        "Private_Clean_KiB": 356,
+        "Private_Dirty_KiB": 17784
+      },
+      "before": {
+        "Rss_KiB": 66800,
+        "Pss_KiB": 56534,
+        "Private_Clean_KiB": 336,
+        "Private_Dirty_KiB": 55792
+      }
+    }
+  ],
+  "binary_sha256": {
+    "before": "fe4b172a6261ef0931d86aba6736da149e833ddfd7a53b638cad47f6a24da12c",
+    "after": "bde5361fa665a67b3937ff435940207afcd6199f4212cf096cebedf2229e2315"
+  },
+  "source_sha256": {
+    "before": "4da8e9bf2c437d91021a278df2f218125c26824802fc1b8bbf37916c95cc2a8a",
+    "after": "f766fbf4350f390a8216bbc32e09a807297b58c617fd14e4d9fadc2356e79c8e"
+  },
+  "shared_library_sha256": "8ead12e45e4fc434dbf1e1b4d4e2787b0210603fe4b3cb05b84d3c78ba9e4841",
+  "measurement_order": "All RSS pairs use the same immutable snapshot; refresh and authorization checks follow.",
+  "import": {
+    "wall_ms": 20314.785,
+    "cpu_ms": 20309.493,
+    "peak_rss_kib": 363636,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 227807330
+  },
+  "storage_format": "qihse-codegraph-packed-v2",
+  "cold_before": {
+    "wall_ms": 11083.361,
+    "cpu_ms": 11094.276,
+    "peak_rss_kib": 316492,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "cold_after": {
+    "wall_ms": 10814.462,
+    "cpu_ms": 10821.297,
+    "peak_rss_kib": 279036,
+    "filesystem_output_blocks": 0,
+    "observed_wchar_lower_bound": 59919
+  },
+  "refresh_invalidation_and_revocation": "passed",
+  "median_rss_KiB": {
+    "before": 66768.0,
+    "after": 28928.0
+  },
+  "cold_query_parity": true,
+  "projection_source_sha256": {
+    "tools/qihse_codegraph_csr.c": "d7a6c59db9e5ebcad42f139888d150850e08dc7bcde5a5555f930ad758c5af86",
+    "tools/qihse_codegraph_csr.h": "c217a4da61c283c043d58ffff84198acc2f4ab706a1f81a6505703d9fb715302"
+  },
+  "cli_delta_sha256": "8e87e91f0f74e54cb77f7359de121c1e66604711dd0c6be409c0e5e444849476",
+  "integrated_cli_source_sha256": "dfd6f7d3be36f2475abd6b6d4cbfe782c2f50b275ee41877cc7eed68621bc1ae",
+  "integrated_cli_note": "Only the traversal-budget comment changed after measurements: clarify graph-walk/subquery rather than whole batch request."
+}

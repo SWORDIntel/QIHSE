@@ -7,10 +7,11 @@
  * monitoring with rollback, deterministic telemetry, signed records) without
  * the bloat. See docs/architecture/cluster_brain.md.
  *
- * Observe + remember + decide always run. Acting (R1 failed-owner re-home via
- * the audited slot-handoff path, with R4 rollback) runs only when `act` is
+ * Observe + remember + decide always run. Configured CT2 rebalancing runs
+ * only with explicit principals and the durable transfer adapter. Acting runs when `act` is
  * set: a brain that can act is a brain that can misact, so the journal earns
- * trust first. Every observation/decision is appended to a durable
+ * trust first. Failed-owner recovery belongs to CT1 promotion; a health-only
+ * rollback never rewrites ownership. Every observation/decision is appended to a durable
  * qihse_event_stream (topic "cluster.brain") and decisions are signed with
  * the node's ML-DSA-87 key when one is configured.
  *
@@ -59,11 +60,27 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "qihse_resp_wire.h"
+#include "qihse_auth.h"
+#include "qihse_cluster_maintenance.h"
 #include "qihse_federation.h" /* qihse_hlc_t, qihse_sig_alg_t */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* The adapter must call the fenced CT2 implementation. PENDING and REJECTED
+ * retain the durable tuple: neither result proves that the source is unfenced.
+ * TOO_LARGE is permitted only before preparation or after a proven abort. */
+typedef enum {
+    QIHSE_BRAIN_TRANSFER_COMMITTED = 0,
+    QIHSE_BRAIN_TRANSFER_PENDING,
+    QIHSE_BRAIN_TRANSFER_REJECTED,
+    QIHSE_BRAIN_TRANSFER_TOO_LARGE
+} qihse_brain_transfer_result_t;
+typedef qihse_brain_transfer_result_t (*qihse_brain_transfer_fn)(
+    void* context, qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const char* transfer_id, const char* expected_generation, const char* target_topology_id,
+    uint16_t first, uint16_t last, char* error, size_t error_cap);
 
 typedef struct {
     qihse_resp_server_t* server;
@@ -74,15 +91,23 @@ typedef struct {
     uint32_t act_cooldown_seconds;  /* per-range re-home cooldown (default 30) */
     uint32_t rollback_window_seconds; /* R4 evaluation window (default 60) */
     uint32_t prune_timeout_seconds;   /* prune a node unhealthy this long (0 = never) */
-    uint32_t rebalance_min_slots;     /* donate a proportional range to a slotless
-                                       * joiner when the largest owner holds at
-                                       * least this many slots (0 = disabled) */
+    uint32_t rebalance_min_slots;     /* minimum donor ownership; configured CT2 also
+                                       * balances populated peers (0 = disabled) */
     const char* federation_journal_dir; /* federation event journal directory;
                                          * NULL = journal_dir (topic "federation") */
     const char* node_key_handle;        /* federation node identity private key
                                          * handle used to sign decisions; NULL =
                                          * dsa_key_path when that is set.  The
                                          * handle is journaled, the key never is. */
+    /* Principals and gate outlive stop(). No default identity is used by CT2. */
+    qihse_user_t* control_principal;
+    qihse_user_t* data_principal;
+    qihse_cluster_maintenance_t* maintenance_gate;
+    qihse_brain_transfer_fn transfer;
+    void* transfer_context;
+    const char* transfer_generation; /* fixed-generation adapters only, HEX32 */
+    bool (*transfer_generation_get)(void* context, qihse_user_t* data_principal,
+                                    char out_generation[33]);
 } qihse_brain_config_t;
 
 /* Start the brain thread. Returns false on allocation/startup failure. */

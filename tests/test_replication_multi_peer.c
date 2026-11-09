@@ -5,6 +5,7 @@
 #undef NDEBUG
 #endif
 #include <assert.h>
+#include <errno.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -140,6 +141,14 @@ static real_client_t *connect_peer(qihse_resp_server_t *server,
     qihse_qkp_config_t cfg = {.dsa_key_path = client->dsa, .trusted_pubs = trust,
         .trusted_count = 1u, .node_id = node, .require = true};
     assert(qihse_qkp_client_negotiate(out->fd, &cfg, &out->session) == QIHSE_QKP_SECURE);
+    /* Keep the finite handshake and client-response deadlines. The server
+     * end must remain readable while this test works through other peers:
+     * otherwise its 10-second SO_RCVTIMEO closes an authenticated idle QKP
+     * session and a later sealed command fails with EPIPE. close_peer still
+     * shuts the socket down explicitly. */
+    struct timeval no_timeout = {0, 0};
+    assert(setsockopt(out->server_fd, SOL_SOCKET, SO_RCVTIMEO,
+                      &no_timeout, sizeof(no_timeout)) == 0);
     return out;
 }
 
@@ -207,7 +216,11 @@ static char *command(real_client_t *client, size_t argc,
         assert(n > 0 && (size_t)n < sizeof(request) - used);
         used += (size_t)n;
     }
-    assert(qihse_qkp_send_sealed(client->session, client->fd, request, used));
+    if (!qihse_qkp_send_sealed(client->session, client->fd, request, used)) {
+        fprintf(stderr, "sealed send failed for %s%s%s (errno=%d)\n",
+                argv[0], argc > 1u ? " " : "", argc > 1u ? argv[1] : "", errno);
+        assert(false);
+    }
     reply_t reply = {0};
     read_value(client, &reply, 0u);
     if (length) *length = reply.length;
@@ -330,7 +343,7 @@ static void startup_coordinator_hold(void) {
     node.bus_port = 17100u;
     node.healthy = true;
     node.primary_index = QIHSE_CLUSTER_NODE_NONE;
-    uint16_t old, local, owner;
+    uint16_t old, local, owner, standby;
     qihse_cluster_node_id_from_seed("held-old", 8u, node.id);
     assert(qihse_cluster_topology_upsert_node(topology, &node, &old));
     node.port++;
@@ -338,6 +351,16 @@ static void startup_coordinator_hold(void) {
     qihse_cluster_node_id_from_seed("held-local", 10u, node.id);
     assert(qihse_cluster_topology_upsert_node(topology, &node, &local));
     assert(qihse_cluster_topology_assign_range(topology, 0u, 99u, old));
+    node.port++; node.bus_port++;
+    qihse_cluster_node_id_from_seed("held-standby", 12u, node.id);
+    assert(qihse_cluster_topology_upsert_node(topology, &node, &standby));
+    char eligibility_err[128] = {0};
+    assert(qihse_cluster_failover_ct_successor_slotless(topology, old, local,
+        standby, eligibility_err, sizeof(eligibility_err)));
+    assert(qihse_cluster_topology_assign_range(topology, 200u, 299u, standby));
+    assert(!qihse_cluster_failover_ct_successor_slotless(topology, old, local,
+        standby, eligibility_err, sizeof(eligibility_err)));
+    assert(strstr(eligibility_err, "owns slots") != NULL);
     unsigned calls = 0u;
     qihse_cluster_failover_config_t cfg = {0};
     cfg.topology = topology;
@@ -348,6 +371,11 @@ static void startup_coordinator_hold(void) {
     cfg.failback_poll_ms = 20u;
     qihse_cluster_failover_t *fo = qihse_cluster_failover_create_paused(&cfg);
     assert(fo && qihse_cluster_failover_is_paused(fo));
+    char ct_err[128] = {0};
+    char ct_generation[33] = {0};
+    assert(!qihse_cluster_failover_promote_ct(fo, old, local,
+        QIHSE_CLUSTER_NODE_NONE, ct_generation, ct_err, sizeof(ct_err)));
+    assert(strstr(ct_err, "paused") != NULL || strstr(ct_err, "context") != NULL);
     assert(!qihse_cluster_failover_promote(fo, old, local));
     qihse_cluster_failover_on_fail_cb(topology, old, fo);
     assert(qihse_cluster_failover_handle(fo, old) == QIHSE_CLUSTER_NODE_NONE);
@@ -435,19 +463,22 @@ static void held_wire_manual_failover(const qihse_resp_server_config_t *base,
     assert(strcmp(reply, "+RESUMED\r\n") == 0);
     free(reply);
     reply = command(wire, 3u, failover, NULL);
-    assert(strcmp(reply, "+OK\r\n") == 0);
+    assert(strcmp(reply, "-ERR ownership transition requires fenced migration\r\n") == 0);
     free(reply);
     assert(qihse_cluster_topology_get_node(topology, local, &current));
-    assert(current.role == QIHSE_CLUSTER_NODE_PRIMARY &&
-           current.primary_index == QIHSE_CLUSTER_NODE_NONE);
+    assert(current.role == QIHSE_CLUSTER_NODE_REPLICA &&
+           current.primary_index == primary);
     for (uint16_t slot = 0u; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
         uint16_t owner;
         assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
-        assert(owner == local);
+        assert(owner == (slot < 100u ? local : primary));
     }
+    char *protected_value = qihse_kv_get_user(base->store, KEY, op);
+    assert(protected_value && strcmp(protected_value, PAYLOAD) == 0);
+    free(protected_value);
     close_peer(wire);
     qihse_resp_server_destroy(server);
-    /* A server without a coordinator retains the compatibility behavior. */
+    /* The compatibility path also lacks a writer fence and data proof. */
     cfg.enable_failover = false;
     server = qihse_resp_server_create(&cfg);
     assert(server);
@@ -457,10 +488,19 @@ static void held_wire_manual_failover(const qihse_resp_server_config_t *base,
     assert(strcmp(reply, "+OK\r\n") == 0);
     free(reply);
     reply = command(wire, 3u, failover, NULL);
-    assert(strcmp(reply, "+OK\r\n") == 0);
+    assert(strcmp(reply, "-ERR ownership transition requires fenced migration\r\n") == 0);
     free(reply);
     assert(qihse_cluster_topology_get_node(topology, local, &current));
-    assert(current.role == QIHSE_CLUSTER_NODE_PRIMARY);
+    assert(current.role == QIHSE_CLUSTER_NODE_REPLICA &&
+           current.primary_index == primary);
+    for (uint16_t slot = 0u; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
+        uint16_t owner;
+        assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
+        assert(owner == (slot < 100u ? local : primary));
+    }
+    protected_value = qihse_kv_get_user(base->store, KEY, op);
+    assert(protected_value && strcmp(protected_value, PAYLOAD) == 0);
+    free(protected_value);
     close_peer(wire);
     qihse_resp_server_destroy(server);
     qihse_cluster_topology_destroy(topology);

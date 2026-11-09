@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -50,6 +51,28 @@ def worktree_digest(repo: Path) -> str:
         digest.update(name + b"\0" + kind + b"\0" +
                       hashlib.sha256(content).hexdigest().encode() + b"\0")
     return digest.hexdigest()
+
+
+def snapshot_xxh3_fixture(binary: Path, payload: bytes) -> str:
+    """Hash explicit synthetic bytes with the bundled canonical XXH3 adapter."""
+    configured = os.environ.get("QIHSE_CODEGRAPH_XXH3_LIBRARY")
+    candidates = ([Path(configured)] if configured else []) + [
+        binary.parent / "libqihse_xxh3.so",
+        binary.parent / "tools/codegraph_xxh3/build/libqihse_xxh3.so",
+        Path.home() / ".local/lib/qihse-codegraph/current/libqihse_xxh3.so",
+    ]
+    library_path = next((p for p in candidates if p.is_file()), None)
+    assert library_path is not None, "build the CodeGraph XXH3 module before this test"
+    library = ctypes.CDLL(str(library_path))
+    library.qx3_backend_get.argtypes = [ctypes.c_char_p]
+    library.qx3_backend_get.restype = ctypes.c_void_p
+    library.qx3_hash_canonical128.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                             ctypes.c_size_t, ctypes.c_void_p]
+    library.qx3_hash_canonical128.restype = ctypes.c_int
+    backend = library.qx3_backend_get(b"auto")
+    output = (ctypes.c_ubyte * 16)()
+    assert backend and library.qx3_hash_canonical128(backend, payload, len(payload), output) == 0
+    return bytes(output).hex()
 
 
 def write_records(dest: Path, records: list[dict]) -> None:
@@ -414,7 +437,8 @@ static int phase(void) {
 int rename(const char *source, const char *destination) {
     const char *mode = getenv("CODEGRAPH_TEST_ENOSPC");
     int token = strstr(destination, "/reader.token") != NULL;
-    if (mode && ((strcmp(mode,"snapshot")==0 && strstr(source,"/.snapshot-") &&
+    if (mode && ((strcmp(mode,"snapshot")==0 && strstr(source,"/.runtime-") &&
+                  strstr(source,"/snapshot.tmp") &&
                   strstr(destination,"/graph-")) ||
                  (strcmp(mode,"manifest")==0 && strstr(destination,"/current.json")) ||
                  (strcmp(mode,"capability")==0 && token && phase()=='R'))) {
@@ -471,6 +495,7 @@ int fsync(int fd) {
             assert manifest.read_bytes() == retained, failure
             assert invoke("status")["fresh"] is True
             assert not list(state.glob("*.tmp-*")), failure
+            assert not list(state.glob(".runtime-*/snapshot.tmp*")), failure
 
         before_sync = invoke("status")["generation"]
         records = [json.loads(line) for line in source.read_text().splitlines()]
@@ -679,13 +704,22 @@ int fsync(int fd) {
                     finally:
                         partial.close()
             assert request(token=token, command="ping")["status"] == "ready"
+            def query_facts(reply):
+                # A resident daemon reclaims spill files once at startup; a
+                # one-shot command does so for each process. Their telemetry
+                # differs even when all query facts are identical.
+                for metric in ("runtime_spill_reclaimed_bytes",
+                               "runtime_spill_reclaimed_files"):
+                    assert isinstance(reply.get(metric), int) and reply[metric] >= 0
+                return {key: value for key, value in reply.items()
+                        if not key.startswith("runtime_spill_")}
             for command in ("query", "impact", "review", "context"):
                 direct = invoke(command, "--symbol", "target", "--depth", "2")
                 resident = request(token=token, command=command, symbol="target", depth=2)
-                assert resident == direct, (command, resident, direct)
+                assert query_facts(resident) == query_facts(direct), (command, resident, direct)
                 fast = invoke(command, "--symbol", "target", "--depth", "2",
                               "--socket", str(sock), "--token-file", str(token_path))
-                assert fast == direct, (command, fast, direct)
+                assert query_facts(fast) == query_facts(direct), (command, fast, direct)
             fast_missing = invoke("query", "--symbol", "absent_name", "--socket", str(sock),
                                   "--token-file", str(token_path), expect=2)
             assert fast_missing["seed_nodes"] == 0, fast_missing
@@ -695,7 +729,8 @@ int fsync(int fd) {
             assert "unavailable" in refused["error"], refused
             fallback = invoke("context", "--symbol", "target", "--socket", str(unavailable),
                               "--token-file", str(token_path), "--fallback", "oneshot")
-            assert fallback == invoke("context", "--symbol", "target"), fallback
+            assert query_facts(fallback) == query_facts(
+                invoke("context", "--symbol", "target")), fallback
             token_path.chmod(0o644)
             try:
                 denied = invoke("query", "--symbol", "target", "--socket", str(sock),
@@ -721,9 +756,9 @@ int fsync(int fd) {
             for command in ("impact", "review"):
                 direct = invoke(command, "--file", "src/a.c")
                 resident = request(token=token, command=command, files=["src/a.c"])
-                assert resident == direct, (command, resident, direct)
-                assert request(token=token, command=command, base="HEAD") == invoke(
-                    command, "--base", "HEAD")
+                assert query_facts(resident) == query_facts(direct), (command, resident, direct)
+                assert query_facts(request(token=token, command=command, base="HEAD")) == \
+                    query_facts(invoke(command, "--base", "HEAD"))
             result = request(token=token, command="context",
                              symbol="classified_marker")
             assert "classified_marker" not in json.dumps(result), result
@@ -773,7 +808,7 @@ int fsync(int fd) {
             for limits in ({"limit": 2}, {"max_tokens": 128}):
                 bounded = request(token=token, command="context",
                                   symbols=["target", "caller"], **limits)
-                assert bounded["fresh"] and bounded["truncated"], bounded
+                assert bounded.get("fresh") and bounded.get("truncated"), bounded
                 if "limit" in limits:
                     assert 0 < len(bounded["nodes"]) <= 2, bounded
                 else:
@@ -834,7 +869,8 @@ int fsync(int fd) {
             current = manifest.read_bytes()
             invoke("import", "--input", str(broken), expect=1)
             assert manifest.read_bytes() == current
-            assert request(token=token, command="context", symbol="target") == restored
+            assert query_facts(request(token=token, command="context", symbol="target")) == \
+                query_facts(restored)
 
             invalid = state / "invalid.json"
             for contents in (b"{broken", b"{}"):
@@ -845,12 +881,17 @@ int fsync(int fd) {
                 assert_no_graph_facts(refused)
                 invalid.write_bytes(current)
                 invalid.replace(manifest)
-                assert request(token=token, command="context", symbol="target") == restored
+                assert query_facts(request(token=token, command="context", symbol="target")) == \
+                    query_facts(restored)
             damaged = state / "graph-damaged.kv"
-            damaged.write_bytes(b"not a valid QIHSE KV snapshot\n")
+            damaged_payload = b"not a valid QIHSE KV snapshot\n"
+            damaged.write_bytes(damaged_payload)
             corrupt_manifest = json.loads(current)
-            corrupt_manifest.update(snapshot=damaged.name,
-                                    sha256=hashlib.sha256(damaged.read_bytes()).hexdigest())
+            corrupt_manifest["snapshot"] = damaged.name
+            if corrupt_manifest.get("snapshot_hash_algorithm") == "xxh3-128":
+                corrupt_manifest["snapshot_hash"] = snapshot_xxh3_fixture(executable, damaged_payload)
+            else:
+                corrupt_manifest["sha256"] = hashlib.sha256(damaged_payload).hexdigest()
             invalid.write_text(json.dumps(corrupt_manifest))
             invalid.replace(manifest)
             refused = request(token=token, command="context", symbol="target")
@@ -858,7 +899,8 @@ int fsync(int fd) {
             assert_no_graph_facts(refused)
             invalid.write_bytes(current)
             invalid.replace(manifest)
-            assert request(token=token, command="context", symbol="target") == restored
+            assert query_facts(request(token=token, command="context", symbol="target")) == \
+                query_facts(restored)
 
             for filename, staged in (("src/a.c", False), ("src/a.c", True),
                                      ("src/new file.c", False)):
@@ -896,7 +938,8 @@ int fsync(int fd) {
                 stale = request(token=token, command=command, symbols=["target"])
                 assert stale.get("fresh") is not True and "stale" in stale["error"], stale
             (repo / "src/a.c").write_text("int target(void) { return 1; }\n")
-            assert request(token=token, command="context", symbol="target") == restored
+            assert query_facts(request(token=token, command="context", symbol="target")) == \
+                query_facts(restored)
         finally:
             stop_reader(daemon)
 
@@ -1007,7 +1050,8 @@ int fsync(int fd) {
             assert "denied" in request(token=old_token, command="context",
                                        symbol="target")["error"]
             restarted = request(token=token, command="context", symbol="target")
-            assert restarted == invoke("context", "--symbol", "target"), restarted
+            assert query_facts(restarted) == query_facts(
+                invoke("context", "--symbol", "target")), restarted
             capability_arm.write_text("R")
             failed_rotation = request(token=token, command="revoke")
             assert "error" in failed_rotation, failed_rotation

@@ -79,12 +79,14 @@ gap <id> area=<id> reason="<why this cannot be tested today>"
 
 ## Current pack coverage
 
-The 2026-10-24 pack declares 72 `expect=pass` workloads in 11 areas and no
-`gap` entries. The clean aggregate run passed all 72. These are pack counts,
-not a claim that every planned QIHSE capability exists: the failover smoke
-uses a preseeded copy and the loadshift guard asserts refusal of an unavailable
-data-bearing transfer. [CT.1–CT.2](../../ROADMAP.md#ct--secure-cluster-transport-follow-ups-open)
-track those secure transport gaps.
+The 2026-11-09 pack declares **74 expect=pass workloads in 11 areas** with
+no gap entries, and the complete aggregate run passes all 74. The new
+[CT.1–CT.2](../../ROADMAP.md#ct-cluster-transport) workloads exercise real
+pinned-QKP successor replication, promotion and interrupted data-bearing
+slot transfer. The older preseeded failover and loadshift refusal smokes
+remain separate safety controls. [Transport evidence](../validation/ct_transport_20261109.md) records the
+acceptance cases. [ROADMAP.md](../../ROADMAP.md) tracks the remaining planned
+database and application capabilities.
 
 | Area | Workloads |
 |---|---:|
@@ -94,7 +96,7 @@ track those secure transport gaps.
 | FTS + vector fusion | 4 |
 | Persistence / recovery | 3 |
 | Protocol compatibility | 7 |
-| Distributed failure | 10 |
+| Distributed failure | 12 |
 | Security regressions | 26 |
 | AI fabric | 5 |
 | Overlay discovery | 2 |
@@ -136,9 +138,8 @@ because a stale "known defect" list is itself a documentation defect:
 * **`tests/test_vector_skip_integrity.c` aborted** — the malformed-tryte
   rejection path now runs to completion (`vector-skip-integrity`).
 
-Still recorded as defects or open items in the current pack: nothing. Every
-workload in `pack.v1.gold` is `expect=pass` and the only caveats the runner
-prints are the nine `gap` entries above.
+Every current workload in `pack.v1.gold` is `expect=pass`. There are no declared
+gap entries or known-failure expectations in the current pack.
 
 ## Maintenance
 

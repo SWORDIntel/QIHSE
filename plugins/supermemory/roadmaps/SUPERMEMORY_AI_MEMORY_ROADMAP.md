@@ -1,5 +1,7 @@
 # Supermemory (QIHSE backend): ai-memory feature adoption roadmap
 
+> **Roadmap authority:** [ROADMAP.md](../../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
+
 > **Status:** proposed work items; what is actually shipped per item is tracked in
 > [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).  
 > **Date:** 2026-10-21 (engine baseline updated; original draft 2026-10-20)  

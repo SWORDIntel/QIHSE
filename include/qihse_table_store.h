@@ -344,9 +344,9 @@ bool qihse_table_txn_commit_group(qihse_table_txn_t** txns, size_t count);
  * durable store. As with commit_group, all valid transactions are consumed. */
 bool qihse_table_txn_validate_group(qihse_table_txn_t** txns, size_t count);
 
-/* Durable retry identity is scoped to one store. This raw API does not
- * authenticate string bindings: adapters derive them from the authenticated
- * principal/tenant, never untrusted caller assertions. Callers compute digest over a
+/* Durable retry identity is scoped to one authenticated principal and tenant.
+ * The typed user must be active and its canonical principal/tenant strings
+ * must match the identity. Callers compute digest over a
  * canonical operation representation (including parameter types/values, target
  * and transaction ordering); the store compares all 32 bytes verbatim. Keys and
  * bindings are nonempty NUL-terminated byte strings, at most 128
@@ -370,24 +370,28 @@ typedef enum {
     QIHSE_TS_RETRY_ERROR = -1, /* invalid input, poisoned store, or I/O failure */
     QIHSE_TS_RETRY_ABSENT = 0,
     QIHSE_TS_RETRY_COMMITTED = 1,
-    QIHSE_TS_RETRY_MISMATCH = 2 /* key already bound to another identity */
+    QIHSE_TS_RETRY_MISMATCH = 2 /* same principal/key, different digest */
 } qihse_ts_retry_status_t;
 
 /* Lookup is safe after reopening an ambiguously failed commit. COMMITTED
- * returns the original outcome; MISMATCH never reveals another principal's
- * outcome. The caller must reopen after an ambiguous persistence failure. */
+ * returns the original outcome; every other status clears *outcome. MISMATCH
+ * never reveals another principal's outcome or key existence. The caller
+ * must reopen after an ambiguous persistence failure. */
 qihse_ts_retry_status_t qihse_table_store_retry_lookup(
-    qihse_table_store_t* store, const qihse_ts_retry_identity_t* identity,
+    qihse_table_store_t* store, const qihse_user_t* user,
+    const qihse_ts_retry_identity_t* identity,
     qihse_ts_retry_outcome_t* outcome);
 
 /* Consumes a valid nonempty group on every result. COMMITTED means this call
  * persisted and published the shadows; ABSENT means a generation conflict
- * (no publication); MISMATCH means key reuse; ERROR means invalid input,
- * ledger capacity exhaustion, or I/O failure (possibly ambiguous). A matching
+ * (no publication); MISMATCH means key reuse with another digest by this
+ * principal; ERROR means invalid input or identity, ledger capacity
+ * exhaustion, or I/O failure (possibly ambiguous). A matching
  * existing request returns COMMITTED with its original outcome and does not
- * publish the supplied shadows. For a fresh request, *outcome is persisted. */
+ * publish the supplied shadows. For a fresh request, *outcome is persisted;
+ * every non-COMMITTED result clears *outcome. */
 qihse_ts_retry_status_t qihse_table_txn_commit_group_retry(
-    qihse_table_txn_t** txns, size_t count,
+    qihse_table_txn_t** txns, size_t count, const qihse_user_t* user,
     const qihse_ts_retry_identity_t* identity,
     qihse_ts_retry_outcome_t* outcome);
 

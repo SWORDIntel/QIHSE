@@ -520,6 +520,19 @@ int main(void) {
     qihse_user_t* tenant_user = qihse_auth_create_tenant_user(operator_user, 42u, 702u,
         QIHSE_ROLE_ANALYST, 0u, 0u, tenant_password, false);
     assert(analyst_user && tenant_user);
+    char protected_key[48];
+    uint16_t protected_slot = QIHSE_CLUSTER_SLOT_COUNT;
+    for (unsigned candidate = 0u; candidate < 1000u; candidate++) {
+        assert(snprintf(protected_key, sizeof protected_key, "cluster-secret-%u",
+                        candidate) > 0);
+        uint16_t slot = qihse_cluster_key_slot(protected_key, strlen(protected_key));
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
+        if (owner == local) { protected_slot = slot; break; }
+    }
+    assert(protected_slot < QIHSE_CLUSTER_SLOT_COUNT);
+    assert(qihse_kv_set_user(store, protected_key, "HIGH_CLUSTER_SECRET",
+                             5u, 1u, operator_user));
 
     qihse_resp_server_config_init(&config);
     config.store = store;
@@ -555,6 +568,21 @@ int main(void) {
         response = read_response(&auth_client);
         assert(strcmp(response, ":12182\r\n") == 0);
         free(response);
+        const char* protected_get[] = { "GET", protected_key };
+        send_command(auth_client.fd, 2u, protected_get);
+        response = read_response(&auth_client);
+        assert((principal == 0u ? strcmp(response, "$-1\r\n") == 0 :
+                strncmp(response, "-NOPERM ", 8u) == 0) &&
+               strstr(response, "HIGH_CLUSTER_SECRET") == NULL);
+        free(response);
+        char slot_text[16];
+        snprintf(slot_text, sizeof slot_text, "%u", (unsigned)protected_slot);
+        const char* unsafe_node[] = { "CLUSTER", "SETSLOT", slot_text,
+                                      "NODE", remote_node.id };
+        send_command(auth_client.fd, 5u, unsafe_node);
+        response = read_response(&auth_client);
+        assert(strcmp(response, "-NOPERM active system Operator required\r\n") == 0);
+        free(response);
     }
     const char* quit_nonoperator[] = { "QUIT" };
     send_command(auth_client.fd, 1u, quit_nonoperator);
@@ -574,10 +602,84 @@ int main(void) {
     response = read_response(&auth_client);
     assert(strcmp(response, "+OK\r\n") == 0);
     free(response);
+    char slot_text[16];
+    snprintf(slot_text, sizeof slot_text, "%u", (unsigned)protected_slot);
+    const char* unsafe_node[] = { "CLUSTER", "SETSLOT", slot_text,
+                                  "NODE", remote_node.id };
+    send_command(auth_client.fd, 5u, unsafe_node);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "-ERR ownership transition requires fenced migration\r\n") == 0);
+    free(response);
+    uint16_t owner_after = QIHSE_CLUSTER_NODE_NONE;
+    assert(qihse_cluster_topology_get_slot(topology, protected_slot,
+                                           &owner_after, NULL, NULL));
+    assert(owner_after == local);
+    const char* idempotent_node[] = { "CLUSTER", "SETSLOT", slot_text,
+                                      "NODE", local_node.id };
+    send_command(auth_client.fd, 5u, idempotent_node);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    const char* unsafe_delete[] = { "CLUSTER", "DELSLOTS", slot_text };
+    send_command(auth_client.fd, 3u, unsafe_delete);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "-ERR ownership transition requires fenced migration\r\n") == 0);
+    free(response);
+    const char* unsafe_failover[] = { "CLUSTER", "FAILOVER" };
+    send_command(auth_client.fd, 2u, unsafe_failover);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "-ERR ownership transition requires fenced migration\r\n") == 0);
+    free(response);
+    uint16_t free_slot = protected_slot == 0u ? 1u : 0u;
+    assert(qihse_cluster_topology_unassign_range(topology, free_slot, free_slot));
+    char free_slot_text[16];
+    snprintf(free_slot_text, sizeof free_slot_text, "%u", (unsigned)free_slot);
+    const char* unsafe_add[] = { "CLUSTER", "ADDSLOTS", free_slot_text };
+    send_command(auth_client.fd, 3u, unsafe_add);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "-ERR ownership transition requires fenced migration\r\n") == 0);
+    free(response);
+    assert(qihse_cluster_topology_get_slot(topology, free_slot,
+                                           &owner_after, NULL, NULL));
+    assert(owner_after == QIHSE_CLUSTER_NODE_NONE);
     const char* add_slot[] = { "CLUSTER", "ADDSLOTS", "30000" };
     send_command(auth_client.fd, 3u, add_slot);
     response = read_response(&auth_client);
     assert(strcmp(response, "-NOPERM active system Operator required\r\n") != 0);
+    free(response);
+    /* A one-node view with unassigned slots is still a sharded view. A
+     * successor may hold a local copy, but ordinary reads cannot expose it
+     * after its former owner leaves without a fenced ownership transfer. */
+    for (uint16_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; slot++) {
+        uint16_t owner;
+        assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
+        if (owner == remote)
+            assert(qihse_cluster_topology_unassign_range(topology, slot, slot));
+    }
+    assert(qihse_cluster_topology_remove_node(topology, remote));
+    const char* asking_cmd[] = { "ASKING" };
+    const char* seed_copy[] = { "SET", "foo", "unproven-copy" };
+    const char* read_copy[] = { "GET", "foo" };
+    send_command(auth_client.fd, 1u, asking_cmd);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    send_command(auth_client.fd, 3u, seed_copy);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    send_command(auth_client.fd, 2u, read_copy);
+    response = read_response(&auth_client);
+    assert(strncmp(response, "-CLUSTERDOWN ", 13u) == 0);
+    assert(strstr(response, "unproven-copy") == NULL);
+    free(response);
+    send_command(auth_client.fd, 1u, asking_cmd);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "+OK\r\n") == 0);
+    free(response);
+    send_command(auth_client.fd, 2u, read_copy);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "$13\r\nunproven-copy\r\n") == 0);
     free(response);
     const char* quit_operator[] = { "QUIT" };
     send_command(auth_client.fd, 1u, quit_operator);

@@ -562,6 +562,17 @@ static void downgrade_empty_snapshot(const char* path, unsigned char version) {
 static void test_durable_retry(const qihse_col_def_t* defs) {
     char dir[] = "./build/qihse-retry-XXXXXX";
     assert(mkdtemp(dir));
+    const char* old_data_dir = getenv("QIHSE_DATA_DIR");
+    char* saved_data_dir = old_data_dir ? strdup(old_data_dir) : NULL;
+    assert(!old_data_dir || saved_data_dir);
+    assert(setenv("QIHSE_DATA_DIR", dir, 1) == 0);
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("TableStoreRetryOperator1!"));
+    qihse_user_t* user = qihse_auth_get_user(0);
+    assert(user);
+    qihse_user_t* low = qihse_auth_create_user(user, 39171,
+        QIHSE_ROLE_GUEST, 0, 0, "TableStoreRetryGuest1!", false);
+    assert(low);
     char path[256], lock[262];
     assert(snprintf(path, sizeof path, "%s/store", dir) < (int)sizeof path);
     assert(snprintf(lock, sizeof lock, "%s.lock", path) < (int)sizeof lock);
@@ -583,17 +594,17 @@ static void test_durable_retry(const qihse_col_def_t* defs) {
     assert(s);
     t = qihse_table_store_find_table(s, "items");
     assert(t);
-    qihse_ts_retry_identity_t id = {.key = "request-1", .principal = "user-1",
-                                    .tenant = "tenant-1", .digest = {17}};
+    qihse_ts_retry_identity_t id = {.key = "request-1", .principal = "user:0",
+                                    .tenant = "tenant:0", .digest = {17}};
     qihse_ts_retry_outcome_t result = { .affected_rows = 1, .command_count = 1 };
     qihse_ts_retry_outcome_t looked = {0};
-    assert(qihse_table_store_retry_lookup(s, &id, &looked) == QIHSE_TS_RETRY_ABSENT);
+    assert(qihse_table_store_retry_lookup(s, user, &id, &looked) == QIHSE_TS_RETRY_ABSENT);
     char oversized[QIHSE_TS_RETRY_MAX_TEXT + 2];
     memset(oversized, 'x', sizeof oversized - 1);
     oversized[sizeof oversized - 1] = 0;
     qihse_ts_retry_identity_t invalid = id;
     invalid.key = oversized;
-    assert(qihse_table_store_retry_lookup(s, &invalid, &looked) == QIHSE_TS_RETRY_ERROR);
+    assert(qihse_table_store_retry_lookup(s, user, &invalid, &looked) == QIHSE_TS_RETRY_ERROR);
     qihse_col_value_t row[3] = {
         { .type = QIHSE_TS_INT32, .v.i32 = 99 },
         { .type = QIHSE_TS_STRING, .v.str = "once" },
@@ -602,37 +613,61 @@ static void test_durable_retry(const qihse_col_def_t* defs) {
     qihse_table_txn_t* tx = qihse_table_txn_begin(t);
     assert(tx && qihse_table_txn_insert(tx, row, 3) >= 0);
     qihse_table_txn_t* group[] = {tx};
-    assert(qihse_table_txn_commit_group_retry(group, 1, &id, &result) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, user, &id, &result) ==
            QIHSE_TS_RETRY_COMMITTED);
-    assert(qihse_table_store_retry_lookup(s, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
+    assert(qihse_table_store_retry_lookup(s, user, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
     assert(looked.affected_rows == 1 && looked.command_count == 1);
+    /* A low-clearance principal cannot query or replay the high principal's
+     * receipt. Reusing the same key in its own namespace reveals nothing. */
+    looked = (qihse_ts_retry_outcome_t){99, 99};
+    assert(qihse_table_store_retry_lookup(s, low, &id, &looked) == QIHSE_TS_RETRY_ERROR);
+    assert(!looked.affected_rows && !looked.command_count);
+    looked = (qihse_ts_retry_outcome_t){99, 99};
+    assert(qihse_table_store_retry_lookup(s, NULL, &id, &looked) == QIHSE_TS_RETRY_ERROR);
+    assert(!looked.affected_rows && !looked.command_count);
+    qihse_ts_retry_identity_t low_id = id;
+    low_id.principal = "user:39171";
+    looked = (qihse_ts_retry_outcome_t){99, 99};
+    assert(qihse_table_store_retry_lookup(s, low, &low_id, &looked) == QIHSE_TS_RETRY_ABSENT);
+    assert(!looked.affected_rows && !looked.command_count);
+    tx = qihse_table_txn_begin(t);
+    assert(tx);
+    group[0] = tx;
+    result = (qihse_ts_retry_outcome_t){99, 99};
+    assert(qihse_table_txn_commit_group_retry(group, 1, low, &id, &result) ==
+           QIHSE_TS_RETRY_ERROR);
+    assert(!result.affected_rows && !result.command_count);
+    assert(qihse_auth_destroy_user(user, 39171));
+    looked = (qihse_ts_retry_outcome_t){99, 99};
+    assert(qihse_table_store_retry_lookup(s, low, &low_id, &looked) == QIHSE_TS_RETRY_ERROR);
+    assert(!looked.affected_rows && !looked.command_count);
     qihse_ts_retry_identity_t fenced = id;
     fenced.key = "fenced-request";
     qihse_table_txn_t* stale_tx = qihse_table_txn_begin(t);
     assert(stale_tx && qihse_table_txn_commit(qihse_table_txn_begin(t)));
     qihse_table_txn_t* stale_group[] = {stale_tx};
-    assert(qihse_table_txn_commit_group_retry(stale_group, 1, &fenced, &result) ==
+    assert(qihse_table_txn_commit_group_retry(stale_group, 1, user, &fenced, &result) ==
            QIHSE_TS_RETRY_ABSENT);
-    assert(qihse_table_store_retry_lookup(s, &fenced, &looked) == QIHSE_TS_RETRY_ABSENT);
+    assert(qihse_table_store_retry_lookup(s, user, &fenced, &looked) == QIHSE_TS_RETRY_ABSENT);
     tx = qihse_table_txn_begin(t);
     assert(tx && qihse_table_txn_insert(tx, row, 3) >= 0);
     group[0] = tx;
     result.affected_rows = 42;
-    assert(qihse_table_txn_commit_group_retry(group, 1, &id, &result) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, user, &id, &result) ==
            QIHSE_TS_RETRY_COMMITTED);
     assert(result.affected_rows == 1 && qihse_table_row_count(t) == 1);
     qihse_ts_retry_identity_t wrong = id;
-    wrong.principal = "user-2";
-    assert(qihse_table_store_retry_lookup(s, &wrong, &looked) == QIHSE_TS_RETRY_MISMATCH);
+    wrong.principal = "user:39171";
+    assert(qihse_table_store_retry_lookup(s, user, &wrong, &looked) == QIHSE_TS_RETRY_ERROR);
     wrong = id;
-    wrong.tenant = "tenant-2";
-    assert(qihse_table_store_retry_lookup(s, &wrong, &looked) == QIHSE_TS_RETRY_MISMATCH);
+    wrong.tenant = "tenant:1";
+    assert(qihse_table_store_retry_lookup(s, user, &wrong, &looked) == QIHSE_TS_RETRY_ERROR);
     wrong = id;
     wrong.digest[0]++;
     tx = qihse_table_txn_begin(t);
     assert(tx && qihse_table_txn_insert(tx, row, 3) >= 0);
     group[0] = tx;
-    assert(qihse_table_txn_commit_group_retry(group, 1, &wrong, &result) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, user, &wrong, &result) ==
            QIHSE_TS_RETRY_MISMATCH);
     assert(qihse_table_row_count(t) == 1);
     qihse_table_store_destroy(s);
@@ -640,7 +675,7 @@ static void test_durable_retry(const qihse_col_def_t* defs) {
     assert(s);
     t = qihse_table_store_find_table(s, "items");
     assert(t && qihse_table_row_count(t) == 1);
-    assert(qihse_table_store_retry_lookup(s, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
+    assert(qihse_table_store_retry_lookup(s, user, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
     assert(looked.affected_rows == 1);
     id.key = "ambiguous";
     row[0].v.i32 = 100;
@@ -649,21 +684,21 @@ static void test_durable_retry(const qihse_col_def_t* defs) {
     group[0] = tx;
     result.affected_rows = 1;
     arm_directory_fsync_failure();
-    assert(qihse_table_txn_commit_group_retry(group, 1, &id, &result) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, user, &id, &result) ==
            QIHSE_TS_RETRY_ERROR);
     assert(!fail_directory_fsync);
-    assert(qihse_table_store_retry_lookup(s, &id, &looked) == QIHSE_TS_RETRY_ERROR);
+    assert(qihse_table_store_retry_lookup(s, user, &id, &looked) == QIHSE_TS_RETRY_ERROR);
     qihse_table_store_destroy(s);
     s = qihse_table_store_open_durable(path);
     assert(s);
     t = qihse_table_store_find_table(s, "items");
     assert(t && qihse_table_row_count(t) == 2);
-    assert(qihse_table_store_retry_lookup(s, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
+    assert(qihse_table_store_retry_lookup(s, user, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
     assert(looked.affected_rows == 1);
     tx = qihse_table_txn_begin(t);
     assert(tx && qihse_table_txn_insert(tx, row, 3) >= 0);
     group[0] = tx;
-    assert(qihse_table_txn_commit_group_retry(group, 1, &id, &result) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, user, &id, &result) ==
            QIHSE_TS_RETRY_COMMITTED);
     assert(qihse_table_row_count(t) == 2);
     qihse_table_store_destroy(s);
@@ -689,7 +724,23 @@ static void test_durable_retry(const qihse_col_def_t* defs) {
     free(bytes);
     assert(close(fd) == 0);
     assert(qihse_table_store_open_durable(path) == NULL);
-    assert(unlink(path) == 0 && unlink(lock) == 0 && rmdir(dir) == 0);
+    assert(unlink(path) == 0 && unlink(lock) == 0);
+    qihse_audit_shutdown();
+    const char* auth_files[] = {"qihse_audit.log", "qihse_audit.writer.lock",
+                                "qihse_integrity.chain"};
+    for (size_t i = 0; i < sizeof auth_files / sizeof *auth_files; ++i) {
+        char file[sizeof dir + 40];
+        assert(snprintf(file, sizeof file, "%s/%s", dir, auth_files[i]) < (int)sizeof file);
+        int rc = unlink(file);
+        assert(rc == 0 || errno == ENOENT);
+    }
+    assert(rmdir(dir) == 0);
+    if (saved_data_dir) {
+        assert(setenv("QIHSE_DATA_DIR", saved_data_dir, 1) == 0);
+        free(saved_data_dir);
+    } else {
+        assert(unsetenv("QIHSE_DATA_DIR") == 0);
+    }
 }
 
 typedef struct { int seen; int fail_on; } transform_probe_t;
@@ -1267,13 +1318,13 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     qihse_col_value_t row[] = {{.type=QIHSE_TS_INT32, .v.i32=17},
         {.type=QIHSE_TS_STRING, .v.str="recovered"},
         {.type=QIHSE_TS_INT32, .v.i32=19}};
-    qihse_ts_retry_identity_t id = {.key="backup-key", .principal="op", .tenant="system"};
+    qihse_ts_retry_identity_t id = {.key="backup-key", .principal="user:0", .tenant="tenant:0"};
     id.digest[0] = 42;
     qihse_ts_retry_outcome_t outcome = {.affected_rows=1, .command_count=1};
     qihse_table_txn_t* tx = qihse_table_txn_begin(t);
     assert(tx && qihse_table_txn_insert(tx, row, 3) >= 0);
     qihse_table_txn_t* group[] = {tx};
-    assert(qihse_table_txn_commit_group_retry(group, 1, &id, &outcome) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, operator, &id, &outcome) ==
            QIHSE_TS_RETRY_COMMITTED);
     assert(!qihse_table_store_backup(s, NULL, backup));
     assert(!qihse_table_store_backup(s, guest, backup));
@@ -1316,7 +1367,7 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     assert(qihse_table_store_schema_image(recovered, &image, &image_len));
     assert(image_len == sizeof catalog && !memcmp(image, catalog, image_len));
     qihse_ts_retry_outcome_t looked = {0};
-    assert(qihse_table_store_retry_lookup(recovered, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
+    assert(qihse_table_store_retry_lookup(recovered, operator, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
     assert(looked.affected_rows == 1 && looked.command_count == 1);
     assert(!qihse_table_store_restore(operator, backup, target));
     qihse_table_store_destroy(recovered);
@@ -1326,19 +1377,19 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     assert(tx && qihse_table_txn_insert(tx, row, 3) >= 0);
     group[0] = tx;
     arm_directory_fsync_failure();
-    assert(qihse_table_txn_commit_group_retry(group, 1, &id, &outcome) ==
+    assert(qihse_table_txn_commit_group_retry(group, 1, operator, &id, &outcome) ==
            QIHSE_TS_RETRY_ERROR);
     assert(!fail_directory_fsync);
     assert(!qihse_table_store_backup(s, operator, after));
     assert(access(after, F_OK) == -1);
     qihse_table_store_destroy(s);
     s = qihse_table_store_open_durable(original);
-    assert(s && qihse_table_store_retry_lookup(s, &id, &looked) ==
+    assert(s && qihse_table_store_retry_lookup(s, operator, &id, &looked) ==
            QIHSE_TS_RETRY_COMMITTED);
     assert(qihse_table_row_count(qihse_table_store_find_table(s, "items")) == 2);
     qihse_table_store_t* frozen = qihse_table_store_open_durable(backup);
     assert(frozen && qihse_table_row_count(qihse_table_store_find_table(frozen, "items")) == 1);
-    assert(qihse_table_store_retry_lookup(frozen, &id, &looked) == QIHSE_TS_RETRY_ABSENT);
+    assert(qihse_table_store_retry_lookup(frozen, operator, &id, &looked) == QIHSE_TS_RETRY_ABSENT);
     qihse_table_store_destroy(frozen);
     int fd = open(backup, O_RDWR);
     assert(fd >= 0);

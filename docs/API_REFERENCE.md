@@ -68,8 +68,8 @@ above):
 | `include/qihse_federation_transport.h` | 16 | 16 |
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
-| `include/qihse_backup.h` | 11 | 11 |
-| `include/qihse_kv_store.h` | 61 | 58 (3 `static inline`) |
+| `include/qihse_backup.h` | 12 | 12 |
+| `include/qihse_kv_store.h` | 98 | 95 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
@@ -646,7 +646,9 @@ compaction; `make test-kv-compaction`), and `tests/test_kv_durable_batch.c`
 (WAL-preserving authenticated durable batch; `make test-kv-durable-batch`, run
 serially because it uses process-global auth/storage state), and
 `tests/test_python_kv_durable_batch.py` (`make test-python-kv-durable-batch`,
-authenticated Python append and reopen).
+authenticated Python append and reopen), and
+`tests/test_kv_change_meta_auth.c` (`make test-kv-change-meta-auth`,
+low-clearance and SCI denial for live and tombstone metadata).
 
 The KV store is the storage substrate the federation APIs write through. The
 `_user` variants are the authorization-aware forms; the context-free forms are
@@ -663,6 +665,7 @@ intentionally restricted to unclassified data.
 | `char* qihse_kv_get(qihse_kv_store_t* store, const char* key)` | Inline wrapper: `qihse_kv_get_user(store, key, NULL)`. | `NULL` |
 | `bool qihse_kv_del_user(...)`, `bool qihse_kv_del(...)` | Delete with/without authorization. | `false` |
 | `bool qihse_kv_exists_user(...)`, `bool qihse_kv_exists(...)` | Existence with/without authorization. | `false` |
+| `bool qihse_kv_change_meta_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user, qihse_kv_change_meta_t* out)` | Authorized live/tombstone change sequence, label and tombstone state for durable retry reconciliation. Requires a live principal and enforces classification/SCI before returning metadata. | `false` for missing, denied or unavailable; `out` is zeroed |
 | `bool qihse_kv_expire(qihse_kv_store_t* store, const char* key, uint64_t ttl_ms, qihse_user_t* user)` | Set a TTL. | `false` |
 | `int64_t qihse_kv_ttl_ms_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user)` | Remaining TTL in ms. | `-1` when the key has no expiry; `-2` when it is missing, denied, or already expired |
 | `void qihse_kv_sweep_expired(qihse_kv_store_t* store)` | Evict expired keys **and** run SSTable compaction (see below). | n/a |

@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <openssl/evp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -52,6 +53,7 @@ typedef struct {
     size_t tx_count;
     int tx_fd;
     int rx_fd;
+    int authority_rx_fd;
 } qcm_peer_t;
 
 /* Select the oldest queued consensus item when present. Removing an interior
@@ -121,6 +123,7 @@ struct qihse_consensus_mesh {
     qihse_consensus_snapshot_stage_t* snapshot_stage;
     char snapshot_stage_path[QIHSE_CONSENSUS_RECORD_PATH_MAX + 1u];
     uint32_t tick_ms;
+    bool authority_proposals_enabled;
 
     qihse_consensus_t* consensus;
     int listener_fd;
@@ -151,6 +154,7 @@ struct qihse_consensus_mesh {
     pthread_mutex_t state_lock;
     uint64_t queue_drops;
 #ifdef QIHSE_CONSENSUS_MESH_TESTING
+    bool test_hold_append_replies;
     unsigned int test_stage_ack_drops[QIHSE_CONSENSUS_MESH_MAX_PEERS];
     unsigned int test_stage_ack_drops_consumed;
     unsigned int test_snapshot_ack_drops[QIHSE_CONSENSUS_MESH_MAX_PEERS];
@@ -159,6 +163,12 @@ struct qihse_consensus_mesh {
 };
 
 #ifdef QIHSE_CONSENSUS_MESH_TESTING
+bool qihse_consensus_mesh_test_hold_append_replies(qihse_consensus_mesh_t* mesh, bool hold) {
+    if (!mesh) return false;
+    __atomic_store_n(&mesh->test_hold_append_replies, hold, __ATOMIC_RELEASE);
+    return true;
+}
+
 static bool qcm_test_consume_stage_ack_drop(qihse_consensus_mesh_t* mesh,
                                              size_t peer_index) {
     if (!mesh || peer_index >= mesh->peer_count) return false;
@@ -469,6 +479,8 @@ static void qcm_rx_done(qcm_rx_ctx_t* ctx) {
     pthread_mutex_lock(&mesh->queue_lock);
     if (mesh->peers[ctx->peer_index].rx_fd == ctx->fd)
         mesh->peers[ctx->peer_index].rx_fd = -1;
+    if (mesh->peers[ctx->peer_index].authority_rx_fd == ctx->fd)
+        mesh->peers[ctx->peer_index].authority_rx_fd = -1;
     if (mesh->rx_active) mesh->rx_active--;
     pthread_cond_broadcast(&mesh->rx_changed);
     pthread_mutex_unlock(&mesh->queue_lock);
@@ -476,6 +488,8 @@ static void qcm_rx_done(qcm_rx_ctx_t* ctx) {
     if (ctx->fd >= 0) close(ctx->fd);
     free(ctx);
 }
+
+static bool qcm_authority_receive(qcm_rx_ctx_t* ctx, const uint8_t* wire, size_t size);
 
 static void* qcm_rx_main(void* opaque) {
     qcm_rx_ctx_t* ctx = opaque;
@@ -504,6 +518,10 @@ static void* qcm_rx_main(void* opaque) {
             }
             history_hello_seen = true;
             continue;
+        }
+        if ((size_t)received >= 4u && memcmp(wire, "QAF1", 4u) == 0) {
+            (void)qcm_authority_receive(ctx, wire, (size_t)received);
+            break; /* Dedicated request stream; ordinary ACK stream stays live. */
         }
         if ((size_t)received >= 4u &&
             (memcmp(wire, "QBT1", 4u) == 0 || memcmp(wire, "QBT2", 4u) == 0)) {
@@ -588,11 +606,13 @@ static void* qcm_accept_main(void* opaque) {
         if (!ctx) { qihse_qkp_session_free(session); close(fd); continue; }
         ctx->mesh = mesh; ctx->peer_index = (size_t)pi; ctx->fd = fd; ctx->session = session;
         pthread_mutex_lock(&mesh->queue_lock);
-        if (mesh->peers[pi].rx_fd >= 0 || qcm_stopping(mesh)) {
+        if ((mesh->peers[pi].rx_fd >= 0 && mesh->peers[pi].authority_rx_fd >= 0) ||
+            qcm_stopping(mesh)) {
             pthread_mutex_unlock(&mesh->queue_lock);
             qihse_qkp_session_free(session); close(fd); free(ctx); continue;
         }
-        mesh->peers[pi].rx_fd = fd;
+        if (mesh->peers[pi].rx_fd < 0) mesh->peers[pi].rx_fd = fd;
+        else mesh->peers[pi].authority_rx_fd = fd;
         mesh->rx_active++;
         pthread_mutex_unlock(&mesh->queue_lock);
         qcm_debug("accepted inbound peer %s", mesh->peers[pi].node_id);
@@ -752,6 +772,12 @@ static void* qcm_event_main(void* opaque) {
             }
             pthread_mutex_unlock(&mesh->queue_lock);
             if (!message) break;
+#ifdef QIHSE_CONSENSUS_MESH_TESTING
+            if (message->type == QIHSE_CONSENSUS_MSG_APPEND_REPLY &&
+                __atomic_load_n(&mesh->test_hold_append_replies, __ATOMIC_ACQUIRE)) {
+                free(message); continue;
+            }
+#endif
             if (message->type == QIHSE_CONSENSUS_MSG_SNAPSHOT_CHUNK) {
                 qcm_handle_snapshot_chunk(mesh, message);
             } else {
@@ -906,6 +932,7 @@ static bool qcm_copy_config(qihse_consensus_mesh_t* mesh,
     mesh->qkp_config.kem_pub_path = mesh->qkp_kem_pub;
     mesh->peer_count = cfg->peer_count;
     mesh->principal = cfg->system_principal;
+    mesh->authority_proposals_enabled = cfg->authority_proposals_enabled;
     mesh->blob_context = cfg->blob_context;
     if (cfg->snapshot_stage_path && *cfg->snapshot_stage_path &&
         !qcm_copy(mesh->snapshot_stage_path,
@@ -931,6 +958,7 @@ static bool qcm_copy_config(qihse_consensus_mesh_t* mesh,
         dst->snapshot_chunks_supported = src->snapshot_chunks_supported;
         dst->tx_fd = -1;
         dst->rx_fd = -1;
+        dst->authority_rx_fd = -1;
         for (size_t j = i + 1u; j < cfg->peer_count; j++)
             if (qihse_uuid_equal(&src->member_uuid, &cfg->peers[j].member_uuid)) return false;
         /* Transport provisioning is independent of the durable membership
@@ -1027,6 +1055,8 @@ void qihse_consensus_mesh_stop(qihse_consensus_mesh_t* mesh) {
     for (size_t i = 0; i < mesh->peer_count; i++) {
         if (mesh->peers[i].tx_fd >= 0) shutdown(mesh->peers[i].tx_fd, SHUT_RDWR);
         if (mesh->peers[i].rx_fd >= 0) shutdown(mesh->peers[i].rx_fd, SHUT_RDWR);
+        if (mesh->peers[i].authority_rx_fd >= 0)
+            shutdown(mesh->peers[i].authority_rx_fd, SHUT_RDWR);
     }
     pthread_mutex_unlock(&mesh->queue_lock);
     if (mesh->accept_started) { pthread_join(mesh->accept_thread, NULL); mesh->accept_started = false; }
@@ -1431,6 +1461,11 @@ bool qihse_consensus_mesh_propose_transaction(
     uint64_t generation, qihse_hlc_t hlc, uint16_t classification,
     uint16_t sci, const void* transaction, size_t transaction_len,
     uint32_t stage_timeout_ms, uint32_t commit_timeout_ms, uint64_t* out_index) {
+    if (transaction && transaction_len >= 4u && !memcmp(transaction, "QCA3", 4u)) {
+        if (out_index) *out_index = 0u;
+        return false;
+    }
+
     if (!mesh || !out_index) return false;
     pthread_mutex_lock(&mesh->proposal_lock);
     bool ok = qcm_mesh_propose_transaction_locked(mesh, principal, generation,
@@ -1446,6 +1481,11 @@ bool qihse_consensus_mesh_propose_transaction_auto_generation(
     const void* transaction, size_t transaction_len,
     uint32_t stage_timeout_ms, uint32_t commit_timeout_ms,
     uint64_t* out_generation, uint64_t* out_index) {
+    if (transaction && transaction_len >= 4u && !memcmp(transaction, "QCA3", 4u)) {
+        if (out_index) *out_index = 0u;
+        return false;
+    }
+
     if (out_generation) *out_generation = 0u;
     if (out_index) *out_index = 0u;
     if (!mesh || !out_generation || !out_index) return false;
@@ -1473,6 +1513,11 @@ bool qihse_consensus_mesh_propose_transaction_if_generation(
     const void* transaction, size_t transaction_len,
     uint32_t stage_timeout_ms, uint32_t commit_timeout_ms,
     uint64_t* out_generation, uint64_t* out_index) {
+    if (transaction && transaction_len >= 4u && !memcmp(transaction, "QCA3", 4u)) {
+        if (out_index) *out_index = 0u;
+        return false;
+    }
+
     if (out_generation) *out_generation = 0u;
     if (out_index) *out_index = 0u;
     if (!mesh || !out_generation || !out_index) return false;
@@ -1515,4 +1560,262 @@ bool qihse_consensus_mesh_read_committed_page(
     if (ok) *out_commit_index = qihse_consensus_commit_index(mesh->consensus);
     pthread_mutex_unlock(&mesh->state_lock);
     return ok;
+}
+
+/* QCF1 decisions are control metadata, not an arbitrary log-write proxy.
+ * Canonical SHA-256 commitments fit the consensus core's 128-byte payload. */
+#define QCM_AUTHORITY_INPUT 164u
+#define QCM_AUTHORITY_RECORD 108u
+#define QCM_AUTHORITY_WIRE 276u
+
+static bool qcm_authority_operator(const qihse_user_t* user) {
+    return user && qihse_auth_user_is_active(user) &&
+        qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR &&
+        qihse_user_get_tenant_id(user) == QIHSE_TENANT_SYSTEM;
+}
+
+static bool qcm_sha256(const void* bytes, size_t size, uint8_t out[32]) {
+    unsigned int len = 0u;
+    return EVP_Digest(bytes, size, out, &len, EVP_sha256(), NULL) == 1 && len == 32u;
+}
+
+static void qcm_auth_put64(uint8_t* p, uint64_t n) {
+    for (size_t i = 0; i < 8u; ++i) p[7u-i] = (uint8_t)(n >> (i*8u));
+}
+static uint64_t qcm_auth_get64(const uint8_t* p) {
+    uint64_t n = 0u;
+    for (size_t i = 0; i < 8u; ++i) n = (n << 8u) | p[i];
+    return n;
+}
+
+static bool qcm_authority_record(const void* payload, size_t len,
+                                  uint8_t record[QCM_AUTHORITY_RECORD]) {
+    const uint8_t* p = payload;
+    if (!p || len != QCM_AUTHORITY_INPUT || memcmp(p, "QCF1", 4u)) return false;
+    for (size_t column = 0; column < 3u; ++column) {
+        bool ended = false;
+        const uint8_t* id = p + 4u + column*40u;
+        if (!id[0]) return false;
+        for (size_t i = 0; i < 40u; ++i) {
+            if (!id[i]) ended = true;
+            else if (ended || id[i] < 33u || id[i] > 126u) return false;
+        }
+    }
+    if (!memcmp(p+4u, p+44u, 40u) || !memcmp(p+4u, p+84u, 40u) ||
+        !memcmp(p+44u, p+84u, 40u)) return false;
+    for (size_t i = 124u; i < 156u; ++i)
+        if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f')))
+            return false;
+    uint8_t identity[72];
+    memcpy(identity, p+4u, 40u); memcpy(identity+40u, p+124u, 32u);
+    memcpy(record, "QCA3", 4u);
+    memcpy(record+100u, p+156u, 8u);
+    return qcm_sha256(identity, sizeof(identity), record+4u) &&
+        qcm_sha256(p, len, record+36u) && qcm_sha256(p, 156u, record+68u);
+}
+
+static bool qcm_authority_exact_locked(qihse_consensus_mesh_t* mesh,
+        const qihse_user_t* principal, uint64_t index, const uint8_t* record) {
+    uint8_t bytes[QCM_AUTHORITY_RECORD];
+    size_t len = 0u;
+    return qihse_consensus_blob_read_committed_transaction_user(mesh->blob_context,
+        mesh->consensus, (qihse_user_t*)principal, index, bytes, sizeof(bytes), &len) &&
+        len == sizeof(bytes) && !memcmp(bytes, record, sizeof(bytes));
+}
+
+static bool qcm_authority_local(qihse_consensus_mesh_t* mesh,
+        const qihse_user_t* principal, const uint8_t* record,
+        uint32_t timeout_ms, uint64_t* out_index) {
+    bool ok = false;
+    uint64_t deadline = qcm_now_ms() + timeout_ms;
+    while (pthread_mutex_trylock(&mesh->proposal_lock) != 0) {
+        if (qcm_stopping(mesh) || qcm_now_ms() >= deadline) return false;
+        struct timespec pause = {0, 1000000L}; nanosleep(&pause, NULL);
+    }
+    pthread_mutex_lock(&mesh->state_lock);
+    uint64_t committed = qihse_consensus_commit_index(mesh->consensus);
+    uint64_t last = qihse_consensus_last_log_index(mesh->consensus);
+    uint64_t generation = qihse_consensus_last_journal_generation(mesh->consensus);
+    if (!qcm_authority_operator(principal) ||
+        qihse_consensus_role(mesh->consensus) != QIHSE_CONSENSUS_LEADER ||
+        last > QIHSE_MESH_EVIDENCE_MAX_ENTRIES ||
+        generation == UINT64_MAX) goto unlock_state;
+    /* Include inherited uncommitted intents before selecting a winner.
+     * A current-term duplicate can commit an exact inherited decision. */
+    uint64_t existing_index = 0u;
+    for (uint64_t i = 1u; i <= last; ++i) {
+        qihse_consensus_entry_t entry;
+        if (!qihse_consensus_read_durable_entry_user(mesh->consensus, principal,
+                i, &entry) || entry.index != i) goto unlock_state;
+        if (entry.type != QIHSE_CONSENSUS_ENTRY_DATA ||
+            entry.payload_len != QIHSE_CONSENSUS_BLOB_REF_BYTES ||
+            memcmp(entry.payload, "QBR1", 4u) ||
+            qcm_auth_get64(entry.payload+112u) !=
+                QIHSE_CONSENSUS_BLOB_HEADER_BYTES+QCM_AUTHORITY_RECORD) continue;
+        uint8_t existing[QCM_AUTHORITY_RECORD];
+        size_t len = 0u;
+        if (!qihse_consensus_blob_read_durable_transaction_user(mesh->blob_context,
+                mesh->consensus, (qihse_user_t*)principal, i, existing,
+                sizeof(existing), &len) || len != sizeof(existing)) goto unlock_state;
+        if (memcmp(existing, "QCA3", 4u) || memcmp(existing+4u, record+4u, 32u)) continue;
+        if (entry.classif != 0u || entry.sci != 0u ||
+            memcmp(existing+68u, record+68u, 32u) ||
+            qcm_auth_get64(existing+100u) > qcm_auth_get64(record+100u)) goto unlock_state;
+        if (!memcmp(existing, record, QCM_AUTHORITY_RECORD) && !existing_index)
+            existing_index = i;
+    }
+    if (existing_index && existing_index <= committed) {
+        *out_index = existing_index; ok = true; goto unlock_state;
+    }
+    pthread_mutex_unlock(&mesh->state_lock);
+    qihse_hlc_t hlc = {0};
+    hlc.physical_ms = qcm_now_ms();
+    uint64_t now = qcm_now_ms();
+    uint32_t half = now < deadline ? (uint32_t)((deadline-now)/2u) : 0u;
+    if (half) ok = qcm_mesh_propose_transaction_locked(mesh, principal, generation+1u, hlc,
+        0u, 0u, record, QCM_AUTHORITY_RECORD, half, half, out_index);
+    if (ok) {
+        pthread_mutex_lock(&mesh->state_lock);
+        ok = qcm_authority_operator(principal) &&
+            qcm_authority_exact_locked(mesh, principal, *out_index, record);
+        pthread_mutex_unlock(&mesh->state_lock);
+    }
+    pthread_mutex_unlock(&mesh->proposal_lock);
+    return ok;
+unlock_state:
+    pthread_mutex_unlock(&mesh->state_lock);
+    pthread_mutex_unlock(&mesh->proposal_lock);
+    return ok;
+}
+
+static bool qcm_authority_voter(qihse_consensus_mesh_t* mesh,
+                                 const qihse_uuid_t* uuid) {
+    qihse_consensus_membership_t membership;
+    bool allowed = false;
+    pthread_mutex_lock(&mesh->state_lock);
+    if (qihse_consensus_get_membership(mesh->consensus, &membership) &&
+        !membership.joint_active && !membership.pending_config_index) {
+        for (size_t i = 0; i < membership.member_count; ++i)
+            if (qihse_uuid_equal(uuid, &membership.members[i]) &&
+                membership.member_roles[i] != QIHSE_CONSENSUS_ROLE_LEARNER)
+                allowed = true;
+    }
+    pthread_mutex_unlock(&mesh->state_lock);
+    return allowed;
+}
+
+static bool qcm_authority_receive(qcm_rx_ctx_t* ctx, const uint8_t* wire,
+                                    size_t size) {
+    qihse_consensus_mesh_t* mesh = ctx->mesh;
+    uint8_t group_hash[32], record[QCM_AUTHORITY_RECORD], reply[13] = {'Q','A','R','1'};
+    if (!mesh->authority_proposals_enabled || !mesh->consensus_config.writer_epoch_floor ||
+        !qcm_authority_operator(mesh->principal) || size != QCM_AUTHORITY_WIRE ||
+        memcmp(wire, "QAF1", 4u) ||
+        memcmp(wire+4u, mesh->consensus_config.history_id, 32u) ||
+        qcm_auth_get64(wire+36u) != mesh->consensus_config.writer_epoch_floor ||
+        !qcm_sha256(mesh->consensus_config.group_id,
+            strlen(mesh->consensus_config.group_id), group_hash) ||
+        memcmp(wire+44u, group_hash, 32u) ||
+        memcmp(wire+76u, mesh->peers[ctx->peer_index].uuid.bytes, 16u) ||
+        memcmp(wire+92u, mesh->consensus_config.self.bytes, 16u) ||
+        !qcm_authority_voter(mesh, &mesh->peers[ctx->peer_index].uuid) ||
+        !qcm_authority_record(wire+112u, QCM_AUTHORITY_INPUT, record)) return false;
+    uint32_t timeout = ((uint32_t)wire[108]<<24u) | ((uint32_t)wire[109]<<16u) |
+        ((uint32_t)wire[110]<<8u) | wire[111];
+    if (!timeout || timeout > 30000u) return false;
+    uint64_t index = 0u;
+    reply[4] = qcm_authority_local(mesh, mesh->principal, record, timeout, &index);
+    qcm_auth_put64(reply+5u, index);
+    return qihse_qkp_send_sealed(ctx->session, ctx->fd, reply, sizeof(reply));
+}
+
+/* Shutdown, rather than close, the live descriptor on deadline. Joining
+ * before its close prevents a timeout from touching a reused descriptor. */
+typedef struct { int socket_fd, cancel_fd; uint64_t deadline; } qcm_authority_guard_t;
+static void* qcm_authority_deadline(void* opaque) {
+    qcm_authority_guard_t* guard = opaque;
+    for (;;) {
+        uint64_t now = qcm_now_ms();
+        if (now >= guard->deadline) { shutdown(guard->socket_fd, SHUT_RDWR); break; }
+        struct pollfd pfd = {guard->cancel_fd, POLLIN, 0};
+        int ready = poll(&pfd, 1, (int)(guard->deadline-now));
+        if (ready > 0) break;
+        if (ready < 0 && errno != EINTR) break;
+    }
+    return NULL;
+}
+
+bool qihse_consensus_mesh_propose_authority(qihse_consensus_mesh_t* mesh,
+        const qihse_user_t* principal, const void* payload, size_t payload_len,
+        uint32_t timeout_ms, uint64_t* out_index) {
+    if (out_index) *out_index = 0u;
+    uint8_t record[QCM_AUTHORITY_RECORD];
+    if (!mesh || !mesh->started || !out_index || !timeout_ms || timeout_ms > 30000u ||
+        !mesh->authority_proposals_enabled || !mesh->consensus_config.writer_epoch_floor ||
+        !qcm_authority_operator(principal) ||
+        !qcm_authority_record(payload, payload_len, record) ||
+        !qcm_authority_voter(mesh, &mesh->consensus_config.self)) return false;
+    uint64_t deadline = qcm_now_ms()+timeout_ms;
+    qihse_uuid_t leader;
+    pthread_mutex_lock(&mesh->state_lock);
+    bool local = qihse_consensus_role(mesh->consensus) == QIHSE_CONSENSUS_LEADER;
+    bool known = qihse_consensus_leader_id(mesh->consensus, &leader);
+    pthread_mutex_unlock(&mesh->state_lock);
+    if (local) return qcm_authority_local(mesh, principal, record, timeout_ms, out_index);
+    int peer = known ? qcm_peer_index(mesh, &leader) : -1;
+    if (peer < 0 || !qcm_authority_voter(mesh, &leader)) return false;
+    int fd = qcm_connect(mesh->peers[peer].ipv4, mesh->peers[peer].port);
+    if (fd < 0) return false;
+    int cancel[2];
+    if (pipe(cancel) != 0) { close(fd); return false; }
+    qcm_authority_guard_t guard = {fd, cancel[0], deadline};
+    pthread_t guard_thread;
+    if (pthread_create(&guard_thread, NULL, qcm_authority_deadline, &guard) != 0) {
+        close(cancel[0]); close(cancel[1]); close(fd); return false;
+    }
+    struct timeval timeout = {(time_t)(timeout_ms/1000u), (suseconds_t)((timeout_ms%1000u)*1000u)};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    qihse_qkp_session_t* session = NULL;
+    bool ok = qihse_qkp_client_negotiate(fd, &mesh->qkp_config, &session) == QIHSE_QKP_SECURE &&
+        session && qihse_qkp_client_session_is_replication_peer(session,
+            mesh->peers[peer].node_id, mesh->peers[peer].public_key);
+    qihse_consensus_channel_config_t channel = qcm_channel(mesh, (size_t)peer);
+    uint8_t wire[QCM_AUTHORITY_WIRE] = {'Q','A','F','1'};
+    memcpy(wire+4u, mesh->consensus_config.history_id, 32u);
+    qcm_auth_put64(wire+36u, mesh->consensus_config.writer_epoch_floor);
+    ok = ok && qcm_sha256(mesh->consensus_config.group_id,
+        strlen(mesh->consensus_config.group_id), wire+44u);
+    memcpy(wire+76u, mesh->consensus_config.self.bytes, 16u);
+    memcpy(wire+92u, leader.bytes, 16u);
+    uint64_t now = qcm_now_ms();
+    uint32_t remaining = now < deadline ? (uint32_t)(deadline-now) : 0u;
+    if (!remaining) ok = false;
+    wire[108] = (uint8_t)(remaining>>24u); wire[109] = (uint8_t)(remaining>>16u);
+    wire[110] = (uint8_t)(remaining>>8u); wire[111] = (uint8_t)remaining;
+    memcpy(wire+112u, payload, payload_len);
+    ok = ok && qcm_authority_operator(principal) &&
+        qihse_consensus_channel_send_hello(session, fd, &channel, principal) &&
+        qihse_qkp_send_sealed(session, fd, wire, sizeof(wire));
+    uint8_t reply[13];
+    if (ok) ok = qihse_qkp_recv_sealed(session, fd, reply, sizeof(reply)) == (ssize_t)sizeof(reply) &&
+        !memcmp(reply, "QAR1", 4u) && reply[4] == 1u;
+    uint64_t index = ok ? qcm_auth_get64(reply+5u) : 0u;
+    close(cancel[1]);
+    (void)pthread_join(guard_thread, NULL);
+    close(cancel[0]);
+    if (session) qihse_qkp_session_free(session);
+    close(fd);
+    if (!ok || !index) return false;
+    *out_index = index;
+    do {
+        pthread_mutex_lock(&mesh->state_lock);
+        ok = qcm_authority_operator(principal) &&
+            qcm_authority_exact_locked(mesh, principal, index, record);
+        pthread_mutex_unlock(&mesh->state_lock);
+        if (ok) return true;
+        if (qcm_stopping(mesh)) return false;
+        struct timespec pause = {0, 5000000L}; nanosleep(&pause, NULL);
+    } while (qcm_now_ms() < deadline);
+    return false;
 }

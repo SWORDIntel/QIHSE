@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
@@ -100,12 +101,25 @@ def main() -> None:
 
         source = root / "source.jsonl"
         snapshot(repo, source)
-        invoke("import", "--input", str(source))
+        invoke("import", "--input", str(source), "--storage-format", "zstd-v1")
         state = root / "state/qihse/codegraph" / hashlib.sha256(str(repo).encode()).hexdigest()
         manifest_path = state / "current.json"
 
         def manifest() -> dict:
             return json.loads(manifest_path.read_text())
+
+        def managed_files() -> set[str]:
+            names = set()
+            for path in state.glob("graph-*.kv"):
+                match = re.fullmatch(r"graph-[0-9a-f]{64}-([A-Za-z0-9]+)\.kv", path.name)
+                if not path.is_file() or not match:
+                    continue
+                suffix = match.group(1)
+                if (len(suffix) == 6 or
+                    (suffix.isdigit() and not suffix.startswith("0") and
+                     int(suffix) <= 2147483647)):
+                    names.add(path.name)
+            return names
 
         original = manifest()
         assert original["storage_format"] == "qihse-codegraph-zstd-v1", original
@@ -148,7 +162,10 @@ def main() -> None:
         subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-I" + str(project / "include"),
                         "-I" + str(project / "tools"), str(helper_source),
                         str(project / "tools/qihse_codegraph_storage.c"),
+                        str(project / "tools/qihse_codegraph_dictionary.c"),
                         str(project / "tools/qihse_codegraph_packed.c"),
+                        str(project / "tools/qihse_codegraph_checksum.c"),
+                        str(project / "tools/codegraph_xxh3/build/libqihse_xxh3.a"),
                         "-L" + str(binary.parent), "-lqihse", *json_flags,
                         "-o", str(helper)], check=True, capture_output=True)
         helper_data = root / "writer-state"
@@ -161,7 +178,7 @@ def main() -> None:
                                         capture_output=True, timeout=90)
         assert fixture_result.returncode == 0, (fixture_result.stdout, fixture_result.stderr)
         legacy = {k: v for k, v in original.items()
-                  if k not in ("storage_format", "previous_snapshot")}
+                  if k not in ("storage_format", "previous_snapshot", "snapshot_hash_algorithm", "snapshot_hash")}
         legacy.update(snapshot=legacy_path.name,
                       sha256=hashlib.sha256(legacy_path.read_bytes()).hexdigest())
         manifest_path.write_text(json.dumps(legacy))
@@ -187,7 +204,10 @@ def main() -> None:
         assert set(denied_stats) == {"error"}, denied_stats
         assert "bytes" not in json.dumps(denied_stats) and "nodes" not in json.dumps(denied_stats)
         manifest_path.write_text(json.dumps(legacy))
-        assert invoke("stats") == legacy_stats, "unreferenced classified history affected guest statistics"
+        restored_stats = invoke("stats")
+        assert restored_stats == legacy_stats, (
+            "unreferenced classified history affected guest statistics",
+            legacy_stats, restored_stats)
 
         unsupported_path = state / ("graph-" + "1" * 64 + "-letters.kv")
         unsupported_path.write_bytes(legacy_path.read_bytes())
@@ -195,7 +215,9 @@ def main() -> None:
         manifest_path.write_text(json.dumps(unsupported))
         before_failed_migrate = manifest_path.read_bytes()
         failed = invoke("migrate", expect=1)
-        assert "unsupported snapshot filename" in failed["error"], failed
+        # The loader now reports a generic migration failure for an invalid
+        # snapshot name; it must still deny without graph facts or publication.
+        assert set(failed) == {"error"} and "migration failed" in failed["error"], failed
         assert manifest_path.read_bytes() == before_failed_migrate
         manifest_path.write_text(json.dumps(legacy))
 
@@ -203,7 +225,7 @@ def main() -> None:
         clean_source = (repo / "src/a.c").read_text()
         (repo / "src/a.c").write_text(clean_source + "/* changed since indexing */\n")
         assert not invoke("status")["fresh"]
-        invoke("migrate")
+        invoke("migrate", "--storage-format", "zstd-v1")
         converted = manifest()
         assert converted["storage_format"] == "qihse-codegraph-zstd-v1"
         assert converted["snapshot"] != legacy_path.name
@@ -223,7 +245,7 @@ def main() -> None:
         for key in ("nodes", "evidence", "unresolved_edges", "candidate_tests"):
             assert after[key] == baseline[key], (key, baseline, after)
         before_second_migrate = manifest_path.read_bytes()
-        invoke("migrate")
+        invoke("migrate", "--storage-format", "zstd-v1")
         assert manifest_path.read_bytes() == before_second_migrate
 
         # Explicit packed-v2 conversion retains freshness, complete graph
@@ -253,11 +275,15 @@ def main() -> None:
         manifest_path.write_text(json.dumps(mismatched))
         assert "error" in invoke("stats", expect=1)
         wrong_magic = {**packed, "snapshot": converted["snapshot"],
-                       "sha256": hashlib.sha256((state / converted["snapshot"]).read_bytes()).hexdigest()}
+                       "snapshot_hash_algorithm": converted["snapshot_hash_algorithm"],
+                       "snapshot_hash": converted["snapshot_hash"]}
         manifest_path.write_text(json.dumps(wrong_magic))
         assert "error" in invoke("stats", expect=1)
         assert "error" in invoke("query", "--symbol", "caller", expect=1)
         manifest_path.write_text(json.dumps(packed))
+        # Re-serialization changes the authorized manifest's byte size. Use
+        # this restored manifest as the baseline for the protected-history case.
+        packed_stats = invoke("stats")
 
         # New packed adapter negative: a Guest cannot read a syntactically
         # valid, Operator-produced graph with one classified/SCI node.
@@ -273,6 +299,8 @@ def main() -> None:
             protected_packed_result.stdout, protected_packed_result.stderr)
         protected_packed = {**packed, "snapshot": protected_packed_path.name,
                             "sha256": hashlib.sha256(protected_packed_path.read_bytes()).hexdigest()}
+        protected_packed.pop("snapshot_hash_algorithm", None)
+        protected_packed.pop("snapshot_hash", None)
         manifest_path.write_text(json.dumps(protected_packed))
         for action in ("status", "stats", "query"):
             report = invoke(action, *(["--symbol", "caller"] if action == "query" else []),
@@ -280,7 +308,8 @@ def main() -> None:
             assert set(report) == {"error"}, (action, report)
             assert "secret" not in json.dumps(report) and "nodes" not in json.dumps(report)
         manifest_path.write_text(json.dumps(packed))
-        assert invoke("stats") == packed_stats
+        restored_packed_stats = invoke("stats")
+        assert restored_packed_stats == packed_stats, (packed_stats, restored_packed_stats)
 
         # GC cannot remove current/previous, active runtime, unmanaged runtime,
         # or files not in the generation namespace.
@@ -339,6 +368,60 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=3) as workers:
             list(workers.map(concurrent_operation, range(9)))
         assert invoke("status")["fresh"]
+
+        # Each successful import retains its verified current generation and
+        # one rollback generation without requiring an explicit GC command.
+        previous_name = manifest()["snapshot"]
+        abandoned = state / ".runtime-abandoned-after-gc"
+        abandoned.mkdir(mode=0o700)
+        (abandoned / ".lease").touch(mode=0o600)
+        (abandoned / "marker").write_text("reclaim")
+        active_again = state / ".runtime-active-after-gc"
+        active_again.mkdir(mode=0o700)
+        (active_again / ".lease").touch(mode=0o600)
+        (active_again / "marker").write_text("retain while locked")
+        for generation in range(3):
+            (repo / "src/a.c").write_text(clean_source + f"/* generation {generation} */\n")
+            snapshot(repo, source)
+            if generation == 0:
+                with (active_again / ".lease").open("w") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    published = invoke("import", "--input", str(source),
+                                       "--storage-format", "packed-v2")
+                    assert active_again.is_dir(), "import removed a locked runtime"
+            else:
+                published = invoke("import", "--input", str(source),
+                                   "--storage-format", "packed-v2")
+            assert not abandoned.exists(), "import left an abandoned leased runtime"
+            if generation > 0:
+                assert not active_again.exists(), "import left a released runtime"
+            assert unmanaged.is_dir(), "import removed unleased legacy scratch"
+            assert published["status"] == "published", published
+            assert "retention_warning" not in published, published
+            current = manifest()
+            assert current["previous_snapshot"] == previous_name, current
+            assert managed_files() == {
+                current["snapshot"], previous_name}, current
+            previous_name = current["snapshot"]
+
+        # A failed manifest publication must not prune either rollback file.
+        retained = managed_files()
+        (repo / "src/a.c").write_text(clean_source + "/* blocked publication */\n")
+        snapshot(repo, source)
+        saved_manifest = state / ".manifest-fixture-backup"
+        manifest_path.rename(saved_manifest)
+        manifest_path.mkdir()
+        try:
+            failed = invoke("import", "--input", str(source),
+                            "--storage-format", "packed-v2", expect=1)
+            assert "publication" in failed["error"], failed
+        finally:
+            manifest_path.rmdir()
+            saved_manifest.rename(manifest_path)
+        assert retained <= managed_files()
+        assert manifest()["snapshot"] == previous_name
+        invoke("gc")
+        assert managed_files() == retained
     print("CodeGraph compact storage, migration, deduplication and GC: PASS")
 
 

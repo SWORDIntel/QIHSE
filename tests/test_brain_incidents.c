@@ -77,6 +77,7 @@ int main(void) {
     qihse_brain_config_t bcfg;
     memset(&bcfg, 0, sizeof bcfg);
     bcfg.server = server;
+    bcfg.control_principal = sys;
     bcfg.journal_dir = jdir;
     bcfg.interval_seconds = 1u;
     bcfg.act = false;

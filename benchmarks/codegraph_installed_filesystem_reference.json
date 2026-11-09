@@ -1,0 +1,21 @@
+{
+  "cases": [
+    {
+      "name": "filesystem",
+      "seconds": 17.35375823598588,
+      "actual_progress": true,
+      "query_fresh": true,
+      "disk_edit_rejected": true,
+      "no_git": true
+    },
+    {
+      "name": "unsaved-overlay",
+      "seconds": 17.27186110999901,
+      "actual_progress": true,
+      "query_fresh": true,
+      "overlay_change_rejected": true,
+      "disk_unchanged": true
+    }
+  ],
+  "status": "passed"
+}

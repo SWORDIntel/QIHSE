@@ -187,7 +187,7 @@ def main():
     if _SELF_SPAWN:
         t, r = n0.cmd("CLUSTER", "MOVESLOTS", "8192-16383", N1_EP)
         check("unavailable migration refused before ownership flip",
-              t == "-" and "target QKP handshake failed" in r, r)
+              t == "-" and "slot transfer unavailable without an all-writer fence" in r, r)
         n0.fresh(); n0.cmd("AUTH", "GODMODE_OP", PW)
         n1 = C(N1); n1.cmd("AUTH", "GODMODE_OP", PW)
         check("seed retains every high key",
@@ -204,10 +204,10 @@ def main():
               n0.cmd("GET", high[0]) == ("$", "after-refusal"))
         t, seed_nodes = n0.cmd("CLUSTER", "NODES")
         t, peer_nodes = n1.cmd("CLUSTER", "NODES")
-        check("both nodes retain seed ownership",
-              all(any(N0_EP in line and "0-16383" in line
-                      for line in view.splitlines())
-                  for view in (seed_nodes, peer_nodes)))
+        check("seed retains ownership; peer refuses unproved slot map",
+              any(N0_EP in line and "0-16383" in line
+                  for line in seed_nodes.splitlines()) and
+              not any("0-16383" in line for line in peer_nodes.splitlines()))
         print(f"\nload-shift guard: {sum(results)}/{len(results)} checks passed")
         _teardown_hermetic()
         return 0 if all(results) else 1

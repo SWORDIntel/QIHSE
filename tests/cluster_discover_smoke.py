@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Dynamic-discovery cluster smoke: node 1 is launched knowing NOTHING except
-one seed bus address (--join). Verifies membership discovery (MEET + gossip),
-slot-map propagation (SLOT_UPDATE re-announcements), and cross-node routing
-through the joiner after the heartbeat health window has elapsed.
+"""Dynamic-discovery safety smoke: node 1 starts knowing only one seed bus
+address. Membership gossip may identify peers, but an unfenced SLOT_UPDATE
+cannot grant slot ownership or make the joiner route data-bearing requests.
 
 Two modes:
   default      Prereq: node 0 (seed, all slots) and node 1 (joiner) are up;
@@ -114,7 +113,7 @@ def main():
     c = C(NODE1); c.cmd("AUTH", "GODMODE_OP", PW)
     t, nodes = c.cmd("CLUSTER", "NODES")
     check("joiner discovered both nodes", NODE0_EP in nodes and NODE1_EP in nodes)
-    check("joiner learned full slot map", "0-16383" in nodes)
+    check("joiner refused unproved slot map", "0-16383" not in nodes)
 
     c0 = C(NODE0); c0.cmd("AUTH", "GODMODE_OP", PW)
     t, nodes0 = c0.cmd("CLUSTER", "NODES")
@@ -124,14 +123,11 @@ def main():
     check("SET on seed", r == "OK", r)
 
     t, r = c.cmd("GET", "dyn:test")
-    hops = 0
-    while t == "-" and r.startswith("MOVED") and hops < 3:
-        tgt = r.split()[2].rsplit(":", 1)
-        c = C((tgt[0], int(tgt[1]))); c.cmd("AUTH", "GODMODE_OP", PW)
-        t, r = c.cmd("GET", "dyn:test"); hops += 1
-    check("GET via joiner redirects + round-trips", r == "discovered-value", r)
+    check("joiner refuses unverified data routing",
+          t == "-" and r.startswith("CLUSTERDOWN") and
+          "discovered-value" not in r, r)
 
-    print(f"\ndiscovery smoke: {sum(results)}/{len(results)} checks passed")
+    print(f"\ndiscovery guard: {sum(results)}/{len(results)} checks passed")
     if _SELF_SPAWN:
         _teardown_hermetic()
     return 0 if all(results) else 1

@@ -1,0 +1,58 @@
+{
+  "full_suite": "Integration owner must run make test TEST_JOBS=32",
+  "legacy_digest_tags": {
+    "literal_digest_duplicate_rejected_before_raw_output": true,
+    "node_and_edge": true
+  },
+  "max_packed_decoder_stack_bytes": 352,
+  "native_cli": {
+    "cases": [
+      "import",
+      "status",
+      "stats",
+      "shared",
+      "context",
+      "impact",
+      "missing"
+    ],
+    "exact_query_parity": true,
+    "fixture_edges": 192,
+    "fixture_nodes": 64,
+    "passed": true,
+    "scope": "Isolated native CLI using real authenticated QIHSE runtime; no live state"
+  },
+  "negative_authorization": [
+    "NULL helper",
+    "low/high helper and native storage open",
+    "wrong SCI helper and native storage open",
+    "revoked helper and native storage open",
+    "protected get on returned immutable store after principal revocation",
+    "wrong trusted SHA through native storage open"
+  ],
+  "normal_tests": [
+    "test_codegraph_packed",
+    "test_codegraph_storage"
+  ],
+  "passed": true,
+  "sanitizers": {
+    "enabled": [
+      "address",
+      "undefined"
+    ],
+    "leak_detection": false,
+    "qihse_shared_library_instrumented": false,
+    "tests": [
+      "test_codegraph_packed",
+      "test_codegraph_storage"
+    ]
+  },
+  "source_hashes": {
+    "benchmarks/codegraph_zip_storage_compare.py": "a6d2fff8e91df69f72009344f98d5fc7641e0eaa59a68691dd8a5d446b1b2d3b",
+    "tests/test_codegraph_packed.c": "4f63fd05670026757d71025c9ba77742ec9ca4f7af796619b987d7b401d633fa",
+    "tests/test_codegraph_storage.c": "c906def03e273ba0993dbdc511be3345a95be5456a64ea88c833d40c25fc6cc1",
+    "tools/qihse_codegraph_packed.c": "7dd7d920fd50766fc5542e031e85e0dafd944d6fa60a78a86e4a682c28fb511e",
+    "tools/qihse_codegraph_packed.h": "7ece0851e9445a7f090de712510985f2e5ba03a48d949ae7e14410fda2eeed70",
+    "tools/qihse_codegraph_storage.c": "a8b362c2ce1fc84c2f70d3d34fc94ffdc252fea807b42c0e3cc502d9ffe58149",
+    "tools/qihse_codegraph_storage.h": "13d3f67ec531aeb4b3c38db648489f7bdaf7737c29a3f1e336f2491430d5e096"
+  }
+}

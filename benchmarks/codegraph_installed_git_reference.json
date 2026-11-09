@@ -1,0 +1,21 @@
+{
+  "cases": [
+    {
+      "name": "git-cold",
+      "seconds": 18.1095248979982,
+      "encoded_bytes": 932,
+      "actual_progress": true,
+      "query_fresh": true,
+      "private_export_removed": true
+    },
+    {
+      "name": "git-incremental-unchanged",
+      "seconds": 23.775298549007857,
+      "encoded_bytes": 932,
+      "actual_progress": true,
+      "query_fresh": true,
+      "private_export_removed": true
+    }
+  ],
+  "status": "passed"
+}

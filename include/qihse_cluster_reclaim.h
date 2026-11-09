@@ -12,6 +12,10 @@
 extern "C" {
 #endif
 
+/* Shared routing/reclamation policy. Tenant prefixes only exempt explicitly
+ * node-local AIMEM families; application namespaces remain shardable. */
+bool qihse_cluster_key_is_node_local(const char* key);
+
 /* Delete every key whose slot is NOT owned by local_index in the topology.
  * Returns the number of keys deleted. Used for COPY-then-GC: run after an
  * ownership journal replay has confirmed a slot moved away. */

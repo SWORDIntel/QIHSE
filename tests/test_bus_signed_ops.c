@@ -6,7 +6,7 @@
  * after the payload.  This suite drives qihse_cluster_bus_inject() exactly
  * like tests/test_federation_bus_trust.c and asserts:
  *   a. a correctly signed SLOT_UPDATE is verified against the signer's
- *      ENROLLED identity and applied;
+ *      ENROLLED identity, but cannot change ownership without data proof;
  *   b. one flipped payload byte after signing -> the whole datagram is
  *      dropped (fail closed, nothing reaches the handler);
  *   c. a signature from an UNENROLLED node id is dropped;
@@ -16,14 +16,17 @@
  */
 
 #include "qihse_cluster_bus.h"
+#include "qihse_cluster_slot.h"
 #include "qihse_federation.h"
 #include "qihse_kv_store.h"
 #include "qihse_auth.h"
 #include "qihse_audit.h"
 #include <stdlib.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static qihse_kv_store_t* g_store;
 static qihse_user_t* g_op;
@@ -124,7 +127,8 @@ static void fixture_down(fixture_t* f) {
 
 /* Build the 16-byte header + payload frame for an ops update. */
 static size_t build_slot_frame(uint8_t* out, size_t cap, uint16_t start,
-                               uint16_t end) {
+                               uint16_t end, const char* owner_id,
+                               uint64_t epoch) {
     assert(cap > 16u + sizeof(qihse_cluster_bus_slot_update_t));
     memset(out, 0, 16u);
     uint32_t magic = QIHSE_CLUSTER_BUS_MAGIC, type = QIHSE_BUS_MSG_SLOT_UPDATE;
@@ -138,6 +142,8 @@ static size_t build_slot_frame(uint8_t* out, size_t cap, uint16_t start,
     memset(&upd, 0, sizeof(upd));
     upd.start = start;
     upd.end = end;
+    if (owner_id) snprintf(upd.owner_id, sizeof(upd.owner_id), "%s", owner_id);
+    upd.config_epoch = epoch;
     memcpy(out + 16u, &upd, sizeof(upd));
     return 16u + plen;
 }
@@ -170,7 +176,29 @@ static size_t append_trailer(uint8_t* out, size_t cap, const uint8_t* frame,
 
 static void test_signed_roundtrip(fixture_t* f) {
     uint8_t frame[512], dgram[4096];
-    size_t flen = build_slot_frame(frame, sizeof(frame), 100u, 199u);
+    qihse_cluster_node_t local_node, remote_node;
+    assert(qihse_cluster_topology_get_node(f->topology, 0u, &local_node));
+    assert(qihse_cluster_topology_get_node(f->topology, 1u, &remote_node));
+    assert(qihse_cluster_topology_assign_range(f->topology, 100u, 149u, 0u));
+    assert(qihse_cluster_topology_assign_range(f->topology, 150u, 199u, 2u));
+
+    qihse_user_t* low = qihse_auth_create_user(g_op, 90u, QIHSE_ROLE_GUEST,
+                                               0u, 0u, "BusLowPass123!", false);
+    assert(low);
+    char protected_key[64] = {0};
+    for (unsigned i = 0; i < 100000u; i++) {
+        snprintf(protected_key, sizeof(protected_key), "bus:protected:%u", i);
+        uint16_t slot = qihse_cluster_key_slot(protected_key, strlen(protected_key));
+        if (slot >= 100u && slot <= 199u) break;
+    }
+    uint16_t protected_slot = qihse_cluster_key_slot(protected_key, strlen(protected_key));
+    assert(protected_slot >= 100u && protected_slot <= 199u);
+    assert(qihse_kv_set_user(g_store, protected_key, "HIGH-SCI-BUS-PAYLOAD", 5u, 9u, g_op));
+    assert(qihse_kv_get_user(g_store, protected_key, low) == NULL);
+
+    /* A signed same-owner announcement is observable but changes no map. */
+    size_t flen = build_slot_frame(frame, sizeof(frame), 100u, 149u,
+                                   local_node.id, local_node.config_epoch);
     size_t dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
                                  f->peer_pkey, &f->peer);
     fprintf(stderr,
@@ -186,13 +214,43 @@ static void test_signed_roundtrip(fixture_t* f) {
     assert(st.signed_ops_accepted == 1u);
     assert(st.signed_ops_rejected == 0u);
     assert(st.slot_updates_received == 1u);
-    printf("PASS (s1) signed SLOT_UPDATE verified against enrolled identity "
-           "and applied\n");
+
+    /* Even an enrolled signer and epoch 0 cannot overwrite a mixed range. */
+    flen = build_slot_frame(frame, sizeof(frame), 100u, 199u,
+                            remote_node.id, 0u);
+    dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
+                          f->peer_pkey, &f->peer);
+    assert(qihse_cluster_bus_inject(f->bus, dgram, dlen, "127.0.0.1", 17001));
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    assert(qihse_cluster_topology_get_slot(f->topology, 100u, &owner, NULL, NULL));
+    assert(owner == 0u);
+    assert(qihse_cluster_topology_get_slot(f->topology, 150u, &owner, NULL, NULL));
+    assert(owner == 2u);
+
+    /* An unknown/empty owner must not unassign the range either. */
+    flen = build_slot_frame(frame, sizeof(frame), 100u, 199u, NULL, 0u);
+    dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
+                          f->peer_pkey, &f->peer);
+    assert(qihse_cluster_bus_inject(f->bus, dgram, dlen, "127.0.0.1", 17001));
+    assert(qihse_cluster_topology_get_slot(f->topology, 150u, &owner, NULL, NULL));
+    assert(owner == 2u);
+    qihse_cluster_bus_stats(f->bus, &st);
+    assert(st.signed_ops_accepted == 3u && st.slot_updates_received == 1u);
+    assert(qihse_kv_get_user(g_store, protected_key, low) == NULL);
+    char* protected_value = qihse_kv_get_user(g_store, protected_key, g_op);
+    assert(protected_value && strcmp(protected_value, "HIGH-SCI-BUS-PAYLOAD") == 0);
+    free(protected_value);
+    char journal_path[512];
+    snprintf(journal_path, sizeof(journal_path), "%s/slot-ownership.journal",
+             getenv("QIHSE_DATA_DIR"));
+    errno = 0;
+    assert(access(journal_path, F_OK) == -1 && errno == ENOENT);
+    printf("PASS (s1) signed slot gossip verified; ownership, journal, and SCI data preserved\n");
 }
 
 static void test_tampered_dropped(fixture_t* f) {
     uint8_t frame[512], dgram[4096];
-    size_t flen = build_slot_frame(frame, sizeof(frame), 200u, 299u);
+    size_t flen = build_slot_frame(frame, sizeof(frame), 200u, 299u, NULL, 0u);
     size_t dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
                                  f->peer_pkey, &f->peer);
     dgram[17] ^= 0xFF; /* flip one payload byte after signing */
@@ -206,7 +264,7 @@ static void test_tampered_dropped(fixture_t* f) {
 
 static void test_unenrolled_signer_dropped(fixture_t* f) {
     uint8_t frame[512], dgram[4096];
-    size_t flen = build_slot_frame(frame, sizeof(frame), 300u, 399u);
+    size_t flen = build_slot_frame(frame, sizeof(frame), 300u, 399u, NULL, 0u);
     size_t dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
                                  f->stranger_pkey, &f->stranger);
     assert(qihse_cluster_bus_inject(f->bus, dgram, dlen, "127.0.0.1", 17001));
@@ -223,7 +281,7 @@ static void test_require_signed_ops(void) {
 
     /* Unsigned SLOT_UPDATE: refused. */
     uint8_t frame[512];
-    size_t flen = build_slot_frame(frame, sizeof(frame), 400u, 499u);
+    size_t flen = build_slot_frame(frame, sizeof(frame), 400u, 499u, NULL, 0u);
     assert(qihse_cluster_bus_inject(f.bus, frame, flen, "127.0.0.1", 17001));
     qihse_cluster_bus_stats_t st;
     qihse_cluster_bus_stats(f.bus, &st);

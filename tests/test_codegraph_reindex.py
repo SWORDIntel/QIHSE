@@ -17,7 +17,11 @@ import unittest
 WRAPPER = Path(__file__).resolve().parents[1] / 'tools' / 'qihse-codegraph-reindex'
 STUB = r'''
 import json, os, pathlib, sys, time
-stage = sys.argv[1]
+stage = 'prepare-source' if pathlib.Path(__file__).name == 'qihse_codegraph_incremental.py' else sys.argv[1]
+if stage == 'stats':
+    print(json.dumps({'coverage':'authorized_current_generation',
+                      'encoded_bytes':int(os.environ.get('STUB_GRAPH_BYTES','1048576'))}))
+    sys.exit(0)
 with open(os.environ['CALL_LOG'], 'a') as f:
     f.write(json.dumps({'stage':stage, 'args':sys.argv[1:], 'pid':os.getpid()})+'\n')
 if os.environ.get('SLEEP_STAGE') == stage:
@@ -26,12 +30,14 @@ if os.environ.get('FAIL_STAGE') == stage:
     print('stage failure detail', file=sys.stderr)
     sys.exit(7)
 repo = pathlib.Path(sys.argv[sys.argv.index('--repo')+1])
-if stage == 'visualize':
-    out = pathlib.Path(os.environ.get('STUB_EXPORT_DIR', str(repo/'.code-review-graph')))/'graph.qihse.jsonl'
-    out.parent.mkdir(parents=True,exist_ok=True)
+if stage == 'prepare-source':
+    out = pathlib.Path(sys.argv[sys.argv.index('--output')+1])
+    assert not out.is_relative_to(repo)
+    assert out.parent.stat().st_mode & 0o077 == 0
+    assert pathlib.Path(sys.argv[sys.argv.index('--expected-identity')+1]).is_file()
     out.write_text('fresh export')
     if not os.environ.get('MISSING_RECEIPT'):
-        print('QIHSE CodeGraph exported: '+str(out))
+        print(json.dumps({'status':'ok','export_path':str(out)}))
 elif stage == 'import':
     path = pathlib.Path(sys.argv[sys.argv.index('--input')+1])
     assert path.read_text() == 'prepared fresh export'
@@ -75,11 +81,13 @@ class ReindexTests(unittest.TestCase):
         self.bin = self.root/'bin'; self.bin.mkdir()
         self.native = self.root/'qihse-codegraph'
         self.crg = self.bin/'code-review-graph'
-        for path in (self.native,self.crg):
+        self.adapter = self.root/'tools'/'qihse_codegraph_incremental.py'
+        for path in (self.native,self.crg,self.adapter):
             path.write_text(f'#!{sys.executable}\n'+STUB); path.chmod(0o700)
         self.repo = self.root/'repo with spaces'; self.repo.mkdir(); (self.repo/'.git').mkdir()
         self.env = os.environ.copy()
-        self.env.update(PATH=str(self.bin),CALL_LOG=str(self.root/'calls'),HELPER_LOG=str(self.root/'helpers'))
+        self.env.update(PATH=str(self.bin),CALL_LOG=str(self.root/'calls'),
+                        HELPER_LOG=str(self.root/'helpers'),XDG_STATE_HOME=str(self.root/'state'))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -94,26 +102,49 @@ class ReindexTests(unittest.TestCase):
 
     def test_reindex_success(self):
         result=self.run_wrapper(); self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual([e['stage'] for e in self.events()],['build','visualize','import'])
-        self.assertEqual([e['operation'] for e in self.events('helpers')],['identity','identity','prepare'])
+        self.assertEqual([e['stage'] for e in self.events()],['prepare-source','import'])
+        self.assertEqual([e['operation'] for e in self.events('helpers')],['identity','identity','prepare','identity'])
         self.assertEqual(json.loads(result.stdout),{'status':'published'})
-        self.assertIn('3/3 stages Complete',result.stderr)
+        self.assertIn('2/2 stages Complete',result.stderr)
         self.assertNotIn('\x1b',result.stderr); self.assertNotIn('elapsed',result.stderr)
-        self.assertIn('index build output',result.stderr)
-        prepared=Path(self.events('helpers')[-1]['destination'])
+        self.assertIn('export_path',result.stderr)
+        prepared=Path(next(e for e in self.events('helpers') if e['operation']=='prepare')['destination'])
         self.assertFalse(prepared.exists())
 
-    def test_custom_export_directory(self):
+    def test_shared_custom_export_directory_is_preserved(self):
         env=self.env|{'STUB_EXPORT_DIR':str(self.root/'custom graph location')}
         stale=self.repo/'.code-review-graph'; stale.mkdir(); (stale/'graph.qihse.jsonl').write_text('stale')
         result=self.run_wrapper(env=env); self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(self.events('helpers')[-1]['source'],str(self.root/'custom graph location'/'graph.qihse.jsonl'))
+        self.assertEqual((stale/'graph.qihse.jsonl').read_text(),'stale')
+        prepared = next(e for e in self.events('helpers') if e['operation'] == 'prepare')
+        self.assertFalse(Path(prepared['source']).is_relative_to(self.repo))
+        self.assertFalse((self.root/'custom graph location').exists())
+
+    def test_second_reindex_estimates_from_completed_run(self):
+        first=self.run_wrapper(); self.assertEqual(first.returncode,0,first.stderr)
+        self.assertIn('ETA calibrating',first.stderr)
+        second=self.run_wrapper(env=self.env|{'STUB_GRAPH_BYTES':'2097152'})
+        self.assertEqual(second.returncode,0,second.stderr)
+        self.assertIn('Estimated total',second.stderr)
+        self.assertIn('current graph 2.0 MiB',second.stderr)
+        self.assertIn('ETA ~',second.stderr)
+        self.assertEqual(len(self.events()),4)
+        history=self.root/'state'/'qihse-codegraph-reindex'/'timings.json'
+        samples=next(iter(json.loads(history.read_text()).values()))
+        self.assertEqual(len(samples),2)
+        self.assertGreater(samples[0]['overhead_seconds'],0)
+
+    def test_failure_does_not_save_timing(self):
+        failed=self.run_wrapper(env=self.env|{'FAIL_STAGE':'prepare-source'})
+        self.assertEqual(failed.returncode,7)
+        history=self.root/'state'/'qihse-codegraph-reindex'/'timings.json'
+        self.assertFalse(history.exists())
 
     def test_failure_propagates_without_completion(self):
-        result=self.run_wrapper(env=self.env|{'FAIL_STAGE':'visualize'})
+        result=self.run_wrapper(env=self.env|{'FAIL_STAGE':'prepare-source'})
         self.assertEqual(result.returncode,7); self.assertNotIn('Complete',result.stderr)
         self.assertIn('stage failure detail',result.stderr)
-        self.assertEqual([e['stage'] for e in self.events()],['build','visualize'])
+        self.assertEqual([e['stage'] for e in self.events()],['prepare-source'])
 
     def test_missing_cli_preflight_prevents_build(self):
         self.native.unlink(); result=self.run_wrapper()
@@ -136,21 +167,37 @@ class ReindexTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout),{'status':'migrated'})
         self.assertIn('0/1 stages Migrating',result.stderr); self.assertIn('1/1 stages Complete',result.stderr)
 
+    def test_auto_format_reaches_native_import_and_migration(self):
+        for mode in ((), ('--migrate-only',)):
+            with self.subTest(mode=mode):
+                result = self.run_wrapper(*mode, '--storage-format', 'auto')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.events()[-1]['args']
+                self.assertEqual(args[args.index('--storage-format') + 1], 'auto')
+
+    def test_dictionary_format_reaches_native_import_and_migration(self):
+        for mode in ((), ('--migrate-only',)):
+            with self.subTest(mode=mode):
+                result = self.run_wrapper(*mode, '--storage-format', 'packed-v3')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.events()[-1]['args']
+                self.assertEqual(args[args.index('--storage-format') + 1], 'packed-v3')
+
     def test_missing_export_receipt_prevents_import(self):
         result=self.run_wrapper(env=self.env|{'MISSING_RECEIPT':'1'})
         self.assertNotEqual(result.returncode,0); self.assertNotIn('Complete',result.stderr)
-        self.assertEqual([e['stage'] for e in self.events()],['build','visualize'])
+        self.assertEqual([e['stage'] for e in self.events()],['prepare-source'])
 
     def test_changed_source_prevents_prepare_and_import(self):
         result=self.run_wrapper(env=self.env|{'CHANGE_SOURCE':'1'})
         self.assertNotEqual(result.returncode,0); self.assertNotIn('Complete',result.stderr)
         self.assertEqual([e['operation'] for e in self.events('helpers')],['identity','identity'])
-        self.assertEqual([e['stage'] for e in self.events()],['build','visualize'])
+        self.assertEqual([e['stage'] for e in self.events()],['prepare-source'])
 
     def test_invalid_export_prevents_import(self):
         result=self.run_wrapper(env=self.env|{'FAIL_PREPARE':'1'})
         self.assertNotEqual(result.returncode,0); self.assertNotIn('Complete',result.stderr)
-        self.assertEqual([e['stage'] for e in self.events()],['build','visualize'])
+        self.assertEqual([e['stage'] for e in self.events()],['prepare-source'])
 
     def test_tty_shows_elapsed_activity(self):
         master,slave=pty.openpty()
@@ -180,7 +227,7 @@ class ReindexTests(unittest.TestCase):
 
     def interrupt(self, signum, expected):
         proc=subprocess.Popen([sys.executable,str(self.wrapper),'--repo',str(self.repo)],
-            env=self.env|{'SLEEP_STAGE':'build','SLEEP_SECONDS':'30'},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            env=self.env|{'SLEEP_STAGE':'prepare-source','SLEEP_SECONDS':'30'},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+5
             while not self.events() and time.monotonic()<deadline: time.sleep(0.02)
@@ -189,7 +236,7 @@ class ReindexTests(unittest.TestCase):
             _,err=proc.communicate(timeout=8)
             self.assertEqual(proc.returncode,expected); self.assertNotIn(b'Complete',err)
             with self.assertRaises(ProcessLookupError): os.kill(child,0)
-            self.assertEqual([e['stage'] for e in self.events()],['build'])
+            self.assertEqual([e['stage'] for e in self.events()],['prepare-source'])
         finally:
             if proc.poll() is None: proc.kill(); proc.wait()
 
