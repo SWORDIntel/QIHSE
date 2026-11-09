@@ -57,6 +57,9 @@ extern "C" {
 #define QIHSE_BACKUP_EXPORT_UNSUPPORTED (-3)
 #define QIHSE_BACKUP_EXPORT_CONFLICT (-4)
 
+/* Bounded recovery union ceiling. The CLI retains its smaller 1 GiB default. */
+#define QIHSE_BACKUP_MAX_MERGE_BYTES ((size_t)3u << 30)
+
 typedef enum {
     BACKUP_FULL = 0,
     BACKUP_INCREMENTAL = 1,
@@ -156,7 +159,7 @@ int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* bac
  * is overwritten or silently selected, and an existing output is preserved.
  * Output must differ from both inputs. Counters are released only to an active
  * authorized caller; no key names or payloads are reported. Limits apply to
- * each input and to the resulting union (max 1 GiB / 2 million records).
+ * each input and to the resulting union (max 3 GiB / 2 million records).
  * The caller retains input paths as conflict provenance and must resolve
  * conflicts before restore. Full backups omit expired rows and tombstones;
  * this function is not a distributed tombstone reconciliation algorithm. */

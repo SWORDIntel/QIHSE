@@ -69,6 +69,9 @@ int main(void) {
     assert(qihse_backup_merge_user(op,a,b,alias,1<<20,100,&st)!=0);
     assert(qihse_backup_merge_user(op,a,b,o,1,100,&st)!=0);
     assert(qihse_backup_merge_user(op,a,b,o,1<<20,1,&st)!=0);
+    char large_union[512];snprintf(large_union,sizeof large_union,"%s/large-union.bak",dir);
+    assert(qihse_backup_merge_user(op,a,b,large_union,((size_t)2 << 30),100,&st)==0);
+    assert(!qihse_backup_verify_user(op,large_union));
     /* Corruption is verified before a new output can be published. */
     int fd=open(b,O_RDWR);assert(fd>=0);unsigned char byte;
     assert(pread(fd,&byte,1,70)==1);byte^=1;assert(pwrite(fd,&byte,1,70)==1);close(fd);
@@ -79,6 +82,11 @@ int main(void) {
     (void)qihse_backup_cli_load_password;
     qihse_backup_cli_clean_password(NULL);
     assert(opts.max_bytes == ((size_t)1 << 30) && opts.max_records == 2000000u);
+    char* large_limit[]={"backup","merge","--data-dir",dir,"--base",a,
+        "--incoming",c,"--output",o,"--max-bytes","2147483648"};
+    qihse_backup_cli_options_t large_opts;
+    assert(qihse_backup_cli_parse(12,large_limit,&large_opts));
+    assert(large_opts.max_bytes == ((size_t)2 << 30));
     char* bad_limits[]={"backup","merge","--data-dir",dir,"--base",a,"--incoming",c,"--output",o,"--max-records","999999999999999999999999999"};
     qihse_backup_cli_options_t rejected;assert(!qihse_backup_cli_parse(12,bad_limits,&rejected));
     FILE* response=tmpfile();assert(response);

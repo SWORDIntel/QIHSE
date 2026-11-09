@@ -1,7 +1,10 @@
 # Three-host cluster recovery and native upgrade
 
 Date: 2026-11-09
-Status: source-level range balancing is validated; live cluster recovery has not started.
+Status: source-level range balancing is validated. All nine services are stopped;
+all nine authenticated full backups verify, the three main-store deltas are
+preserved, and the merged union backup verifies. Fresh-generation restore and
+the new topology deployment remain pending.
 
 Step 1 checkpoint: the demonstrated 730xd-to-T320 alias ARP failure was
 repaired at the user's request using a persistent verified neighbour mapping.
@@ -87,6 +90,30 @@ under the coordinated write stop.
 | T320 cluster service | 296 application/tool keys; 0 AIMEM records | Preserve and reconcile these records; they are not proven duplicates or disposable bookkeeping. |
 | Separate local HAX memory service | 97 records visible in the `hax` project scope | This is a separate service and a scoped count, not its total dataset. Cluster slot transfers do not migrate it. |
 
+Authenticated Operator QKP probes on 2026-11-09 also found six active
+read-only namespace replica services outside the three main cluster units:
+
+| Host | Service / namespace | Keys | Current upstream |
+| --- | --- | ---: | --- |
+| T420 | `qihse-replica-keystone` | 3 | 730xd `192.168.1.90:7115` |
+| T420 | `qihse-replica-kp14` | 56 | 730xd `192.168.1.90:7115` |
+| 730xd | `qihse-replica-audit` | 352 | 730xd `192.168.1.90:7115` |
+| 730xd | `qihse-replica-chain` | 40 | 730xd `192.168.1.90:7115` |
+| T320 | `qihse-replica-sabot` | 212 | 730xd `192.168.1.90:7115` |
+| T320 | `qihse-replica-tool` | 167 | 730xd `192.168.1.90:7115` |
+
+These 830 cached keys must be included in the cutover inventory. Their
+read-only status and upstream do not prove every cached row is still present
+in 730xd's main store. Take authenticated full backups of each cache while its
+service is stopped, compare their records against the reconciled main-store
+union, and account for any unique or conflicting rows before retiring or
+reattaching the cache services. Do not leave them pointed at the old 730xd
+endpoint after cutover. Authenticated `REPLSTATUS` reported `sync=ok` for all
+six during the probe, but each showed `pulled=0`; this is not a record-level
+equality proof. No current TCP clients were connected to their ports during
+the sample, and the targeted HAX/QIHSE documentation/config search found no
+endpoint references. Confirm consumers again before retiring them.
+
 The direct T320/730xd value-comparison probe stalled and was stopped. It
 produced no trustworthy comparison counts. Do not treat its result as proof
 of duplication.
@@ -109,7 +136,7 @@ does not assign a permanent primary role to a physical host.
 | Workstream | State and remaining result |
 | --- | --- |
 | Network and membership | The 730xd-to-T320 neighbor repair is in place. Reconcile the live ownership maps and prove bus membership before cutover. |
-| Automatic balancing | Populated-owner CT2 balancing is implemented and tested. Keep CT1 replica role mapping explicit in each process configuration; dynamic remote role discovery/reassignment remains open. |
+| Automatic balancing | Populated-owner R5 CT2 balancing is implemented and tested **by slot count**. It has no bytes/capacity weighting, so it must stay disabled for this uneven three-host layout until a capacity-aware policy is implemented and tested. Keep CT1 replica role mapping explicit in each process configuration; dynamic remote role discovery/reassignment remains open. |
 | Automatic failover | Still open: connect an authenticated quorum/authority decision to CT1 promotion, complete generation/listener recovery, and provision successor capacity after a host failure. |
 | Recovery and memory preservation | The authenticated bounded merge and transfer locality checks are tested. Refresh live inventories, preserve conflicts and scoped AIMEM state, and verify the restored union before reopening writes. |
 
@@ -149,10 +176,24 @@ package checks and recovery-helper rehearsals before the outage.
 
 ### 3. Take one coordinated outage and back up every node
 
-Stop the three cluster daemons and take separate authenticated full backups.
-Verify the containers and restore them into separate fresh staging directories.
-Preserve configured identities, pins, credentials and service configuration
-separately: a KV backup is not a complete authentication or cluster backup.
+Stop all three main cluster daemons and the six read-only namespace replica
+services together. Take separate authenticated full backups of all nine
+stores; also export authenticated retained deltas from the three main stores
+for tombstone evidence. The delta helper must receive that store's explicit
+`QIHSE_DATA_DIR` (T420 `/opt/qihse-data/node0`, 730xd
+`/opt/qihse-data/node5-host`, T320 `/opt/qihse/data/node1`) to avoid its
+fallback selecting the wrong directory. Delta exports are evidence only, not
+restorable snapshots or a complete cross-node deletion history. Verify the
+full backup containers and keep the six cache backups separate until their
+contents are reconciled. Preserve configured identities, pins, credentials
+and service configuration separately: a KV backup is not a complete
+authentication or cluster backup.
+
+Execution checkpoint (2026-11-09): the coordinated stop is complete. All nine
+full backups passed authenticated verification. The three main-store delta
+exports were captured separately (`since_seq=0`) for deletion-history evidence.
+The 730xd and T320 full images copied to T420 have matching source/destination
+SHA-256 hashes. Original stores remain stopped and intact.
 
 Fresh directories avoid replaying contradictory ownership journals. Keep the
 original stopped stores and verified backups until the recovered dataset and
@@ -164,10 +205,24 @@ binary/data recovery.
 
 ### 4. Reconcile the datasets into a fresh generation
 
-Restore 730xd's verified image as the temporary recovery seed. Merge the
-distinct T320 application/tool records through the tested recovery helper and
-account for conflicts. Refresh T420's inventory and include any newly observed
-records as well.
+The verified 730xd full image is 1.76 GB, above the former 1 GiB merge ceiling.
+The bounded merge ceiling has been raised to 3 GiB (the default remains 1 GiB),
+and the focused merge test plus the required `make test TEST_JOBS=32` suite pass.
+
+The nine full backups were reconciled into
+`qihse-union-08-t320-tool.qbk` on T420. Authenticated merge accounting reports
+296 added T320 records, 830 exact duplicates across the six namespace caches,
+and zero conflicting live keys. T420's main backup was empty. The final union
+is 1,764,599,446 bytes and passed authenticated verification. All source full
+backups and three main-store deltas remain preserved; intermediate union files
+also remain available. No store has been restored yet.
+
+Next restore the verified union into a fresh generation with an Operator auth
+context, then partition and transfer ranges using the tested CT2 path. Preserve
+the old stores and source backups until the accepted new cluster proves the
+recovered union. The restore target needs a usable Operator auth context before
+the restore command runs; bootstrap it through the configured Operator
+credential rather than assuming restore creates identity state.
 
 Verify the recovered union using canonical record comparisons, including
 labels and expiry, not counts alone. Expired records must be accounted for
@@ -183,9 +238,13 @@ for both owned data and replicas before selecting the placement.
 Bring up the fresh generation with startup maintenance and failover holds
 until topology and replication prerequisites are satisfied. Use the tested
 Operator CT2 transfer path for initial distribution, retaining transfer IDs
-for interrupted retries. Each transfer is bounded to 4,096 rows and 64 MiB;
-subdivide ranges accordingly. An oversized individual slot requires explicit
-handling, never truncation.
+for interrupted retries. Keep automatic R5 rebalancing disabled during this
+uneven-capacity rollout: its current target is equal slot counts, which can
+undo the capacity-weighted placement. Each transfer is bounded to 4,096 rows
+and 64 MiB; subdivide ranges accordingly. An oversized individual slot
+requires explicit handling, never truncation.
+Set `--brain-rebalance-min-slots 0` on each brain process for this deployment;
+zero disables R5. Manual Operator CT2 transfers remain available.
 
 All three machines must own data after distribution. Choose allocation using
 actual stored bytes and available capacity rather than assuming equal slot
@@ -195,6 +254,11 @@ and distribution. Enable the repaired automatic balancing policy afterward.
 The separate upgraded HAX memory service remains available during cluster
 preparation. Its memories do not become cluster-distributed merely because
 cluster slots moved; preserve its endpoint and validate its reads separately.
+After the new owner/replica ring is healthy, reattach the six namespace caches
+only if their consumers still require those endpoints; point them at the
+appropriate new owner and verify their filters. Otherwise leave them stopped
+with their verified backups retained, after confirming no configured consumer
+depends on them.
 
 ### 6. Verify the finish line
 
@@ -206,7 +270,9 @@ Acceptance requires:
   absolute expiry, AIMEM auxiliary state and resolved conflicts.
 - All three machines own data and each owner has a durable off-host successor.
 - Automatic balancing successfully moves data between populated nodes and
-  recovers an interrupted transfer.
+  recovers an interrupted transfer without violating per-host disk budgets.
+  The current slot-count-only R5 policy does not meet this gate on the
+  heterogeneous hosts; keep it disabled until capacity-aware behavior passes.
 - Failure/rejoin testing proves automatic promotion, fencing of the old
   generation, replacement replica coverage and continued reads/writes.
 - HAX exact reads and BM25/semantic/hybrid memory operations still work.
@@ -236,5 +302,25 @@ new backup instead. Do not promise an automatic rollback after cutover.
 
 At plan creation, no live cluster stop, restart, backup, restore, transfer,
 promotion or configuration change had been performed during the study. Source
-transport validation is complete; live recovery and automation integration
-remain pending.
+transport validation is complete; see the execution checkpoint below for live
+recovery progress and remaining automation work.
+
+## Current execution checkpoint (2026-11-09)
+
+- The T420-to-T320 persistent neighbour repair is in place. The coordinated
+  outage stopped all three main services and six namespace replicas; old
+  stores and ownership journals remain intact.
+- Candidate source `fc4fe6cb00205dda55dcbef4327548fd755cedb5` is published and
+  natively built on all three hosts. Inactive package directories are named
+  with `fc4fe6c`; all three checksum manifests validate 104 files. No systemd
+  unit has been changed.
+- The source now includes the 3 GiB bounded backup-merge ceiling required by
+  the 1.76 GB source image. Focused merge tests pass; the full required suite
+  passed 203 targets with zero failures.
+- Nine authenticated full backups verify. Main-store delta evidence is
+  preserved separately. The merged full container verifies and accounts for
+  296 new records, 830 exact duplicate cache records and zero conflicts.
+- No restore, range transfer, new service activation or live ownership change
+  has been performed. The next phase is fresh-generation restore and topology
+  staging; capacity-weighted initial placement still requires a measured
+  per-range byte inventory.

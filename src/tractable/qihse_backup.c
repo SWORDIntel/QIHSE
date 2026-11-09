@@ -664,7 +664,7 @@ int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
     int rc = backup_principal_gate(user);
     if (rc) return rc;
     if (!base_path || !incoming_path || !output_path || !*output_path ||
-        !max_bytes || max_bytes > ((size_t)1 << 30) || !max_records ||
+        !max_bytes || max_bytes > QIHSE_BACKUP_MAX_MERGE_BYTES || !max_records ||
         max_records > 2000000u || !strcmp(base_path, output_path) ||
         !strcmp(incoming_path, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
     /* Reject aliases as well as identical spellings. */

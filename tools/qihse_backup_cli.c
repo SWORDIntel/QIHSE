@@ -59,7 +59,7 @@ static void qihse_backup_cli_usage(FILE* stream, const char* program) {
             "  %s verify --data-dir DIR --input FILE [--password-file FILE]\n"
             "  %s restore --data-dir DIR --input FILE [--password-file FILE]\n"
             "  %s merge --data-dir AUTH_DIR --base FILE --incoming FILE --output FILE [--password-file FILE] [--max-bytes N] [--max-records N]\n"
-            "Merge defaults/ceilings: 1073741824 encoded bytes, 2000000 records; each input and union.\n"
+            "Merge default: 1073741824 bytes; ceilings: 3221225472 bytes and 2000000 records per input and union.\n"
             "\n"
             "Environment fallbacks:\n"
             "  QIHSE_DATA_DIR          store and authentication directory\n"
@@ -131,7 +131,7 @@ static bool qihse_backup_cli_parse(int argc, char** argv,
                     return false;
                 n = n*10 + (size_t)(*p - '0');
             }
-            if (!n || (bytes && n > ((size_t)1 << 30)) ||
+            if (!n || (bytes && n > QIHSE_BACKUP_MAX_MERGE_BYTES) ||
                 (!bytes && n > 2000000u)) return false;
             if (bytes) options->max_bytes = n;
             else options->max_records = n;
