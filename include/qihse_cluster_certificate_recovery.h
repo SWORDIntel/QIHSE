@@ -3,6 +3,10 @@
 
 #include "qihse_cluster_ownership.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Fetch original signed envelopes from a pinned peer and authenticate the
  * complete chain through the requested canonical QCP2 event before applying
  * it. Run on the ownership recovery worker, never the bus receive thread.
@@ -13,5 +17,9 @@ bool qihse_cluster_ownership_pull_ct1_promotion_chain(
     qihse_cluster_ownership_context_t* context, uint16_t peer_index,
     const char* lane_id, const uint8_t through_event_digest[32],
     uint32_t timeout_ms, char* error, size_t error_cap);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
