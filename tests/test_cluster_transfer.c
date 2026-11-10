@@ -21,6 +21,7 @@ static int read_calls;
 static int publish_calls;
 static int abort_calls;
 static bool force_prepare_failure_after_fence;
+static bool prepare_diagnostic;
 static bool force_prepare_definite_failure;
 static bool suppress_prepared_recovery;
 static unsigned prepared_lookup_count;
@@ -325,6 +326,8 @@ bool qihse_cluster_ownership_transfer_prepare_ex(qihse_cluster_ownership_context
     pending.source_lsn = 4;
     *cut = pending.source_lsn;
     *fence_may_be_active = true;
+    if (force_prepare_failure_after_fence && prepare_diagnostic && err && cap)
+        snprintf(err,cap,"injected PREPARED journal write failure");
     assert(src == 1 && dst == 2);
     c->topology = (qihse_cluster_topology_t *)(uintptr_t)3;
     c->peer_id = peer_id;
@@ -560,13 +563,15 @@ static void test_prepare_failure_after_fence_is_pending(void) {
     pending.phase = 0;
     force_prepare_failure_after_fence = true;
     suppress_prepared_recovery = true;
+    prepare_diagnostic = true;
     prepared_lookup_count = 0;
     memset(err, 0, sizeof(err));
     assert(qihse_cluster_transfer_range(&context, "transfer-prepare-unknown",
         1, 2, 10, 12, err, sizeof(err)) == QIHSE_CLUSTER_TRANSFER_PENDING);
-    assert(strstr(err, "source may remain fenced") != NULL);
+    assert(!strcmp(err, "injected PREPARED journal write failure"));
     assert(read_calls == 0);
     suppress_prepared_recovery = false;
+    prepare_diagnostic = false;
     force_prepare_failure_after_fence = false;
     prepared_lookup_count = 0;
 }

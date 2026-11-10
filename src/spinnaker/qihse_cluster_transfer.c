@@ -476,14 +476,16 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
             if (recovered && txn.phase == QIHSE_OWNERSHIP_PREPARED &&
                 !strcmp(txn.transfer_id, transfer_id)) {
                 OPENSSL_cleanse(&txn, sizeof(txn));
-                set_error(err, err_cap,
-                    "CT2 prepare failed after fencing; source remains fenced and recovery is required");
+                if (!err || !err_cap || !err[0])
+                    set_error(err, err_cap,
+                        "CT2 prepare failed after fencing; source remains fenced and recovery is required");
                 return QIHSE_CLUSTER_TRANSFER_PENDING;
             }
             OPENSSL_cleanse(&txn, sizeof(txn));
             if (fence_may_be_active) {
-                set_error(err, err_cap,
-                    "CT2 prepare outcome is unresolved after fencing began; source may remain fenced");
+                if (!err || !err_cap || !err[0])
+                    set_error(err, err_cap,
+                        "CT2 prepare outcome is unresolved after fencing began; source may remain fenced");
                 return QIHSE_CLUSTER_TRANSFER_PENDING;
             }
             return QIHSE_CLUSTER_TRANSFER_REJECTED;

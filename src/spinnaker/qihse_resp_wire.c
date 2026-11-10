@@ -216,9 +216,11 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
 #ifdef _WIN32
             int received = recv(client_fd, buffer + buffered,
                                 (int)((size_t)MAX_FRAME_BYTES - buffered), 0);
+            if (received == SOCKET_ERROR && WSAGetLastError() == WSAEINTR) continue;
 #else
             ssize_t received = recv(client_fd, buffer + buffered,
                                     (size_t)MAX_FRAME_BYTES - buffered, 0);
+            if (received < 0 && errno == EINTR) continue;
 #endif
             if (received <= 0) goto client_done;
             buffered += (size_t)received;
@@ -255,6 +257,11 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             while (token && argc < MAX_ARGS) {
                 args[argc++] = token;
                 token = strtok_r(NULL, " \r\n", &save_ptr);
+            }
+            if (token) {
+                const char* reply = "-ERR malformed inline request\r\n";
+                resp_write_all(client_fd, reply, strlen(reply));
+                break;
             }
         }
 

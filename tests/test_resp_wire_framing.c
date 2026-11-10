@@ -3,6 +3,7 @@
 #endif
 #include "qihse_resp_wire.h"
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_kv_store.h"
 
 #include <assert.h>
@@ -161,6 +162,19 @@ static void test_write_all(void) {
     close(sockets[0]);
 }
 
+static void test_inline_arg_limit(qihse_kv_store_t* store) {
+    client_args_t args; pthread_t thread;
+    start_client(&args,&thread,store);
+    char request[5000]; size_t used=0;
+    for(unsigned i=0;i<2049;i++) { request[used++]='x'; request[used++]=' '; }
+    request[used++]='\r'; request[used++]='\n';
+    write_exact(args.client_fd,request,used);
+    static const char expected[]="-ERR malformed inline request\r\n";
+    char reply[sizeof(expected)]; read_exact(args.client_fd,reply,sizeof(expected)-1);
+    assert(!memcmp(reply,expected,sizeof(expected)-1));
+    close(args.client_fd); assert(pthread_join(thread,NULL)==0);
+}
+
 static void remove_test_dir(const char* path) {
     DIR* dir = opendir(path);
     if (!dir) return;
@@ -189,9 +203,13 @@ int main(void) {
     test_split_pipeline(store);
     test_bounds(store, "*1\r\n$1048577\r\n");
     test_bounds(store, "*2049\r\n");
+    test_inline_arg_limit(store);
     test_write_all();
 
     qihse_kv_store_destroy(store);
+    qihse_auth_shutdown_rate_limiter();
+    qihse_auth_shutdown_volume_limiter();
+    qihse_audit_shutdown();
     remove_test_dir(data_dir);
     puts("test_resp_wire_framing: all assertions passed");
     return 0;
