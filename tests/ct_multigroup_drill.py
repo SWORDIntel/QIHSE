@@ -12,13 +12,15 @@ import binascii
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 from ct_transport_drill import (
     IsolatedCluster, OPERATOR_PASSWORD, ROOT, ct1_receiver_status, ct1_source_status,
-    new_generation, parse_resp_frame, topology_id_for,
+    _free_udp_port, new_generation, parse_resp_frame, topology_id_for,
 )
 
 NODES = ("lead", "successor", "joiner")  # A, B, C
@@ -154,6 +156,8 @@ def main():
         for name in NODES:
             cluster.reserve_endpoint(name)
         topology = {name: topology_id_for(*cluster.endpoints[name]) for name in NODES}
+        mesh_members = {name: str(uuid.uuid4()) for name in NODES}
+        mesh_ports = {name: _free_udp_port() for name in NODES}
         group_ids = {name: secrets.token_hex(32) for name in OWNER}
         generations = {name: new_generation() for name in OWNER}
         protected_tag = tag_for(5692, 8191, "protected")
@@ -161,6 +165,17 @@ def main():
         protected_value = f"classified-sci-fixture-{secrets.token_hex(12)}"
         seed_classified_kv(cluster, "lead", protected_key, protected_value,
                            classification=5, sci=1)
+
+        # Provision each member's pinned mesh peer keys beneath its own data
+        # directory. Every daemon receives the same voter UUID set and its two
+        # peer UUID/QKP/DSA/loopback endpoint tuples.
+        for local in NODES:
+            peer_dir = cluster.root / local / "data" / "consensus-peers"
+            peer_dir.mkdir(mode=0o700, exist_ok=True)
+            for peer in NODES:
+                if peer != local:
+                    shutil.copyfile(cluster.identity_file(peer, "qihse_dsa_pub.pem"),
+                                    peer_dir / f"{peer}.pem")
 
         # One common replicated configuration on every daemon. A receives B's
         # group, B receives C's group, and C receives A's group.
@@ -175,6 +190,22 @@ def main():
 
         def start(name, *, brain=False, target_clearance=65535, target_sci=65535):
             extra = list(group_args)
+            extra.extend(["--consensus-group", "ct-multigroup-ring",
+                          "--consensus-self", mesh_members[name],
+                          "--consensus-listen-ip", "127.0.0.1",
+                          "--consensus-port", str(mesh_ports[name]),
+                          "--consensus-authority-proposals",
+                          "--consensus-history-id", "2a" * 32,
+                          "--consensus-writer-epoch", "1",
+                          "--consensus-election-base-ms", "500",
+                          "--consensus-election-spread-ms", "500",
+                          "--consensus-heartbeat-ms", "50"])
+            for member in NODES:
+                extra.extend(["--consensus-member", mesh_members[member]])
+                if member != name:
+                    extra.extend(["--consensus-peer",
+                        f"{mesh_members[member]}:{NODE_IDS[member]}:"
+                        f"consensus-peers/{member}.pem:127.0.0.1:{mesh_ports[member]}"])
             for candidate in NODES:
                 if candidate != name:
                     extra.extend(["--replication-allowed-peer", NODE_IDS[candidate],
@@ -191,8 +222,8 @@ def main():
                               "--brain-cooldown", "1", "--brain-dir", str(brain_dir)])
             return cluster.start_node(name, NODES.index(name), NODE_IDS[name], extra,
                 topology_names=NODES,
-                slot_ranges={name: tuple(map(int, SLOT_RUNS[name].split("-")))
-                             for name in NODES},
+                slot_ranges={node: tuple(map(int, SLOT_RUNS[node].split("-")))
+                             for node in NODES},
                 topology_qkp_ids=NODE_IDS)[1]
 
         # Start concurrently: group membership is cyclic, so no node may wait
