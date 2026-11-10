@@ -41,6 +41,11 @@ int main(void) {
     assert(qihse_ctr_open_write(path, true, &ctr));
     assert(sync_calls == 2); /* initialized inode, then its parent directory */
     qihse_ctr_close(&ctr);
+    sync_calls = 0;
+    fail_sync_call = 1;
+    assert(qihse_ctr_open_write(path, false, &ctr));
+    assert(sync_calls == 0); /* hot WAL reopens remain unsynced */
+    qihse_ctr_close(&ctr);
     assert(unlink(path) == 0);
 
     make_path(path, sizeof(path), dir, "file-sync-fails.qdb");
@@ -49,6 +54,11 @@ int main(void) {
     errno = 0;
     assert(!qihse_ctr_open_write(path, true, &ctr));
     assert(sync_calls == 1 && errno == EIO);
+    sync_calls = 0;
+    fail_sync_call = 0;
+    assert(qihse_ctr_open_write(path, true, &ctr));
+    assert(sync_calls == 2); /* retry re-syncs file and parent */
+    qihse_ctr_close(&ctr);
     assert(unlink(path) == 0);
 
     make_path(path, sizeof(path), dir, "directory-sync-fails.qdb");
@@ -57,8 +67,13 @@ int main(void) {
     errno = 0;
     assert(!qihse_ctr_open_write(path, true, &ctr));
     assert(sync_calls == 2 && errno == EIO);
-    /* The pathname may exist despite uncertain directory durability. The
-     * caller is told failure and this isolated test removes its own fixture. */
+    /* The file is valid, but the parent sync was uncertain. Retry through the
+     * create=true contract and verify both syncs are attempted again. */
+    sync_calls = 0;
+    fail_sync_call = 0;
+    assert(qihse_ctr_open_write(path, true, &ctr));
+    assert(sync_calls == 2);
+    qihse_ctr_close(&ctr);
     assert(unlink(path) == 0);
 
     assert(unsetenv("QIHSE_ALLOW_INSECURE_CONTAINER") == 0);

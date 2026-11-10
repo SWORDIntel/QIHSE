@@ -536,6 +536,7 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
     int fd;
     uint32_t count = 0u;
     size_t path_len;
+    bool sync_file_and_parent = create;
 
     if (!path || !ctr) {
         errno = EINVAL;
@@ -605,26 +606,7 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
                 close(fd);
                 return false;
             }
-#ifndef _WIN32
-            /* Persist the initial file before callers can acknowledge a
-             * later WAL fsync. File sync alone does not make this new
-             * directory entry durable. */
-            if (!ctr_sync_fd(fd) || !ctr_sync_parent_directory(path)) {
-                int saved_errno = errno ? errno : EIO;
-                ctr_lock_release(fd);
-                close(fd);
-                errno = saved_errno;
-                return false;
-            }
-#else
-            if (!ctr_sync_fd(fd)) {
-                int saved_errno = errno ? errno : EIO;
-                ctr_lock_release(fd);
-                close(fd);
-                errno = saved_errno;
-                return false;
-            }
-#endif
+            sync_file_and_parent = true;
             count = 0u;
         } else {
             if (!ctr_read_table(fd, ctr->sections, &count)) {
@@ -641,6 +623,23 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
                     qihse_pqc_init(&ctr->pqc_ctx, enc_key, NULL);
                 }
             }
+        }
+    }
+
+    /* Explicit create/open requests must re-establish durability even when a
+     * prior attempt left a valid initialized file but failed its parent sync.
+     * A create=false reopen of an existing container stays sync-free. */
+    if (sync_file_and_parent) {
+        bool synced = ctr_sync_fd(fd);
+#ifndef _WIN32
+        if (synced) synced = ctr_sync_parent_directory(path);
+#endif
+        if (!synced) {
+            int saved_errno = errno ? errno : EIO;
+            ctr_lock_release(fd);
+            close(fd);
+            errno = saved_errno;
+            return false;
         }
     }
 
