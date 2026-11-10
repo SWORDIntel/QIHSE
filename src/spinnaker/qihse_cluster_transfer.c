@@ -175,6 +175,9 @@ static bool ct_seal(qihse_cluster_ownership_context_t *c,
               sizeof(parts) / sizeof(parts[0]), &reply) && reply.data &&
               reply.len == 5u && memcmp(reply.data, "+OK\r\n", 5u) == 0;
     qihse_resp_ct_reply_free(&reply);
+    /* The response can be lost after the target has durably sealed. The
+     * caller resolves that ambiguity using the QKP-pinned receipt, whose
+     * exact tuple is independently validated before COMMIT. */
     return ok;
 }
 
@@ -312,13 +315,14 @@ static bool activate_and_publish(qihse_cluster_transfer_context_t *c,
         strlen(txn->generation), strlen(first), strlen(last), strlen(source_lsn),
         strlen(epoch), strlen(target_lsn), 64u};
     qihse_resp_ct_reply_t reply = {0};
-    bool activated_command = ct_rpc(c->ownership, target_index, txn->target_qkp_id,
-                                    parts, lens, 14u, &reply) && reply.data &&
-                             reply.len == 5u && memcmp(reply.data, "+OK\r\n", 5u) == 0;
+    (void)ct_rpc(c->ownership, target_index, txn->target_qkp_id,
+                 parts, lens, 14u, &reply);
     qihse_resp_ct_reply_free(&reply);
     qihse_cluster_ct_activation_receipt_t *receipt = NULL;
-    bool activated = activated_command &&
-        qihse_resp_ct_peer_activation_receipt_query_to(c->ownership->resp_server,
+    /* Treat the typed durable receipt as the completion authority. ACTIVATE
+     * may have committed at the target even when its transport reply was
+     * lost; querying only after +OK strands a recoverable transfer fenced. */
+    bool activated = qihse_resp_ct_peer_activation_receipt_query_to(c->ownership->resp_server,
             target_index, txn->target_qkp_id, txn->transfer_id,
             txn->source_id, txn->target_id, txn->source_qkp_id,
             txn->target_qkp_id, txn->generation, txn->start, txn->end,
@@ -613,11 +617,10 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
     }
 
     progress(c, QIHSE_CLUSTER_TRANSFER_SEALING, total, total);
-    if (!ct_seal(c->ownership, target_index, &txn, total, image_sha_hex, range_sha_hex)) {
-        set_error(err, err_cap, "target CT2 seal is unconfirmed; source remains fenced");
-        return QIHSE_CLUSTER_TRANSFER_PENDING;
-    }
-
+    /* SEAL may have durably completed even if its reply was lost. The
+     * following pinned receipt query decides whether COMMIT is authorized. */
+    (void)ct_seal(c->ownership, target_index, &txn, total,
+                  image_sha_hex, range_sha_hex);
     qihse_cluster_ct_peer_receipt_t *receipt = NULL;
     if (!qihse_resp_ct_peer_receipt_query_to(c->ownership->resp_server, target_index,
             txn.target_qkp_id,

@@ -16,6 +16,11 @@ static const unsigned char image[] = "classified-row-a\0classified-row-b\n";
 static unsigned char received[sizeof(image)];
 static uint64_t durable_offset;
 static int dropped_first_chunk_ack;
+static bool drop_seal_reply_after_commit;
+static bool drop_activate_reply_after_commit;
+static bool durable_sealed;
+static bool durable_activated;
+static bool forge_activation_receipt;
 static int fail_owner_token;
 static int read_calls;
 static int publish_calls;
@@ -165,6 +170,11 @@ bool qihse_resp_ct_peer_command_to(qihse_resp_server_t *server,
         assert(argv[13].len == 64);
         assert_hex_byte(&argv[14], 0x42);
         event("seal");
+        durable_sealed = true;
+        if (drop_seal_reply_after_commit) {
+            drop_seal_reply_after_commit = false;
+            return false; /* Target committed seal, transport lost reply. */
+        }
         out->data = malloc(5);
         assert(out->data);
         memcpy(out->data, "+OK\r\n", 5);
@@ -178,6 +188,11 @@ bool qihse_resp_ct_peer_command_to(qihse_resp_server_t *server,
         assert(!strcmp(argv[11].data, "7"));
         assert(!strcmp(argv[12].data, "6"));
         event("activate");
+        durable_activated = true;
+        if (drop_activate_reply_after_commit) {
+            drop_activate_reply_after_commit = false;
+            return false; /* Target activated, transport lost reply. */
+        }
         out->data = malloc(5);
         assert(out->data);
         memcpy(out->data, "+OK\r\n", 5);
@@ -386,6 +401,7 @@ bool qihse_resp_ct_peer_receipt_query_to(qihse_resp_server_t *server, uint16_t t
     assert(source_lsn == pending.source_lsn && config_epoch == pending.config_epoch &&
            memcmp(received, image, sizeof(image)) == 0);
     event("receipt");
+    if (!durable_sealed) return false;
     *out = calloc(1, sizeof(**out));
     return *out != NULL;
 }
@@ -424,6 +440,7 @@ bool qihse_resp_ct_peer_activation_receipt_query_to(qihse_resp_server_t *server,
     assert(source_lsn == committed.source_lsn && config_epoch == committed.config_epoch &&
            target_lsn == committed.target_lsn);
     assert(memcmp(checksum, committed.proof_digest, 32) == 0);
+    if (!durable_activated) return false;
     activated = 1;
     event("activation-receipt");
     *out = calloc(1, sizeof(**out));
@@ -442,7 +459,7 @@ bool qihse_resp_ct_activation_receipt_validate(const qihse_cluster_ct_activation
     assert(!strcmp(generation, committed.generation) && first == committed.start && last == committed.end);
     assert(source_lsn == committed.source_lsn && target_lsn && checksum);
     if (config_epoch != committed.config_epoch) return false;
-    *target_lsn = committed.target_lsn;
+    *target_lsn = committed.target_lsn + (forge_activation_receipt ? 1u : 0u);
     memcpy(checksum, committed.proof_digest, 32);
     return activated;
 }
@@ -599,6 +616,10 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
         .ownership = &ownership,
         .chunk_bytes = 8,
     };
+    /* Both replies are lost after the remote durable transition. The exact
+     * pinned receipts must resolve these cases without a manual retry. */
+    drop_seal_reply_after_commit = true;
+    drop_activate_reply_after_commit = true;
     unsigned int n = 0;
     assert(EVP_Digest(image, sizeof(image), sealed_sha, &n, EVP_sha256(), NULL) == 1 && n == 32);
     assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
@@ -627,10 +648,18 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
     assert(!strcmp(events[events_before_retry], "activate") &&
            !strcmp(events[events_before_retry + 1], "activation-receipt") &&
            !strcmp(events[events_before_retry + 2], "publish"));
+    /* An invalid durable receipt cannot advance or republish ownership. */
+    forge_activation_receipt = true;
+    int publishes_before_forged = publish_calls;
+    assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
+        NULL, 0) == QIHSE_CLUSTER_TRANSFER_PENDING);
+    assert(publish_calls == publishes_before_forged);
+    forge_activation_receipt = false;
+    size_t events_before_immutable_reject = event_count;
     /* Reusing an immutable finalized ID with a different range is refused. */
     assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 11, 12,
         NULL, 0) == QIHSE_CLUSTER_TRANSFER_REJECTED);
-    assert(event_count == events_before_retry + 3 && read_calls == reads_before_retry &&
+    assert(event_count == events_before_immutable_reject && read_calls == reads_before_retry &&
            publish_calls == publishes_before_retry + 1);
     qihse_cluster_ct_peer_receipt_t staged = {0};
     uint64_t target_lsn = 0;
@@ -655,6 +684,8 @@ int main(void) {
     test_definite_prepare_rejection_stays_rejected();
     event_count = 0; read_calls = 0; publish_calls = 0; activated = 0;
     durable_offset = 0; dropped_first_chunk_ack = 0;
+    durable_sealed = false; durable_activated = false;
+    forge_activation_receipt = false;
     memset(received, 0, sizeof(received));
     test_pinned_qkp_transfer_resumes_and_activates_before_publish();
     return 0;
