@@ -42,6 +42,7 @@
 #define WAL_BUFFER_FLUSH_THRESHOLD 65536u
 #define KV_MAX_KEY_LEN 65535u
 #define KV_MAX_VALUE_LEN (16u * 1024u * 1024u)
+#define KV_CT_DEFAULT_LANE_LIMIT_BYTES (512u * 1024u * 1024u)
 #define KV_FLAG_TOMBSTONE 0x01u
 #define KV_ALLOWED_FLAGS KV_FLAG_TOMBSTONE
 #define KV_WAL_MAGIC "QKV2"
@@ -49,6 +50,8 @@
 #define KV_WAL_MAGIC_LOCAL_SEQ "QKV4"
 #define KV_WAL_MAGIC_DELETE_RECEIPT "QKV5"
 #define KV_WAL_MAGIC_CT "QKV6"
+#define KV_WAL_MAGIC_CT_LANE_BASELINE "QKV7"
+#define KV_WAL_CT_LANE_BASELINE_FRAME_BYTES 2256u
 #define KV_REPLICA_CURSOR_MAGIC "QRC1"
 #define KV_REPLICA_CURSOR_MAX_ITEMS 4096u
 #define KV_REPLICA_CURSOR_MAX_ID 128u
@@ -326,7 +329,7 @@ typedef struct qihse_kv_ct_lane {
 
 typedef struct qihse_kv_ct_lane_transfer_state {
     bool active;
-    uint8_t phase; /* 1 reserved, 2 imported, 3 finalized */
+    uint8_t phase; /* 1 reserved, 2 imported, 3 membership intent, 4 finalized */
     qihse_kv_ct_lane_authority_claim_t claim;
     uint64_t source_cut, target_cursor, import_base_change_seq, applied_records;
     uint8_t import_prefix_digest[32], range_digest[32], image_digest[32];
@@ -918,7 +921,9 @@ static bool ct_lane_read_u64(FILE* f, uint64_t* hash, uint64_t* out) {
 
 static bool ct_lane_serialize(FILE* f, uint64_t* hash, const qihse_kv_ct_lane_t* lane) {
     uint8_t flags = (uint8_t)((lane->status.baseline_sealed ? 1u : 0u) |
-                              (lane->status.admitted ? 2u : 0u));
+                              (lane->status.admitted ? 2u : 0u) |
+                              (lane->status.promotion_pending ? 4u : 0u) |
+                              (lane->status.baseline_refresh_needed ? 8u : 0u));
     return ct_lane_emit(f, hash, lane->status.lane_id, sizeof(lane->status.lane_id)) &&
         ct_lane_emit(f, hash, lane->status.source_id, sizeof(lane->status.source_id)) &&
         ct_lane_emit(f, hash, lane->status.peer_id, sizeof(lane->status.peer_id)) &&
@@ -926,6 +931,7 @@ static bool ct_lane_serialize(FILE* f, uint64_t* hash, const qihse_kv_ct_lane_t*
         ct_lane_emit(f, hash, &lane->status.mode, 1u) &&
         ct_lane_emit(f, hash, lane->status.slot_bitmap, QIHSE_KV_CT_SLOT_BITMAP_BYTES) &&
         ct_lane_emit_u64(f, hash, lane->status.baseline_row_seq) &&
+        ct_lane_emit_u64(f, hash, lane->status.baseline_stream_cut) &&
         ct_lane_emit_u64(f, hash, lane->status.durable_position) &&
         ct_lane_emit_u64(f, hash, lane->status.acknowledged_position) &&
         ct_lane_emit_u64(f, hash, lane->status.retained_bytes) &&
@@ -941,7 +947,8 @@ static bool ct_lane_serialize(FILE* f, uint64_t* hash, const qihse_kv_ct_lane_t*
         ct_lane_emit(f, hash, lane->last_group_digest, 32u);
 }
 
-static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lane) {
+static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lane,
+                               bool has_stream_cut) {
     uint8_t flags = 0u; uint32_t policy = 0u;
     memset(lane, 0, sizeof(*lane));
     bool ok = ct_lane_read(f, hash, lane->status.lane_id, sizeof(lane->status.lane_id)) &&
@@ -951,6 +958,8 @@ static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lan
         ct_lane_read(f, hash, &lane->status.mode, 1u) &&
         ct_lane_read(f, hash, lane->status.slot_bitmap, QIHSE_KV_CT_SLOT_BITMAP_BYTES) &&
         ct_lane_read_u64(f, hash, &lane->status.baseline_row_seq) &&
+        (!has_stream_cut || ct_lane_read_u64(f, hash,
+            &lane->status.baseline_stream_cut)) &&
         ct_lane_read_u64(f, hash, &lane->status.durable_position) &&
         ct_lane_read_u64(f, hash, &lane->status.acknowledged_position) &&
         ct_lane_read_u64(f, hash, &lane->status.retained_bytes) &&
@@ -963,7 +972,7 @@ static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lan
         ct_lane_read_u32(f, hash, &lane->tenant_id) &&
         ct_lane_read(f, hash, lane->owner_token, sizeof(lane->owner_token)) &&
         ct_lane_read(f, hash, lane->last_group_digest, 32u);
-    if (!ok || (flags & ~3u) ||
+    if (!ok || (flags & ~15u) ||
         lane->status.lane_id[QIHSE_KV_CT_LANE_ID_MAX] != '\0' ||
         lane->status.source_id[QIHSE_KV_CT_ID_MAX] != '\0' ||
         lane->status.peer_id[QIHSE_KV_CT_ID_MAX] != '\0' ||
@@ -971,6 +980,8 @@ static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lan
     lane->used = true;
     lane->status.baseline_sealed = (flags & 1u) != 0u;
     lane->status.admitted = (flags & 2u) != 0u;
+    lane->status.promotion_pending = (flags & 4u) != 0u;
+    lane->status.baseline_refresh_needed = (flags & 8u) != 0u;
     lane->tenant_policy = (qihse_kv_ct_tenant_policy_t)policy;
     return true;
 }
@@ -982,7 +993,7 @@ static bool ct_lanes_state_write(qihse_kv_store_t* store) {
     if (!build_data_path(path, sizeof(path), "ct-lanes.bin") ||
         !atomic_file_begin(path, temp, sizeof(temp), &f)) return false;
     uint64_t hash = 14695981039346656037ULL;
-    bool ok = ct_lane_emit(f, &hash, "QCTLN002", 8u) &&
+    bool ok = ct_lane_emit(f, &hash, "QCTLN003", 8u) &&
               ct_lane_emit_u32(f, &hash, (uint32_t)store->ct_lane_count);
     size_t emitted = 0u;
     for (size_t i = 0; ok && i < store->ct_lane_capacity; ++i)
@@ -1011,22 +1022,36 @@ static bool ct_lanes_state_read(qihse_kv_store_t* store, qihse_user_t* user) {
     if (!f) { close(fd); return false; }
     uint64_t hash = 14695981039346656037ULL;
     char magic[8]; uint32_t count = 0u;
-    bool ok = ct_lane_read(f, &hash, magic, sizeof(magic)) &&
-        memcmp(magic, "QCTLN002", 8u) == 0 && ct_lane_read_u32(f, &hash, &count) &&
+    bool ok = ct_lane_read(f, &hash, magic, sizeof(magic));
+    bool has_stream_cut = ok && memcmp(magic, "QCTLN003", 8u) == 0;
+    ok = ok && (has_stream_cut || memcmp(magic, "QCTLN002", 8u) == 0) &&
+        ct_lane_read_u32(f, &hash, &count) &&
         count <= QIHSE_KV_CT_MAX_LANES;
     qihse_kv_ct_lane_t* lanes = ok && count ? calloc(count, sizeof(*lanes)) : NULL;
     if (ok && count && !lanes) ok = false;
     for (uint32_t i = 0; ok && i < count; ++i) {
         qihse_kv_ct_lane_t* lane = &lanes[i];
-        ok = ct_lane_deserialize(f, &hash, lane) &&
+        ok = ct_lane_deserialize(f, &hash, lane, has_stream_cut) &&
             ct_lane_id_valid(lane->status.lane_id) && ct_id_valid(lane->status.source_id) &&
             ct_id_valid(lane->status.peer_id) && ct_id_valid(lane->status.generation) &&
             (lane->status.mode == QIHSE_KV_CT_LANE_SOURCE || lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER) &&
             lane->status.durable_position >= lane->status.acknowledged_position &&
+            lane->status.baseline_stream_cut <= lane->status.durable_position &&
             (lane->tenant_policy == QIHSE_KV_CT_TENANT_EXACT || lane->tenant_policy == QIHSE_KV_CT_TENANT_SYSTEM_ALL);
         for (uint32_t j = 0; ok && j < i; ++j)
             if (!strcmp(lanes[j].status.lane_id, lane->status.lane_id) ||
                 !strcmp(lanes[j].status.generation, lane->status.generation)) ok = false;
+    }
+    if (ok && !has_stream_cut) {
+        for (uint32_t i = 0; i < count; ++i) {
+            qihse_kv_ct_lane_status_t* status = &lanes[i].status;
+            status->baseline_sealed = false;
+            status->admitted = false;
+            status->baseline_refresh_needed = true;
+            status->baseline_row_seq = 0u;
+            status->baseline_stream_cut = 0u;
+            memset(status->baseline_digest, 0, sizeof(status->baseline_digest));
+        }
     }
     unsigned char stored_sum[8] = {0};
     if (ok) ok = fread(stored_sum, 1u, sizeof(stored_sum), f) == sizeof(stored_sum) &&
@@ -1045,8 +1070,6 @@ static bool ct_lanes_state_read(qihse_kv_store_t* store, qihse_user_t* user) {
     store->ct_lane_count = count;
     store->ct_lane_capacity = count;
     for (size_t i = 0; i < count; ++i) {
-        store->lanes[i].status.durable_position = 0u;
-        store->lanes[i].status.retained_bytes = 0u;
         if (store->lanes[i].status.mode == QIHSE_KV_CT_LANE_SOURCE)
             store->lanes[i].status.admitted = false;
     }
@@ -1059,7 +1082,7 @@ static bool ct_lanes_state_read(qihse_kv_store_t* store, qihse_user_t* user) {
         errno = EINVAL;
         return false;
     }
-    if (certificates_changed && !ct_lanes_state_write(store)) {
+    if ((certificates_changed || !has_stream_cut) && !ct_lanes_state_write(store)) {
         free(store->lanes);
         store->lanes = NULL;
         store->ct_lane_count = store->ct_lane_capacity = 0u;
@@ -1295,7 +1318,7 @@ static bool ct_write_allowed(qihse_kv_store_t* store, qihse_user_t* user,
             kv_ct_scope->lane_id[0] ? ct_lane_find(store, kv_ct_scope->lane_id) :
                                       ct_lane_for_key(store, key);
         if (!lane || lane->status.mode != QIHSE_KV_CT_LANE_SOURCE ||
-            !lane->status.admitted || !key ||
+            !lane->status.admitted || lane->status.promotion_pending || !key ||
             !ct_lane_bitmap_contains(lane, key)) { errno = EACCES; return false; }
         if (kv_ct_scope->lane_id[0] &&
             strcmp(kv_ct_scope->lane_id, lane->status.lane_id) != 0) {
@@ -1340,7 +1363,7 @@ static bool ct_read_ready(qihse_kv_store_t* store) {
             if (!lane->used || lane->status.mode != QIHSE_KV_CT_LANE_SOURCE) continue;
             have_source = true;
             if (!lane->status.admitted || lane->status.durable_position !=
-                lane->status.acknowledged_position) {
+                lane->status.acknowledged_position || lane->status.promotion_pending) {
                 errno = EAGAIN;
                 return false;
             }
@@ -1367,7 +1390,8 @@ static bool ct_key_owned_for_read(qihse_kv_store_t* store, const char* key) {
                 (uint8_t)(1u << (slot % 8u)))) { lane = candidate; break; }
         }
         return lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
-            lane->status.admitted && lane->status.durable_position ==
+            lane->status.admitted && !lane->status.promotion_pending &&
+            lane->status.durable_position ==
                 lane->status.acknowledged_position;
     }
     return !(store->ct_moved_slots[slot / 8u] & (1u << (slot % 8u))) &&
@@ -1389,7 +1413,7 @@ static bool ct_key_read_ready(qihse_kv_store_t* store, const char* key) {
                 (uint8_t)(1u << (slot % 8u)))) { lane = candidate; break; }
         }
         if (!lane || lane->status.mode != QIHSE_KV_CT_LANE_SOURCE ||
-            !lane->status.admitted ||
+            !lane->status.admitted || lane->status.promotion_pending ||
             lane->status.durable_position != lane->status.acknowledged_position) {
             errno = EAGAIN; return false;
         }
@@ -1422,10 +1446,18 @@ static void ct_scope_note_seq(qihse_kv_store_t* store, uint64_t seq) {
         kv_ct_scope->last_seq = seq;
 }
 
+static bool ct_lane_log_append_fd(qihse_kv_store_t* store, const char* lane_id,
+    const char* source_id, const char* generation, uint64_t ack_position,
+    uint64_t position, qihse_user_t* principal,
+    qihse_kv_ct_tenant_policy_t policy, uint32_t tenant_id, int wal_fd,
+    off_t frame_offset, size_t frame_bytes, uint64_t retained_limit,
+    uint64_t* out_retained_bytes);
+
 static bool ct_lane_append_record(qihse_kv_store_t* store, qihse_user_t* user,
     qihse_kv_ct_lane_t* lane, const qihse_kv_ct_record_t* record, bool dry_run) {
     if (!store || !user || !lane || !record || !store->wal_fd ||
-        !lane->status.admitted || lane->status.mode != QIHSE_KV_CT_LANE_SOURCE ||
+        !lane->status.admitted || lane->status.promotion_pending ||
+        lane->status.mode != QIHSE_KV_CT_LANE_SOURCE ||
         !ct_lane_bitmap_contains(lane, record->key) ||
         lane->status.durable_position == UINT64_MAX) { errno = EACCES; return false; }
     qihse_kv_ct_group_t group = {0};
@@ -1447,6 +1479,9 @@ static bool ct_lane_append_record(qihse_kv_store_t* store, qihse_user_t* user,
     unsigned char digest[32];
     if (!qihse_ct_codec_group_digest(store->ct_system_principal,
             QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, &group, digest)) return false;
+    if (fflush(store->wal_fd) != 0) return false;
+    off_t frame_offset = lseek(fileno(store->wal_fd), 0, SEEK_END);
+    if (frame_offset < 0) return false;
     size_t written = 0u;
     if (!qihse_ct_codec_write(store->wal_fd, store->ct_system_principal,
             QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 1u, &group,
@@ -1454,12 +1489,25 @@ static bool ct_lane_append_record(qihse_kv_store_t* store, qihse_user_t* user,
         fflush(store->wal_fd) != 0 || fdatasync(fileno(store->wal_fd)) != 0) {
         store->recovery_pending = true; return false;
     }
+    uint64_t retained_after = 0u;
+    if (!ct_lane_log_append_fd(store, lane->status.lane_id,
+            lane->status.source_id, lane->status.generation,
+            lane->status.acknowledged_position, group.stream_position,
+            store->ct_system_principal, QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+            fileno(store->wal_fd),
+            frame_offset, frame_bytes, lane->status.limit_bytes,
+            &retained_after) ||
+        retained_after > lane->status.limit_bytes) {
+        store->recovery_pending = true;
+        if (errno == 0) errno = ENOSPC;
+        return false;
+    }
     uint64_t old_position = lane->status.durable_position;
     uint64_t old_bytes = lane->status.retained_bytes;
     unsigned char old_digest[32];
     memcpy(old_digest, lane->last_group_digest, sizeof(old_digest));
     lane->status.durable_position = group.stream_position;
-    lane->status.retained_bytes += frame_bytes;
+    lane->status.retained_bytes = retained_after;
     memcpy(lane->last_group_digest, digest, sizeof(digest));
     if (!ct_lanes_state_write(store)) {
         lane->status.durable_position = old_position;
@@ -1565,6 +1613,14 @@ bool qihse_kv_ct_lane_source_enable(qihse_kv_store_t* store,
     if (!valid || store->recovery_pending) {
         kv_store_unlock(store); errno = valid ? EIO : EEXIST; return false;
     }
+    /* Materialize any legacy, ungrouped WAL before publishing the downgrade
+     * fence. Those authenticated records predate the lane map and must remain
+     * recoverable, but a lane-mode reader must reject unscoped QKV4 frames. */
+    if (is_new && store->ct_lane_count == 0u && !store->ct_enabled &&
+        !kv_sync_store_locked(store)) {
+        kv_store_unlock(store);
+        return false;
+    }
     qihse_kv_ct_lane_t old = *lane;
     memset(lane, 0, sizeof(*lane));
     lane->used = true;
@@ -1646,6 +1702,13 @@ bool qihse_kv_ct_lane_receiver_bind(qihse_kv_store_t* store,
     if (!valid || store->recovery_pending) {
         kv_store_unlock(store); errno = valid ? EIO : EEXIST; return false;
     }
+    /* Flush/rotate pre-lane ungrouped mutations before the QCTST004 marker
+     * makes the new group-aware reader authoritative. */
+    if (is_new && store->ct_lane_count == 0u && !store->ct_enabled &&
+        !kv_sync_store_locked(store)) {
+        kv_store_unlock(store);
+        return false;
+    }
     qihse_kv_ct_lane_t old = *lane;
     memset(lane, 0, sizeof(*lane));
     lane->used = true;
@@ -1656,6 +1719,10 @@ bool qihse_kv_ct_lane_receiver_bind(qihse_kv_store_t* store,
     lane->status.mode = QIHSE_KV_CT_LANE_RECEIVER;
     memcpy(lane->status.slot_bitmap, slot_bitmap, QIHSE_KV_CT_SLOT_BITMAP_BYTES);
     lane->status.baseline_row_seq = baseline_row_seq;
+    /* A receiver becomes a source after promotion. Give it a usable bounded
+     * retransmission budget even though the bind handshake currently carries
+     * no sender quota; each sender still enforces its own configured limit. */
+    lane->status.limit_bytes = KV_CT_DEFAULT_LANE_LIMIT_BYTES;
     lane->tenant_policy = tenant_policy;
     lane->tenant_id = tenant_id;
     lane->status.baseline_sealed = false;
@@ -1746,9 +1813,49 @@ bool qihse_kv_ct_lane_status(qihse_kv_store_t* store, qihse_user_t* principal,
     kv_store_rdlock(store);
     qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
     bool ok = lane && !store->recovery_pending &&
-        (ct_admin(principal) || (lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
-         principal == store->ct_system_principal));
+        (ct_admin(principal) || principal == store->ct_system_principal ||
+         (qihse_user_get_tenant_id(principal) == 0u &&
+          ct_lane_peer_principal(store, principal)));
     if (ok) *out_status = lane->status;
+    kv_store_unlock(store);
+    if (!ok) errno = EACCES;
+    return ok;
+}
+
+bool qihse_kv_ct_lane_source_for_slots(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal,
+    const uint8_t slot_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    qihse_kv_ct_lane_status_t* out_status) {
+    if (out_status) memset(out_status, 0, sizeof(*out_status));
+    if (!store || !slot_bitmap || !out_status || !ct_admin(operator_principal)) {
+        errno = EACCES;
+        return false;
+    }
+    bool nonempty = false;
+    for (size_t i = 0; i < QIHSE_KV_CT_SLOT_BITMAP_BYTES; ++i)
+        nonempty |= slot_bitmap[i] != 0;
+    if (!nonempty) { errno = EINVAL; return false; }
+
+    kv_store_rdlock(store);
+    qihse_kv_ct_lane_t* found = NULL;
+    size_t matches = 0;
+    bool ok = !store->recovery_pending;
+    for (size_t i = 0; ok && i < store->ct_lane_count; ++i) {
+        qihse_kv_ct_lane_t* lane = &store->lanes[i];
+        if (lane->status.mode != QIHSE_KV_CT_LANE_SOURCE ||
+            !lane->status.admitted || lane->status.promotion_pending ||
+            !lane->status.baseline_sealed)
+            continue;
+        bool contains = true;
+        for (size_t b = 0; b < QIHSE_KV_CT_SLOT_BITMAP_BYTES; ++b)
+            if (slot_bitmap[b] & (uint8_t)~lane->status.slot_bitmap[b]) {
+                contains = false;
+                break;
+            }
+        if (contains) { found = lane; ++matches; }
+    }
+    ok = ok && matches == 1;
+    if (ok) *out_status = found->status;
     kv_store_unlock(store);
     if (!ok) errno = EACCES;
     return ok;
@@ -1784,7 +1891,7 @@ bool qihse_kv_ct_writer_scope_enter(qihse_kv_store_t* store,
         for (size_t j = 0; j < store->ct_lane_capacity; ++j) {
             qihse_kv_ct_lane_t* lane = &store->lanes[j];
             if (!lane->used || lane->status.mode != QIHSE_KV_CT_LANE_SOURCE ||
-                !lane->status.admitted) continue;
+                !lane->status.admitted || lane->status.promotion_pending) continue;
             mismatch = 0u;
             for (size_t i = 0; i < QIHSE_KV_CT_TOKEN_BYTES; i++)
                 mismatch |= owner_token[i] ^ lane->owner_token[i];
@@ -1829,7 +1936,8 @@ bool qihse_kv_ct_writer_scope_enter_lane(qihse_kv_store_t* store,
     if (lane) for (size_t i = 0; i < QIHSE_KV_CT_TOKEN_BYTES; ++i)
         mismatch |= owner_token[i] ^ lane->owner_token[i];
     bool ok = lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
-        lane->status.admitted && !store->recovery_pending && mismatch == 0u;
+        lane->status.admitted && !lane->status.promotion_pending &&
+        !store->recovery_pending && mismatch == 0u;
     kv_store_unlock(store);
     if (!ok) { errno = EACCES; return false; }
     qihse_kv_ct_writer_scope_t* scope = calloc(1u, sizeof(*scope));
@@ -2459,6 +2567,34 @@ typedef struct {
     size_t* remaining_snapshot_records;
 } kv_read_context_t;
 
+static bool ct_lane_baseline_frame_validate(
+    const uint8_t frame[KV_WAL_CT_LANE_BASELINE_FRAME_BYTES]);
+static bool ct_lane_baseline_apply_frame(qihse_kv_store_t* store,
+    const uint8_t frame[KV_WAL_CT_LANE_BASELINE_FRAME_BYTES],
+    const kv_read_context_t* context);
+static bool ct_lane_log_append_fd(qihse_kv_store_t* store, const char* lane_id,
+    const char* source_id, const char* generation, uint64_t ack_position,
+    uint64_t position,
+    qihse_user_t* principal, qihse_kv_ct_tenant_policy_t policy,
+    uint32_t tenant_id, int wal_fd, off_t frame_offset,
+    size_t frame_bytes, uint64_t retained_limit, uint64_t* out_retained_bytes);
+static bool ct_lane_log_read(qihse_kv_store_t* store, const char* lane_id,
+    const char* source_id, const char* generation, qihse_user_t* principal,
+    qihse_kv_ct_tenant_policy_t policy, uint32_t tenant_id,
+    uint64_t after_position, size_t max_groups, size_t max_bytes,
+    qihse_kv_ct_group_t** out_groups, size_t* out_count,
+    uint64_t* out_resume_position);
+static bool ct_lane_log_ack(qihse_kv_store_t* store, const char* lane_id,
+    const char* source_id, const char* generation, uint64_t ack_position,
+    qihse_kv_ct_tenant_policy_t policy, uint32_t tenant_id,
+    uint64_t* out_retained_bytes);
+static bool ct_lane_log_checkpoint(qihse_kv_store_t* store, const char* lane_id,
+    const char* source_id, const char* generation, uint64_t ack_position);
+static bool ct_lane_log_status(qihse_kv_store_t* store, const char* lane_id,
+    const char* source_id, const char* generation, uint64_t* out_ack_position,
+    uint64_t* out_last_position, uint64_t* out_retained_bytes);
+static bool ct_lane_logs_reconcile(qihse_kv_store_t* store);
+
 static bool kv_read_allowed(const kv_read_context_t* context, uint16_t classification,
                             uint16_t sci) {
     if (context && context->legacy_bootstrap) return true;
@@ -2647,7 +2783,10 @@ static bool rotate_wal_empty(qihse_kv_store_t* store) {
     if (!atomic_file_begin(wal_path, tmp_path, sizeof(tmp_path), &tmp)) return false;
     if (!atomic_file_commit(tmp, tmp_path, wal_path)) return false;
     if (store->wal_fd) fclose(store->wal_fd);
-    int fd = open(wal_path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+    /* Lane-log appenders copy the already-fsynced QKV6 frame by offset. Keep
+     * the append descriptor readable so that this copy remains exact and does
+     * not need to re-encode an authenticated frame. */
+    int fd = open(wal_path, O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) { store->wal_fd = NULL; return false; }
     store->wal_fd = fdopen(fd, "ab");
     if (!store->wal_fd) { close(fd); return false; }
@@ -3048,8 +3187,7 @@ bool qihse_kv_ct_lane_receiver_apply(qihse_kv_store_t* store,
         if (state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) {
             bool permitted = qihse_auth_can_access(principal, old.classification, old.sci_compartment) &&
                 row->classification >= old.classification &&
-                (row->sci_compartment & old.sci_compartment) == old.sci_compartment &&
-                old.change_seq < row->change_seq;
+                (row->sci_compartment & old.sci_compartment) == old.sci_compartment;
             lookup_result_free(&old);
             if (!permitted) { ok = false; goto lane_done; }
         } else lookup_result_free(&old);
@@ -3084,6 +3222,10 @@ bool qihse_kv_ct_lane_receiver_apply(qihse_kv_store_t* store,
                 row->tombstone ? KV_FLAG_TOMBSTONE : 0u, row->change_seq)) {
             store->recovery_pending = true; ok = false; goto lane_done;
         }
+        /* The source lane's contiguous stream position orders receiver
+         * mutations. Preserve the source row version in storage, while only
+         * flooring the target's allocator so future local writes stay above
+         * every imported version. */
         kv_change_seq_floor(store, row->change_seq);
     }
     *out_durable_cursor = group->stream_position;
@@ -3810,6 +3952,8 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
                            uint64_t* last_seen_position) {
     if (!store->ct_enabled || !context || !context->user ||
         fseeko(f, -4, SEEK_CUR) != 0) return -1;
+    off_t frame_offset = ftello(f);
+    if (frame_offset < 0) return -1;
     qihse_kv_ct_group_t group = {0};
     uint8_t mode = 0u;
     size_t frame_bytes = 0u;
@@ -3821,11 +3965,16 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
     if (rc != 1) return rc == -2 ? -2 : (feof(f) && !ferror(f) ? 0 : -1);
     qihse_kv_ct_lane_t* lane = lane_mode
         ? ct_lane_for_generation(store, group.generation) : NULL;
-    bool is_lane = lane != NULL;
-    bool ok = lane_mode ? (is_lane && mode == (uint8_t)lane->status.mode &&
-        strcmp(group.source_id, lane->status.source_id) == 0 &&
-        group.stream_position != 0u &&
-        group.stream_position == lane->status.durable_position + 1u) :
+    bool current_lane = lane && mode == (uint8_t)lane->status.mode &&
+        strcmp(group.source_id, lane->status.source_id) == 0;
+    /* Lane generations are immutable stream identities. A WAL may contain
+     * authenticated frames from a generation that was later promoted or had
+     * its slot bitmap changed; those frames still reconstruct the historical
+     * data image but must not advance the current lane cursor. */
+    bool ok = lane_mode ? (group.stream_position != 0u &&
+        (!current_lane || group.stream_position <= lane->status.durable_position ||
+         (lane->status.durable_position != UINT64_MAX &&
+          group.stream_position == lane->status.durable_position + 1u))) :
         (mode == store->ct_mode &&
         strcmp(group.source_id, store->ct_source_id) == 0 &&
         strcmp(group.generation, store->ct_generation) == 0 &&
@@ -3836,7 +3985,7 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
     if (ok) {
         for (size_t i = 0; i < group.count; i++) {
             qihse_kv_ct_record_t* r = &group.records[i];
-            if (lane_mode && (!ct_lane_bitmap_contains(lane, r->key) ||
+            if (current_lane && (!ct_lane_bitmap_contains(lane, r->key) ||
                 (lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
                  (lane->tenant_policy == QIHSE_KV_CT_TENANT_EXACT &&
                   r->resource_tenant_id != lane->tenant_id)))) {
@@ -3846,11 +3995,18 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
             kv_lookup_state_t state = logical_lookup(store, r->key, &old);
             if (state == KV_LOOKUP_ERROR) { ok = false; break; }
             if (state == KV_LOOKUP_LIVE || state == KV_LOOKUP_DEAD) {
-                if (old.change_seq > r->change_seq) {
+                /* Stream position supersedes target-local row versions only
+                 * while replaying the currently bound receiver generation.
+                 * A retired receiver generation may predate later promoted
+                 * source writes already present in SSTs, so those historical
+                 * frames retain ordinary source-version reconciliation. */
+                bool receiver_stream = current_lane &&
+                    lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER;
+                if (!receiver_stream && old.change_seq > r->change_seq) {
                     lookup_result_free(&old);
                     continue;
                 }
-                if (old.change_seq == r->change_seq) {
+                if (!receiver_stream && old.change_seq == r->change_seq) {
                     bool same = old.classification == r->classification &&
                         old.sci_compartment == r->sci_compartment &&
                         old.expire_time_ms == r->expire_time_ms &&
@@ -3878,18 +4034,28 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
                                        QIHSE_KV_CT_TENANT_SYSTEM_ALL,
                 !lane_mode && store->ct_mode == 2u ? store->ct_tenant_id : 0u,
                 &group, recovered_digest)) ok = false;
-        if (ok && lane_mode) memcpy(lane->last_group_digest, recovered_digest,
-                       sizeof(recovered_digest));
-        else if (ok) memcpy(store->ct_last_group_digest, recovered_digest,
+        if (ok && lane_mode && current_lane)
+            memcpy(lane->last_group_digest, recovered_digest, sizeof(recovered_digest));
+        else if (ok && !lane_mode) memcpy(store->ct_last_group_digest, recovered_digest,
                        sizeof(recovered_digest));
     }
     if (ok) {
         *last_seen_position = group.stream_position;
-        if (lane_mode) {
-            lane->status.durable_position = group.stream_position;
-            lane->status.retained_bytes += frame_bytes;
+        if (lane_mode && current_lane) {
+            if (lane->status.mode == QIHSE_KV_CT_LANE_SOURCE) {
+                uint64_t retained = 0u;
+                if (!ct_lane_log_append_fd(store, lane->status.lane_id,
+                        lane->status.source_id, lane->status.generation,
+                        lane->status.acknowledged_position, group.stream_position,
+                        context->user, lane->tenant_policy, lane->tenant_id,
+                        fileno(f), frame_offset, frame_bytes,
+                        lane->status.limit_bytes, &retained)) ok = false;
+                else lane->status.retained_bytes = retained;
+            }
+            if (ok && group.stream_position > lane->status.durable_position)
+                lane->status.durable_position = group.stream_position;
         }
-        else if (group.stream_position > store->ct_durable_lsn)
+        else if (!lane_mode && group.stream_position > store->ct_durable_lsn)
             store->ct_durable_lsn = group.stream_position;
     }
     qihse_ct_codec_clear(&group);
@@ -3917,7 +4083,8 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
              * even if a previous transition should have rotated them away. */
             bool lane_local_wal = store->ct_lane_count &&
                 (memcmp(magic, KV_WAL_MAGIC_LOCAL_SEQ, 4u) == 0 ||
-                 memcmp(magic, KV_WAL_MAGIC_DELETE_RECEIPT, 4u) == 0);
+                 memcmp(magic, KV_WAL_MAGIC_DELETE_RECEIPT, 4u) == 0 ||
+                 memcmp(magic, KV_WAL_MAGIC_CT_LANE_BASELINE, 4u) == 0);
             if (store->ct_enabled && !lane_local_wal &&
                 memcmp(magic, KV_WAL_MAGIC_CT, 4u) != 0) {
                 fclose(f); errno = EINVAL; return false;
@@ -3927,6 +4094,19 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
                 if (replay == -2) goto denied;
                 if (replay == -1) { fclose(f); return false; }
                 if (!replay) break;
+                last_good = ftello(f);
+                continue;
+            }
+            if (memcmp(magic, KV_WAL_MAGIC_CT_LANE_BASELINE, 4u) == 0) {
+                if (fseeko(f, -4, SEEK_CUR) != 0) { fclose(f); return false; }
+                uint8_t frame[KV_WAL_CT_LANE_BASELINE_FRAME_BYTES];
+                if (fread(frame, 1u, sizeof(frame), f) != sizeof(frame)) break;
+                errno = 0;
+                if (!ct_lane_baseline_frame_validate(frame) ||
+                    !ct_lane_baseline_apply_frame(store, frame, context)) {
+                    if (errno == EACCES) goto denied;
+                    fclose(f); return false;
+                }
                 last_good = ftello(f);
                 continue;
             }
@@ -4253,6 +4433,10 @@ static qihse_kv_store_t* kv_store_create_internal(const kv_read_context_t* conte
         qihse_kv_store_destroy(store); errno = ENOMEM; return NULL;
     }
     if (!recover_from_wal(store, context)) { qihse_kv_store_destroy(store); return NULL; }
+    if (!ct_lane_logs_reconcile(store)) {
+        qihse_kv_store_destroy(store);
+        return NULL;
+    }
     if (store->ct_lane_count && !ct_lanes_state_write(store)) {
         qihse_kv_store_destroy(store); return NULL;
     }
@@ -4263,7 +4447,7 @@ static qihse_kv_store_t* kv_store_create_internal(const kv_read_context_t* conte
     if (!replica_install_finish_recovery(store, dir, user)) { qihse_kv_store_destroy(store); return NULL; }
     char wal_path[4096];
     if (!build_data_path(wal_path, sizeof(wal_path), "wal.log")) { qihse_kv_store_destroy(store); return NULL; }
-    int fd = open(wal_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int fd = open(wal_path, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) { qihse_kv_store_destroy(store); return NULL; }
     store->wal_fd = fdopen(fd, "ab");
     if (!store->wal_fd) { close(fd); qihse_kv_store_destroy(store); return NULL; }
@@ -6001,8 +6185,9 @@ bool qihse_kv_ct_lane_transfer_source_fence(qihse_kv_store_t* store,
                 break;
             }
     }
-    bool ok = !store->recovery_pending &&
-        (!store->lane_transfer || !store->lane_transfer->active) &&
+    bool reusable_transfer = !store->lane_transfer ||
+        !store->lane_transfer->active || store->lane_transfer->phase == 4u;
+    bool ok = !store->recovery_pending && reusable_transfer &&
         lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
         lane->status.admitted && lane->status.baseline_sealed &&
         strcmp(lane->status.generation, claim.source_generation) == 0 &&
@@ -6015,6 +6200,7 @@ bool qihse_kv_ct_lane_transfer_source_fence(qihse_kv_store_t* store,
     qihse_kv_ct_lane_transfer_state_t* state = ok
         ? calloc(1u, sizeof(*state)) : NULL;
     if (ok && !state) ok = false;
+    qihse_kv_ct_lane_transfer_state_t* prior_transfer = store->lane_transfer;
     if (ok) {
         state->active = true;
         state->phase = 1u;
@@ -6025,10 +6211,13 @@ bool qihse_kv_ct_lane_transfer_source_fence(qihse_kv_store_t* store,
         store->lane_transfer = state;
         ok = ct_lane_transfer_state_write(store);
         if (!ok) {
-            store->lane_transfer = NULL;
+            store->lane_transfer = prior_transfer;
             free(state);
             store->recovery_pending = true;
-        } else *out_source_cut = state->source_cut;
+        } else {
+            if (prior_transfer != state) free(prior_transfer);
+            *out_source_cut = state->source_cut;
+        }
     }
     kv_store_unlock(store);
     if (!ok) errno = EBUSY;
@@ -6318,6 +6507,9 @@ bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store,
             if (!qihse_ct_codec_group_digest(store->ct_system_principal,
                     QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, &group, digest))
                 { free(rows); goto done; }
+            if (fflush(store->wal_fd) != 0) { free(rows); goto done; }
+            off_t frame_offset = lseek(fileno(store->wal_fd), 0, SEEK_END);
+            if (frame_offset < 0) { free(rows); goto done; }
             size_t written = 0u;
             if (!qihse_ct_codec_write(store->wal_fd, store->ct_system_principal,
                     QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 1u, &group,
@@ -6328,12 +6520,24 @@ bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store,
                 free(rows);
                 goto done;
             }
+            uint64_t retained_after = 0u;
+            if (!ct_lane_log_append_fd(store, lane->status.lane_id,
+                    lane->status.source_id, lane->status.generation,
+                    lane->status.acknowledged_position, group.stream_position,
+                    store->ct_system_principal, QIHSE_KV_CT_TENANT_SYSTEM_ALL,
+                    0u, fileno(store->wal_fd), frame_offset, frame_bytes,
+                    lane->status.limit_bytes, &retained_after) ||
+                retained_after > lane->status.limit_bytes) {
+                store->recovery_pending = true;
+                free(rows);
+                goto done;
+            }
             uint64_t old_position = lane->status.durable_position;
             uint64_t old_bytes = lane->status.retained_bytes;
             unsigned char old_digest[32];
             memcpy(old_digest, lane->last_group_digest, sizeof(old_digest));
             lane->status.durable_position = group.stream_position;
-            lane->status.retained_bytes += frame_bytes;
+            lane->status.retained_bytes = retained_after;
             memcpy(lane->last_group_digest, digest, sizeof(digest));
             if (!ct_lanes_state_write(store)) {
                 lane->status.durable_position = old_position;
@@ -7483,10 +7687,11 @@ static bool kv_sync_store_locked(qihse_kv_store_t* store) {
         store->wal_unflushed_bytes = 0u;
     }
     /* 2. Memtable -> new SSTable (atomic rename, file fsynced inside the
-     * atomic commit) + WAL rotation. Every mutation lands in BOTH the WAL
-     * and the memtable, so an empty memtable means the WAL holds nothing
-     * that is not already durable -- skip the flush, keep the fsyncs. */
+     * atomic commit). Lane CT frames also have independent durable source
+     * logs, so after the full data image is durable the shared WAL can rotate
+     * without tying one lane's retention to another lane's ACK cursor. */
     if (store->mem_usage > 0u && !flush_memtable_to_sstable(store)) return false;
+    if (store->ct_lane_count && !rotate_wal_empty(store)) return false;
     /* 3. The renames above and in flush/rotate are only as durable as the
      * directory entry that points at them. */
     const char* dir = get_qihse_data_dir();
@@ -7600,6 +7805,7 @@ typedef struct {
     const char* glob;
     const qihse_kv_ct_lane_t* lane;
     uint64_t now;
+    uint64_t max_change_seq;
     bool include_dead;
     bool ok;
     bool authorized;
@@ -7614,12 +7820,13 @@ static bool replica_snapshot_write_mem_cb(const char* key, void* value,
     if (fnmatch(ctx->glob, key, 0) != 0 ||
         (ctx->lane && !ct_lane_bitmap_contains(ctx->lane, key)) ||
         (!ctx->include_dead && payload_is_dead(p, ctx->now)) ||
-        !ct_key_owned_for_read(ctx->store, key)) return true;
+        (!ctx->lane && !ct_key_owned_for_read(ctx->store, key))) return true;
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
         ctx->authorized = false;
         return false;
     }
     if (!disk_record_write(ctx->f, key, p)) { ctx->ok = false; return false; }
+    if (p->change_seq > ctx->max_change_seq) ctx->max_change_seq = p->change_seq;
     return true;
 }
 
@@ -7629,7 +7836,7 @@ static bool replica_snapshot_write_sst_cb(const char* key,
     if (!ctx || !ctx->ok || !ctx->authorized || !key || !r) return false;
     if (fnmatch(ctx->glob, key, 0) != 0 ||
         (ctx->lane && !ct_lane_bitmap_contains(ctx->lane, key)) ||
-        !ct_key_owned_for_read(ctx->store, key)) return true;
+        (!ctx->lane && !ct_key_owned_for_read(ctx->store, key))) return true;
     if (!qihse_auth_can_access(ctx->user, r->classification, r->sci_compartment)) {
         ctx->authorized = false;
         return false;
@@ -7640,6 +7847,7 @@ static bool replica_snapshot_write_sst_cb(const char* key,
         ctx->ok = false;
         return false;
     }
+    if (r->change_seq > ctx->max_change_seq) ctx->max_change_seq = r->change_seq;
     return true;
 }
 
@@ -7648,7 +7856,9 @@ static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
                                                qihse_user_t* user,
                                                const char* glob,
                                                bool include_dead,
-                                               const qihse_kv_ct_lane_t* lane) {
+                                               const qihse_kv_ct_lane_t* lane,
+                                               uint64_t* out_row_seq) {
+    if (out_row_seq) *out_row_seq = 0u;
     if (!store || !store->trie || !filepath || !glob || !*glob) return -1;
     /* The newest-first SST iterator has a bounded metadata-only fallback for
      * degraded indexes. Do not compact here: compaction intentionally drops
@@ -7668,7 +7878,9 @@ static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
     }
     if (!ctx.authorized) { fclose(f); unlink(tmp); errno = EACCES; return -2; }
     if (!ctx.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
-    return atomic_file_commit(f, tmp, filepath) ? 0 : -1;
+    if (!atomic_file_commit(f, tmp, filepath)) return -1;
+    if (out_row_seq) *out_row_seq = ctx.max_change_seq;
+    return 0;
 }
 
 static int qihse_kv_save_user_internal(qihse_kv_store_t* store,
@@ -7775,7 +7987,8 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
      * authorized snapshot. The name is never sent over the replication wire. */
     kv_store_wrlock(store);
     int save_rc = store->recovery_pending ? -1 :
-        qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob, false, NULL);
+        qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob,
+                                             false, NULL, NULL);
     /* The data file and this watermark must describe the same locked store
      * view. Callers can safely resume delta replication after this value. */
     uint64_t source_change_seq = save_rc == 0 ? store->change_seq : 0u;
@@ -7840,8 +8053,20 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
     if (!ct_lane_baseline_path(lane_id, path, sizeof(path))) {
         kv_store_unlock(store); return -1;
     }
-    if (!lane->status.baseline_sealed) {
-        ok = qihse_kv_save_replica_snapshot_file(store, path, principal, "*", true, lane) == 0;
+    if (!lane->status.baseline_sealed || lane->status.baseline_refresh_needed ||
+        lane->status.baseline_stream_cut < lane->status.acknowledged_position) {
+        qihse_kv_ct_lane_status_t prior_status = lane->status;
+        if (!lane->status.baseline_refresh_needed) {
+            lane->status.baseline_refresh_needed = true;
+            if (!ct_lanes_state_write(store)) {
+                lane->status = prior_status;
+                kv_store_unlock(store);
+                return -1;
+            }
+        }
+        uint64_t snapshot_row_seq = 0u;
+        ok = qihse_kv_save_replica_snapshot_file(store, path, principal, "*",
+                                                  true, lane, &snapshot_row_seq) == 0;
         if (!ok) { kv_store_unlock(store); return errno == EACCES ? -2 : -1; }
         int fd = open_secure_read(path);
         unsigned char digest[32];
@@ -7857,22 +8082,22 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
         if (!snapshot) { close(fd); kv_store_unlock(store); return -1; }
         snapshot->fd = fd;
         snapshot->size = (uint64_t)st.st_size;
-        snapshot->source_change_seq = store->change_seq;
+        snapshot->source_change_seq = snapshot_row_seq;
         snapshot->principal = principal;
         snapshot->principal_id = qihse_user_get_id(principal);
         snapshot->tenant_id = qihse_user_get_tenant_id(principal);
         snapshot->classification = qihse_user_get_classification(principal);
         snapshot->sci = qihse_user_get_sci(principal);
         memcpy(lane->status.baseline_digest, digest, 32u);
-        lane->status.baseline_row_seq = store->change_seq;
+        lane->status.baseline_row_seq = snapshot_row_seq;
+        lane->status.baseline_stream_cut = lane->status.durable_position;
         lane->status.baseline_sealed = true;
+        lane->status.baseline_refresh_needed = false;
         ok = ct_lanes_state_write(store);
         if (!ok) {
-            lane->status.baseline_sealed = false;
-            lane->status.baseline_row_seq = 0u;
-            memset(lane->status.baseline_digest, 0, 32u);
+            lane->status = prior_status;
+            lane->status.baseline_refresh_needed = true;
             qihse_kv_replica_snapshot_destroy(snapshot);
-            unlink(path);
             kv_store_unlock(store); return -1;
         }
         *out_snapshot = snapshot;
@@ -7918,11 +8143,31 @@ bool qihse_kv_ct_lane_source_reconcile_peer(qihse_kv_store_t* store,
     }
     kv_store_wrlock(store);
     qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
+    if (lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+        strcmp(lane->status.peer_id, peer_id) == 0 &&
+        strcmp(lane->status.generation, generation) == 0 &&
+        peer_position < lane->status.acknowledged_position) {
+        /* ACKed deltas may already have been collected. A lagging peer cannot
+         * move the durable ACK backwards; mark the cached image for refresh
+         * so its next explicit baseline open can restart it at the current cut. */
+        bool was_refresh = lane->status.baseline_refresh_needed;
+        lane->status.baseline_refresh_needed = true;
+        if (!was_refresh && !ct_lanes_state_write(store)) {
+            lane->status.baseline_refresh_needed = was_refresh;
+            kv_store_unlock(store);
+            return false;
+        }
+        kv_store_unlock(store);
+        errno = EAGAIN;
+        return false;
+    }
     bool ok = lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
         lane->status.baseline_sealed && !store->recovery_pending &&
         strcmp(lane->status.peer_id, peer_id) == 0 &&
         strcmp(lane->status.generation, generation) == 0 &&
         memcmp(lane->status.baseline_digest, receiver_baseline_digest, 32u) == 0 &&
+        peer_position >= lane->status.baseline_stream_cut &&
+        peer_position >= lane->status.acknowledged_position &&
         peer_position <= lane->status.durable_position;
     uint64_t old_ack = 0u; bool old_admitted = false;
     if (ok) {
@@ -7950,145 +8195,32 @@ bool qihse_kv_ct_lane_source_read(qihse_kv_store_t* store,
         !ct_lane_id_valid(lane_id) || !ct_id_valid(generation) || !out_groups ||
         !out_count || !out_resume_position || !max_groups || max_groups > 4096u ||
         !max_bytes || max_bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES) {
-        errno = EINVAL; return false;
+        errno = EINVAL;
+        return false;
     }
     kv_store_rdlock(store);
     qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
     bool ok = lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
-        lane->status.admitted && strcmp(lane->status.generation, generation) == 0 &&
+        lane->status.admitted && !lane->status.promotion_pending &&
+        strcmp(lane->status.generation, generation) == 0 &&
         after_position >= lane->status.acknowledged_position &&
         after_position <= lane->status.durable_position && !store->recovery_pending;
-    char path[4096];
-    if (!ok || !build_data_path(path, sizeof(path), "wal.log")) {
-        kv_store_unlock(store); errno = EACCES; return false;
+    if (ok) {
+        ok = ct_lane_log_read(store, lane->status.lane_id,
+            lane->status.source_id, lane->status.generation,
+            replication_principal, lane->tenant_policy, lane->tenant_id,
+            after_position, max_groups, max_bytes, out_groups, out_count,
+            out_resume_position);
     }
-    int fd = open_secure_read(path);
-    FILE* input = fd >= 0 ? fdopen(fd, "rb") : NULL;
-    if (!input) { if (fd >= 0) close(fd); kv_store_unlock(store); return false; }
-    qihse_kv_ct_group_t* groups = calloc(max_groups, sizeof(*groups));
-    if (!groups) { fclose(input); kv_store_unlock(store); return false; }
-    size_t count = 0u, used = 0u;
-    uint64_t cursor = after_position;
-    for (;;) {
-        if (count == max_groups || used >= max_bytes) break;
-        int c = fgetc(input);
-        if (c == EOF) { if (ferror(input)) ok = false; break; }
-        if (c != 'Q') { ok = false; break; }
-        char magic[4] = {'Q',0,0,0};
-        if (fread(magic + 1, 1u, 3u, input) != 3u) { ok = false; break; }
-        /* Lane-local metadata uses the ordinary sequenced WAL, interleaved
-         * with CT frames in wal.log. It is not part of any lane stream. Skip
-         * only a well-formed QKV4 record whose key is in the established
-         * node-local namespace. */
-        if (memcmp(magic, KV_WAL_MAGIC_LOCAL_SEQ, 4u) == 0) {
-            if (fseeko(input, -4, SEEK_CUR) != 0) { ok = false; break; }
-            unsigned char header[40];
-            if (fread(header, 1u, sizeof(header), input) != sizeof(header))
-                { ok = false; break; }
-            uint8_t op = header[4], flags = header[5];
-            uint16_t key_len = 0u, classification = 0u, sci = 0u;
-            uint32_t value_len = 0u;
-            uint64_t expiry = 0u, sequence = 0u, crc = 0u;
-            memcpy(&key_len, header + 6u, sizeof(key_len));
-            memcpy(&value_len, header + 8u, sizeof(value_len));
-            memcpy(&classification, header + 12u, sizeof(classification));
-            memcpy(&sci, header + 14u, sizeof(sci));
-            memcpy(&expiry, header + 16u, sizeof(expiry));
-            memcpy(&sequence, header + 24u, sizeof(sequence));
-            memcpy(&crc, header + 32u, sizeof(crc));
-            if ((op != KV_WAL_OP_SET && op != KV_WAL_OP_DEL) || !key_len ||
-                value_len > KV_MAX_VALUE_LEN ||
-                (flags & ~KV_ALLOWED_FLAGS) || !sequence) { ok = false; break; }
-            char* local_key = malloc((size_t)key_len + 1u);
-            char* local_value = malloc((size_t)value_len + 1u);
-            if (!local_key || !local_value) {
-                free(local_key); free(local_value); ok = false; break;
-            }
-            bool read_ok = fread(local_key, 1u, key_len, input) == key_len &&
-                fread(local_value, 1u, value_len, input) == value_len;
-            local_key[key_len] = '\0'; local_value[value_len] = '\0';
-            bool valid_local = read_ok && !memchr(local_key, '\0', key_len) &&
-                !memchr(local_value, '\0', value_len) &&
-                qihse_cluster_key_is_node_local(local_key) &&
-                wal_replica_record_crc(op, flags, key_len, value_len,
-                    classification, sci, expiry, sequence, local_key,
-                    local_value) == crc;
-            free(local_key); free(local_value);
-            if (!valid_local) { ok = false; break; }
-            continue;
-        }
-        if (memcmp(magic, KV_WAL_MAGIC_DELETE_RECEIPT, 4u) == 0) {
-            if (fseeko(input, -4, SEEK_CUR) != 0) { ok = false; break; }
-            unsigned char header[48];
-            if (fread(header, 1u, sizeof(header), input) != sizeof(header))
-                { ok = false; break; }
-            uint16_t source_len = 0u, receipt_len = 0u, source_class = 0u;
-            uint16_t source_sci = 0u, receipt_class = 0u, receipt_sci = 0u;
-            uint32_t value_len = 0u;
-            uint64_t crc = 0u;
-            memcpy(&source_len, header + 4u, 2u);
-            memcpy(&receipt_len, header + 6u, 2u);
-            memcpy(&value_len, header + 8u, 4u);
-            memcpy(&source_class, header + 12u, 2u);
-            memcpy(&source_sci, header + 14u, 2u);
-            memcpy(&receipt_class, header + 16u, 2u);
-            memcpy(&receipt_sci, header + 18u, 2u);
-            memcpy(&crc, header + 36u, 8u);
-            if (!source_len || !receipt_len ||
-                value_len > QIHSE_KV_DELETE_RECEIPT_MAX_VALUE ||
-                header[44] || header[45] || header[46] || header[47] ||
-                !qihse_auth_can_access(replication_principal, source_class, source_sci) ||
-                !qihse_auth_can_access(replication_principal, receipt_class, receipt_sci)) {
-                ok = false; break;
-            }
-            char* source = malloc((size_t)source_len + 1u);
-            char* receipt = malloc((size_t)receipt_len + 1u);
-            char* value = malloc((size_t)value_len + 1u);
-            if (!source || !receipt || !value) {
-                free(source); free(receipt); free(value); ok = false; break;
-            }
-            bool read_ok = fread(source, 1u, source_len, input) == source_len &&
-                fread(receipt, 1u, receipt_len, input) == receipt_len &&
-                fread(value, 1u, value_len, input) == value_len;
-            source[source_len] = '\0'; receipt[receipt_len] = '\0'; value[value_len] = '\0';
-            bool valid_local = read_ok && !memchr(source, '\0', source_len) &&
-                !memchr(receipt, '\0', receipt_len) && !memchr(value, '\0', value_len) &&
-                qihse_cluster_key_is_node_local(source) &&
-                qihse_cluster_key_is_node_local(receipt) &&
-                strcmp(source, receipt) != 0 &&
-                wal_delete_receipt_crc(header, source, source_len, receipt,
-                    receipt_len, value, value_len) == crc;
-            free(source); free(receipt); free(value);
-            if (!valid_local) { ok = false; break; }
-            continue;
-        }
-        if (memcmp(magic, KV_WAL_MAGIC_CT, 4u) != 0) { ok = false; break; }
-        if (fseeko(input, -4, SEEK_CUR) != 0) { ok = false; break; }
-        qihse_kv_ct_group_t next = {0}; uint8_t mode = 0u; size_t frame = 0u;
-        int rc = qihse_ct_codec_read(input, replication_principal,
-            QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, max_bytes - used,
-            &next, &mode, &frame);
-        if (rc != 1) { ok = false; qihse_ct_codec_clear(&next); break; }
-        if (strcmp(next.generation, generation) != 0) {
-            qihse_ct_codec_clear(&next); continue;
-        }
-        if (mode != QIHSE_KV_CT_LANE_SOURCE ||
-            strcmp(next.source_id, lane->status.source_id) != 0 ||
-            next.stream_position > lane->status.durable_position) {
-            qihse_ct_codec_clear(&next); ok = false; break;
-        }
-        if (next.stream_position <= after_position) { qihse_ct_codec_clear(&next); continue; }
-        if (next.stream_position != cursor + 1u) { qihse_ct_codec_clear(&next); ok = false; break; }
-        bool slots_ok = true;
-        for (size_t i = 0; i < next.count; ++i)
-            if (!ct_lane_bitmap_contains(lane, next.records[i].key)) { slots_ok = false; break; }
-        if (!slots_ok || frame > max_bytes - used) { qihse_ct_codec_clear(&next); ok = false; break; }
-        groups[count++] = next; used += frame; cursor = next.stream_position;
+    kv_store_unlock(store);
+    if (!ok) {
+        qihse_kv_ct_groups_free(*out_groups, *out_count);
+        *out_groups = NULL;
+        *out_count = 0u;
+        *out_resume_position = after_position;
+        if (errno == 0) errno = EACCES;
     }
-    fclose(input); kv_store_unlock(store);
-    if (!ok) { qihse_kv_ct_groups_free(groups, count); return false; }
-    *out_groups = groups; *out_count = count; *out_resume_position = cursor;
-    return true;
+    return ok;
 }
 
 bool qihse_kv_ct_lane_source_ack(qihse_kv_store_t* store,
@@ -8106,11 +8238,92 @@ bool qihse_kv_ct_lane_source_ack(qihse_kv_store_t* store,
         durable_position >= lane->status.acknowledged_position &&
         durable_position <= lane->status.durable_position;
     uint64_t old = lane ? lane->status.acknowledged_position : 0u;
-    if (ok) { lane->status.acknowledged_position = durable_position; ok = ct_lanes_state_write(store); }
-    if (!ok && lane) lane->status.acknowledged_position = old;
+    uint64_t old_retained = lane ? lane->status.retained_bytes : 0u;
+    if (ok) {
+        lane->status.acknowledged_position = durable_position;
+        ok = ct_lanes_state_write(store);
+    }
+    if (ok) {
+        /* Commit the data image before discarding the corresponding source
+         * replication frames. A crash before GC leaves an idempotent prefix. */
+        ok = kv_sync_store_locked(store);
+        if (ok) {
+            uint64_t retained = 0u;
+            ok = ct_lane_log_ack(store, lane->status.lane_id,
+                lane->status.source_id, lane->status.generation,
+                durable_position, lane->tenant_policy, lane->tenant_id,
+                &retained);
+            if (ok) {
+                lane->status.retained_bytes = retained;
+                ok = ct_lanes_state_write(store);
+            }
+        }
+    }
+    if (!ok && lane && lane->status.acknowledged_position == durable_position) {
+        /* ACK is already durable; retain the conservative local accounting if
+         * sidecar GC or its metadata publication failed. */
+        lane->status.retained_bytes = old_retained;
+    } else if (!ok && lane) {
+        lane->status.acknowledged_position = old;
+    }
     kv_store_unlock(store);
     if (ok) { pthread_mutex_lock(&store->ct_ack_lock); pthread_cond_broadcast(&store->ct_ack_changed); pthread_mutex_unlock(&store->ct_ack_lock); }
     return ok;
+}
+
+static bool ct_lane_logs_reconcile(qihse_kv_store_t* store) {
+    if (!store) return false;
+    if (!store->ct_lane_count) return true;
+    bool changed = false;
+    for (size_t i = 0; i < store->ct_lane_capacity; ++i) {
+        qihse_kv_ct_lane_t* lane = &store->lanes[i];
+        if (!lane->used || lane->status.mode != QIHSE_KV_CT_LANE_SOURCE) continue;
+        uint64_t log_ack = 0u, log_last = 0u, retained = 0u;
+        if (!ct_lane_log_status(store, lane->status.lane_id,
+                lane->status.source_id, lane->status.generation,
+                &log_ack, &log_last, &retained)) return false;
+        if (log_ack > lane->status.acknowledged_position ||
+            log_last > lane->status.durable_position) {
+            errno = EINVAL;
+            return false;
+        }
+        if (log_last < lane->status.durable_position) {
+            if (lane->status.acknowledged_position == lane->status.durable_position &&
+                log_ack == 0u && log_last == 0u && retained == 0u &&
+                lane->status.durable_position != 0u) {
+                if (!ct_lane_log_checkpoint(store, lane->status.lane_id,
+                        lane->status.source_id, lane->status.generation,
+                        lane->status.acknowledged_position)) return false;
+                log_ack = log_last = lane->status.acknowledged_position;
+            } else {
+                /* WAL replay must have reconstructed every unacknowledged
+                 * frame. A missing suffix cannot be safely inferred. */
+                errno = EIO;
+                return false;
+            }
+        }
+        if (log_last != lane->status.durable_position) {
+            errno = EINVAL;
+            return false;
+        }
+        if (log_ack < lane->status.acknowledged_position) {
+            if (!ct_lane_log_ack(store, lane->status.lane_id,
+                    lane->status.source_id, lane->status.generation,
+                    lane->status.acknowledged_position, lane->tenant_policy,
+                    lane->tenant_id, &retained)) return false;
+            log_ack = lane->status.acknowledged_position;
+        }
+        if (log_ack != lane->status.acknowledged_position) {
+            errno = EINVAL;
+            return false;
+        }
+        if (lane->status.retained_bytes != retained) {
+            lane->status.retained_bytes = retained;
+            changed = true;
+        }
+    }
+    if (changed && !ct_lanes_state_write(store)) return false;
+    return true;
 }
 
 static bool ct_lane_certificate_path(const char* lane_id, char* out, size_t cap) {
@@ -8206,8 +8419,8 @@ static bool ct_lane_transfer_state_write(qihse_kv_store_t* store) {
         if (unlink(path) != 0 && errno != ENOENT) return false;
         return fsync_dir_path(get_qihse_data_dir());
     }
-    if (state->phase < 1u || state->phase > 3u ||
-        !ct_lane_claim_valid(&state->claim, state->phase == 3u)) return false;
+    if (state->phase < 1u || state->phase > 4u ||
+        !ct_lane_claim_valid(&state->claim, state->phase >= 3u)) return false;
     char temp[8192]; FILE* f = NULL;
     if (!atomic_file_begin(path, temp, sizeof(temp), &f)) return false;
     uint64_t hash = 14695981039346656037ULL;
@@ -8271,7 +8484,7 @@ static bool ct_lane_transfer_state_read(qihse_kv_store_t* store) {
     uint64_t stored = 0u;
     for (size_t i = 0; i < sizeof(sum); ++i) stored = (stored << 8) | sum[i];
     ok = ok && stored == hash && !(flags & ~3u) && state->phase >= 1u &&
-        state->phase <= 3u && ct_lane_claim_valid(&state->claim, state->phase == 3u);
+        state->phase <= 4u && ct_lane_claim_valid(&state->claim, state->phase >= 3u);
     if (!ok) { free(state); errno = EINVAL; return false; }
     state->active = true;
     state->source_fenced = (flags & 1u) != 0u;
@@ -8792,6 +9005,8 @@ bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
     if (lane) { previous = lane->status; memcpy(previous_token, lane->owner_token, sizeof(previous_token)); }
     if (ok) {
         lane->status.mode = QIHSE_KV_CT_LANE_SOURCE;
+        if (lane->status.limit_bytes == 0u)
+            lane->status.limit_bytes = KV_CT_DEFAULT_LANE_LIMIT_BYTES;
         snprintf(lane->status.source_id, sizeof(lane->status.source_id), "%s",
                  claim.target_qkp_id);
         snprintf(lane->status.peer_id, sizeof(lane->status.peer_id), "%s",
@@ -8799,8 +9014,10 @@ bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
         snprintf(lane->status.generation, sizeof(lane->status.generation), "%s",
                  claim.target_generation);
         lane->status.admitted = false;
+        lane->status.promotion_pending = true;
         lane->status.baseline_sealed = false;
         lane->status.baseline_row_seq = 0u;
+        lane->status.baseline_stream_cut = 0u;
         memset(lane->status.baseline_digest, 0, sizeof(lane->status.baseline_digest));
         lane->status.durable_position = 0u;
         lane->status.acknowledged_position = 0u;
@@ -8815,6 +9032,55 @@ bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
     }
     kv_store_unlock(store);
     if (!ok) errno = EBUSY;
+    return ok;
+}
+
+bool qihse_kv_ct_lane_promotion_finalize(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* final_claim,
+    const qihse_kv_ct_proof_t* final_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context) {
+    qihse_kv_ct_lane_authority_claim_t proof_claim;
+    if (!store || !ct_admin(control_principal) || !data_principal ||
+        !final_claim || final_claim->operation != QIHSE_KV_CT_LANE_AUTH_PROMOTION ||
+        !ct_lane_claim_valid(final_claim, true) ||
+        !qihse_kv_ct_lane_authority_proof_validate(store, control_principal,
+            data_principal, final_proof, verify, verify_context, true) ||
+        !qihse_kv_ct_lane_authority_proof_fields(store, control_principal,
+            data_principal, final_proof, &proof_claim) ||
+        !ct_lane_claim_equal(final_claim, &proof_claim)) {
+        errno = EACCES;
+        return false;
+    }
+    char path[4096];
+    qihse_kv_ct_lane_authority_claim_t marker_claim, expected_marker = *final_claim;
+    expected_marker.final_decision_index = 0u;
+    memset(expected_marker.final_decision_digest, 0,
+           sizeof(expected_marker.final_decision_digest));
+    if (!ct_lane_promotion_path(final_claim->target_group_id,
+            final_claim->promotion_event_digest, path, sizeof(path)) ||
+        !ct_lane_promotion_marker_read(path, &marker_claim) ||
+        !ct_lane_claim_equal(&marker_claim, &expected_marker)) {
+        errno = EACCES;
+        return false;
+    }
+
+    kv_store_wrlock(store);
+    qihse_kv_ct_lane_t* lane = ct_lane_find(store, final_claim->target_group_id);
+    bool ok = !store->recovery_pending && lane &&
+        lane->status.admitted &&
+        ct_lane_promotion_claim_matches(store, lane, &marker_claim);
+    bool previous_pending = lane ? lane->status.promotion_pending : false;
+    if (ok && previous_pending) {
+        lane->status.promotion_pending = false;
+        ok = ct_lanes_state_write(store);
+        if (!ok) {
+            lane->status.promotion_pending = previous_pending;
+            store->recovery_pending = true;
+        }
+    }
+    kv_store_unlock(store);
+    if (!ok) errno = EACCES;
     return ok;
 }
 
@@ -8888,7 +9154,8 @@ int qihse_kv_ct_owner_data_snapshot_create(qihse_kv_store_t* store,
         store->ct_transfer_source_id[0] == '\0';
     if (!owner_ready) errno = EBUSY;
     int save_rc = owner_ready
-        ? qihse_kv_save_replica_snapshot_file(store, path, principal, "*", true, NULL)
+        ? qihse_kv_save_replica_snapshot_file(store, path, principal, "*",
+                                               true, NULL, NULL)
         : -1;
     uint64_t source_change_seq = save_rc == 0 ? store->change_seq : 0u;
     kv_store_unlock(store);
@@ -9868,4 +10135,7 @@ bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
 }
 
 #include "qihse_ct_range_export.inc"
+#include "qihse_ct_lane_baseline.inc"
+#include "qihse_ct_lane_log.inc"
+#include "qihse_ct_lane_transfer.inc"
 

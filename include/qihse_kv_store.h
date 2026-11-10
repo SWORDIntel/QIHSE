@@ -82,6 +82,7 @@ typedef struct {
     qihse_kv_ct_lane_mode_t mode;
     uint8_t slot_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES];
     uint64_t baseline_row_seq;
+    uint64_t baseline_stream_cut; /* CT position at this image, separate sequence domain. */
     uint64_t durable_position;
     uint64_t acknowledged_position;
     uint64_t retained_bytes;
@@ -92,6 +93,8 @@ typedef struct {
     unsigned char certificate_ack_digest[32];
     bool baseline_sealed;
     bool admitted;
+    bool promotion_pending; /* Source stream is ready, but mesh FINAL is absent. */
+    bool baseline_refresh_needed; /* Cached image no longer matches slot_bitmap. */
 } qihse_kv_ct_lane_status_t;
 
 typedef struct {
@@ -204,6 +207,12 @@ bool qihse_kv_ct_lane_receiver_empty_baseline_seal(qihse_kv_store_t* store,
 bool qihse_kv_ct_lane_status(qihse_kv_store_t* store,
     qihse_user_t* principal, const char* lane_id,
     qihse_kv_ct_lane_status_t* out_status);
+/* Resolve a nonempty exact slot bitmap to its unique admitted source lane.
+ * No match, multiple matches, cross-lane bitmap, or unready lane fails closed. */
+bool qihse_kv_ct_lane_source_for_slots(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal,
+    const uint8_t slot_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    qihse_kv_ct_lane_status_t* out_status);
 bool qihse_kv_ct_lane_owner_token_get(qihse_kv_store_t* store,
     qihse_user_t* operator_principal, const char* lane_id,
     unsigned char out[QIHSE_KV_CT_TOKEN_BYTES]);
@@ -213,7 +222,9 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
     uint64_t* out_baseline_row_seq, unsigned char out_digest[32]);
 bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     qihse_user_t* operator_principal, qihse_user_t* data_principal,
-    const char* lane_id, const char* snapshot_filepath,
+    const char* lane_id,
+    const uint8_t selected_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    const char* snapshot_filepath,
     uint64_t baseline_row_seq, uint64_t source_cut,
     const unsigned char expected_digest[32],
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
@@ -502,6 +513,17 @@ bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
     qihse_kv_replica_snapshot_t* snapshot,
     const unsigned char expected_image_digest[32],
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* File-backed form for authenticated RESP transfer staging. The file must be
+ * a private regular file owned by the service inside QIHSE_DATA_DIR. */
+bool qihse_kv_ct_lane_transfer_target_import_apply_file(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* replication_principal,
+    qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reserved_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    const char* snapshot_filepath,
+    const unsigned char expected_image_digest[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
 bool qihse_kv_ct_lane_transfer_target_seal(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_user_t* data_principal,
     const qihse_kv_ct_lane_authority_claim_t* claim,
@@ -524,6 +546,11 @@ bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
     const qihse_kv_ct_proof_t* reservation_proof,
     qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_lane_promotion_finalize(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* final_claim,
+    const qihse_kv_ct_proof_t* final_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context);
 qihse_kv_ct_proof_t* qihse_kv_ct_lane_promoted_proof_get(
     qihse_kv_store_t* store, qihse_user_t* control_principal,
     qihse_user_t* data_principal, const char* lane_id,

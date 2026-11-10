@@ -192,7 +192,7 @@ static int target_process(const char *data_dir, const char *image_path,
     bitmap_set(target_slots, SELECTED_SLOT);
     if (partial) bitmap_set(target_slots, RETAINED_SLOT);
     bitmap_set(selected_slots, SELECTED_SLOT);
-    bitmap_set(other_slots, RETAINED_SLOT);
+    if (!partial) bitmap_set(other_slots, RETAINED_SLOT);
     bitmap_set(other_slots, OTHER_SLOT);
 
     qihse_kv_store_t *store = qihse_kv_store_create_user(operator_user);
