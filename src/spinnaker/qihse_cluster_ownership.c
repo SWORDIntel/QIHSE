@@ -207,6 +207,12 @@ static void set_error(char* err, size_t cap, const char* message) {
     if (err && cap) snprintf(err, cap, "%s", message ? message : "ownership transfer failed");
 }
 
+static bool digest_is_zero(const uint8_t digest[32]) {
+    uint8_t acc = 0;
+    for (size_t i = 0; i < 32u; ++i) acc |= digest[i];
+    return acc == 0;
+}
+
 static bool ownership_system_operator_active(const qihse_user_t* user);
 static bool resolve_qkp_id(const qihse_cluster_ownership_context_t* c,
                            const char* topology_id,
@@ -1674,6 +1680,132 @@ bool qihse_cluster_ownership_transfer_commit(
         strcmp(txn.source_qkp_id, source_qkp) || strcmp(txn.target_qkp_id, target_qkp)) {
         set_error(err, err_cap, "PREPARED identities no longer match the configured QKP pins"); return false;
     }
+    if (txn.lane_id[0] != '\0') {
+        if (!c->lane_claim || !c->lane_verify_claim) {
+            set_error(err, err_cap, "group transfer commit lacks authority hooks");
+            return false;
+        }
+        qihse_kv_ct_lane_transfer_status_t lane_transfer;
+        memset(&lane_transfer, 0, sizeof(lane_transfer));
+        uint8_t expected_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+        for (uint32_t slot = txn.start; slot <= txn.end; ++slot)
+            expected_slots[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+
+        if (!qihse_kv_ct_lane_transfer_status(c->store, c->principal, &lane_transfer) ||
+            !lane_transfer.active || lane_transfer.phase < 1u || !lane_transfer.source_fenced ||
+            lane_transfer.source_cut != txn.source_lsn ||
+            strcmp(lane_transfer.claim.transfer_id, txn.transfer_id) != 0 ||
+            strcmp(lane_transfer.claim.source_group_id, txn.lane_id) != 0 ||
+            strcmp(lane_transfer.claim.source_qkp_id, txn.source_qkp_id) != 0 ||
+            strcmp(lane_transfer.claim.target_qkp_id, txn.target_qkp_id) != 0 ||
+            strcmp(lane_transfer.claim.source_generation, txn.generation) != 0 ||
+            lane_transfer.claim.grant_epoch != txn.config_epoch ||
+            CRYPTO_memcmp(lane_transfer.claim.slots, expected_slots, sizeof(expected_slots)) != 0) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            OPENSSL_cleanse(expected_slots, sizeof(expected_slots));
+            set_error(err, err_cap, "persisted group transfer reservation does not match PREPARED transaction");
+            return false;
+        }
+
+        uint64_t target_lsn = 0;
+        uint8_t target_checksum[32] = {0};
+        if (!qihse_resp_ct_peer_receipt_validate(receipt, txn.transfer_id,
+                txn.source_id, txn.target_id, txn.source_qkp_id, txn.target_qkp_id,
+                txn.generation, txn.start, txn.end, txn.source_lsn,
+                txn.config_epoch,
+                &target_lsn, target_checksum)) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            set_error(err, err_cap, "QKP-pinned durable target receipt does not match the fenced source cut");
+            return false;
+        }
+
+        if (lane_transfer.target_cursor != 0 && lane_transfer.target_cursor != target_lsn) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            OPENSSL_cleanse(target_checksum, sizeof(target_checksum));
+            set_error(err, err_cap, "target receipt cursor does not match persisted transfer state");
+            return false;
+        }
+
+        qihse_kv_ct_lane_authority_claim_t claim = lane_transfer.claim;
+        if (digest_is_zero(claim.range_digest))
+            memcpy(claim.range_digest, lane_transfer.range_digest, sizeof(claim.range_digest));
+        if (digest_is_zero(claim.image_digest))
+            memcpy(claim.image_digest, lane_transfer.image_digest, sizeof(claim.image_digest));
+
+        if (digest_is_zero(claim.range_digest) || digest_is_zero(claim.image_digest)) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            OPENSSL_cleanse(&claim, sizeof(claim));
+            OPENSSL_cleanse(target_checksum, sizeof(target_checksum));
+            set_error(err, err_cap, "persisted group transfer export hashes are missing");
+            return false;
+        }
+
+        claim.source_cut = txn.source_lsn;
+        claim.target_cursor = target_lsn;
+
+        uint8_t expected_checksum[32] = {0};
+        if (!qihse_kv_ct_lane_transfer_checksum(&claim, expected_checksum) ||
+            CRYPTO_memcmp(expected_checksum, target_checksum, sizeof(expected_checksum)) != 0) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            OPENSSL_cleanse(&claim, sizeof(claim));
+            OPENSSL_cleanse(expected_checksum, sizeof(expected_checksum));
+            OPENSSL_cleanse(target_checksum, sizeof(target_checksum));
+            set_error(err, err_cap, "group export composite checksum does not match target receipt");
+            return false;
+        }
+        OPENSSL_cleanse(expected_checksum, sizeof(expected_checksum));
+
+        if (!range_check_reserved(c, &txn, err, err_cap)) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            OPENSSL_cleanse(&claim, sizeof(claim));
+            OPENSSL_cleanse(target_checksum, sizeof(target_checksum));
+            return false;
+        }
+
+        qihse_kv_ct_lane_authority_claim_t reserved_claim;
+        memset(&reserved_claim, 0, sizeof(reserved_claim));
+        txn.target_lsn = target_lsn;
+        memcpy(txn.slot_bitmap, expected_slots, sizeof(txn.slot_bitmap));
+        if (!c->lane_claim(c->range_authority_context, c->principal, &txn, &reserved_claim) ||
+            reserved_claim.operation != QIHSE_KV_CT_LANE_AUTH_TRANSFER ||
+            strcmp(reserved_claim.transfer_id, txn.transfer_id) != 0 ||
+            strcmp(reserved_claim.source_group_id, txn.lane_id) != 0 ||
+            strcmp(reserved_claim.source_qkp_id, txn.source_qkp_id) != 0 ||
+            strcmp(reserved_claim.target_qkp_id, txn.target_qkp_id) != 0 ||
+            strcmp(reserved_claim.source_generation, txn.generation) != 0 ||
+            reserved_claim.grant_epoch != txn.config_epoch ||
+            CRYPTO_memcmp(reserved_claim.slots, expected_slots, sizeof(expected_slots)) != 0 ||
+            !c->lane_verify_claim(c->range_authority_context, c->principal, &reserved_claim, false)) {
+            OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+            OPENSSL_cleanse(&claim, sizeof(claim));
+            OPENSSL_cleanse(&reserved_claim, sizeof(reserved_claim));
+            OPENSSL_cleanse(expected_slots, sizeof(expected_slots));
+            OPENSSL_cleanse(target_checksum, sizeof(target_checksum));
+            set_error(err, err_cap, "group transfer RESERVED mesh grant verification failed");
+            return false;
+        }
+        OPENSSL_cleanse(&reserved_claim, sizeof(reserved_claim));
+        OPENSSL_cleanse(&claim, sizeof(claim));
+        OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
+        OPENSSL_cleanse(expected_slots, sizeof(expected_slots));
+
+        txn.phase = QIHSE_OWNERSHIP_COMMITTED;
+        txn.owner_id[0] = '\0';
+        snprintf(txn.owner_id, sizeof(txn.owner_id), "%s", target.id);
+        txn.target_lsn = target_lsn;
+        memcpy(txn.proof_digest, target_checksum, sizeof(txn.proof_digest));
+        OPENSSL_cleanse(target_checksum, sizeof(target_checksum));
+
+        /* CT2 journal frames require slot_bitmap to remain zeroed */
+        memset(txn.slot_bitmap, 0, sizeof(txn.slot_bitmap));
+        if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+            set_error(err, err_cap, "committed journal transition failed; source remains fenced for recovery");
+            return false;
+        }
+        set_error(err, err_cap, "");
+        return true;
+    }
+
     qihse_kv_ct_source_status_t status;
     memset(&status, 0, sizeof(status));
     if (!qihse_kv_ct_source_status(c->store, c->principal, &status) ||
