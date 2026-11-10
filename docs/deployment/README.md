@@ -6,8 +6,11 @@
 > - Cluster install: `scripts/install_qihse.sh` (provisions keys/config, systemd
 >   units, health checks; this mutates live deployment state).
 > - Rolling binary updates: `scripts/cluster_rolling_restart.sh` is an entry
->   point to review, not proof of rolling compatibility or current health.
->   Apply the staged upgrade gates below before any activation.
+>   point, not proof of rolling compatibility or current health. It targets the
+>   executable and `libqihse.so` mapped by each running unit, fails if those
+>   paths cannot be resolved, and uses only pinned QKP probes. Set
+>   `QIHSE_ADMIN_CLI` if the local pinned admin client is outside the checkout's
+>   `bin/` directory. Apply the staged upgrade gates below before activation.
 > - Replication: `scripts/cluster_replica_deploy.sh` (read-only QKP-pinned
 >   replica units, one namespace each).
 > - Operator access on hardened nodes: `qihse-admin-cli` (pinned QKP admin

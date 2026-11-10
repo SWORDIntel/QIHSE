@@ -244,11 +244,67 @@ for tool in cmake ninja; do
         exit 1
     fi
 done
+for tool in sha256sum awk; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Required build tool '$tool' not found." >&2
+        exit 1
+    fi
+done
 
 if [ "$CLEAN" -eq 1 ]; then
-    make clean
+    make -C "$ROOT_DIR" clean
+    rm -f "$ROOT_DIR/build/.native-build-config"
+fi
+
+# Make does not track compiler flags as prerequisites. Remember the resolved
+# native ISA and toolchain settings so a second build in this checkout cannot
+# reuse objects produced for a different CPU or feature matrix. Source/header
+# edits remain handled by make's normal dependency tracking.
+NATIVE_CONFIG_STAMP="$ROOT_DIR/build/.native-build-config"
+mkdir -p "$ROOT_DIR/build"
+NATIVE_CONFIG_INPUT=$(cat <<EOF
+target=$TARGET
+avx=$EN_AVX
+f16c=$EN_F16C
+avx2=$EN_AVX2
+avx512=$EN_AVX512
+avx_vnni=$EN_AVX_VNNI
+amx=$EN_AMX
+cpu_flags=$FLAGS
+arch_flags=${QIHSE_ARCH_FLAGS:-}
+cflags_extra=$CFLAGS_EXTRA
+cc=${CC:-gcc}
+cxx=${CXX:-g++}
+cc_path=$(command -v ${CC:-gcc} 2>/dev/null || true)
+cxx_path=$(command -v ${CXX:-g++} 2>/dev/null || true)
+cc_version=$(${CC:-gcc} --version 2>/dev/null | head -1 || true)
+cxx_version=$(${CXX:-g++} --version 2>/dev/null | head -1 || true)
+make_version=$(make --version 2>/dev/null | head -1 || true)
+cmake_version=$(cmake --version 2>/dev/null | head -1 || true)
+ninja_version=$(ninja --version 2>/dev/null || true)
+makefile_sha256=$(sha256sum "$ROOT_DIR/Makefile" | awk '{print $1}')
+other_isa_overrides=${QIHSE_ENABLE_AESNI:-},${QIHSE_ENABLE_PCLMUL:-},${QIHSE_ENABLE_POPCNT:-},${QIHSE_ENABLE_RDRAND:-},${QIHSE_ENABLE_FSGSBASE:-},${QIHSE_ENABLE_ERMS:-},${QIHSE_ENABLE_FMA:-},${QIHSE_ENABLE_BMI1:-},${QIHSE_ENABLE_BMI2:-},${QIHSE_ENABLE_MOVBE:-},${QIHSE_ENABLE_RDSEED:-},${QIHSE_ENABLE_ADX:-},${QIHSE_ENABLE_RTM:-},${QIHSE_ENABLE_ABM:-}
+aimem_keystone=${QIHSE_ENABLE_AIMEM_KEYSTONE:-0}
+aimem_include=${QIHSE_AIMEM_KEYSTONE_INCLUDE:-}
+aimem_lib=${QIHSE_AIMEM_KEYSTONE_LIB:-}
+ldflags=${LDFLAGS:-}
+EOF
+)
+NATIVE_CONFIG_HASH=$(printf '%s\n' "$NATIVE_CONFIG_INPUT" | sha256sum | awk '{print $1}')
+if [ -f "$NATIVE_CONFIG_STAMP" ] &&
+   [ "$(cat "$NATIVE_CONFIG_STAMP")" != "$NATIVE_CONFIG_HASH" ]; then
+    echo "Native compiler/ISA configuration changed; cleaning incompatible objects."
+    make -C "$ROOT_DIR" clean
+    rm -f "$NATIVE_CONFIG_STAMP"
+elif [ ! -f "$NATIVE_CONFIG_STAMP" ] && [ "$CLEAN" -eq 0 ]; then
+    # No stamp means objects may predate this guard or have unknown flags.
+    make -C "$ROOT_DIR" clean
 fi
 
 echo "Building with: make QIHSE_ENABLE_AVX=$EN_AVX QIHSE_ENABLE_F16C=$EN_F16C QIHSE_ENABLE_AVX2=$EN_AVX2 QIHSE_ENABLE_AVX512=$EN_AVX512 QIHSE_ENABLE_AVX_VNNI=$EN_AVX_VNNI QIHSE_ENABLE_AMX=$EN_AMX QIHSE_CFLAGS_EXTRA='$CFLAGS_EXTRA'"
 (cd "$ROOT_DIR" && \
 make -j"$(nproc 2>/dev/null || echo 4)" all QIHSE_ENABLE_AVX="$EN_AVX" QIHSE_ENABLE_F16C="$EN_F16C" QIHSE_ENABLE_AVX2="$EN_AVX2" QIHSE_ENABLE_AVX512="$EN_AVX512" QIHSE_ENABLE_AVX_VNNI="$EN_AVX_VNNI" QIHSE_ENABLE_AMX="$EN_AMX" QIHSE_CFLAGS_EXTRA="$CFLAGS_EXTRA")
+
+stamp_tmp="$NATIVE_CONFIG_STAMP.tmp.$$"
+printf '%s\n' "$NATIVE_CONFIG_HASH" > "$stamp_tmp"
+mv -f "$stamp_tmp" "$NATIVE_CONFIG_STAMP"
