@@ -27,6 +27,7 @@ extern "C" {
  */
 
 typedef struct qihse_cluster_failover qihse_cluster_failover_t;
+typedef struct qihse_cluster_ownership_context qihse_cluster_ownership_context_t;
 
 /* Explicit, operator-provisioned mapping. Topology IDs and QKP identities are
  * distinct namespaces; implementations must resolve through a trusted pin
@@ -144,6 +145,16 @@ bool qihse_cluster_failover_promote_ct(qihse_cluster_failover_t* fo,
                                        uint16_t new_successor_index,
                                        char out_new_generation[33],
                                        char* err, size_t err_cap);
+
+/* Promote one explicitly selected replication lane after its source has
+ * failed. The ownership context supplies the authenticated store, group
+ * authority, local peer pins, bus signer, and successor-preparation adapter.
+ * A false return with out_pending=true means durable work was started and the
+ * caller should retry this same lane; it must not start a second promotion. */
+bool qihse_cluster_failover_promote_lane(
+    qihse_cluster_ownership_context_t* ownership,
+    const char* lane_id, uint16_t new_successor_index,
+    bool* out_pending, char* err, size_t err_cap);
 
 /* Find the best replica for a given primary.  "Best" is the replica with
  * the lowest node index (deterministic).  Returns QIHSE_CLUSTER_NODE_NONE

@@ -432,6 +432,10 @@ void qihse_cluster_bus_set_ct_slot_update_callback(
 void qihse_cluster_bus_set_ct1_promotion_update_callback(
     qihse_cluster_bus_t* bus,
     qihse_cluster_bus_on_ct1_promotion_update_cb cb, void* user_data);
+/* QCP2 callbacks can fetch a signed predecessor chain over QKP. They run on
+ * the bounded CT proof worker, outside the UDP receive thread and bus lock.
+ * Install before qihse_cluster_bus_start(); changing the callback afterward
+ * is ignored because the worker's lifetime is fixed at start. */
 void qihse_cluster_bus_set_ct1_promotion_v2_update_callback(
     qihse_cluster_bus_t* bus,
     qihse_cluster_bus_on_ct1_promotion_v2_update_cb cb, void* user_data);
@@ -467,6 +471,14 @@ bool qihse_cluster_bus_broadcast_ct1_promotion(
 bool qihse_cluster_bus_broadcast_ct1_promotion_v2(
     qihse_cluster_bus_t* bus,
     const qihse_cluster_bus_ct1_promotion_update_v2_t* update);
+/* Create the exact QBS-authenticated QCP2 slot-update envelope without
+ * sending it. Lane promotion persists and replicates this immutable envelope
+ * before the common ownership decision is finalized. */
+bool qihse_cluster_bus_ct1_promotion_certificate_create(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update,
+    uint8_t** out_envelope, size_t* out_envelope_len);
+void qihse_cluster_bus_ct1_certificate_free(void* envelope, size_t envelope_len);
 /* Relay the exact original signed QCP2 datagram as an opaque certificate.
  * The outer bus sender is authenticated independently from the original
  * target signer embedded in the certificate. */
