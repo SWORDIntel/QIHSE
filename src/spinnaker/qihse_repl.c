@@ -9,6 +9,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdint.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 /* Replay staging helpers, defined with the applier below. */
 static int  repl_stage_open(qihse_repl_context_t* ctx);
@@ -97,6 +102,22 @@ void qihse_repl_destroy(qihse_repl_context_t* ctx) {
     free(ctx);
 }
 
+static int repl_send_all(int fd, const void* data, size_t length) {
+    const uint8_t* bytes = (const uint8_t*)data;
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t n = send(fd, bytes + sent, length - sent, MSG_NOSIGNAL);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n == 0) errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 int qihse_repl_ship_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, size_t len, uint64_t lsn) {
     if (!ctx || !wal_data || len == 0) return -1;
     pthread_mutex_lock(&ctx->lock);
@@ -108,10 +129,18 @@ int qihse_repl_ship_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, size
     uint64_t hdr[2];
     hdr[0] = lsn;
     hdr[1] = (uint64_t)len;
-    ssize_t w = write(ctx->stream_fd, hdr, sizeof(hdr));
-    if (w != (ssize_t)sizeof(hdr)) { ctx->state = REPL_STATE_ERROR; pthread_mutex_unlock(&ctx->lock); return -1; }
-    w = write(ctx->stream_fd, wal_data, len);
-    if (w != (ssize_t)len) { ctx->state = REPL_STATE_ERROR; pthread_mutex_unlock(&ctx->lock); return -1; }
+    int fd = ctx->stream_fd;
+    if (repl_send_all(fd, hdr, sizeof(hdr)) != 0 ||
+        repl_send_all(fd, wal_data, len) != 0) {
+        /* A partial frame makes this stream unusable: never let a later frame
+         * be appended to its tail. MSG_NOSIGNAL above keeps peer closure local. */
+        ctx->state = REPL_STATE_ERROR;
+        ctx->stream_fd = -1;
+        (void)shutdown(fd, SHUT_RDWR);
+        (void)close(fd);
+        pthread_mutex_unlock(&ctx->lock);
+        return -1;
+    }
     ctx->last_lsn = lsn;
     pthread_mutex_unlock(&ctx->lock);
     return 0;
@@ -376,14 +405,44 @@ int qihse_repl_create_slot(qihse_repl_context_t* ctx, const char* name) {
     for (size_t i = 0; i < ctx->num_slots; i++) {
         if (strcmp(ctx->slots[i].name, name) == 0) { pthread_mutex_unlock(&ctx->lock); return -1; }
     }
-    if (ctx->num_slots >= ctx->slots_cap) {
-        ctx->slots_cap = ctx->slots_cap ? ctx->slots_cap * 2 : 4;
-        ctx->slots = (qihse_repl_slot_t*)realloc(ctx->slots, ctx->slots_cap * sizeof(qihse_repl_slot_t));
+    char* slot_name = strdup(name);
+    if (!slot_name) {
+        pthread_mutex_unlock(&ctx->lock);
+        return -1;
     }
-    ctx->slots[ctx->num_slots].name = strdup(name);
-    ctx->slots[ctx->num_slots].restart_lsn = 0;
-    ctx->slots[ctx->num_slots].confirmed_flush_lsn = 0;
-    ctx->slots[ctx->num_slots].active = 0;
+    if (ctx->num_slots >= ctx->slots_cap) {
+        size_t new_cap = ctx->slots_cap ? ctx->slots_cap : 4;
+        if (ctx->slots_cap) {
+            if (ctx->slots_cap > SIZE_MAX / 2) {
+                free(slot_name);
+                pthread_mutex_unlock(&ctx->lock);
+                errno = EOVERFLOW;
+                return -1;
+            }
+            new_cap = ctx->slots_cap * 2;
+        }
+        if (new_cap > SIZE_MAX / sizeof(*ctx->slots)) {
+            free(slot_name);
+            pthread_mutex_unlock(&ctx->lock);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        qihse_repl_slot_t* slots =
+            (qihse_repl_slot_t*)realloc(ctx->slots, new_cap * sizeof(*slots));
+        if (!slots) {
+            free(slot_name);
+            pthread_mutex_unlock(&ctx->lock);
+            return -1;
+        }
+        ctx->slots = slots;
+        ctx->slots_cap = new_cap;
+    }
+    ctx->slots[ctx->num_slots] = (qihse_repl_slot_t){
+        .name = slot_name,
+        .restart_lsn = 0,
+        .confirmed_flush_lsn = 0,
+        .active = 0
+    };
     ctx->num_slots++;
     pthread_mutex_unlock(&ctx->lock);
     return 0;
