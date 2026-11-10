@@ -26,6 +26,14 @@ static unsigned char* read_file(const char* path, size_t* out_size) {
     return bytes;
 }
 
+static void append_tail(const char* path) {
+    FILE* file = fopen(path, "ab");
+    assert(file);
+    assert(fwrite("QKV", 1u, 3u, file) == 3u);
+    assert(fflush(file) == 0);
+    assert(fclose(file) == 0);
+}
+
 int main(void) {
     char data_dir[] = "./tests/wal_replay_apply_XXXXXX";
     assert(mkdtemp(data_dir));
@@ -76,6 +84,36 @@ int main(void) {
     free(value);
     value = qihse_kv_get_user(store, "wal-replay-apply-second", operator_user);
     assert(value && strcmp(value, "also-committed") == 0);
+    free(value);
+    qihse_kv_store_destroy(store);
+
+    /* A read error while examining a malformed tail must leave the entire WAL
+     * untouched. Only a subsequent healthy startup may repair the tail. */
+    append_tail(wal_path);
+    before = read_file(wal_path, &before_size);
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "wal-replay-read", 1) == 0);
+    assert(qihse_kv_store_create_user(operator_user) == NULL);
+    after = read_file(wal_path, &after_size);
+    assert(after_size == before_size && memcmp(after, before, before_size) == 0);
+    free(after);
+    free(before);
+
+    before = read_file(wal_path, &before_size);
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "wal-tail-truncate", 1) == 0);
+    assert(qihse_kv_store_create_user(operator_user) == NULL);
+    after = read_file(wal_path, &after_size);
+    assert(after_size == before_size && memcmp(after, before, before_size) == 0);
+    free(after);
+    free(before);
+
+    /* Tail truncation is not considered complete until its fsync succeeds. */
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "wal-tail-fsync", 1) == 0);
+    assert(qihse_kv_store_create_user(operator_user) == NULL);
+    assert(unsetenv("QIHSE_AIMEM_FAIL_AT") == 0);
+    store = qihse_kv_store_create_user(operator_user);
+    assert(store);
+    value = qihse_kv_get_user(store, "wal-replay-apply", operator_user);
+    assert(value && strcmp(value, "committed") == 0);
     free(value);
     qihse_kv_store_destroy(store);
     aimem_fixture_cleanup(data_dir);

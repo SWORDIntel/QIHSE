@@ -230,6 +230,26 @@ static bool backup_sibling_path(const char* path, const char* suffix,
     return n >= 0 && (size_t)n < cap;
 }
 
+/* Reserve a private, collision-free scratch pathname. The producer atomically
+ * replaces this owned placeholder; cleanup must never target a path that was
+ * merely guessed from pid and wall-clock time. */
+static bool backup_sibling_reserve_path(const char* path, const char* suffix,
+                                        char* out, size_t cap) {
+    int n = snprintf(out, cap, "%s%s.XXXXXX", path, suffix);
+    if (n < 0 || (size_t)n >= cap) return false;
+    int fd = mkstemp(out);
+    if (fd < 0) return false;
+    bool ok = fchmod(fd, 0600) == 0;
+    int saved_errno = ok ? 0 : errno;
+    if (close(fd) != 0 && ok) { ok = false; saved_errno = errno; }
+    if (!ok) {
+        (void)unlink(out);
+        errno = saved_errno ? saved_errno : EIO;
+        return false;
+    }
+    return true;
+}
+
 static FILE* backup_open_read(const char* path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return NULL;
@@ -439,7 +459,14 @@ done:
     if (out_f) fclose(out_f);
     if (tmp_pending) unlink(tmp_path);
     if (data_f) fclose(data_f);
-    unlink(data_path);
+    if (unlink(data_path) != 0 && errno != ENOENT &&
+        result == QIHSE_BACKUP_EXPORT_OK) {
+        result = QIHSE_BACKUP_EXPORT_ERR;
+        if (info) {
+            qihse_backup_info_free(info);
+            memset(info, 0, sizeof(*info));
+        }
+    }
     free(chunk);
     if (result != QIHSE_BACKUP_EXPORT_OK && info) {
         qihse_backup_info_free(info);
@@ -475,38 +502,37 @@ static int backup_write_container(qihse_kv_store_t* kv, qihse_user_t* user,
         return QIHSE_BACKUP_EXPORT_DENIED;
     }
     char data_path[BACKUP_PATH_MAX];
-    if (!backup_sibling_path(output_path, ".data", data_path, sizeof(data_path))) {
+    bool data_path_pending = false;
+    if (!backup_sibling_reserve_path(output_path, ".data", data_path,
+                                     sizeof(data_path))) {
         qihse_auth_release_principal_scoped(principal);
         qihse_backup_info_free(info);
         if (info) memset(info, 0, sizeof(*info));
         return QIHSE_BACKUP_EXPORT_ERR;
     }
+    data_path_pending = true;
     uint64_t resume_seq = 0u;
     int save_rc = produce(kv, data_path, principal, since_seq, &resume_seq);
-    /* The KV layer only ever leaves a file at data_path when it returns 0,
-     * so a truncated or unbuilt scratch path is never unlinked. */
-    if (save_rc == -2) {
-        qihse_auth_release_principal_scoped(principal);
-        qihse_backup_info_free(info);
-        if (info) memset(info, 0, sizeof(*info));
-        return QIHSE_BACKUP_EXPORT_DENIED;
-    }
-    if (save_rc != 0) {
-        qihse_auth_release_principal_scoped(principal);
-        qihse_backup_info_free(info);
-        if (info) memset(info, 0, sizeof(*info));
-        return QIHSE_BACKUP_EXPORT_ERR;
-    }
-    if (!qihse_auth_validate_handle_generation(principal, generation)) {
-        unlink(data_path);
-        qihse_auth_release_principal_scoped(principal);
-        qihse_backup_info_free(info);
-        if (info) memset(info, 0, sizeof(*info));
-        return QIHSE_BACKUP_EXPORT_DENIED;
-    }
-    int result = backup_seal_container(output_path, type, since_seq, resume_seq,
+    int result = save_rc == -2 ? QIHSE_BACKUP_EXPORT_DENIED :
+                 save_rc != 0 ? QIHSE_BACKUP_EXPORT_ERR : QIHSE_BACKUP_EXPORT_OK;
+    if (save_rc == 0 && !qihse_auth_validate_handle_generation(principal, generation)) {
+        result = QIHSE_BACKUP_EXPORT_DENIED;
+        errno = EACCES;
+    } else if (save_rc == 0) {
+        result = backup_seal_container(output_path, type, since_seq, resume_seq,
                                        data_path, principal, generation, NULL, info);
+    }
+    if (data_path_pending && unlink(data_path) != 0 && errno != ENOENT &&
+        result == QIHSE_BACKUP_EXPORT_OK) {
+        int unlink_errno = errno;
+        result = QIHSE_BACKUP_EXPORT_ERR;
+        errno = unlink_errno;
+    }
     qihse_auth_release_principal_scoped(principal);
+    if (result != QIHSE_BACKUP_EXPORT_OK && info) {
+        qihse_backup_info_free(info);
+        memset(info, 0, sizeof(*info));
+    }
     return result;
 }
 
@@ -641,7 +667,7 @@ int qihse_backup_owner_snapshot_create(qihse_kv_store_t* kv, qihse_user_t* user,
     int seal_rc = backup_seal_container(container_path, BACKUP_OWNER_DATA, 0u,
             source_seq, raw_path, principal, generation, NULL, NULL);
     if (seal_rc != QIHSE_BACKUP_EXPORT_OK) {
-        raw_pending = false; /* sealer always consumes the data path */
+        result = seal_rc;
         goto done;
     }
     raw_pending = false;
@@ -654,7 +680,12 @@ int qihse_backup_owner_snapshot_create(qihse_kv_store_t* kv, qihse_user_t* user,
         int saved = errno ? errno : EACCES;
         close(fd); errno = saved; goto done;
     }
-    (void)unlink(container_path);
+    if (unlink(container_path) != 0) {
+        int unlink_errno = errno;
+        close(fd);
+        errno = unlink_errno;
+        goto done;
+    }
     container_pending = false;
     snapshot = calloc(1u, sizeof(*snapshot));
     if (!snapshot) { close(fd); goto done; }

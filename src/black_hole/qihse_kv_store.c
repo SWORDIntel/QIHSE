@@ -2977,16 +2977,45 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
         }
         break;
     }
+    /* Read failures are not evidence of a torn tail.  In particular, an EIO
+     * after some complete frames must not cause a valid suffix to be lost. */
+    bool injected_read_error = aimem_durability_test_fail_once("wal-replay-read");
+    if (injected_read_error || ferror(f)) {
+        int saved_errno = injected_read_error ? EIO : (errno ? errno : EIO);
+        fclose(f);
+        errno = saved_errno;
+        return false;
+    }
     off_t end = ftello(f);
-    fclose(f);
+    if (end < 0 || last_good < 0 || end < last_good) {
+        int saved_errno = errno ? errno : EIO;
+        fclose(f);
+        errno = saved_errno;
+        return false;
+    }
+    if (fclose(f) != 0) {
+        if (errno == 0) errno = EIO;
+        return false;
+    }
     /* A short/invalid final frame is an unacknowledged write tail. Remove it
      * before opening the append handle so a retry's valid frame is replayable. */
     if (end >= 0 && last_good >= 0 && end > last_good) {
+        if (aimem_durability_test_fail_once("wal-tail-open")) return false;
         int repair_fd = open(wal_path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (repair_fd >= 0) {
-            if (ftruncate(repair_fd, last_good) == 0) (void)fsync(repair_fd);
-            close(repair_fd);
+        if (repair_fd < 0) return false;
+        bool repaired = !aimem_durability_test_fail_once("wal-tail-truncate") &&
+                        ftruncate(repair_fd, last_good) == 0;
+        int saved_errno = repaired ? 0 : (errno ? errno : EIO);
+        if (repaired) {
+            repaired = !aimem_durability_test_fail_once("wal-tail-fsync") &&
+                       fsync(repair_fd) == 0;
+            if (!repaired) saved_errno = errno ? errno : EIO;
         }
+        if (close(repair_fd) != 0 && repaired) {
+            repaired = false;
+            saved_errno = errno ? errno : EIO;
+        }
+        if (!repaired) { errno = saved_errno ? saved_errno : EIO; return false; }
     }
     if (store->ct_enabled &&
         ((store->ct_mode == 1u && store->ct_durable_lsn > store->ct_ack_lsn &&
@@ -6097,7 +6126,12 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
     }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     int saved_errno = errno;
-    (void)unlink(path);
+    if (unlink(path) != 0) {
+        int unlink_errno = errno;
+        if (fd >= 0) close(fd);
+        errno = unlink_errno;
+        return -1;
+    }
     if (fd < 0) { errno = saved_errno; return -1; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
@@ -6170,7 +6204,12 @@ int qihse_kv_ct_owner_data_snapshot_create(qihse_kv_store_t* store,
     }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     int saved_errno = errno;
-    (void)unlink(path);
+    if (unlink(path) != 0) {
+        int unlink_errno = errno;
+        if (fd >= 0) close(fd);
+        errno = unlink_errno;
+        return -1;
+    }
     if (fd < 0) { errno = saved_errno; return -1; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
