@@ -258,35 +258,40 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
      * ranges. Even when B remains a primary, the old proof cannot establish
      * that A's lagging slots still belong to B; they must wait for the newer
      * promotion chain. */
-    nodes[0].role = QIHSE_CLUSTER_NODE_PRIMARY;
-    nodes[0].primary_index = QIHSE_CLUSTER_NODE_NONE;
-    nodes[0].config_epoch = 20;
-    nodes[1].role = QIHSE_CLUSTER_NODE_PRIMARY;
-    nodes[1].primary_index = QIHSE_CLUSTER_NODE_NONE;
-    nodes[1].config_epoch = 20;
-    nodes[2].config_epoch = 20;
-    nodes[3].config_epoch = 20;
-    qihse_cluster_topology_t* stale_topo = qihse_cluster_topology_create();
-    assert(stale_topo);
-    for (size_t i = 0; i < 4; ++i) assert(qihse_cluster_topology_upsert_node(
-        stale_topo, &nodes[i], &ix[i]));
-    assert(qihse_cluster_topology_adopt_range(stale_topo, 100, 100, ix[0], 8u));
-    assert(qihse_cluster_topology_adopt_range(stale_topo, 101, 110, ix[3], 20u));
-    ownership.topology = stale_topo;
-    snprintf(event.transfer_id, sizeof(event.transfer_id), "ct1-stale-role-check");
-    event.config_epoch = 10;
-    promotion_seal_fields(&event);
-    assert(qihse_cluster_ownership_receive_ct1_promotion(&ownership,
-        &event, err, sizeof(err)));
-    qihse_cluster_node_t check;
-    assert(qihse_cluster_topology_get_node(stale_topo, ix[1], &check));
-    assert(check.role == QIHSE_CLUSTER_NODE_PRIMARY &&
-           check.primary_index == QIHSE_CLUSTER_NODE_NONE && check.config_epoch == 20);
-    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
-    assert(qihse_cluster_topology_get_slot(stale_topo, 100, &owner, NULL, NULL));
-    assert(owner == ix[0]);
+    for (unsigned role_case = 0; role_case < 3; ++role_case) {
+        nodes[0].role = QIHSE_CLUSTER_NODE_PRIMARY;
+        nodes[0].primary_index = QIHSE_CLUSTER_NODE_NONE;
+        nodes[0].config_epoch = 20;
+        nodes[1].role = role_case == 1 ? QIHSE_CLUSTER_NODE_PRIMARY :
+                                             QIHSE_CLUSTER_NODE_REPLICA;
+        nodes[1].primary_index = role_case == 1 ? QIHSE_CLUSTER_NODE_NONE :
+                                    role_case == 0 ? ix[3] : ix[0];
+        nodes[1].config_epoch = role_case == 2 ? 10 : 20;
+        nodes[2].config_epoch = 20;
+        nodes[3].config_epoch = 20;
+        qihse_cluster_topology_t* stale_topo = qihse_cluster_topology_create();
+        assert(stale_topo);
+        for (size_t i = 0; i < 4; ++i) assert(qihse_cluster_topology_upsert_node(
+            stale_topo, &nodes[i], &ix[i]));
+        assert(qihse_cluster_topology_adopt_range(stale_topo, 100, 100, ix[0], 8u));
+        assert(qihse_cluster_topology_adopt_range(stale_topo, 101, 110, ix[3], 20u));
+        ownership.topology = stale_topo;
+        snprintf(event.transfer_id, sizeof(event.transfer_id), "ct1-stale-role-check");
+        event.config_epoch = 10;
+        promotion_seal_fields(&event);
+        assert(qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+            &event, err, sizeof(err)));
+        qihse_cluster_node_t check;
+        assert(qihse_cluster_topology_get_node(stale_topo, ix[1], &check));
+        assert(check.role == nodes[1].role &&
+               check.primary_index == nodes[1].primary_index &&
+               check.config_epoch == nodes[1].config_epoch);
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        assert(qihse_cluster_topology_get_slot(stale_topo, 100, &owner, NULL, NULL));
+        assert(owner == ix[0]);
 
-    qihse_cluster_topology_destroy(stale_topo);
+        qihse_cluster_topology_destroy(stale_topo);
+    }
     qihse_cluster_topology_destroy(topo);
     puts("[PASS] signed CT1 promotion validates pins, preserves overlap, and skips stale role rollback");
 }
