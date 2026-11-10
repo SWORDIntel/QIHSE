@@ -183,6 +183,21 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
     assert(!qihse_cluster_ownership_receive_ct1_promotion(&ownership,
         &forged, err, sizeof(err)));
 
+    /* This observer missed A->B. A later valid B->C promotion cannot replace
+     * A's unrelated local ownership without an authenticated skipped-link
+     * proof, even though its epoch is newer and C's target proof is valid. */
+    qihse_cluster_bus_ct1_promotion_update_t skipped = event;
+    skipped.config_epoch = 12;
+    snprintf(skipped.transfer_id, sizeof(skipped.transfer_id), "ct1-skipped-A-B-C");
+    snprintf(skipped.source_id, sizeof(skipped.source_id), "%s", pins.node[1]);
+    snprintf(skipped.target_id, sizeof(skipped.target_id), "%s", pins.node[3]);
+    snprintf(skipped.source_qkp_id, sizeof(skipped.source_qkp_id), "%s", pins.pin[1]);
+    snprintf(skipped.target_qkp_id, sizeof(skipped.target_qkp_id), "%s", pins.pin[3]);
+    promotion_seal_fields(&skipped);
+    assert(!qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &skipped, err, sizeof(err)));
+    assert(strstr(err, "conflicts with a newer or same-epoch owner") != NULL);
+
     /* The bus handler has verified the target signature; ownership validation
      * persists ADOPTED, updates the still-lagging outer runs, and skips only
      * the newer B->C middle slots. */
@@ -196,6 +211,34 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
         if (slot >= 104 && slot <= 106) assert(owner == ix[3] && epoch == 11u);
         else assert(owner == ix[1] && epoch == 10u);
     }
+
+    /* One valid maximal run carries the full signed bitmap. Disjoint slots in
+     * the same durable promotion event must be adopted together. */
+    qihse_cluster_topology_t* disjoint_topo = qihse_cluster_topology_create();
+    assert(disjoint_topo);
+    for (size_t i = 0; i < 4; ++i) assert(qihse_cluster_topology_upsert_node(
+        disjoint_topo, &nodes[i], &ix[i]));
+    assert(qihse_cluster_topology_adopt_range(disjoint_topo, 200, 200, ix[0], 8u));
+    assert(qihse_cluster_topology_adopt_range(disjoint_topo, 202, 202, ix[0], 8u));
+    qihse_cluster_bus_ct1_promotion_update_t disjoint = event;
+    disjoint.start = 200; disjoint.end = 200;
+    disjoint.config_epoch = 12;
+    snprintf(disjoint.transfer_id, sizeof(disjoint.transfer_id), "ct1-disjoint-A-B");
+    memset(disjoint.slot_bitmap, 0, sizeof(disjoint.slot_bitmap));
+    disjoint.slot_bitmap[200 / 8u] |= (uint8_t)(1u << (200 % 8u));
+    disjoint.slot_bitmap[202 / 8u] |= (uint8_t)(1u << (202 % 8u));
+    promotion_seal_fields(&disjoint);
+    ownership.topology = disjoint_topo;
+    assert(qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &disjoint, err, sizeof(err)));
+    for (uint16_t slot = 200; slot <= 202; slot += 2) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        assert(qihse_cluster_topology_get_slot(disjoint_topo, slot, &owner, NULL, NULL));
+        assert(qihse_cluster_topology_get_slot_epoch(disjoint_topo, slot, &epoch));
+        assert(owner == ix[1] && epoch == disjoint.config_epoch);
+    }
+    qihse_cluster_topology_destroy(disjoint_topo);
 
     /* A still older signed event must not demote a target that has since
      * become a replica at a newer node epoch. The local source's old slot is

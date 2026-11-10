@@ -172,6 +172,53 @@ static void test_ct_slot_update_queued_off_rx_thread(void) {
     printf("PASS CT slot update is queued to off-receive proof worker\n");
 }
 
+static void test_ct2_reannounce(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0); assert(fd >= 0);
+    struct sockaddr_in dst = {0}; dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(fd, (struct sockaddr*)&dst, sizeof(dst)) == 0);
+    socklen_t sl = sizeof(dst); assert(getsockname(fd, (struct sockaddr*)&dst, &sl) == 0);
+    struct timeval tv = {.tv_sec=6}; assert(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv))==0);
+    qihse_cluster_topology_t* topo=qihse_cluster_topology_create(); assert(topo);
+    qihse_cluster_node_t src,tgt; make_node(&src,"reannounce-src","127.0.0.1",7000,0);
+    make_node(&tgt,"reannounce-tgt","127.0.0.1",7001,ntohs(dst.sin_port));
+    uint16_t si,ti; assert(qihse_cluster_topology_upsert_node(topo,&src,&si));
+    assert(qihse_cluster_topology_upsert_node(topo,&tgt,&ti));
+    assert(qihse_cluster_topology_assign_range(topo,10,20,ti));
+    qihse_cluster_bus_config_t cfg={0}; cfg.topology=topo; cfg.local_node_index=si;
+    cfg.bus_port=0;
+    qihse_cluster_bus_t* bus=qihse_cluster_bus_create(&cfg); assert(bus&&qihse_cluster_bus_start(bus));
+    qihse_cluster_bus_ct_slot_update_t a={0}; a.magic=QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC;
+    a.start=10;a.end=20;a.config_epoch=9;a.source_lsn=100;a.target_lsn=1;
+    strcpy(a.transfer_id,"original");strcpy(a.source_id,src.id);strcpy(a.target_id,tgt.id);
+    strcpy(a.source_qkp_id,"sp");strcpy(a.target_qkp_id,"tp");strcpy(a.generation,"g1");
+    strcpy(a.owner_id,tgt.id);a.checksum[0]=1;
+    assert(qihse_cluster_bus_broadcast_ct_slot_update(bus,&a));
+    qihse_cluster_bus_ct_slot_update_t b=a;b.start=b.end=15;b.config_epoch=10;
+    b.source_lsn=101;strcpy(b.transfer_id,"newer");strcpy(b.generation,"g2");b.checksum[0]=2;
+    assert(qihse_cluster_bus_broadcast_ct_slot_update(bus,&b));
+    uint8_t frame[2048];
+    /* Consume immediate sends before awaiting periodic cache emissions. */
+    while(recv(fd,frame,sizeof(frame),MSG_DONTWAIT)>0){}
+    unsigned original_count=0, overlap_count=0;
+    uint64_t stop=(uint64_t)time(NULL)+5;
+    while((uint64_t)time(NULL)<stop){
+        ssize_t n=recv(fd,frame,sizeof(frame),0);
+        if(n < (ssize_t)(16+sizeof(a)))continue;
+        uint32_t typ;memcpy(&typ,frame+4,4);typ=ntohl(typ);
+        if(typ!=QIHSE_BUS_MSG_SLOT_UPDATE)continue;
+        qihse_cluster_bus_ct_slot_update_t x;memcpy(&x,frame+16,sizeof(x));
+        if(x.config_epoch==a.config_epoch&&x.start==a.start&&x.end==a.end&&
+           !strcmp(x.transfer_id,a.transfer_id))original_count++;
+        if(x.config_epoch==b.config_epoch&&x.start==b.start&&x.end==b.end&&
+           !strcmp(x.transfer_id,b.transfer_id))overlap_count++;
+    }
+    assert(original_count >= 1 && original_count <= 3);
+    assert(overlap_count >= 1 && overlap_count <= 3);
+    puts("PASS CT2 periodic reannounce retains original receipt bounds once per tick after overlap");
+    qihse_cluster_bus_stop(bus);qihse_cluster_bus_destroy(bus);qihse_cluster_topology_destroy(topo);close(fd);
+}
+
 /* Test 2: Inject a MEET message and verify the node is added to topology. */
 static void test_meet_inject(void) {
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
@@ -677,6 +724,7 @@ int main(void) {
 }
     test_slot_update_inject();
     test_ct_slot_update_queued_off_rx_thread();
+    test_ct2_reannounce();
     test_meet_inject();
     test_fail_inject();
     test_bad_magic();

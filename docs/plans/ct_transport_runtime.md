@@ -102,6 +102,17 @@ Peer ownership convergence requires independently resolving the authenticated
 target receipt and persisting the transition locally. A bus notification is
 a hint to perform this verification, never authority to adopt a new owner.
 
+The bus periodically reannounces retained proof-bearing CT ownership events
+because UDP delivery is not acknowledged. CT2 resend preserves each original
+receipt-bound range while receivers apply only slots whose local epochs are
+older. A single CT1 promotion frame carries its full authenticated slot bitmap,
+even when that bitmap is disjoint; the receiver applies the full bitmap after
+validating a maximal run. This repairs a missed announcement while a peer still
+has a compatible predecessor view. It does not provide a proof chain for a peer
+that missed A-to-B and later receives only B-to-C: such a peer must not replace
+an unrelated current owner without authenticated evidence for the skipped
+transition. Multi-hop missed-promotion recovery remains open.
+
 ## Operator commands
 
 An authenticated system Operator on the successor may run:

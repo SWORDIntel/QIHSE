@@ -220,6 +220,9 @@ static bool qihse_bus_valid_ct1_promotion(
     const qihse_cluster_bus_ct1_promotion_update_t* update);
 static bool qihse_bus_valid_ct1_promotion_event(
     const qihse_cluster_bus_ct1_promotion_update_t* update);
+static bool qihse_bus_ct1_first_run(
+    const qihse_cluster_bus_ct1_promotion_update_t* update,
+    qihse_cluster_bus_ct1_promotion_update_t* run);
 static bool qihse_bus_ct1_promotion_digest(
     const qihse_cluster_bus_ct1_promotion_update_t* update, uint8_t out[32]);
 static void qihse_bus_handle_ct1_promotion_update(qihse_cluster_bus_t* bus,
@@ -887,6 +890,26 @@ static bool qihse_bus_valid_ct1_promotion_event(
         last = slot;
     }
     return first == u->start && last == u->end;
+}
+
+/* The event digest authenticates the complete bitmap, and the receiver applies
+ * that complete bitmap after validating any maximal contiguous run. One run is
+ * therefore enough to carry a proof event, even when its slots are disjoint. */
+static bool qihse_bus_ct1_first_run(
+    const qihse_cluster_bus_ct1_promotion_update_t* update,
+    qihse_cluster_bus_ct1_promotion_update_t* run) {
+    if (!update || !run) return false;
+    uint32_t slot = update->start;
+    while (slot <= update->end &&
+           !(update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
+    if (slot > update->end) return false;
+    uint32_t first = slot++;
+    while (slot <= update->end &&
+           (update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
+    *run = *update;
+    run->start = (uint16_t)first;
+    run->end = (uint16_t)(slot - 1u);
+    return true;
 }
 
 static bool qihse_bus_ct1_promotion_digest(
@@ -1570,11 +1593,13 @@ static void* qihse_bus_thread(void* arg) {
              * current proof-per-slot cache each cycle; epoch checks on receive
              * make repeats idempotent and prevent historical rollback. */
             bus->last_ct_announce_ms = now;
-            for (unsigned sent = 0; sent < 64u; ++sent) {
+            uint32_t ct_scanned = 0;
+            for (unsigned sent = 0; sent < 64u && ct_scanned < QIHSE_CLUSTER_SLOT_COUNT; ++sent) {
                 qihse_cluster_bus_ct_slot_update_t update;
                 bool found = false;
                 pthread_mutex_lock(&bus->ct_queue_lock);
-                for (uint32_t scanned = 0; scanned < QIHSE_CLUSTER_SLOT_COUNT; ++scanned) {
+                while (ct_scanned < QIHSE_CLUSTER_SLOT_COUNT) {
+                    ++ct_scanned;
                     uint16_t slot = bus->ct_announce_cursor;
                     bus->ct_announce_cursor = (uint16_t)((slot + 1u) % QIHSE_CLUSTER_SLOT_COUNT);
                     if (bus->ct_announcements &&
@@ -1612,8 +1637,10 @@ static void* qihse_bus_thread(void* arg) {
             bus->ct1_announce_round++;
             if (bus->ct1_announce_round == 0) {
                 bus->ct1_announce_round = 1;
+                pthread_mutex_lock(&bus->ct_queue_lock);
                 for (size_t i = 0; i < bus->ct1_announcement_count; ++i)
                     bus->ct1_announcements[i].announced_round = 0;
+                pthread_mutex_unlock(&bus->ct_queue_lock);
             }
             /* Keep the proof tuple for every slot that still depends on it.
              * Later promotions replace only their covered slots; older
@@ -1637,22 +1664,13 @@ static void* qihse_bus_thread(void* arg) {
                 }
                 pthread_mutex_unlock(&bus->ct_queue_lock);
                 if (!found) break;
-                /* Wire ranges are contiguous bitmap runs, while event_digest
-                 * binds the unchanged complete promotion bitmap and tuple. */
-                uint32_t slot = update.start;
-                uint32_t full_end = update.end;
-                while (slot <= full_end) {
-                    if (!(update.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) {
-                        ++slot;
-                        continue;
-                    }
-                    uint32_t first = slot++;
-                    while (slot <= full_end &&
-                           (update.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
-                    update.start = (uint16_t)first;
-                    update.end = (uint16_t)(slot - 1u);
+                /* One maximal bitmap run carries the full authenticated event;
+                 * the receiver applies the complete bitmap after validation. */
+                qihse_cluster_bus_ct1_promotion_update_t run;
+                if (qihse_bus_ct1_first_run(&update, &run)) {
                     (void)qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
-                        (const uint8_t*)&update, sizeof(update));
+                        (const uint8_t*)&run, sizeof(run));
+                    OPENSSL_cleanse(&run, sizeof(run));
                 }
                 OPENSSL_cleanse(&update, sizeof(update));
             }
@@ -2049,23 +2067,11 @@ bool qihse_cluster_bus_broadcast_ct1_promotion(
     }
     pthread_mutex_unlock(&bus->ct_queue_lock);
     if (!cached) return false;
-    bool ok = true;
-    uint32_t slot = update->start;
-    while (slot <= update->end) {
-        if (!(update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) {
-            ++slot;
-            continue;
-        }
-        uint32_t first = slot++;
-        while (slot <= update->end &&
-               (update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
-        qihse_cluster_bus_ct1_promotion_update_t run = *update;
-        run.start = (uint16_t)first;
-        run.end = (uint16_t)(slot - 1u);
-        if (!qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
-                (const uint8_t*)&run, sizeof(run))) ok = false;
-        OPENSSL_cleanse(&run, sizeof(run));
-    }
+    qihse_cluster_bus_ct1_promotion_update_t run;
+    bool ok = qihse_bus_ct1_first_run(update, &run) &&
+        qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+            (const uint8_t*)&run, sizeof(run));
+    OPENSSL_cleanse(&run, sizeof(run));
     return ok;
 }
 
