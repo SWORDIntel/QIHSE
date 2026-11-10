@@ -50,6 +50,14 @@ bool qihse_cluster_range_authority_initialize(
     const qihse_consensus_range_slot_t slots[QIHSE_CONSENSUS_RANGE_SLOT_COUNT],
     char* error, size_t error_cap);
 
+/* Reconcile routing from the committed common map. This never changes KV
+ * admission or replication roles. Older local journal/event replay cannot
+ * undo newer committed slot epochs. */
+bool qihse_cluster_range_authority_refresh(
+    void* authority, qihse_user_t* principal,
+    const uint8_t slots[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES],
+    char* error, size_t error_cap);
+
 /* Ownership adapter hooks. Reserve fills config_epoch before the local
  * INTENT/fence is created. An existing ID must resolve its original immutable
  * reservation rather than computing a new CAS input on retry. */
