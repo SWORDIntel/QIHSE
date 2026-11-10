@@ -2497,6 +2497,7 @@ bool qihse_ai_memory_projection_wait_ready(qihse_resp_server_t* server,
     pthread_mutex_lock(&g_projection_lock);
     aimem_projection_t* p = g_projection;
     if (!p || p->server != server || p->principal != user) {
+        errno = p && p->server == server ? EACCES : ENOTSUP;
         pthread_mutex_unlock(&g_projection_lock); return false;
     }
     pthread_mutex_lock(&p->lock);
@@ -2519,6 +2520,12 @@ bool qihse_ai_memory_projection_wait_ready(qihse_resp_server_t* server,
             qihse_kv_projection_marker(qihse_resp_server_store(server), &seq, &epoch) &&
             epoch == p->projection_epoch && seq == p->checked_seq;
         if (ready || pthread_cond_timedwait(&p->wake, &p->lock, &deadline) != 0) break;
+    }
+    if (!ready) {
+        if (!qihse_auth_user_is_active(user)) errno = EACCES;
+        else if (p->stop) errno = ECANCELED;
+        else if (!p->ready) errno = EAGAIN;
+        else errno = ESTALE;
     }
     pthread_mutex_unlock(&p->lock);
     return ready;
@@ -2705,10 +2712,8 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
         uint64_t remaining_ms = now < query_deadline ?
             (query_deadline - now) / 1000000u : 0u;
         uint32_t wait_ms = remaining_ms > 750u ? 750u : (uint32_t)remaining_ms;
-        if (!wait_ms || !qihse_ai_memory_projection_wait_ready(server, user, wait_ms)) {
-            errno = wait_ms ? EAGAIN : ETIMEDOUT;
-            return 0u;
-        }
+        if (!wait_ms) { errno = ETIMEDOUT; return 0u; }
+        if (!qihse_ai_memory_projection_wait_ready(server, user, wait_ms)) return 0u;
     }
     if (want_vector && (!qihse_ai_memory_embedder_fingerprint(query_model) ||
         !qihse_kv_projection_marker(store, &query_seq, &query_epoch) ||
