@@ -2455,9 +2455,20 @@ bool qihse_ai_memory_projection_enable(qihse_resp_server_t* server,
     if (ok) { AIMEM_SYMBOL(create); AIMEM_SYMBOL(add); AIMEM_SYMBOL(seal);
               AIMEM_SYMBOL(search); AIMEM_SYMBOL(destroy); }
 #undef AIMEM_SYMBOL
+    /* A cache generation is valid only for the model that produced its
+     * vectors. Keep model revisions in separate files: opening the old
+     * tenant/owner-only path with a new fingerprint correctly fails the
+     * projection-store identity check, but would otherwise strand semantic
+     * recall until an operator manually removed the old cache. A provider
+     * swap while enabled remains stale by design; shutdown/re-enable binds
+     * the projection to the new provider and its matching cache. */
+    char model_hex[65];
+    for (size_t i = 0u; i < sizeof p->model; i++)
+        snprintf(model_hex + i * 2u, 3u, "%02x", p->model[i]);
     char path[1024];
-    int n = snprintf(path, sizeof path, "%s/aimem-projection-%u-%u.qap", cache_directory,
-        (unsigned)qihse_user_get_tenant_id(principal), (unsigned)qihse_user_get_id(principal));
+    int n = snprintf(path, sizeof path, "%s/aimem-projection-%u-%u-%s.qap", cache_directory,
+        (unsigned)qihse_user_get_tenant_id(principal),
+        (unsigned)qihse_user_get_id(principal), model_hex);
     if (n <= 0 || (size_t)n >= sizeof path) ok = false;
     if (ok) p->cache = qihse_aimem_projection_store_open(path,
         qihse_user_get_tenant_id(principal), qihse_user_get_id(principal),
