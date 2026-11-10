@@ -5,12 +5,15 @@ Status: all nine original stores were backed up and reconciled into one
 authenticated union. That union was restored into a fresh generation and
 independently compared as 271,434 identical records with zero additions or
 conflicts. CT2 then distributed ownership across T420, 730xd and T320. Six
-recovery services are enabled and active. T420 and T320 serve data; 730xd is
-still data-fenced because restart replay retries an already completed abort.
-The focused replay fix and regression test pass locally; complete-suite
-validation now passes (204 targets, zero failures); native deployment is in
-progress. Keep all original backups and the union intact until all three
-owners pass data-plane and replication checks.
+recovery services are enabled and active. A replay-order fix was natively
+deployed on 730xd; all three owners now answer data commands and report the
+same six-peer map, `cluster_state:ok`, and 16,384/16,384 assigned slots. The
+required full suite passed 204 targets with zero failures. Per-owner key counts
+sum to 271,462 at the latest probe, 28 above the authenticated union count;
+this count difference is not yet classified by a fresh record-level backup
+comparison. All 309 AIMEM records remain visible on 730xd. Keep the nine
+original backups and merged union intact while reconciling this live inventory
+and confirming CT1 stream health.
 
 Step 1 checkpoint: the demonstrated 730xd-to-T320 alias ARP failure was
 repaired at the user's request using a persistent verified neighbour mapping.
@@ -303,7 +306,7 @@ provide a recovery point. After new writes are accepted, simply restarting old
 stores would lose those writes; use forward recovery or an explicitly reconciled
 new backup instead. Do not promise an automatic rollback after cutover.
 
-## Current execution checkpoint (2026-11-10)
+## Current execution checkpoint (2026-11-10, after 730xd recovery)
 
 - Nine authenticated original full backups, three main-store delta exports,
   and the authenticated merged union remain preserved under
@@ -314,30 +317,46 @@ new backup instead. Do not promise an automatic rollback after cutover.
   zero additions and zero conflicts. The six cache inputs contributed 830
   exact duplicates; the merge recorded zero conflicting live keys.
 - Native recovery packages were built for each host from source revision
-  `8d79780b4556c9e2170e1d012d0f7f8203535946`. Six persistent enabled recovery
-  services are active: owners A/B/C on T420/730xd/T320 and off-host successors
-  on T320/T420/730xd respectively. The old services and old data directories
-  remain stopped and untouched.
+  `8d79780b4556c9e2170e1d012d0f7f8203535946`; 730xd now runs the native
+  `cabe8dc` package. Six persistent recovery services are enabled and active:
+  owners A/B/C on T420/730xd/T320 and off-host successors on T320/T420/730xd.
+  The old services and old data directories remain stopped and untouched.
 - All three owners independently return the same six-peer cluster map, with
   all peers connected. Slot ownership is T420 `0–5039, 5041–5460` (5,460),
   T320 `5461–10921` (5,461), and 730xd `5040, 10922–16383` (5,463). Slot 5040
   safely stayed on 730xd after CT2 refused its isolated transfer under the
   current bound; no rows were truncated.
-- Data-plane status is not yet uniform. T420 and T320 answer data commands;
-  730xd returns `TRYAGAIN ownership recovery is in progress`. Its log identifies
-  the cause as `durable source abort fence recovery failed`.
-- The cause is that startup replay attempts to release an already released
-  ABORTED CT2 fence. The source fix now releases only the exact matching active
-  fence, accepts a verified clear fence on later restarts, and refuses to clear
-  a different active transfer. `make test-ownership-abort-replay` passes and
-  covers the original recovery, repeat replay and different-fence refusal.
-  `make test TEST_JOBS=32` passed 204 targets with zero failures. Native 730xd
-  deployment and post-restart data-plane verification remain pending.
-- CT1 had drained to durable=acknowledged on all owners before the persistent
-  restart. Recheck all three cursors after clearing the 730xd fence.
-- AIMEM remains node-local by current CT2 design: 309 records on B, none on A
-  or C. The memories are present in the verified union but are not distributed
-  evenly by slot movement. Treat this separately from cluster slot readiness.
+- The original `a7c9848` fix was insufficient: replay processes historical
+  ABORTED entries before the final pending transaction, so an old abort could
+  reject the later transaction's valid active fence. Commit `cabe8dc` defers
+  that historical comparison, releases only a fence whose full identity/range/
+  cursor matches the abort, and validates any remaining active fence against
+  the final unfinished journal entry. The regression covers both the valid
+  later pending transfer and an unrelated active-fence refusal.
+- `make test-ownership-abort-replay` passed locally and on 730xd. The required
+  `make test TEST_JOBS=32` run passed **204 targets, 0 failures** (including
+  the 1,381.9-second CodeGraph aggregate and the gold parallel lane). The
+  versioned `native-730xd-cabe8dc` package has verified checksums and its
+  systemd unit backup is preserved at
+  `/var/lib/qihse-maintenance/cluster-recovery-20261109/`.
+- Authenticated QKP `PING` returns `PONG` on 730xd and `DBSIZE` succeeds. All
+  three owner probes report identical membership, all six peers connected,
+  and 16,384/16,384 slots assigned. Slot ownership remains T420 `0–5039,
+  5041–5460` (5,460), T320 `5461–10921` (5,461), and 730xd `5040,
+  10922–16383` (5,463). The three per-owner `DBSIZE` values were 8,860,
+  209,941, and 52,661 (sum 271,462); compare this against the preserved union
+  at record level before declaring inventory equality. No original backup was
+  modified.
+- Authenticated CT1 source/target status shows the successors at the source's
+  acknowledged cursor. At capture, A and C each had one durable group beyond
+  their acknowledgement (25/24 and 23/22); B was advancing during expiry
+  processing and its target cursor matched the acknowledged cursor. Recheck
+  after quiescing writes before taking a consistent post-migration snapshot.
+- `AIMEM COUNT` reports 309 on B/730xd and 0 on A/T420 and C/T320. Those 309
+  records are present in the verified union and remain on a live owner; CT2
+  slot transfer does not distribute node-local AIMEM state. Do not retire the
+  original stores until the live inventory comparison and AIMEM access path
+  are reconciled.
 - Automatic capacity-aware balancing, automatic failover promotion, and
   dynamic successor reassignment remain open roadmap items. Keep the current
   slot-count R5 automatic rebalancer disabled for this heterogeneous layout.
