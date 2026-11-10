@@ -53,6 +53,13 @@ static void assert_value(qihse_kv_store_t *store, qihse_user_t *user,
     free(value);
 }
 
+static bool verify_lane_claim(void *context,
+    const qihse_kv_ct_lane_authority_claim_t *claim, bool require_final) {
+    const bool final_available = context && *(const bool *)context;
+    if (!claim || claim->reserve_index != 11u) return false;
+    return !require_final || (final_available && claim->final_decision_index == 12u);
+}
+
 int main(void) {
     char data_dir[] = "./ct_lanes_XXXXXX";
     umask(0077);
@@ -64,9 +71,9 @@ int main(void) {
     qihse_user_t *op = qihse_auth_authenticate_id(0u, "CtLaneOperator1!");
     assert(op);
     qihse_user_t *low = qihse_auth_create_user(op, 8401u, QIHSE_ROLE_ANALYST,
-                                                0u, 0u, "CtLaneLow1!", false);
+                                                0u, 0u, "CtLaneLowPass1!", false);
     qihse_user_t *peer = qihse_auth_create_user(op, 8402u, QIHSE_ROLE_ANALYST,
-                                                 5u, 3u, "CtLanePeer1!", false);
+                                                 5u, 3u, "CtLanePeerPass1!", false);
     assert(low && peer);
 
     /* Two disjoint lanes on one store. Keys are generated against the actual
@@ -88,6 +95,13 @@ int main(void) {
     unsigned char token_b[QIHSE_KV_CT_TOKEN_BYTES];
     assert(qihse_kv_ct_lane_source_enable(store, op, LANE_A, slots_a,
         "node-a", "peer-a", GEN_A, token_a, RETAINED_LIMIT));
+    char marker_path[256];
+    int marker_n = snprintf(marker_path, sizeof(marker_path), "%s/ct-state.bin", data_dir);
+    assert(marker_n > 0 && (size_t)marker_n < sizeof(marker_path));
+    FILE *marker_file = fopen(marker_path, "rb"); assert(marker_file);
+    char marker[8]; assert(fread(marker, 1u, sizeof(marker), marker_file) == sizeof(marker));
+    assert(memcmp(marker, "QCTST004", sizeof(marker)) == 0);
+    assert(fclose(marker_file) == 0);
     assert(qihse_kv_ct_lane_receiver_bind(store, op, LANE_B, slots_b,
         "peer-b", "node-a", GEN_B, QIHSE_KV_CT_TENANT_SYSTEM_ALL,
         0u, 0u, token_b));
@@ -124,10 +138,67 @@ int main(void) {
         "peer-a", GEN_A, baseline_digest, 0u));
     qihse_kv_replica_snapshot_destroy(baseline);
 
+    /* Exact original certificate bytes have their own durable, bounded page
+     * and ACK cursor, separate from user-row deltas. */
+    static const unsigned char certificate[] = {0x51, 0x42, 0x53, 0x31, 0x00, 0xff};
+    unsigned char cert_digest[32], cert_page_digest[32];
+    assert(qihse_kv_ct_lane_certificate_append(store, op, LANE_A, GEN_A,
+        certificate, sizeof(certificate), cert_digest));
+    assert(qihse_kv_ct_lane_certificate_append(store, op, LANE_A, GEN_A,
+        certificate, sizeof(certificate), cert_page_digest));
+    assert(memcmp(cert_digest, cert_page_digest, sizeof(cert_digest)) == 0);
+    unsigned char cert_page[128]; size_t cert_page_len = 0u; bool cert_more = false;
+    unsigned char zero_digest[32] = {0};
+    assert(qihse_kv_ct_lane_certificate_page(store, peer, LANE_A, zero_digest,
+        cert_page, sizeof(cert_page), &cert_page_len, cert_page_digest, &cert_more));
+    assert(!cert_more && cert_page_len == 36u + sizeof(certificate));
+    assert(memcmp(cert_page + 36u, certificate, sizeof(certificate)) == 0);
+    assert(qihse_kv_ct_lane_certificate_ack(store, peer, LANE_A, "peer-a",
+        GEN_A, cert_digest));
+
+    qihse_kv_ct_lane_authority_claim_t authority = {0};
+    authority.operation = QIHSE_KV_CT_LANE_AUTH_TRANSFER;
+    snprintf(authority.transfer_id, sizeof(authority.transfer_id), "move-1");
+    snprintf(authority.source_group_id, sizeof(authority.source_group_id), "%s", LANE_A);
+    snprintf(authority.target_group_id, sizeof(authority.target_group_id), "%s", LANE_B);
+    snprintf(authority.source_qkp_id, sizeof(authority.source_qkp_id), "peer-a");
+    snprintf(authority.target_qkp_id, sizeof(authority.target_qkp_id), "peer-b");
+    snprintf(authority.source_generation, sizeof(authority.source_generation), "%s", GEN_A);
+    snprintf(authority.target_generation, sizeof(authority.target_generation), "%s", GEN_B);
+    snprintf(authority.successor_qkp_id, sizeof(authority.successor_qkp_id), "peer-a");
+    memcpy(authority.slots, slots_a, sizeof(slots_a));
+    authority.grant_epoch = 1u;
+    authority.reserve_index = 11u;
+    memset(authority.reserve_digest, 0x11, sizeof(authority.reserve_digest));
+    bool no_final_decision = false;
+    qihse_kv_ct_proof_t *authority_proof =
+        qihse_kv_ct_lane_authority_proof_create(store, op, op, &authority,
+            verify_lane_claim, &no_final_decision);
+    assert(authority_proof);
+    assert(!qihse_kv_ct_lane_authority_proof_create(store, low, low, &authority,
+        verify_lane_claim, &no_final_decision));
+    assert(qihse_kv_ct_lane_authority_proof_validate(store, op, op,
+        authority_proof, verify_lane_claim, &no_final_decision, false));
+    assert(!qihse_kv_ct_lane_authority_proof_validate(store, op, op,
+        authority_proof, verify_lane_claim, &no_final_decision, true));
+    authority.final_decision_index = 12u;
+    memset(authority.final_decision_digest, 0x12,
+        sizeof(authority.final_decision_digest));
+    bool final_available = true;
+    qihse_kv_ct_proof_t *final_proof =
+        qihse_kv_ct_lane_authority_proof_create(store, op, op, &authority,
+            verify_lane_claim, &final_available);
+    assert(final_proof && qihse_kv_ct_lane_authority_proof_validate(store,
+        op, op, final_proof, verify_lane_claim, &final_available, true));
+    qihse_kv_ct_proof_destroy(final_proof);
+    qihse_kv_ct_proof_destroy(authority_proof);
+
     qihse_kv_ct_writer_scope_t *scope = NULL;
     assert(!qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_A, token_b, &scope));
+    assert(!qihse_kv_set_user(store, key_a, "scope-required", 4u, 1u, op));
     assert(qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_A, token_a, &scope));
     assert(qihse_kv_set_user(store, key_a, "lane-a-v1", 4u, 1u, op));
+    assert(qihse_kv_get_user(store, key_a, op) == NULL);
     assert(!qihse_kv_set_user(store, key_b, "wrong-lane-write", 4u, 1u, op));
     assert_value(store, op, key_a, NULL); /* durable ACK gates primary reads */
 
@@ -210,6 +281,33 @@ int main(void) {
         "peer-a", GEN_A, resume));
     assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
     qihse_kv_ct_groups_free(groups, group_count);
+
+    /* A verified reservation fences only its selected slots and persists a
+     * recoverable transfer state before source export begins. */
+    authority.final_decision_index = 0u;
+    memset(authority.final_decision_digest, 0,
+        sizeof(authority.final_decision_digest));
+    authority.source_cut = resume;
+    qihse_kv_ct_proof_t *transfer_proof =
+        qihse_kv_ct_lane_authority_proof_create(store, op, op, &authority,
+            verify_lane_claim, &no_final_decision);
+    assert(transfer_proof);
+    uint64_t source_cut = UINT64_MAX;
+    assert(qihse_kv_ct_lane_transfer_source_fence(store, op, op, &authority,
+        transfer_proof, verify_lane_claim, &no_final_decision, token_a,
+        &source_cut));
+    assert(source_cut == resume);
+    qihse_kv_ct_proof_destroy(transfer_proof);
+    assert(qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_A,
+        token_a, &scope));
+    assert(!qihse_kv_set_user(store, key_a, "fenced", 0u, 0u, op));
+    qihse_kv_ct_writer_scope_leave(scope);
+    char transfer_path[256];
+    int transfer_n = snprintf(transfer_path, sizeof(transfer_path),
+        "%s/ct-lane-transfer.bin", data_dir);
+    assert(transfer_n > 0 && (size_t)transfer_n < sizeof(transfer_path));
+    struct stat transfer_st;
+    assert(stat(transfer_path, &transfer_st) == 0 && S_ISREG(transfer_st.st_mode));
 
     qihse_kv_store_destroy(store);
     qihse_auth_release_principal_scoped(op);
