@@ -250,6 +250,10 @@ static bool backup_sibling_reserve_path(const char* path, const char* suffix,
     return true;
 }
 
+#ifdef QIHSE_BACKUP_TEST
+extern void qihse_backup_test_merge_scratch_ready(const char* path);
+#endif
+
 static FILE* backup_open_read(const char* path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return NULL;
@@ -1130,7 +1134,12 @@ int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
     owner_data = base_type == BACKUP_OWNER_DATA;
     c.owner_data = owner_data;
     rc = QIHSE_BACKUP_EXPORT_ERR;
-    if (!backup_sibling_path(output_path, ".merge", path, sizeof(path))) goto done;
+    if (!backup_sibling_reserve_path(output_path, ".merge", path, sizeof(path)))
+        goto done;
+    pending = true;
+#ifdef QIHSE_BACKUP_TEST
+    qihse_backup_test_merge_scratch_ready(path);
+#endif
     int save_rc = owner_data
         ? qihse_kv_snapshot_save_user(base, path, principal)
         : qihse_kv_save_user(base, path, principal);
@@ -1138,7 +1147,6 @@ int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
         if (save_rc == -2 || errno == EACCES) rc = QIHSE_BACKUP_EXPORT_DENIED;
         goto done;
     }
-    pending = true;
     size_t base_records = 0u;
     bool count_ok = owner_data
         ? qihse_kv_snapshot_foreach_record_user(base, principal,
@@ -1168,10 +1176,12 @@ int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
     fclose(merged); merged = NULL;
     rc = backup_seal_container(output_path, base_type, 0, 0, path,
                                principal, generation, NULL, NULL);
-    pending = false;
 done:
     if (merged) fclose(merged);
-    if (pending) unlink(path);
+    if (pending && unlink(path) != 0 && errno != ENOENT &&
+        rc == QIHSE_BACKUP_EXPORT_OK) {
+        rc = QIHSE_BACKUP_EXPORT_ERR;
+    }
     if (incoming) qihse_kv_store_destroy(incoming);
     if (base) qihse_kv_store_destroy(base);
     if (stats && (rc == QIHSE_BACKUP_EXPORT_OK || rc == QIHSE_BACKUP_EXPORT_CONFLICT))
