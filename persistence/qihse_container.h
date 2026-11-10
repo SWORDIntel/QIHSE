@@ -94,7 +94,10 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr);
 /*
  * Open or create a .qdb file for read/write access.
  * Acquires an OFD write lock; fails if any independent writer holds the lock.
- * On create, initialises an empty section table.
+ * On create, initialises an empty section table and syncs both the new inode
+ * and its parent directory before reporting success. A sync failure returns
+ * false; the path may still exist, so callers must treat creation as failed
+ * and its durability as uncertain.
  */
 bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr);
 

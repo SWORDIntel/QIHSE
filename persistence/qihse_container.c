@@ -424,6 +424,43 @@ static int ctr_find_idx(const qihse_container_t* ctr, uint16_t section_id) {
     return -1;
 }
 
+static bool ctr_sync_fd(int fd) {
+#ifndef _WIN32
+    int rc;
+    do { rc = fsync(fd); } while (rc != 0 && errno == EINTR);
+    return rc == 0;
+#else
+    return _commit(fd) == 0;
+#endif
+}
+
+static bool ctr_sync_parent_directory(const char* path) {
+#ifndef _WIN32
+    char dir[PATH_MAX];
+    size_t len = strlen(path);
+    if (len >= sizeof(dir)) { errno = ENAMETOOLONG; return false; }
+    memcpy(dir, path, len + 1u);
+    char* slash = strrchr(dir, '/');
+    if (!slash) {
+        strcpy(dir, ".");
+    } else if (slash == dir) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = ctr_sync_fd(fd);
+    int saved_errno = errno;
+    (void)close(fd);
+    errno = saved_errno;
+    return ok;
+#else
+    (void)path;
+    return true;
+#endif
+}
+
 /* ── Public API ─────────────────────────────────────────────────────── */
 
 bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
@@ -568,6 +605,26 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
                 close(fd);
                 return false;
             }
+#ifndef _WIN32
+            /* Persist the initial file before callers can acknowledge a
+             * later WAL fsync. File sync alone does not make this new
+             * directory entry durable. */
+            if (!ctr_sync_fd(fd) || !ctr_sync_parent_directory(path)) {
+                int saved_errno = errno ? errno : EIO;
+                ctr_lock_release(fd);
+                close(fd);
+                errno = saved_errno;
+                return false;
+            }
+#else
+            if (!ctr_sync_fd(fd)) {
+                int saved_errno = errno ? errno : EIO;
+                ctr_lock_release(fd);
+                close(fd);
+                errno = saved_errno;
+                return false;
+            }
+#endif
             count = 0u;
         } else {
             if (!ctr_read_table(fd, ctr->sections, &count)) {
@@ -913,23 +970,7 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     /* fsync of the parent directory makes the rename durable after crashes.
      * On fsync failure the new fd remains live, but durable publication is
      * NOT claimed. Callers must handle a false return as uncertain commit. */
-    char dir[PATH_MAX];
-    memcpy(dir, ctr->path, path_len + 1u);
-    char* slash = strrchr(dir, '/');
-    if (!slash) {
-        strcpy(dir, ".");
-    } else if (slash == dir) {
-        slash[1] = '\0';
-    } else {
-        *slash = '\0';
-    }
-    int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd < 0) {
-        ok = false;
-    } else {
-        if (fsync(dir_fd) != 0) ok = false;
-        close(dir_fd);
-    }
+    if (!ctr_sync_parent_directory(ctr->path)) ok = false;
 #endif
     goto out;
 
