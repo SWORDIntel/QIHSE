@@ -472,6 +472,13 @@ bool qihse_cluster_bus_broadcast_ct1_promotion_v2(
  * target signer embedded in the certificate. */
 bool qihse_cluster_bus_relay_ct1_certificate(qihse_cluster_bus_t* bus,
     const void* signed_envelope, size_t envelope_len);
+/* Verify one original target-signed QCP2 certificate independently of its
+ * relay wrapper. The returned tuple is copied only after QBS authentication,
+ * QCP2 digest validation, and topology UUID-to-target matching. */
+bool qihse_cluster_bus_ct1_certificate_verify(qihse_cluster_bus_t* bus,
+    const void* signed_envelope, size_t envelope_len,
+    qihse_cluster_bus_ct1_promotion_update_v2_t* out_update,
+    qihse_uuid_t* out_signer);
 bool qihse_cluster_bus_ct1_promotion_seal(
     qihse_cluster_bus_ct1_promotion_update_t* update);
 bool qihse_cluster_bus_ct1_promotion_v2_seal(

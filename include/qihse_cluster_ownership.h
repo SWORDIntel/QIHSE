@@ -194,6 +194,15 @@ bool qihse_cluster_ownership_receive_ct1_promotion_v2(
     const uint8_t* verified_signed_envelope, size_t envelope_len,
     const qihse_uuid_t* original_signer,
     char* err, size_t err_cap);
+/* Apply an ordered chain of original target-signed QCP2 envelopes. The caller
+ * obtains these exact envelopes from durable certificate pages. The complete
+ * chain is authenticated and checked for lane/generation/bitmap continuity
+ * before any topology mutation, then each link is journaled and applied in
+ * order with per-slot epoch monotonicity. */
+bool qihse_cluster_ownership_receive_ct1_promotion_chain(
+    qihse_cluster_ownership_context_t* context,
+    const uint8_t* const* signed_envelopes, const size_t* envelope_lengths,
+    size_t envelope_count, char* err, size_t err_cap);
 void qihse_cluster_ownership_ct1_promotion_bus_callback(
     qihse_cluster_bus_t* bus,
     const qihse_cluster_bus_ct1_promotion_update_t* update,

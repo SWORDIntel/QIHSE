@@ -1063,6 +1063,41 @@ static bool qihse_bus_verify_nested_qbs(qihse_cluster_bus_t* bus,
     return true;
 }
 
+bool qihse_cluster_bus_ct1_certificate_verify(qihse_cluster_bus_t* bus,
+    const void* signed_envelope, size_t envelope_len,
+    qihse_cluster_bus_ct1_promotion_update_v2_t* out_update,
+    qihse_uuid_t* out_signer) {
+    if (!bus || !signed_envelope || !out_update || !out_signer) return false;
+    memset(out_update, 0, sizeof(*out_update));
+    memset(out_signer, 0, sizeof(*out_signer));
+    const uint8_t* payload = NULL;
+    size_t payload_len = 0;
+    qihse_uuid_t signer;
+    if (!qihse_bus_verify_nested_qbs(bus, signed_envelope, envelope_len,
+            &signer, &payload, &payload_len) ||
+        payload_len != sizeof(*out_update)) {
+        OPENSSL_cleanse(&signer, sizeof(signer));
+        return false;
+    }
+    qihse_cluster_bus_ct1_promotion_update_v2_t update;
+    memcpy(&update, payload, sizeof(update));
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t target;
+    bool valid = qihse_bus_ct1_promotion_v2_valid(&update) &&
+        qihse_cluster_topology_find_node(bus->topology, update.base.target_id,
+            &target_index) &&
+        qihse_cluster_topology_get_node(bus->topology, target_index, &target) &&
+        target.has_uuid && CRYPTO_memcmp(target.node_uuid, signer.bytes,
+            sizeof(signer.bytes)) == 0;
+    if (valid) {
+        *out_update = update;
+        *out_signer = signer;
+    }
+    OPENSSL_cleanse(&update, sizeof(update));
+    OPENSSL_cleanse(&signer, sizeof(signer));
+    return valid;
+}
+
 static void qihse_bus_handle_ct1_certificate(qihse_cluster_bus_t* bus,
     uint16_t relay_sender, const uint8_t* payload, size_t payload_len,
     bool relay_signature_verified) {

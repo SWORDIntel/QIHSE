@@ -2687,29 +2687,43 @@ bool qihse_cluster_ownership_receive_ct1_promotion_v2(
         return true;
     }
 
-    /* Persist the original target-signed QBS envelope before the local
-     * ownership journal/routing change whenever this store holds the lane. */
+    /* Persist the original target-signed QBS envelope when this node holds
+     * the corresponding new-generation lane. A non-member observer may still
+     * adopt the authenticated topology transition; the promoted target itself
+     * must have the durable source lane before it can publish ownership. */
     qihse_kv_ct_lane_status_t lane_status;
     memset(&lane_status, 0, sizeof(lane_status));
     errno = 0;
-    if (!qihse_kv_ct_lane_status(c->store, c->principal, txn.lane_id, &lane_status)) {
-        OPENSSL_cleanse(&lane_status, sizeof(lane_status));
-        set_error(err, err_cap, "local promoted CT lane is unavailable for the signed QCP2 certificate");
-        goto txn_fail;
-    }
-    if (strcmp(lane_status.generation, txn.next_generation) ||
-        strcmp(lane_status.source_id, txn.target_qkp_id) ||
-        CRYPTO_memcmp(lane_status.slot_bitmap, txn.slot_bitmap, sizeof(txn.slot_bitmap))) {
-        OPENSSL_cleanse(&lane_status, sizeof(lane_status));
-        set_error(err, err_cap, "local CT lane does not match the promoted generation/bitmap");
-        goto txn_fail;
-    }
-    qihse_user_t* certificate_principal =
-        lane_status.mode == QIHSE_KV_CT_LANE_SOURCE ? c->principal : c->data_principal;
     unsigned char cert_digest[32] = {0};
-    bool appended = certificate_principal &&
-        qihse_kv_ct_lane_certificate_append(c->store, certificate_principal,
-            txn.lane_id, txn.next_generation, envelope, envelope_len, cert_digest);
+    uint16_t local_index = qihse_cluster_topology_local_node(c->topology);
+    bool target_is_local = local_index == target_index;
+    bool have_lane = qihse_kv_ct_lane_status(c->store, c->principal,
+        txn.lane_id, &lane_status);
+    bool lane_matches = have_lane &&
+        strcmp(lane_status.generation, txn.next_generation) == 0 &&
+        strcmp(lane_status.source_id, txn.target_qkp_id) == 0 &&
+        CRYPTO_memcmp(lane_status.slot_bitmap, txn.slot_bitmap,
+            sizeof(txn.slot_bitmap)) == 0;
+    if (target_is_local && (!lane_matches || lane_status.mode != QIHSE_KV_CT_LANE_SOURCE)) {
+        OPENSSL_cleanse(&lane_status, sizeof(lane_status));
+        OPENSSL_cleanse(cert_digest, sizeof(cert_digest));
+        set_error(err, err_cap, "promoted target lacks its durable source lane for the signed QCP2 certificate");
+        goto txn_fail;
+    }
+    bool appended = true;
+    if (lane_matches) {
+        qihse_user_t* certificate_principal =
+            lane_status.mode == QIHSE_KV_CT_LANE_SOURCE ? c->principal : c->data_principal;
+        appended = certificate_principal &&
+            qihse_kv_ct_lane_certificate_append(c->store, certificate_principal,
+                txn.lane_id, txn.next_generation, envelope, envelope_len, cert_digest);
+    } else if (have_lane) {
+        /* This node has a different generation/membership and is not the
+         * promoted target; never rebind its lane to a historical certificate. */
+        appended = true;
+    } else if (target_is_local || errno != EACCES) {
+        appended = false;
+    }
     OPENSSL_cleanse(cert_digest, sizeof(cert_digest));
     OPENSSL_cleanse(&lane_status, sizeof(lane_status));
     if (!appended) {
@@ -2739,6 +2753,80 @@ fail:
     OPENSSL_cleanse(target_qkp, sizeof(target_qkp));
     OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
     return false;
+}
+
+bool qihse_cluster_ownership_receive_ct1_promotion_chain(
+    qihse_cluster_ownership_context_t* c,
+    const uint8_t* const* envelopes, const size_t* envelope_lengths,
+    size_t envelope_count, char* err, size_t err_cap) {
+    if (!c || !c->bus || !envelopes || !envelope_lengths || !envelope_count ||
+        !ownership_system_operator_active(c->principal)) {
+        set_error(err, err_cap, "active System Operator and a non-empty signed certificate chain are required");
+        return false;
+    }
+    qihse_cluster_bus_ct1_promotion_update_v2_t previous;
+    memset(&previous, 0, sizeof(previous));
+    qihse_uuid_t signer;
+    for (size_t i = 0; i < envelope_count; ++i) {
+        qihse_cluster_bus_ct1_promotion_update_v2_t current;
+        memset(&current, 0, sizeof(current));
+        memset(&signer, 0, sizeof(signer));
+        if (!envelopes[i] || !envelope_lengths[i] ||
+            !qihse_cluster_bus_ct1_certificate_verify(c->bus, envelopes[i],
+                envelope_lengths[i], &current, &signer)) {
+            OPENSSL_cleanse(&current, sizeof(current));
+            OPENSSL_cleanse(&signer, sizeof(signer));
+            OPENSSL_cleanse(&previous, sizeof(previous));
+            set_error(err, err_cap, "certificate chain contains an invalid target signature or QCP2 event");
+            return false;
+        }
+        bool link_ok = true;
+        if (i) {
+            link_ok = strcmp(previous.lane_id, current.lane_id) == 0 &&
+                strcmp(previous.base.target_id, current.base.source_id) == 0 &&
+                strcmp(previous.base.target_qkp_id, current.base.source_qkp_id) == 0 &&
+                strcmp(previous.base.next_generation, current.base.generation) == 0 &&
+                current.base.config_epoch > previous.base.config_epoch &&
+                strcmp(previous.base.transfer_id, current.base.transfer_id) != 0 &&
+                CRYPTO_memcmp(previous.base.slot_bitmap, current.base.slot_bitmap,
+                    sizeof(current.base.slot_bitmap)) == 0;
+        }
+        OPENSSL_cleanse(&signer, sizeof(signer));
+        if (!link_ok) {
+            OPENSSL_cleanse(&current, sizeof(current));
+            OPENSSL_cleanse(&previous, sizeof(previous));
+            set_error(err, err_cap, "certificate chain is reordered or changes lane, owner, generation, epoch, or bitmap");
+            return false;
+        }
+        previous = current;
+        OPENSSL_cleanse(&current, sizeof(current));
+    }
+    OPENSSL_cleanse(&previous, sizeof(previous));
+
+    /* All certificates and lineage links are valid before replay begins.
+     * Re-decode each bounded envelope so no variable-sized chain copy or
+     * signature buffer is kept on the stack. Each accepted prefix is durable
+     * and independently safe if a later mesh receipt has since been pruned. */
+    for (size_t i = 0; i < envelope_count; ++i) {
+        qihse_cluster_bus_ct1_promotion_update_v2_t update;
+        qihse_uuid_t original_signer;
+        memset(&update, 0, sizeof(update));
+        memset(&original_signer, 0, sizeof(original_signer));
+        bool decoded = qihse_cluster_bus_ct1_certificate_verify(c->bus,
+            envelopes[i], envelope_lengths[i], &update, &original_signer);
+        bool applied = decoded && qihse_cluster_ownership_receive_ct1_promotion_v2(
+            c, &update, envelopes[i], envelope_lengths[i], &original_signer,
+            err, err_cap);
+        OPENSSL_cleanse(&update, sizeof(update));
+        OPENSSL_cleanse(&original_signer, sizeof(original_signer));
+        if (!applied) {
+            if (!err || !err_cap || !err[0])
+                set_error(err, err_cap, "authenticated promotion chain could not be applied in order");
+            return false;
+        }
+    }
+    set_error(err, err_cap, "");
+    return true;
 }
 
 void qihse_cluster_ownership_ct1_promotion_bus_callback(
