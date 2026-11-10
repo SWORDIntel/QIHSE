@@ -12,10 +12,12 @@ import binascii
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import secrets
+import subprocess
+import sys
 import time
 
 from ct_transport_drill import (
-    IsolatedCluster, ROOT, ct1_receiver_status, ct1_source_status,
+    IsolatedCluster, OPERATOR_PASSWORD, ROOT, ct1_receiver_status, ct1_source_status,
     new_generation, parse_resp_frame, topology_id_for,
 )
 
@@ -90,6 +92,53 @@ def wait_drained(source_to_receiver, receiver_to_source, label):
     raise AssertionError(f"CT1 lane {label} did not drain")
 
 
+def seed_classified_kv(cluster, node_name, key, value, classification=5, sci=1):
+    """Seed an ordinary slot-owned row through the authenticated native API."""
+    code = r"""
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.qihse_auth_init.restype = ctypes.c_bool
+lib.qihse_auth_bootstrap_operator.argtypes = [ctypes.c_char_p]
+lib.qihse_auth_bootstrap_operator.restype = ctypes.c_bool
+lib.qihse_auth_get_user.argtypes = [ctypes.c_uint32]
+lib.qihse_auth_get_user.restype = ctypes.c_void_p
+lib.qihse_kv_store_create_user.argtypes = [ctypes.c_void_p]
+lib.qihse_kv_store_create_user.restype = ctypes.c_void_p
+lib.qihse_kv_set_user.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                                  ctypes.c_uint16, ctypes.c_uint16, ctypes.c_void_p]
+lib.qihse_kv_set_user.restype = ctypes.c_bool
+lib.qihse_kv_get_user.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+lib.qihse_kv_get_user.restype = ctypes.c_void_p
+lib.qihse_auth_create_user.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+    ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_bool]
+lib.qihse_auth_create_user.restype = ctypes.c_void_p
+lib.qihse_kv_sync_store.argtypes = [ctypes.c_void_p]
+lib.qihse_kv_sync_store.restype = ctypes.c_bool
+lib.qihse_kv_store_destroy.argtypes = [ctypes.c_void_p]
+assert lib.qihse_auth_init()
+lib.qihse_auth_bootstrap_operator(sys.argv[4].encode())
+operator = lib.qihse_auth_get_user(0)
+assert operator
+store = lib.qihse_kv_store_create_user(operator)
+assert store
+try:
+    assert lib.qihse_kv_set_user(store, sys.argv[2].encode(), sys.argv[3].encode(),
+                                 int(sys.argv[5]), int(sys.argv[6]), operator)
+    low = lib.qihse_auth_create_user(operator, 777, 2, 0, 0,
+                                     b"CtMultiGroupLowUser42!", False)
+    assert low
+    assert not lib.qihse_kv_get_user(store, sys.argv[2].encode(), low)
+    assert lib.qihse_kv_sync_store(store)
+finally:
+    lib.qihse_kv_store_destroy(store)
+"""
+    env = dict(cluster.env)
+    env["QIHSE_DATA_DIR"] = str(cluster.root / node_name / "data")
+    subprocess.run([sys.executable, "-c", code, str(ROOT / "libqihse.so"),
+                    key, value, OPERATOR_PASSWORD, str(classification), str(sci)],
+                   env=env, check=True, capture_output=True, timeout=20)
+
+
 def main():
     if not (ROOT / "qihse-cluster-daemon").is_file():
         raise AssertionError("build the integrated daemon before running this drill")
@@ -99,6 +148,11 @@ def main():
         topology = {name: topology_id_for(*cluster.endpoints[name]) for name in NODES}
         group_ids = {name: secrets.token_hex(32) for name in OWNER}
         generations = {name: new_generation() for name in OWNER}
+        protected_tag = tag_for(5692, 8191, "protected")
+        protected_key = f"{{{protected_tag}}}:slot-protected"
+        protected_value = f"classified-sci-fixture-{secrets.token_hex(12)}"
+        seed_classified_kv(cluster, "lead", protected_key, protected_value,
+                           classification=5, sci=1)
 
         # One common replicated configuration on every daemon. A receives B's
         # group, B receives C's group, and C receives A's group.
@@ -196,28 +250,11 @@ def main():
             wait_value(admins[name], keys[name], values[name])
         wait_value(admins["successor"], keys["joiner"], values["joiner"])
 
-        # Add classified/SCI-bearing source data within A's owned group, then
-        # restart C with a low replication service ceiling to prove the CT2
-        # import path does not expose it. The existing C receiver remains a
-        # durable group-A target while access is denied.
-        high_id = None
-        high_key = None
-        for attempt in range(128):
-            text = f"CT multi-group protected fixture {attempt} {secrets.token_hex(8)}"
-            candidate = command(admins["lead"], "AIMEM", "STORE", "2", text)
-            if not isinstance(candidate, bytes) or len(candidate) != 36:
-                continue
-            key = "aimem:" + candidate.decode("ascii").replace("-", "")[:16]
-            slot = command(admins["lead"], "CLUSTER", "KEYSLOT", key)
-            if isinstance(slot, int) and 5692 <= slot <= 8191:
-                high_id, high_key = candidate.decode(), key
-                break
-        if high_id is None:
-            raise AssertionError("could not create protected source data in group A")
-        protected_value = command(admins["lead"], "GET", high_key)
-        if not isinstance(protected_value, bytes):
-            raise AssertionError(f"protected source record is unavailable: {protected_value!r}")
-        wait_value(admins["joiner"], high_key, protected_value)
+        # Verify the generic slot-owned classified/SCI row seeded through the
+        # authenticated qihse_kv_set_user API reached A's existing C receiver.
+        if command(admins["lead"], "GET", protected_key) != protected_value.encode():
+            raise AssertionError("generic classified source row is missing on A")
+        wait_value(admins["joiner"], protected_key, protected_value.encode())
         # Reopen C with low clearance and SCI so CT2 target authorization must
         # refuse the protected group and preserve A's durable pending tuple.
         admins["joiner"].close()
@@ -237,7 +274,7 @@ def main():
         time.sleep(8)
         denied_view = owner_map(admins["successor"])
         if denied_view is None or denied_view.get(7000) != topology["lead"]:
-            raise AssertionError("low-clearance/SCI target changed A ownership before authorization")
+            raise AssertionError("clearance/SCI denial changed A ownership before authorization")
 
         # Raise C's data principal through the existing startup configuration.
         # The source brain retries the same fenced operation and the local
@@ -269,7 +306,7 @@ def main():
         wait_value(admins["lead"], keys["lead"], values["lead"])
         wait_value(admins["successor"], keys["successor"], values["successor"])
         wait_value(admins["joiner"], keys["joiner"], values["joiner"])
-        wait_value(admins["joiner"], high_key, protected_value)
+        wait_value(admins["joiner"], protected_key, protected_value.encode())
         post_transfer_key = f"{{{tags['joiner']}}}:post-transfer-write"
         expect_ok(command(admins["joiner"], "SET", post_transfer_key,
                           "C remains a live owner"), "write C-owned group after CT2")
