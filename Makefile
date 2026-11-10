@@ -622,6 +622,16 @@ test-ct-transfer-storage: lib
 
 test-serial: test-ct-transfer-storage
 
+.PHONY: test-ct-transfer-large
+test-ct-transfer-large: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_ct_transfer_large tests/test_ct_transfer_storage.c \
+	    src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_transfer_large --large
+
+test-serial: test-ct-transfer-large
+
 .PHONY: test-ct-target
 test-ct-target:
 	$(CC) $(CFLAGS) -std=c11 -UNDEBUG -o tests/test_ct_target tests/test_ct_target.c src/spinnaker/qihse_ct_target.c $(LDFLAGS)
@@ -1553,6 +1563,39 @@ test-vector-derived-lifecycle: lib
 	LD_LIBRARY_PATH=. ./tests/test_vector_derived_lifecycle
 
 test-serial: test-vector-derived-lifecycle
+
+.PHONY: test-hnsw-allocation-failures
+test-hnsw-allocation-failures: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -Wl,--wrap=malloc,--wrap=posix_memalign \
+	    -o tests/test_hnsw_allocation_failure tests/test_hnsw_allocation_failure.c \
+	    src/broad_oak/qihse_hnsw.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_hnsw_allocation_failure
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -Wl,--wrap=posix_memalign \
+	    -o tests/test_vector_graph_build_allocation_failure \
+	    tests/test_vector_graph_build_allocation_failure.c \
+	    src/broad_oak/qihse_vector_db.c src/broad_oak/qihse_hnsw.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_graph_build_allocation_failure
+
+test-serial: test-hnsw-allocation-failures
+
+.PHONY: test-kv-compaction-recovery
+test-kv-compaction-recovery: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -Wl,--wrap=unlink,--wrap=fsync \
+	    -o tests/test_kv_compaction_unlink_failure tests/test_kv_compaction_unlink_failure.c \
+	    src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_compaction_unlink_failure
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_kv_compaction_corrupt_input \
+	    tests/test_kv_compaction_corrupt_input.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_compaction_corrupt_input
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_kv_degraded_read_recovery tests/test_kv_degraded_read_recovery.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_degraded_read_recovery
+
+test-serial: test-kv-compaction-recovery
 
 test-backup-merge-concurrent: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_BACKUP_TEST -Wl,--export-dynamic \

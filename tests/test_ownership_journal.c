@@ -232,34 +232,38 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
     assert(qihse_kv_ct_source_enable(store, op, "stale-source:1",
         "stale-successor:1", "stale-generation:1", NULL,
         128u * 1024u * 1024u));
-    qihse_cluster_topology_t* replay_topo = qihse_cluster_topology_create();
-    assert(replay_topo);
-    qihse_cluster_node_t replay_nodes[4];
-    uint16_t replay_ix[4];
-    for (size_t i = 0; i < 4; ++i) {
-        replay_nodes[i] = nodes[i];
-        replay_nodes[i].config_epoch = 20u;
-        assert(qihse_cluster_topology_upsert_node(replay_topo,
-            &replay_nodes[i], &replay_ix[i]));
+    for (unsigned replay_case = 0; replay_case < 2; ++replay_case) {
+        qihse_cluster_topology_t* replay_topo = qihse_cluster_topology_create();
+        assert(replay_topo);
+        qihse_cluster_node_t replay_nodes[4];
+        uint16_t replay_ix[4];
+        for (size_t i = 0; i < 4; ++i) {
+            replay_nodes[i] = nodes[i];
+            replay_nodes[i].config_epoch = 20u;
+            assert(qihse_cluster_topology_upsert_node(replay_topo,
+                &replay_nodes[i], &replay_ix[i]));
+        }
+        replay_nodes[1].role = QIHSE_CLUSTER_NODE_REPLICA;
+        replay_nodes[1].primary_index = replay_case ? replay_ix[0] : replay_ix[3];
+        replay_nodes[1].config_epoch = replay_case ? 10u : 20u;
+        assert(qihse_cluster_topology_upsert_node(replay_topo, &replay_nodes[1], NULL));
+        assert(qihse_cluster_topology_adopt_range(replay_topo, 100, 100, replay_ix[0], 8u));
+        ownership.topology = replay_topo;
+        bool replay_unresolved = true;
+        assert(qihse_cluster_ownership_replay(&ownership, &replay_unresolved,
+            err, sizeof(err)));
+        assert(!replay_unresolved);
+        qihse_cluster_node_t replay_check;
+        assert(qihse_cluster_topology_get_node(replay_topo, replay_ix[1], &replay_check));
+        assert(replay_check.role == QIHSE_CLUSTER_NODE_REPLICA &&
+               replay_check.primary_index == replay_nodes[1].primary_index &&
+               replay_check.config_epoch == replay_nodes[1].config_epoch);
+        uint16_t replay_owner = QIHSE_CLUSTER_NODE_NONE;
+        assert(qihse_cluster_topology_get_slot(replay_topo, 100,
+            &replay_owner, NULL, NULL));
+        assert(replay_owner == replay_ix[0]);
+        qihse_cluster_topology_destroy(replay_topo);
     }
-    replay_nodes[1].role = QIHSE_CLUSTER_NODE_REPLICA;
-    replay_nodes[1].primary_index = replay_ix[3];
-    assert(qihse_cluster_topology_upsert_node(replay_topo, &replay_nodes[1], NULL));
-    assert(qihse_cluster_topology_adopt_range(replay_topo, 100, 100, replay_ix[0], 8u));
-    ownership.topology = replay_topo;
-    bool replay_unresolved = true;
-    assert(qihse_cluster_ownership_replay(&ownership, &replay_unresolved,
-        err, sizeof(err)));
-    assert(!replay_unresolved);
-    qihse_cluster_node_t replay_check;
-    assert(qihse_cluster_topology_get_node(replay_topo, replay_ix[1], &replay_check));
-    assert(replay_check.role == QIHSE_CLUSTER_NODE_REPLICA &&
-           replay_check.primary_index == replay_ix[3] && replay_check.config_epoch == 20u);
-    uint16_t replay_owner = QIHSE_CLUSTER_NODE_NONE;
-    assert(qihse_cluster_topology_get_slot(replay_topo, 100,
-        &replay_owner, NULL, NULL));
-    assert(replay_owner == replay_ix[0]);
-    qihse_cluster_topology_destroy(replay_topo);
 
     /* One valid maximal run carries the full signed bitmap. Disjoint slots in
      * the same durable promotion event must be adopted together. */

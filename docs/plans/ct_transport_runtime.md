@@ -46,7 +46,7 @@ authority decision; peer health counts alone are insufficient.
 
 ## Slot transfer
 
-CT2 uses a durable source range fence, an authenticated bounded transfer image,
+CT2 uses a durable source range fence, an authenticated range image,
 a target canonical seal, and a local ownership journal. Ordinary writer scopes
 do not bypass a frozen or permanently moved range, including direct KV callers.
 
@@ -84,7 +84,9 @@ writes on the old source. An unresolved COMMITTED transfer still needs target
 activation. FINALIZED records replay locally: a later legitimate target write
 or another transfer must not make an already completed historical transition
 depend on a mutable current seal. An uncertain network outcome keeps the
-source fenced until explicit reconciliation or a proven abort.
+source fenced until receipt reconciliation or a proven abort. The transfer
+manager consults the existing pinned SEAL/ACTIVATE receipts even when the
+command acknowledgement is lost, so that case can complete in the same call.
 
 An exact retry of a locally FINALIZED transfer returns completion from its
 durable tuple without transmitting data or repeating activation. Reusing that
@@ -92,11 +94,21 @@ ID with another range or identity is rejected. Historical ACTIVATED receipts
 use the durable finalized digest and cursor; full-scope, pinned observers must
 also have a unique explicit topology/QKP mapping to verify those receipts.
 
-The bounded range-image contract is at most 4096 live rows and 64 MiB; target
-merge tombstones also count against the atomic-group bound. An over-limit range
-must be refused before mutation, never truncated. Callers may divide a range
-into smaller slot ranges; an individual oversized slot remains an explicit
-unsupported transfer rather than losing records.
+The fixed 4096-row/64-MiB whole-range limit is removed. Source export and target
+staging accept larger images; target import uses multiple QKV6 groups, each
+retaining the existing 4096-record/64-MiB frame bounds. QCTST003 records the
+base cursor, base sequence and completed-prefix evidence so restart can resume
+the same import, including a crash after a group fsync but before its progress
+publication. QCTST002 state remains readable; older binaries cannot read newly
+written QCTST003 state. Ordinary reads stay hidden until
+activation, and completion is not published for a partial import.
+
+The existing configured CT log-retention budget is checked before mutation;
+insufficient capacity is reported before importing a prefix. Allocation and
+disk failures remain possible. Target import still materializes incoming and
+existing range rows, so memory grows with the range; this is not a constant-RAM
+import. The focused interrupted fixture transfers 4097 rows in a 67,284,039-byte
+image and resumes to exactly two durable groups.
 
 Peer ownership convergence requires independently resolving the authenticated
 target receipt and persisting the transition locally. A bus notification is

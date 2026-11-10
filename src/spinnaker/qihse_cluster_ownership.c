@@ -1843,7 +1843,8 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
             &source, &target, &successor_node);
         promotion_roles_applied = apply_roles;
         bool promotion_range_is_stale = !apply_roles &&
-            target.config_epoch > txn->config_epoch;
+            (target.role != QIHSE_CLUSTER_NODE_PRIMARY ||
+             target.config_epoch > txn->config_epoch);
         if (apply_roles &&
             (!qihse_cluster_topology_upsert_node(c->topology, &source, NULL) ||
              !qihse_cluster_topology_upsert_node(c->topology, &successor_node, NULL))) {

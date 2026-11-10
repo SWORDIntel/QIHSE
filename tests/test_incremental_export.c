@@ -799,6 +799,57 @@ static void test_backup_incremental_wired(void) {
            "whole-store restore still refuses a delta\n");
 }
 
+static void test_expired_replacement_is_a_delta_delete(void) {
+    for (unsigned disk = 0; disk < 2; ++disk) {
+        const char* key = disk ? "ttl-delta:disk" : "ttl-delta:memory";
+        const char* barrier = disk ? "ttl-delta:after-disk" : "ttl-delta:after-memory";
+        put(g_op, key, "previous non-expiring value", 0u, 0u);
+        uint64_t before = seq_now();
+        qihse_kv_batch_set_record_t expired = {
+            .key = key, .value = "expired protected replacement",
+            .expire_time_ms = 1u, .classification = 3u, .sci_compartment = 0x2u
+        };
+        assert(qihse_kv_set_batch_durable_user(g_store, &expired, 1u, g_op));
+        put(g_op, barrier, "later visible mutation", 0u, 0u);
+        if (disk) assert(qihse_kv_sync_store(g_store));
+
+        qihse_kv_delta_record_t* rows = NULL;
+        size_t count = 0u;
+        uint64_t resume = 0u;
+        assert(qihse_kv_export_incremental_user(g_store, g_op, before,
+                                               &rows, &count, &resume) == 0);
+        const qihse_kv_delta_record_t* row = delta_find(rows, count, key);
+        assert(row && row->tombstone && !row->value && !row->expire_time_ms);
+        assert(row->change_seq == before + 1u && row->classification == 3u &&
+               row->sci_compartment == 0x2u && resume == before + 2u);
+        qihse_kv_replica_record_t retry = {
+            .key = key, .value = "expired protected replacement",
+            .change_seq = row->change_seq, .expire_time_ms = 1u,
+            .classification = 3u, .sci_compartment = 0x2u
+        };
+        assert(qihse_kv_apply_replica_record(g_store, &retry, g_op));
+        retry.value = NULL; retry.expire_time_ms = 0u; retry.tombstone = true;
+        retry.classification = 2u;
+        assert(!qihse_kv_apply_replica_record(g_store, &retry, g_op));
+        retry.classification = 3u;
+        assert(!qihse_kv_apply_replica_record(g_store, &retry, g_guest));
+        assert(qihse_kv_apply_replica_record(g_store, &retry, g_op));
+        assert(qihse_kv_apply_replica_record(g_store, &retry, g_op));
+        retry.key = barrier; retry.change_seq = before + 2u;
+        retry.classification = retry.sci_compartment = 0u;
+        assert(!qihse_kv_apply_replica_record(g_store, &retry, g_op));
+        qihse_kv_delta_records_free(rows, count);
+        for (unsigned low = 0u; low < 2u; ++low) {
+            assert(qihse_kv_export_incremental_user(g_store,
+                low ? g_analyst : g_guest, before, &rows, &count, &resume) == 0);
+            assert(count == 1u && !delta_find(rows, count, key));
+            assert(!strcmp(rows[0].key, barrier));
+            qihse_kv_delta_records_free(rows, count);
+        }
+    }
+    puts("PASS expired replacements export labeled deletes before advancing delta cursors");
+}
+
 /* ── Driver ───────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -833,6 +884,7 @@ int main(void) {
     test_bounded_oversize_fails_closed();
     test_legacy_format_decodes();
     test_backup_incremental_wired();
+    test_expired_replacement_is_a_delta_delete();
 
     qihse_kv_store_destroy(g_store);
     qihse_audit_shutdown();

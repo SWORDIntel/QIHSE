@@ -911,12 +911,8 @@ int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* bac
     if (!chunk) goto done;
 
     const char* data_dir = qihse_kv_store_data_directory(kv);
-    int prefix_n = data_dir ? snprintf(scratch_path, sizeof(scratch_path),
-                                       "%sqihse-backup-restore", data_dir) : -1;
-    if (prefix_n < 0 || (size_t)prefix_n >= sizeof(scratch_path)) goto done;
-    char restore_prefix[BACKUP_PATH_MAX];
-    memcpy(restore_prefix, scratch_path, (size_t)prefix_n + 1u);
-    int scratch_fd = backup_sibling_reserve(restore_prefix, "",
+    if (!data_dir) goto done;
+    int scratch_fd = backup_sibling_reserve(data_dir, "qihse-backup-restore",
                                             scratch_path, sizeof(scratch_path));
     if (scratch_fd < 0) goto done;
     scratch_f = backup_create_reserved(scratch_fd);

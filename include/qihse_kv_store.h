@@ -712,6 +712,8 @@ void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)
 
 /* Export the delta since `since_seq`: every record whose stamped sequence
  * is STRICTLY greater than `since_seq`, in ascending sequence order,
+ * with expired replacements represented as label-preserving tombstones at
+ * their original sequence so a lagging consumer removes its older value,
  * enumerated through the same authorization-aware iteration as the full
  * export (each record checked with qihse_auth_can_access at THIS, the
  * lowest data-retrieval layer — AGENTS.md invariant 1).  A NULL user keeps

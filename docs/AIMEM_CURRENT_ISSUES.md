@@ -272,6 +272,66 @@ make -o lib test-vector-spill-recovery test-persist test-container-create-sync \
   test-ownership-journal-write-status test-ownership-abort-replay
 ```
 
+### Range transfer and durability review (2026-11-10)
+
+The follow-up review covers cluster lifecycle/placement, backup and restore,
+transaction recovery, storage lifecycle, derived indexes and other protocol
+adapters. These remain local changes; no live service or dataset was changed.
+
+| Area | Confirmed defect and resulting behavior |
+| --- | --- |
+| CT2 capacity and restart | Remove the fixed whole-transfer 4096-row/64-MiB cap across source export, target staging and import. Import uses bounded QKV6 groups with durable QCTST003 prefix progress and reads existing QCTST002 state. An exact persisted target-fence retry can resume after process-local admission is lost on restart. The fault fixture crashes after its first group fsync, resumes to exactly two groups, and exposes 4097 transferred rows only after activation/reopen. Its source image is **67,284,039 bytes total**. |
+| Migration acknowledgements | SEAL/ACTIVATE could finish durably but a lost command reply forced another manual retry before receipt lookup. The manager now checks the existing pinned, typed receipt after either command attempt. Exact receipt evidence completes that invocation; an unavailable or forged receipt cannot publish ownership. This removes an acknowledgement prerequisite by recovering the actual outcome. |
+| Migration retry and restore friction | Exact COMMITTED retries now validate the durable tuple and current trusted identity/pin mapping without requiring the old source-owned slots or PRIMARY roles to remain unchanged. New-transfer admission and per-slot publication ordering still apply. Backup/restore writers reserve unique scratch inodes; restore stages in the target data directory, requiring only read access beside its input archive. A nonempty CT-disabled target can be atomically replaced; the restore command's normal store startup recovers pending intent. |
+| KV compaction and exports | Failed input-file cleanup resurrected deleted and expired keys; a forgiving damaged-row scan could publish incomplete full, replica, delta and owner-data exports and then delete compaction inputs. Recovery-producing scans now stop on corruption. Publish and sync the replacement before retiring inputs; retain dead states while older files can survive, check cleanup errors and preserve accurate live-file counts. Failed export leaves an existing destination unchanged. |
+| Degraded KV reads | The metadata-index fallback loaded SSTables into RAM and unlinked their only durable copies. A read/export followed by process exit lost a previously durable key. Materialization now retains original SSTables until a durable replacement retires them. Compaction also retains disk versions shadowed by RAM whose WAL replacement may not yet be fsynced. The restart regression fails before this change and passes afterward. |
+| Expired delta replacements | Legacy delta export skipped an expired replacement, allowing a lagging consumer to keep an older non-expiring value after its cursor advanced. Emit a tombstone at the replacement's original sequence with its classification/SCI and no value. RAM/SST fixtures cover the later cursor and low-clearance/missing-SCI exclusion without relying on a sweeper. This is separate from CT1's grouped replication journal. |
+| Transactions and WAL | Terminal transaction handles/write sets were orphaned; UWP could drop pending COMMITTING/ABORTING handles. Add explicit terminal release, release consumed UWP/PG handles, and keep pending work attached for retry. A complete WAL write followed by failed fdatasync now disables that writer until reopen rather than allowing later records to make an ambiguously acknowledged operation durable. |
+| Vector/HNSW lifecycle | Mutations left graph/INT8/binary candidate indexes valid and sidecar loading ignored post-WAL generations. Invalidate stale accelerators with exact fallback, validate live generations and keep read-only builds ephemeral. Fix over-aligned HNSW allocations and propagate build allocation failures instead of publishing an incomplete index. The existing void insertion API remains as a compatibility wrapper. |
+| Other protocols | BSON builders could dereference failed allocations, miscount serialized terminators or partially replace fields; grouped aggregation array growth was not allocation-atomic. Bolt wrapped chunk lengths above 65535 bytes, and socket/buffer failures could lose framing. PG could emit incomplete messages after allocation failure. Preserve BSON/Bolt public struct layouts, check construction failures, split Bolt chunks, terminate failed writes and protect PG TLS writes from SIGPIPE only in the writing thread. |
+| Projection identity | The SQLite cache identity included model and dimension but its filename did not. Cache files now include both, so shutdown/re-enable selects a compatible cache after a provider change. An enabled fixture uses actual KEYSTONE with deterministic provider/ONNX-active test substitution; it checks model and dimension changes without KV mutation. It does not validate a real ONNX model or remote service. Hot provider replacement still requires projection shutdown/re-enable. |
+| Delayed CT1 events | A historical promotion could adopt unresolved slots after the target's node relationship had advanced. Keep those slots unresolved and preserve current roles. Tests retain the earlier replica cases and add advanced-primary coverage; this does not implement missing predecessor-chain recovery. |
+
+The transfer has no fixed aggregate row/image cap, but still needs its configured
+replication-log retention capacity, available disk/RAM and representable file
+offsets. Target import materializes incoming/existing rows; memory is proportional
+to the range. Compaction retains dead states until input retirement is durable,
+then uses a second rewrite when needed to preserve ordinary GC behavior. Failed
+cleanup retains them for retry. The unchanged projection-epoch/GC regression
+caught the initial over-retention and passes after that correction. Terminal
+transaction release frees the handle/write set; manager arena shells remain
+until manager destruction. No throughput or RSS improvement is claimed.
+
+The combined library/daemon build and focused checks cover protocol write and
+allocation faults, PG/UWP transaction behavior, WAL durability, BSON and adapter
+denials, vector lifecycle, HNSW allocation failures, compaction/recovery/export
+faults, ownership replay and interrupted large transfer. Scoped protocol
+ASan/UBSan passes with leak detection enabled; changed HNSW/vector and BSON
+units also have focused sanitizer evidence, not whole-library coverage.
+
+Reproduce the principal focused checks from a built checkout:
+
+```sh
+make -j8 lib cluster-daemon
+make -o lib test-protocol-io-failures test-pg-wire-txn test-sql-dml-exec \
+  test-txn test-wal-durability test-mongo-bson-builder test-mongo-wire-security \
+  test-vector-derived-lifecycle test-hnsw-allocation-failures
+make -o lib test-kv-compaction-recovery test-ownership-journal-write-status \
+  test-ct-transfer-storage test-cluster-transfer test-ct-transfer-large
+make test-aimem-projection-model-swap QIHSE_ENABLE_AIMEM_KEYSTONE=1 \
+  QIHSE_AIMEM_KEYSTONE_INCLUDE=../KEYSTONE/include
+```
+
+Still open: authenticated missing-promotion chains; per-range replication roles
+(a daemon still has one CT role/peer and a dedicated slotless successor);
+consensus-backed range arbitration for automatic balancing under divergent
+partition views; durable generic 2PC coordinator decisions and general SQL WAL
+redo; container-v1 crash-atomic section-table/header updates; and real remote
+KEYSTONE/ONNX readiness. Automatic rebalance is opt-in in the source, not a
+default cluster guarantee. No live partition incident is claimed by this
+source review. The full suite remains paused at the user's request; these
+repairs have not been deployed.
+
 ## Resolved: expiry sweep and SSTable compaction
 
 The standalone daemon now defaults to a 30-second KV sweep cadence (`--kv-sweep-interval`, with `0` explicitly disabling it). In the earlier 2026-11-05 verification, authenticated QKP `PING` returned `PONG`; INFO reported sweep interval `30`, sweeper running, one live SST file, no degraded SST index, and healthy status. The previous 1,227 live SST files were compacted to one. The suite passed 164 targets at that time. The 2026-11-09 deployment obtained authenticated INFO and verified healthy SST indexing, a 30-second sweep interval and an active sweeper.

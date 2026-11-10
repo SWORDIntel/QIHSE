@@ -2413,14 +2413,10 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
     qihse_trinary_trie_t* old = store->trie;
     store->trie = merged; store->mem_usage = copy_ctx.mem_usage;
     qihse_trinary_trie_destroy(old);
-    for (int i = 0; i < store->sstable_counter; i++) {
-        char path[4096]; int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);
-        if (n >= 0 && (size_t)n < sizeof(path)) (void)unlink(path);
-    }
-    store->sstable_counter = 0;
-    store->sstable_live_count = 0u;
-    sst_meta_index_reset(store);
-    sst_fd_cache_clear(store);
+    /* This is a read-side materialization, not a durable replacement.
+     * Keep every SSTable (and its index/counters) until a normal flush or
+     * streaming compaction publishes a replacement. A crash must not lose
+     * the only durable copies merely because a degraded read needed RAM. */
     kv_projection_epoch_advance(store);
     return true;
 }
@@ -2474,8 +2470,9 @@ typedef bool (*kv_sst_record_cb)(const char* key, const kv_disk_record_t* r, voi
  * or degraded we therefore track seen keys in a temporary membership set, so
  * compaction still runs and can rebuild a healthy index afterwards.  A
  * degraded index must never block the merge that repairs it. */
-static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
-                              bool include_expired, kv_sst_record_cb cb, void* ud) {
+static int sst_foreach_newest_ex(qihse_kv_store_t* store, bool include_tombstones,
+    bool include_expired, bool strict, bool include_shadowed,
+    kv_sst_record_cb cb, void* ud) {
     if (!store || !store->trie || !cb) return -1;
     const bool index_usable = store->sst_meta && !store->sst_meta->degraded;
     sst_meta_index_t* seen = NULL;
@@ -2497,8 +2494,10 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
         kv_disk_record_t r; int rc = 0; int stopped = 0;
         for (;;) {
             long rec_off = ftell(f);
+            if (strict && rec_off < 0) { rc = -1; break; }
             rc = disk_record_read(f, &r);
             if (rc < 0) {
+                if (strict) break;
                 /* One malformed/unreadable record must not blind the whole
                  * enumeration: this used to abort the entire scan, so a
                  * single poison record — often in the NEWEST sstable, which
@@ -2523,12 +2522,16 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
                 newest = !sst_meta_index_lookup(seen, r.key, NULL, NULL, NULL, NULL,
                                                 NULL, NULL);
                 if (newest) sst_meta_index_insert(seen, r.key, 0u, 0u, 0u, 0u, 0, 0u);
+                if (seen->degraded) {
+                    disk_record_free(&r); rc = -1; errno = ENOMEM; break;
+                }
             }
             bool tombstone = (r.flags & KV_FLAG_TOMBSTONE) != 0u;
             bool expired = (!tombstone && r.expire_time_ms != 0u && r.expire_time_ms <= now);
             size_t z = 0u;
             bool shadowed = qihse_trinary_trie_search(store->trie, r.key, &z) != NULL;
-            bool emit = newest && !shadowed && (include_expired || !expired) &&
+            bool emit = newest && (include_shadowed || !shadowed) &&
+                        (include_expired || !expired) &&
                         (include_tombstones || !tombstone);
             if (emit) {
                 if (!cb(r.key, &r, ud)) stopped = 1;
@@ -2536,6 +2539,7 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
             disk_record_free(&r);
             if (stopped) { fclose(f); sst_meta_index_destroy(seen); return 0; }
         }
+        if (strict && ferror(f)) rc = -1;
         fclose(f);
         if (rc < 0) { sst_meta_index_destroy(seen); return -1; }
     }
@@ -2543,12 +2547,23 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
     return 1;
 }
 
-/* Streaming compaction: write one merged SSTable containing only the newest
- * live, unshadowed records, then atomically swap out the old files and
- * re-index.  Unlike compact_sstables_into_memtable() this never materializes
- * the whole dataset in a RAM trie and it physically drops tombstoned and
- * expired records. */
-typedef struct { FILE* f; bool ok; size_t written; qihse_kv_store_t* store; } compact_emit_ctx_t;
+static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
+    bool include_expired, kv_sst_record_cb cb, void* ud) {
+    return sst_foreach_newest_ex(store, include_tombstones, include_expired,
+                               false, false, cb, ud);
+}
+
+/* Publish a merged durable SSTable before retiring any inputs. Keep latest
+ * dead states while older input files may survive a failed unlink/crash;
+ * reclaim them only after input retirement is durable. Include disk records
+ * shadowed by RAM: their replacement WAL writes may not be fsynced yet. */
+typedef struct {
+    FILE* f;
+    bool ok, retain_dead, prunable_dead;
+    size_t written;
+    uint64_t now;
+    qihse_kv_store_t* store;
+} compact_emit_ctx_t;
 static bool tombstone_has_unacked_replica(qihse_kv_store_t* store, const char* key,
                                           uint64_t change_seq) {
     for (kv_replica_cursor_t* c = store ? store->replica_cursors : NULL; c; c = c->next) {
@@ -2560,8 +2575,12 @@ static bool tombstone_has_unacked_replica(qihse_kv_store_t* store, const char* k
 static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud) {
     compact_emit_ctx_t* ctx = (compact_emit_ctx_t*)ud;
     if (!ctx || !ctx->ok || !key || !r) return false;
-    if ((r->flags & KV_FLAG_TOMBSTONE) != 0u &&
-        !tombstone_has_unacked_replica(ctx->store, key, r->change_seq)) return true;
+    bool unpinned_tombstone = (r->flags & KV_FLAG_TOMBSTONE) != 0u &&
+        !tombstone_has_unacked_replica(ctx->store, key, r->change_seq);
+    if (!ctx->retain_dead && unpinned_tombstone) return true;
+    if (ctx->retain_dead && (unpinned_tombstone ||
+        (r->expire_time_ms != 0u && r->expire_time_ms <= ctx->now)))
+        ctx->prunable_dead = true;
     if (!disk_record_write_fields(ctx->f, key, r->val, r->expire_time_ms,
                                   r->classification, r->sci_compartment, r->flags,
                                   r->change_seq)) {
@@ -2571,7 +2590,7 @@ static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud
     return true;
 }
 
-static bool compact_sstables_stream(qihse_kv_store_t* store) {
+static bool compact_sstables_stream_pass(qihse_kv_store_t* store, bool finish_gc) {
     if (!store || !store->trie) return false;
     /* Streaming compaction drops expired physical rows. A CT2 source range
      * must remain byte-identical from its fence cut through every retry. */
@@ -2582,50 +2601,82 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
     if (store->sstable_counter == 0) return true;
     const char* dir = get_qihse_data_dir();
     if (!dir) return false;
+    if (store->sstable_counter >= INT_MAX) { errno = EOVERFLOW; return false; }
     int new_id = store->sstable_counter;
+    size_t inputs = 0u;
+    for (int i = 0; i < new_id; i++) {
+        char path[4096];
+        struct stat info;
+        int n = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);
+        if (n < 0 || (size_t)n >= sizeof(path)) return false;
+        if (lstat(path, &info) == 0) inputs++;
+        else if (errno != ENOENT) return false;
+    }
     char new_path[4096];
     int n = snprintf(new_path, sizeof(new_path), "%ssstable_%d.db", dir, new_id);
     if (n < 0 || (size_t)n >= sizeof(new_path)) return false;
     char tmp[8192]; FILE* out = NULL;
     if (!atomic_file_begin(new_path, tmp, sizeof(tmp), &out)) return false;
-    compact_emit_ctx_t wctx = { .f = out, .ok = true, .written = 0u, .store = store };
-    int rc = sst_foreach_newest(store, true, false, compact_emit_cb, &wctx);
+    compact_emit_ctx_t wctx = {
+        .f = out, .ok = true, .retain_dead = inputs > 1u, .store = store,
+        .now = current_time_ms()
+    };
+    int rc = sst_foreach_newest_ex(store, true, wctx.retain_dead,
+                                 true, true, compact_emit_cb, &wctx);
     if (rc < 0 || !wctx.ok || ferror(out)) { fclose(out); unlink(tmp); return false; }
-    if (wctx.written == 0u) {
-        /* Nothing live left in SSTables — drop all old files, no new one. */
+    bool published = wctx.written != 0u;
+    if (!published) {
         fclose(out); unlink(tmp);
-    } else if (!atomic_file_commit(out, tmp, new_path)) {
-        return false;
-    }
-    for (int i = 0; i < store->sstable_counter; i++) {
-        char p[4096]; int m = snprintf(p, sizeof(p), "%ssstable_%d.db", dir, i);
-        if (m >= 0 && (size_t)m < sizeof(p)) (void)unlink(p);
-    }
-    sst_fd_cache_clear(store);
-    if (wctx.written == 0u) {
-        store->sstable_counter = 0;
-        store->sstable_live_count = 0u;
-        sst_meta_index_reset(store); /* entries now point at deleted files — rebuild empty */
     } else {
-        store->sstable_counter = new_id + 1;
-        store->sstable_live_count = 1u;
-        sst_meta_index_reset(store);
-        /* Re-index the merged file.  If the index is gone (OOM) lookups fall
-         * back to the degraded full scan, which still finds sstable_<new_id>
-         * because sstable_counter covers it. */
-        if (store->sst_meta) {
-            const kv_read_context_t context = { .legacy_bootstrap = true };
-            if (!sst_index_load_file(store, new_path, new_id, &context)) {
-                store->sst_meta->degraded = true;
-                fprintf(stderr,
-                        "qihse-kv: re-index of merged sstable %d failed; reads "
-                        "fall back to the scan path until the next compaction\n",
-                        new_id);
-            }
+        if (!atomic_file_commit(out, tmp, new_path)) return false;
+        /* A durable inode does not establish its directory entry. */
+        if (!fsync_dir_path(dir)) return false;
+    }
+    bool cleanup_ok = true;
+    int cleanup_errno = 0;
+    size_t remaining = 0u;
+    for (int i = 0; i < new_id; i++) {
+        char path[4096];
+        int m = snprintf(path, sizeof(path), "%ssstable_%d.db", dir, i);
+        if (m < 0 || (size_t)m >= sizeof(path) ||
+            (unlink(path) != 0 && errno != ENOENT)) {
+            if (cleanup_ok) cleanup_errno = errno ? errno : EIO;
+            cleanup_ok = false;
+            remaining++;
         }
     }
-    kv_projection_epoch_advance(store);
-    return true;
+    if (!fsync_dir_path(dir)) {
+        if (cleanup_ok) cleanup_errno = errno;
+        cleanup_ok = false;
+    }
+    sst_fd_cache_clear(store);
+    store->sstable_counter = published ? new_id + 1 : remaining ? new_id : 0;
+    store->sstable_live_count = remaining + (published ? 1u : 0u);
+    sst_meta_index_reset(store);
+    /* The merged file contains each newest disk state. Surviving inputs are
+     * older copies; keeping their count lets a later pass retire them. */
+    if (published && store->sst_meta) {
+        const kv_read_context_t context = { .legacy_bootstrap = true };
+        if (!sst_index_load_file(store, new_path, new_id, &context)) {
+            store->sst_meta->degraded = true;
+            fprintf(stderr, "qihse-kv: merged sstable index unavailable; reads use scan\n");
+        }
+    }
+    /* Only after every old input is durably gone may a single-input rewrite
+     * omit dead states. Failed cleanup leaves their shadow markers intact.
+     * This second pass is needed only when there are reclaimable dead rows. */
+    if (cleanup_ok && finish_gc && wctx.prunable_dead && inputs > 1u &&
+        !compact_sstables_stream_pass(store, false)) {
+        cleanup_errno = errno;
+        cleanup_ok = false;
+    }
+    if (finish_gc) kv_projection_epoch_advance(store);
+    if (!cleanup_ok) errno = cleanup_errno;
+    return cleanup_ok;
+}
+
+static bool compact_sstables_stream(qihse_kv_store_t* store) {
+    return compact_sstables_stream_pass(store, true);
 }
 
 static int wal_replay_new_record(qihse_kv_store_t* store, FILE* f, bool has_source_seq,
@@ -5559,9 +5610,21 @@ bool qihse_kv_apply_replica_record(qihse_kv_store_t* store,
                 kv_store_unlock(store);
                 return true;
             }
-            lookup_result_free(&current);
-            kv_store_unlock(store);
-            return false; /* same sequence with different or unobservable payload */
+            /* A poll before expiry may have applied S while losing its ACK;
+             * the retry after expiry exports D at that same source sequence.
+             * Retiring an already-expired state with identical labels is the
+             * same logical outcome, not a conflicting live replacement. */
+            bool retire_expired = record->tombstone &&
+                (current.flags & KV_FLAG_TOMBSTONE) == 0u &&
+                current.expire_time_ms != 0u &&
+                current.expire_time_ms <= current_time_ms() &&
+                current.classification == record->classification &&
+                current.sci_compartment == record->sci_compartment;
+            if (!retire_expired) {
+                lookup_result_free(&current);
+                kv_store_unlock(store);
+                return false; /* conflicting or unobservable live payload */
+            }
         }
     }
     lookup_result_free(&current);
@@ -6252,8 +6315,8 @@ static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
     };
     qihse_trinary_trie_foreach(store->trie, replica_snapshot_write_mem_cb, &ctx);
     if (ctx.ok && ctx.authorized && store->sstable_counter > 0) {
-        int rc = sst_foreach_newest(store, include_dead, include_dead,
-                                    replica_snapshot_write_sst_cb, &ctx);
+        int rc = sst_foreach_newest_ex(store, include_dead, include_dead, true, false,
+                                       replica_snapshot_write_sst_cb, &ctx);
         if (rc < 0) ctx.ok = false;
     }
     if (!ctx.authorized) { fclose(f); unlink(tmp); errno = EACCES; return -2; }
@@ -6303,7 +6366,7 @@ static int qihse_kv_save_user_internal(qihse_kv_store_t* store,
     export_write_ctx_t wr = { .f = f, .now = now, .ok = true };
     qihse_trinary_trie_foreach(store->trie, export_write_cb, &wr);
     if (wr.ok && fast) {
-        int rc = sst_foreach_newest(store, false, false, export_sst_write_cb, &wr);
+        int rc = sst_foreach_newest_ex(store, false, false, true, false, export_sst_write_cb, &wr);
         if (rc < 0) wr.ok = false;
     }
     if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); kv_store_unlock(store); return -1; }
@@ -7215,9 +7278,8 @@ static bool delta_collect_push(delta_collect_ctx_t* ctx, const char* key, const 
     return true;
 }
 
-/* Memtable walk: one payload at a time, authorization-checked HERE before
- * anything is copied.  Tombstones are included (a delete is a delta event);
- * live-but-expired payloads are skipped, matching the full export. */
+/* Authorization precedes materialization. An expired replacement must still
+ * remove a replica's older value, even if it expired before the next poll. */
 static bool delta_trie_cb(const char* key, void* value, size_t value_size, void* user_data) {
     (void)value_size;
     delta_collect_ctx_t* ctx = (delta_collect_ctx_t*)user_data;
@@ -7229,7 +7291,12 @@ static bool delta_trie_cb(const char* key, void* value, size_t value_size, void*
     if (ctx->glob && fnmatch(ctx->glob, key, 0) != 0) return true;
     bool tombstone = (p->flags & KV_FLAG_TOMBSTONE) != 0u;
     bool expired = !tombstone && p->expire_time_ms != 0u && p->expire_time_ms <= ctx->now;
-    if (expired) return true;
+    if (expired) {
+        kv_payload_t dead = *p;
+        dead.flags |= KV_FLAG_TOMBSTONE;
+        dead.expire_time_ms = 0u;
+        return delta_collect_push(ctx, key, NULL, &dead);
+    }
     return delta_collect_push(ctx, key, p->val, p);
 }
 
@@ -7250,8 +7317,11 @@ static bool delta_sst_cb(const char* key, const kv_disk_record_t* r, void* ud) {
     view.sci_compartment = r->sci_compartment;
     view.flags = r->flags;
     bool tombstone = (r->flags & KV_FLAG_TOMBSTONE) != 0u;
-    bool expired = !tombstone && r->expire_time_ms != 0u && r->expire_time_ms <= ctx->now;
-    if (expired) return true;
+    if (!tombstone && r->expire_time_ms != 0u &&
+        r->expire_time_ms <= ctx->now) {
+        view.flags |= KV_FLAG_TOMBSTONE;
+        view.expire_time_ms = 0u;
+    }
     return delta_collect_push(ctx, key, r->val, &view);
 }
 
@@ -7305,7 +7375,7 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
     if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return -1; }
     qihse_trinary_trie_foreach(store->trie, delta_trie_cb, &ctx);
     if (ctx.ok && fast) {
-        int rc = sst_foreach_newest(store, true, false, delta_sst_cb, &ctx);
+        int rc = sst_foreach_newest_ex(store, true, true, true, false, delta_sst_cb, &ctx);
         if (rc < 0) ctx.ok = false;
     }
     if (!ctx.ok) {
