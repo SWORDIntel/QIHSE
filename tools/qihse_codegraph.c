@@ -1952,11 +1952,17 @@ done:
 static int collect_snapshots(cg_state *st) {
     if (!storage_lock(st, LOCK_EX)) return error_json("storage lock failed");
     int rc = 1;
-    size_t removed = 0, runtimes = 0;
+    size_t removed = 0, runtimes = 0, shared_removed = 0;
+    uint64_t shared_bytes = 0;
     /* Authenticate and validate the retained current graph before removing anything. */
     if (!load_snapshot_unlocked(st, true)) goto done;
     if (!prune_snapshots_unlocked(st, st->manifest, &removed)) goto done;
     if (!prune_runtimes_unlocked(st, &runtimes)) goto done;
+    /* Keep the generation directory in sync with the same verified current and
+     * rollback roots retained above. Validation failure is fail-closed: the
+     * shared-block collector does not remove anything unless both roots pass. */
+    if (!generation_cleanup_unlocked(st, st->manifest, &shared_removed,
+                                     &shared_bytes)) goto done;
     rc = 0;
 done:
     storage_lock(st, LOCK_UN);
@@ -1964,6 +1970,8 @@ done:
     json_text(report, "status", rc ? "collection_failed" : "collected");
     json_int(report, "removed_snapshots", (int64_t)removed);
     json_int(report, "removed_runtimes", (int64_t)runtimes);
+    json_int(report, "removed_shared_blocks", (int64_t)shared_removed);
+    json_int(report, "removed_shared_block_bytes", (int64_t)shared_bytes);
     print_json(report);
     json_object_put(report);
     return rc;

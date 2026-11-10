@@ -422,6 +422,66 @@ def main() -> None:
         assert manifest()["snapshot"] == previous_name
         invoke("gc")
         assert managed_files() == retained
+
+        # Explicit GC also reclaims valid shared blocks abandoned by an older
+        # generation, while preserving the union referenced by current and
+        # rollback parents. Reinsert a real content-addressed block after the
+        # third publication to model a writer killed before its next GC.
+        blocks = state / "blocks"
+        generation_sources = []
+        for generation in range(3):
+            path = repo / "src/a.c"
+            path.write_text(path.read_text() + f"/* shared-block generation {generation} */\n")
+            snapshot(repo, source)
+            published = invoke("import", "--input", str(source),
+                               "--storage-format", "generations-v1")
+            assert published["status"] == "published", published
+            assert manifest()["storage_format"] == "qihse-codegraph-generations-v1"
+            if generation == 0:
+                generation_sources = [
+                    (entry.name, entry.read_bytes()) for entry in blocks.glob("*.qgb")
+                ]
+                assert generation_sources
+
+        current_generation = manifest()
+        assert current_generation.get("previous_snapshot")
+        generation_evidence = invoke("context", "--symbol", "caller", "--depth", "2")["evidence"]
+        block_names = {entry.name for entry in blocks.glob("*.qgb")}
+        candidates = [(name, data) for name, data in generation_sources if name not in block_names]
+        assert candidates, "fixture did not produce an unreferenced historical block"
+        orphan_name, orphan_data = candidates[0]
+        orphan = blocks / orphan_name
+        orphan.write_bytes(orphan_data)
+        orphan.chmod(0o600)
+
+        before_gc = invoke("stats")["generation_account"]
+        assert before_gc["orphan_blocks"] == 1, before_gc
+        referenced_before = before_gc["referenced_blocks"]
+
+        # An invalid retained rollback root must stop collection before it can
+        # remove even a separately validated orphan block.
+        invalid_roots = dict(current_generation)
+        invalid_roots["previous_snapshot_hash"] = "0" * len(
+            invalid_roots["previous_snapshot_hash"]
+        )
+        manifest_path.write_text(json.dumps(invalid_roots))
+        failed_gc = invoke("gc", expect=1)
+        assert failed_gc["status"] == "collection_failed", failed_gc
+        assert orphan.is_file(), "GC deleted blocks despite an invalid retained root"
+        manifest_path.write_text(json.dumps(current_generation))
+
+        collected = invoke("gc")
+        assert collected["status"] == "collected", collected
+        assert collected["removed_shared_blocks"] == 1, collected
+        assert collected["removed_shared_block_bytes"] == len(orphan_data), collected
+        assert not orphan.exists(), "explicit GC left a valid orphan generation block"
+        after_gc = invoke("stats")["generation_account"]
+        assert after_gc["orphan_blocks"] == 0, after_gc
+        assert after_gc["referenced_blocks"] == referenced_before, after_gc
+        assert len(list(blocks.glob("*.qgb"))) == referenced_before
+        assert (state / current_generation["snapshot"]).is_file()
+        assert (state / current_generation["previous_snapshot"]).is_file()
+        assert invoke("context", "--symbol", "caller", "--depth", "2")["evidence"] == generation_evidence
     print("CodeGraph compact storage, migration, deduplication and GC: PASS")
 
 
