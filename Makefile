@@ -680,7 +680,8 @@ liboqs:
 # oqs-provider — OpenSSL 3.x provider bridging liboqs PQC algorithms
 # ---------------------------------------------------------------------------
 oqs-provider: liboqs
-	@if { [ -s $(QIHSE_DEPS_PREFIX)/lib/ossl-modules/oqsprovider.so ] && OPENSSL_MODULES=$(QIHSE_DEPS_PREFIX)/lib/ossl-modules openssl list -providers -provider-path $(QIHSE_DEPS_PREFIX)/lib/ossl-modules -provider oqsprovider 2>/dev/null | grep -q oqsprovider; } || { [ -s vendor/oqs-provider/build/lib/oqsprovider.so ] && OPENSSL_MODULES=$(CURDIR)/vendor/oqs-provider/build/lib openssl list -providers -provider-path $(CURDIR)/vendor/oqs-provider/build/lib -provider oqsprovider 2>/dev/null | grep -q oqsprovider; }; then \
+	@# Accept a provider already available through OpenSSL's configured search path.
+	@if openssl list -providers -provider oqsprovider >/dev/null 2>&1 || { [ -s $(QIHSE_DEPS_PREFIX)/lib/ossl-modules/oqsprovider.so ] && OPENSSL_MODULES=$(QIHSE_DEPS_PREFIX)/lib/ossl-modules openssl list -providers -provider-path $(QIHSE_DEPS_PREFIX)/lib/ossl-modules -provider oqsprovider 2>/dev/null | grep -q oqsprovider; } || { [ -s vendor/oqs-provider/build/lib/oqsprovider.so ] && OPENSSL_MODULES=$(CURDIR)/vendor/oqs-provider/build/lib openssl list -providers -provider-path $(CURDIR)/vendor/oqs-provider/build/lib -provider oqsprovider 2>/dev/null | grep -q oqsprovider; }; then \
 		echo "oqs-provider usable."; \
 	else \
 		if [ ! -f vendor/oqs-provider/CMakeLists.txt ]; then \
