@@ -1,6 +1,6 @@
 # AIMEM Current Issues
 
-Status updated 2026-11-09. This note records verified blockers and risks; it contains no credential values.
+Status updated 2026-11-10. This note records verified blockers and risks; it contains no credential values. The Nov. 9 cluster ownership and outage observations in section 1 are historical; the later three-owner health and inventory checkpoint is in [the recovery record](plans/cluster_recovery_20261109.md). Remote KEYSTONE semantic-projection readiness remains unverified.
 
 ## 1. Durable authentication authority migration is blocked
 
@@ -37,15 +37,19 @@ an invalidated generation retries without repeating completed inference.
 
 The real HAX Python QKP client now passes durable store, exact read,
 wrong-project denial, BM25/semantic/hybrid recall and local-fsync forget;
-disposable smoke memories were cleaned up. The broader cluster rollout is
-held: T320 is reachable again, but the three authenticated cluster views
-disagree on slot ownership, T320 reports FAIL, and all maintenance gates are
-OPEN. The historical rolling script also targets install paths overridden by
-the running units' versioned release paths. No remote service was restarted.
+disposable smoke memories were cleaned up. At the Nov. 9 checkpoint, the
+broader cluster rollout was held: authenticated cluster views disagreed on
+slot ownership, T320 reported FAIL, and maintenance gates were OPEN. This was
+superseded by the Nov. 10 recovery deployment recorded in the linked recovery
+document. Remote KEYSTONE semantic-projection readiness is still unverified;
+cluster health does not establish semantic recall availability.
 
-## 2. QIHSE push is blocked by secret scanning
+## 2. Historical QIHSE push-protection rejection
 
-Local QIHSE commit `52765af` was rejected by GitHub push protection (GH013). Secret scanning identified credential-like environment values in these benchmark captures:
+An earlier local QIHSE commit `52765af` was rejected by GitHub push protection
+(GH013). This is historical: the functional baseline was subsequently
+published to `main` as `4ca5bcd`. Secret scanning identified credential-like
+environment values in these benchmark captures:
 
 - `benchmarks/codegraph_hot_hax_suite.json`
 - `benchmarks/codegraph_search_delivery_hax_suite.json`
@@ -61,9 +65,43 @@ delete AIMEM data as a cleanup shortcut.
 
 ## 4. Source validation and CT1/CT2 closure (2026-11-09)
 
+**2026-11-10 review override:** the runs below are historical evidence, not
+closure of the subsequently found defects. CT.1/CT.2 are partial again while
+promotion dissemination, transfer ordering and fence/journal interruption
+repairs are integrated. The user stopped the new full-suite run so source
+review and repairs can continue. The repair branch has not been deployed;
+the published functional baseline remains the live reference.
+
 The final CT1/CT2 integration supersedes the earlier transport coverage-gap result. The required `make test TEST_JOBS=32` run completed **198 targets with zero failures**, including ten new transport targets; gold now runs 74 workloads with no declared gaps. The real pinned-QKP fixtures prove successor promotion and interrupted arbitrary-target transfer with independent successors, scoped denial, ordinary-read admission, observer convergence, historical receipts and reverse transfer. [Verification](validation/ct_transport_20261109.md) records the evidence and bounds. This closes the source transport gaps; the live authority/remote ownership rollout conditions in section 1 remain separate operational work.
 
 The earlier required `make test TEST_JOBS=32` run completed 188 targets with two failures. `test-docs-api-counts` found a stale generated KV header count; `make docs-api-counts` refreshed the table and the focused gate now passes. At that stage, `test-parallel-runner` rejected the gold pack's explicit CT1 pinned-write-replication and CT2 fenced-slot-transfer gaps. Those guarantees still required implementation and proof; the test was kept intact. The new AIMEM atomic forget, scoped authorization, source citation, Python SDK, and CodeGraph aggregate targets passed. HAX's final full suite passed 305 tests and lint passed. The local runtime verification is recorded above. On 2026-11-09, the required standard-build full run completed 188 targets with only `test-parallel-runner` failing on the same CT1/CT2 coverage gaps; the gold pack and CodeGraph aggregate passed. The projection-enabled interruption/ranking/authorization fixture also passed against the installed library, followed by the real HAX QKP memory smoke.
+
+## 5. Repair batch in progress (2026-11-10)
+
+These changes are local source repairs, with focused checks in isolated
+worktrees. They do not establish a new live deployment or a completed full
+regression run. The existing Operator retains its authority; the work uses
+the existing APIs and identities.
+
+| Area | Confirmed defect | Current repair status |
+| --- | --- | --- |
+| CT ownership | Promotion announcements did not establish peer ownership; stale/partially superseded transfers and lost announcements could leave conflicting maps; fencing preceded recoverable intent. | Repair and focused interruption/convergence checks in progress. |
+| AIMEM adapters | Raw tenant KV access could read or change internal memory/grant/receipt records. | Central RESP/Python boundary repair integrated; readiness errors and snapshot dispatch follow-ups in progress. |
+| Owner backup | Inventory streams were not restorable backups; ordinary whole-store export was blocked on active CT owners. | Authenticated owner-data container and SDK streaming integrated; retained tombstones and fresh CT-disabled restore checked. Actual socket backup stream integration is in progress. |
+| Export lifecycle | Export could outlive its principal generation; failed private owner backup preparation could leave an orphan; a failed partial read could leave copied bytes in the output. | Native export generation checks and owner-container cleanup/read scrubbing integrated. |
+| CodeGraph retention | Explicit GC omitted shared generation blocks; some failure receipts reported zero rather than unknown counts. | Shared cleanup and truthful incomplete-count receipts integrated. Chosen XXH3 snapshot formats are unchanged. |
+| SDK/build tools | Missing installed public headers, Python input bounds, overlapping header names, unsafe native object reuse and inaccurate rollout script discovery. | Focused fixes integrated. Rolling script refuses immutable release-package paths; activation of new versioned releases is still separate work. |
+| Generic graph engine | Property updates left stale index entries; external-ID maps were shared across graphs; analytics and fixed neighbor buffers returned wrong/truncated results. | Source repair and focused correctness cases in progress. The CodeGraph CLI uses its own CSR engine. |
+| Hybrid graph/vector | Expanded neighbors lacked per-vector authorization; query-sized buffers could receive database-sized vectors. | Source repair and focused visibility/dimension cases in progress. |
+| Transactions/query results | Participant commit failures were reported as success; Cypher accepted ordering/pagination clauses without applying them. | Focused repair in progress. Durable coordinator-decision recovery remains absent and must not be claimed. |
+| Persistence | Native KV replay could truncate valid frames after an apply failure. Generic MVCC redo ignored mutation failures; sparse cache truncation retained pages; VFS WAL accepted partial replay and unchecked offset arithmetic. | Source repair and focused fault cases in progress. Native KV replay is active. Generic recovery is exercised through its public API/tests; no daemon caller was found. VFS WAL has no current in-tree consumers. SQLite has conditional cache calls but never creates the cache; those VFS defects are latent. |
+
+Owner-data containers are data recovery images, not CT journal/cursor resume
+images. Restore uses a fresh CT-disabled destination and then the existing
+cluster admission process. Merge still opens two bounded detached input views;
+it no longer builds a third full trie, but is not a fully streaming
+merge. Legacy full exports do not contain deletion causality and cannot be
+mixed with owner-data containers.
 
 ## Resolved: expiry sweep and SSTable compaction
 

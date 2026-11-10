@@ -2,8 +2,11 @@
 
 > **Roadmap authority:** [ROADMAP.md](../../ROADMAP.md) is the sole authority for delivery status, remaining work, sequencing and acceptance. This file retains supporting design, acceptance criteria and dated evidence; historical status labels below are not an independent current checklist. Consolidated 2026-11-07.
 
-Status: current as of the 2026-10-25 migration-hardening + SDK pass. Tracks the
-operational workstreams around the 3-node cluster (t420 / 730xd / t320):
+Historical status snapshot: 2026-10-25 migration-hardening + SDK pass. The
+current cluster recovery state is recorded in
+[cluster_recovery_20261109.md](cluster_recovery_20261109.md); delivery status
+is owned by [ROADMAP.md](../../ROADMAP.md). This document retains the design
+and evidence from the 3-node cluster workstreams (t420 / 730xd / t320):
 native builds, QKP-hardened access, replication, slot migration/GC, and tooling.
 `make test` is fully green (all suites + gold workloads).
 
@@ -65,7 +68,10 @@ Also landed: replica units pin the admin identity and trust the admin pub, so
 
 ## Phase 4 — Historical cluster capability observations
 
-**Current override:** the migration, takeover and failback claims below do not establish current data-bearing transport safety. Master CT.1/CT.2 remain open, with unfenced ownership-changing paths deliberately fail-closed. Historical drill success is not successor replication proof.
+**Historical override (2026-10-25):** the migration, takeover and failback
+claims below did not establish data-bearing transport safety at that time.
+The later CT.1/CT.2 implementation and verification status is in
+[ROADMAP.md](../../ROADMAP.md) and the current recovery record.
 
 | # | Item | Notes |
 |---|---|---|

@@ -1,12 +1,12 @@
 # QIHSE Roadmap
 
-**Status date:** 2026-11-07
+**Status date:** 2026-11-10
 **License:** first-party QIHSE code uses SRSL-1.1; vendored and other third-party components retain their own applicable licenses.
 **Role:** sole authoritative roadmap for delivery status, remaining work, sequencing and acceptance. All other roadmap/plan files are supporting designs or dated evidence; their historical labels do not override this file. Former work identifiers remain mapped below. This is the master sequencing document. Detailed designs live in `docs/plans/` and `docs/architecture/`; this file tracks *what is being built, in what order, and what "done" means*. It does not replace those documents.
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` open (not started or completion not established) · `[>]` superseded/conditional
 
-**Current program status (verified 2026-11-09):** 172 implemented, 25 partial, 12 open and 3 superseded/conditional checklist entries. CT.1 and CT.2 now provide opt-in pinned-QKP successor replication and recoverable, fenced data-bearing slot transfer. The required `make test TEST_JOBS=32` run completed **203 targets with zero failures**; gold covers **74 workloads in 11 areas with no declared gaps**, including both real transport drills. The remaining W11/W12 partial stages retain their documented acceptance gates. See [transport verification](docs/validation/ct_transport_20261109.md) for the source/runtime evidence and operating bounds.
+**Current program status (reviewed 2026-11-10):** 169 implemented, 28 partial, 12 open and 3 superseded/conditional checklist entries. The live cluster has a functional published baseline. The recent-change review reopened CT.1/CT.2 for promotion dissemination, transfer ordering/convergence and fence/journal crash recovery; HAX.2 for raw tenant KV access to internal AIMEM records/grants. The raw adapter boundary and authenticated owner-data backup repairs are locally integrated; CT convergence and socket backup integration are still in progress. The wider review also found generic graph, hybrid-vector, transaction and persistence defects; [the repair record](docs/AIMEM_CURRENT_ISSUES.md#5-repair-batch-in-progress-2026-11-10) separates these from live status. CG.13 explicit CLI shared-block collection is repaired, with retained-root and orphan-cleanup regression coverage. The earlier required suite completed 203 targets with zero failures; the new full run was stopped at the user's request so review and fixes can finish first. Historical passing tests do not close the newly found cases.
 
 **Canonical tracking:** [CodeGraph](#codegraph) · [native HAX / KEYSTONE index](#native-hax) · [optional bridge](#bridge) · [design mappings / operational gaps](#consolidated-designs). W0–W12 and CT identifiers remain below.
 
@@ -595,10 +595,16 @@ Namespace-limited read-only replica pull is separate from the grouped CT1 succes
 
 <a id="ct-cluster-transport"></a>
 <a id="ct--secure-cluster-transport-follow-ups-open"></a>
-### CT — Secure cluster transport (implemented)
+### CT — Secure cluster transport (repair in progress)
 
-- [x] **CT.1 — Replicate writes to a promotable successor:** implemented opt-in pinned QKP transport with an explicit topology/transport identity map, fsynced grouped mutation history, and atomic receiver apply/cursor recovery. Write success waits for successor durability; reopened sources stay disarmed until pinned reconciliation. Five real-daemon tests prove restart, lost-ACK recovery, log GC followed by another write, lead failure, Operator promotion with a fresh successor, and stale-lead rejection. Native protocol/storage/codec tests cover classified data, SCI, tenants, forged peers, replay and fault boundaries. Legacy cleartext replication remains disabled; automatic takeover still requires a genuine authority decision. [Verification](docs/validation/ct_transport_20261109.md).
-- [x] **CT.2 — Secure data-bearing slot transfer:** implemented Operator-triggered pinned transfer to an existing primary with its own CT1 successor. All-writer range fences, durable chunk offsets, image verification, canonical seals and successor ACKs protect the transfer. Target activation refreshes data admission before source publication; peers verify the actual target's durable receipt before adopting ownership. Completed retries and historical receipts use immutable FINALIZED evidence. The four-daemon drill proves low-clearance denial, concurrent-write refusal, interrupted recovery, authoritative in-range replacement, outside-range preservation, peer convergence, primary restart and reverse transfer with a 60-character ID. Storage tests include SCI/tenant denial, abort and transfer-back recovery. The 4096-row/64-MiB bound refuses oversized operations rather than truncating data; unfenced ownership paths remain closed. [Contract](docs/plans/ct_transport_runtime.md) · [Verification](docs/validation/ct_transport_20261109.md).
+The evidence below describes the implemented baseline. The Nov. 10 review
+reopened completion for signed promotion dissemination, eventual ownership
+convergence after lost announcements, per-slot ordering under partially
+superseded transfers, and durable intent before fencing. Focused repairs are
+in progress; prior passing drills do not cover those newly found cases.
+
+- [~] **CT.1 — Replicate writes to a promotable successor:** implemented opt-in pinned QKP transport with an explicit topology/transport identity map, fsynced grouped mutation history, and atomic receiver apply/cursor recovery. Write success waits for successor durability; reopened sources stay disarmed until pinned reconciliation. Five real-daemon tests prove restart, lost-ACK recovery, log GC followed by another write, lead failure, Operator promotion with a fresh successor, and stale-lead rejection. Native protocol/storage/codec tests cover classified data, SCI, tenants, forged peers, replay and fault boundaries. Legacy cleartext replication remains disabled; automatic takeover still requires a genuine authority decision. [Verification](docs/validation/ct_transport_20261109.md).
+- [~] **CT.2 — Secure data-bearing slot transfer:** implemented Operator-triggered pinned transfer to an existing primary with its own CT1 successor. All-writer range fences, durable chunk offsets, image verification, canonical seals and successor ACKs protect the transfer. Target activation refreshes data admission before source publication; peers verify the actual target's durable receipt before adopting ownership. Completed retries and historical receipts use immutable FINALIZED evidence. The four-daemon drill proves low-clearance denial, concurrent-write refusal, interrupted recovery, authoritative in-range replacement, outside-range preservation, peer convergence, primary restart and reverse transfer with a 60-character ID. Storage tests include SCI/tenant denial, abort and transfer-back recovery. The 4096-row/64-MiB bound refuses oversized operations rather than truncating data; unfenced ownership paths remain closed. [Contract](docs/plans/ct_transport_runtime.md) · [Verification](docs/validation/ct_transport_20261109.md).
 
 ---
 
@@ -754,7 +760,7 @@ Measured synthetic comparisons: packed-v2 to v3 **1,974,079 → 1,686,048 bytes*
 The [native HAX design](NATIVE_HAX_MEMORY_ROADMAP.md), [service-principal contract](docs/plans/hax_aimem_service_principal_contract.md), [citation contract](docs/plans/hax_document_citation_contract.md) and [scoped hybrid design](docs/plans/aimem_scoped_hybrid_index.md) supply acceptance criteria. W10 engine completion does not close client integration or live rollout gates. HAX owns extraction and source orchestration; QIHSE owns durable records, identity, authorization and atomic transitions; KEYSTONE holds derived candidates only.
 
 - [x] **HAX.1 — Retire HAX Supermemory routing:** native integration records removal of capture configuration/routes while retaining queued outbox data. This does not delete the optional standalone bridge source.
-- [x] **HAX.2 — Native memory surface:** native recall, durable capture, scoped store/forget/count and evidence IDs are recorded implemented in the native HAX design.
+- [~] **HAX.2 — Native memory surface:** native recall, durable capture, scoped store/forget/count and evidence IDs are recorded implemented in the native HAX design.
 - [x] **HAX.3 — Proposed knowledge context:** model-guided general-knowledge/profile proposals, contextual use and version history are recorded implemented. Operator approval/retraction remains separately authenticated; broader quality evaluation is open.
 - [~] **QH-HAX-01 — Client/security contract:** pin supported authenticated capabilities and denial behavior through the actual deployment; do not infer readiness from engine availability.
 - [~] **QH-HAX-02 — Recoverable delivery:** HAX stages exact capture and forget identities and validates intent/completion attribution across interruption and cross-process recovery. `FORGET-SCOPED-RECEIPT` now writes the delete tombstone and completed QFS1 receipt in one fsynced QKV5 WAL frame; torn frames, crash after fsync, restart, SST persistence, scope and label denial, and exact retry were tested. A prepared intent with a missing row from an unrelated operation still returns `UNRESOLVED`. The local installed server and HAX memory path were verified on 2026-11-09; durable authority migration and broader rollout remain open.
@@ -816,7 +822,7 @@ The [cluster operations design](docs/plans/cluster_ops_roadmap.md) records usefu
 
 ## 4. Sequencing
 
-**Historical W0–W10 checklist sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** W11.0 → scoped W11.1–W11.5 work → W11.6. **Cluster transport:** CT.1 and CT.2 are implemented and verified independently of W11. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
+**Historical W0–W10 checklist sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** complete the confirmed repair batch, then W11.0 → scoped W11.1–W11.5 work → W11.6. **Cluster transport:** CT.1 and CT.2 have an implemented baseline but are reopened for the confirmed interruption and convergence defects above. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).
 
 | Horizon | Work | Why now |
 |---|---|---|
@@ -826,7 +832,7 @@ The [cluster operations design](docs/plans/cluster_ops_roadmap.md) records usefu
 | **Historical: Later** | F6, then F7 | Supply-chain substrate needs journal + leases + trust; chaos/regression budgets gate the whole thing |
 | **Historical: Opportunistic** | W4.2 only after F5; W5.2–W5.5 whenever | DHT before trust would build unauthenticated membership; docs/telemetry are non-blocking |
 | **QIHSE AIMEM lane (complete)** | QH-00 through QH-09 complete; QH-10 conditional gate not triggered | Durable scoped lifecycle, coordination, lineage, querying, maintenance, archives and assurance are integrated and tested |
-| **Cluster transport** | CT.1–CT.2 implemented | Pinned QKP write replication to a promotable successor and recoverable data-bearing slot migration |
+| **Cluster transport** | CT.1–CT.2 partial, repair in progress | Pinned QKP replication and slot migration exist; promotion dissemination, transfer convergence and interruption repairs remain under review |
 | **Active stretch program** | W11.0 complete; W11.1–W11.6 partial | General database guarantees across application models, workload isolation, online evolution, history, developer tooling, and combined failure validation |
 | **Optional vector-index research lane** | W12.0–W12.3/W12.5–W12.6 partial; W12.4 open | Independent TurboQuant candidate index with authenticated pre-top-K filtering, FP32 rerank, benchmark-gated optional SIMD/Vulkan and reversible sidecars |
 

@@ -50,10 +50,10 @@ passed against the exact installed release.
 
 ## Wider rollout
 
-No remote services were restarted. After T320 became reachable, authenticated
-cluster views still disagreed: T420 reported T320 owning all slots; 730xd
-reported itself owning all except 5182; T320 reported itself owning all except
-5182 with 730xd failed and cluster state FAIL. All maintenance gates were OPEN.
-The existing rolling script also copies into paths overridden by the active
-units' versioned release paths. Reconcile ownership and adapt the release
-activation path before rolling any cluster node.
+Historical Nov. 9 rollout checkpoint (superseded for cluster health by the
+[Nov. 10 recovery record](../plans/cluster_recovery_20261109.md)): at that
+time no remote services had been restarted; authenticated views disagreed,
+T320 reported FAIL, and maintenance gates were OPEN. The recovery record
+documents the later native deployment and converged slot map. This local HAX
+deployment note does not verify whether remote KEYSTONE semantic projection
+is enabled and ready.

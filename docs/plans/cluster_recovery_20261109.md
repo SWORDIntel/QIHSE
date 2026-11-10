@@ -30,9 +30,11 @@ merged union intact while the recent recovery and migration work is reviewed.
 
 After that inventory was captured, an explicitly requested Sentinel cleanup
 removed 100 Sentinel keys from 730xd and two from T420 before the bulk command
-stalled. No other records were changed; current live `DBSIZE` totals 271,368.
-The inventory and reconciliation counts above therefore describe the earlier
-captured state, not the live counts at publication.
+stalled. The contemporaneous `DBSIZE` observation was 271,368. The recorded
+starting total (271,468) minus the 102 logged removals is 271,366, a two-key
+discrepancy that was not reconciled to a fresh record inventory. Treat 271,368
+as a reported point-in-time `DBSIZE`, not a record-level reconciliation. The
+inventory counts above describe the earlier captured state.
 
 Step 1 checkpoint: the demonstrated 730xd-to-T320 alias ARP failure was
 repaired at the user's request using a persistent verified neighbour mapping.
@@ -94,9 +96,10 @@ completion roadmap.
 - CT1 roles are exclusive per process. Three data owners therefore need three
   separate successor processes, placed on other hosts. A host failure also
   requires replacement replica capacity on the surviving hosts.
-- Reclamation and range probing exempt bare AIMEM prefixes but miss tenant
-  scoped AIMEM keys and related state. Fix and test that classification before
-  enabling reclamation around recovered memory data.
+- Reclamation and range probing keep AIMEM data node-local. The 2026-11-10
+  review added the omitted tenant-scoped and legacy `aimem-idem:` family to
+  this classifier and its reclaim regression. Any new AIMEM key family must
+  be added here before slot reclamation is enabled for it.
 
 Relevant source:
 
@@ -115,9 +118,9 @@ under the coordinated write stop.
 
 | Service | Last verified inventory | Recovery consequence |
 | --- | --- | --- |
-| T420 cluster service | 0 keys; 0 AIMEM records | Still take a backup and preserve configuration/identity. |
-| 730xd cluster service | 271,138 keys; 309 AIMEM records | Candidate temporary recovery seed because it holds most observed cluster data. |
-| T320 cluster service | 296 application/tool keys; 0 AIMEM records | Preserve and reconcile these records; they are not proven duplicates or disposable bookkeeping. |
+| T420 cluster service | 0 keys; 0 AIMEM records (Nov. 9 pre-recovery observation) | Preserve configuration/identity; counts are historical, not current. |
+| 730xd cluster service | 271,138 keys; 309 AIMEM records (Nov. 9 pre-recovery observation) | Historical recovery-seed observation; later owner inventories supersede it. |
+| T320 cluster service | 296 application/tool keys; 0 AIMEM records (Nov. 9 pre-recovery observation) | Historical observation; records were reconciled later. |
 | Separate local HAX memory service | 97 records visible in the `hax` project scope | This is a separate service and a scoped count, not its total dataset. Cluster slot transfers do not migrate it. |
 
 Authenticated Operator QKP probes on 2026-11-09 also found six active
@@ -285,8 +288,10 @@ T420, 730xd and T320 is:
 All six peers report connected. Slot 5040 remains on B because the CT2 row/byte
 bound rejected that isolated slot before mutation; the one-slot skew is
 intentional. Each owner has an off-host successor. Slot-count automatic
-rebalancing remains disabled because it is not capacity-aware. The 730xd owner
-must be unfenced before the cluster is ready for ordinary use.
+rebalancing remains disabled because it is not capacity-aware. At the earlier
+recovery-planning checkpoint, 730xd still needed to be unfenced. The Nov. 10
+live-deployment observations below supersede that gate: they report all three
+owner services answering with a converged, healthy slot map.
 
 The separate HAX memory service remains outside this slot merge. The six
 namespace cache services are stopped with their authenticated backups
@@ -443,10 +448,10 @@ new backup instead. Do not promise an automatic rollback after cutover.
   restore backup and does not replace the QBK union.
 - The preserved authenticated union remains 271,434 records with SHA-256
   `bf400593bb9157329626f8bedb0932904fc5f9c599c19a7c25be61c7fc20ea3e`.
-  The live inventory has 34 more keys by count; a record-identity comparison
-  against the encrypted union has not yet been completed, so the 28-row gap
-  noted earlier is not yet explained. All originals and the verified union
-  remain untouched.
+  This checkpoint preceded the completed record comparison summarized at the
+  top of this document: no union keys were missing, and the 34 extra keys were
+  Sentinel artifact/chunk pairs. The earlier 28-row observation is superseded
+  by that later inventory. All originals and the verified union remain intact.
 - Automatic capacity-aware balancing, automatic failover promotion, and
   dynamic successor reassignment remain open roadmap items. Keep the current
   slot-count R5 automatic rebalancer disabled for this heterogeneous layout.
