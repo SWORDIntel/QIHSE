@@ -241,7 +241,8 @@ endif
 SRCS_BASE += src/black_hole/qihse_ct_codec.c src/spinnaker/qihse_cluster_ownership.c \
     src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c \
     src/spinnaker/qihse_cluster_range_authority.c \
-    src/spinnaker/qihse_cluster_certificate_recovery.c
+    src/spinnaker/qihse_cluster_certificate_recovery.c \
+    src/spinnaker/qihse_ct_group_config.c
 SRCS=$(SRCS_BASE)
 
 ifeq ($(LIB_TARGET),qihse.dll)
@@ -552,6 +553,25 @@ test-ct-replication-lanes: lib
 
 test-serial: test-ct-replication-lanes
 
+.PHONY: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer
+test-ct-lane-baseline: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_baseline tests/test_ct_lane_baseline.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_lane_baseline
+
+# The executable owns a fault-enabled KV implementation; production shared
+# objects never expose the crash-injection environment switches.
+test-ct-lane-log: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_ct_lane_log tests/test_ct_lane_log.c src/black_hole/qihse_kv_store.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_lane_log
+
+test-ct-lane-transfer: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_transfer tests/test_ct_lane_transfer.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_lane_transfer
+
+test-serial: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer
+
 .PHONY: test-cluster-range-authority
 test-cluster-range-authority: lib
 	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
@@ -624,6 +644,21 @@ test-ct-brain-balance: cluster-daemon keygen
 	LD_LIBRARY_PATH=. python3 tests/ct_brain_drill.py
 
 test-serial: test-ct-brain-balance
+
+.PHONY: test-ct-group-config test-ct-lane-commands test-ct-multigroup
+test-ct-group-config:
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_group_config \
+	    tests/test_ct_group_config.c src/spinnaker/qihse_ct_group_config.c
+	./tests/test_ct_group_config
+
+test-ct-lane-commands: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_commands tests/test_ct_lane_commands.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_lane_commands
+
+test-ct-multigroup: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/ct_multigroup_drill.py
+
+test-serial: test-ct-group-config test-ct-lane-commands test-ct-multigroup
 
 .PHONY: test-consensus-authority-forward test-consensus-authority-auth
 test-consensus-authority-forward: lib

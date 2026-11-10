@@ -22,8 +22,17 @@ static const char LANE_A[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static const char LANE_C[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+static const char LANE_B[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+static const char LANE_D[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+static const char LANE_E[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 static const char GEN_A[33] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static const char GEN_C[33] = "cccccccccccccccccccccccccccccccc";
+static const char GEN_B[33] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+static const char GEN_D[33] = "dddddddddddddddddddddddddddddddd";
+static const char GEN_E[33] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 static void bitmap_set(uint8_t bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES], uint16_t slot) {
     bitmap[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
@@ -47,8 +56,8 @@ static char *key_for_slot(const char *prefix, uint16_t wanted_slot) {
 static bool verify_reserved(void *context,
     const qihse_kv_ct_lane_authority_claim_t *claim, bool require_final) {
     (void)context;
-    return claim && claim->reserve_index == 11u &&
-        (!require_final || claim->final_decision_index == 12u);
+    return claim && claim->reserve_index != 0u &&
+        (!require_final || claim->final_decision_index == claim->reserve_index + 1u);
 }
 
 static void create_admitted_source_lane(qihse_kv_store_t *store,
@@ -213,8 +222,21 @@ int main(void) {
     memcpy(claim.image_digest, image_digest, sizeof(image_digest));
     memcpy(claim.range_digest, range_digest, sizeof(range_digest));
     unsigned char checksum[32];
+    qihse_kv_ct_lane_authority_claim_t wrong_digest_claim = claim;
+    wrong_digest_claim.image_digest[0] ^= 0x80u;
+    qihse_kv_ct_proof_t *wrong_digest_proof =
+        qihse_kv_ct_lane_authority_proof_create(store, operator_user,
+            operator_user, &wrong_digest_claim, verify_reserved, NULL);
+    assert(wrong_digest_proof);
+    assert(!qihse_kv_ct_lane_transfer_target_import_begin(store, operator_user,
+        operator_user, &wrong_digest_claim, wrong_digest_proof,
+        verify_reserved, NULL, target_token));
+    qihse_kv_ct_proof_destroy(wrong_digest_proof);
+    qihse_kv_ct_proof_t *image_proof = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &claim, verify_reserved, NULL);
+    assert(image_proof);
     assert(qihse_kv_ct_lane_transfer_target_seal(store, operator_user,
-        operator_user, &claim, proof, verify_reserved, NULL,
+        operator_user, &claim, image_proof, verify_reserved, NULL,
         target_token, checksum));
 
     qihse_kv_ct_lane_transfer_status_t transfer = {0};
@@ -269,7 +291,122 @@ int main(void) {
     assert(finalized_c.mode == QIHSE_KV_CT_LANE_SOURCE && finalized_c.admitted &&
         finalized_c.baseline_sealed && !finalized_c.baseline_refresh_needed);
 
+    /* A completed phase-4 receipt must be replaceable by a distinct next
+     * transfer. This models a target node that received one range and later
+     * receives another, without losing the ability to retry the first final. */
+    const uint16_t moved_slot_2 = 1000u, target_slot_2 = 15000u;
+    uint8_t moved_bitmap_2[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    uint8_t target_bitmap_2[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    bitmap_set(moved_bitmap_2, moved_slot_2);
+    bitmap_set(target_bitmap_2, target_slot_2);
+    unsigned char target_token_2[QIHSE_KV_CT_TOKEN_BYTES];
+    create_admitted_source_lane(store, operator_user, replication_user,
+        LANE_D, target_bitmap_2, "target-d", "target-d-successor", GEN_D,
+        target_token_2);
+    unsigned char receiver_token_2[QIHSE_KV_CT_TOKEN_BYTES];
+    assert(qihse_kv_ct_lane_receiver_bind(store, operator_user, LANE_B,
+        moved_bitmap_2, "source-b", "target-d", GEN_B,
+        QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 0u, receiver_token_2));
+
+    qihse_kv_ct_lane_authority_claim_t claim_2 = {0};
+    claim_2.operation = QIHSE_KV_CT_LANE_AUTH_TRANSFER;
+    snprintf(claim_2.transfer_id, sizeof(claim_2.transfer_id), "move-empty-2");
+    snprintf(claim_2.source_group_id, sizeof(claim_2.source_group_id), "%s", LANE_B);
+    snprintf(claim_2.target_group_id, sizeof(claim_2.target_group_id), "%s", LANE_D);
+    snprintf(claim_2.source_qkp_id, sizeof(claim_2.source_qkp_id), "source-b");
+    snprintf(claim_2.target_qkp_id, sizeof(claim_2.target_qkp_id), "target-d");
+    snprintf(claim_2.source_generation, sizeof(claim_2.source_generation), "%s", GEN_B);
+    snprintf(claim_2.target_generation, sizeof(claim_2.target_generation), "%s", GEN_D);
+    snprintf(claim_2.successor_qkp_id, sizeof(claim_2.successor_qkp_id),
+        "target-d-successor");
+    memcpy(claim_2.slots, moved_bitmap_2, sizeof(moved_bitmap_2));
+    claim_2.grant_epoch = 2u;
+    claim_2.reserve_index = 21u;
+    memset(claim_2.reserve_digest, 0x21, sizeof(claim_2.reserve_digest));
+    qihse_kv_ct_proof_t *proof_2 = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &claim_2, verify_reserved, NULL);
+    assert(proof_2);
+    assert(qihse_kv_ct_lane_transfer_target_import_begin(store, operator_user,
+        operator_user, &claim_2, proof_2, verify_reserved, NULL, target_token_2));
+    char image_path_2[512];
+    n = snprintf(image_path_2, sizeof(image_path_2), "%s/ct-empty-image-2.qfs", data_dir);
+    assert(n > 0 && (size_t)n < sizeof(image_path_2));
+    image_fd = open(image_path_2, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    assert(image_fd >= 0 && fsync(image_fd) == 0 && close(image_fd) == 0);
+    unsigned char image_digest_2[32], range_digest_2[32];
+    empty_image_digest(image_digest_2);
+    empty_range_digest(moved_bitmap_2, range_digest_2);
+    assert(qihse_kv_ct_lane_transfer_target_import_apply_file(store,
+        operator_user, replication_user, operator_user, &claim_2, proof_2,
+        verify_reserved, NULL, image_path_2, image_digest_2, target_token_2));
+    memcpy(claim_2.image_digest, image_digest_2, sizeof(image_digest_2));
+    memcpy(claim_2.range_digest, range_digest_2, sizeof(range_digest_2));
+    qihse_kv_ct_proof_t *image_proof_2 = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &claim_2, verify_reserved, NULL);
+    assert(image_proof_2);
+    assert(qihse_kv_ct_lane_transfer_target_seal(store, operator_user,
+        operator_user, &claim_2, image_proof_2, verify_reserved, NULL,
+        target_token_2, checksum));
+    claim_2.final_decision_index = 22u;
+    memset(claim_2.final_decision_digest, 0x22,
+           sizeof(claim_2.final_decision_digest));
+    qihse_kv_ct_proof_t *final_proof_2 = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &claim_2, verify_reserved, NULL);
+    assert(final_proof_2);
+    assert(qihse_kv_ct_lane_transfer_membership_finalize(store, operator_user,
+        operator_user, &claim_2, final_proof_2, verify_reserved, NULL,
+        receiver_token_2, target_token_2));
+    assert(qihse_kv_ct_lane_transfer_membership_finalize(store, operator_user,
+        operator_user, &claim_2, final_proof_2, verify_reserved, NULL,
+        receiver_token_2, target_token_2));
+    qihse_kv_ct_lane_transfer_status_t transfer_2 = {0};
+    assert(qihse_kv_ct_lane_transfer_status(store, operator_user, &transfer_2));
+    assert(transfer_2.active && transfer_2.phase == 4u &&
+        strcmp(transfer_2.claim.transfer_id, "move-empty-2") == 0);
+    qihse_kv_ct_lane_status_t finalized_d = {0};
+    assert(qihse_kv_ct_lane_status(store, operator_user, LANE_D, &finalized_d));
+    for (size_t i = 0; i < sizeof(moved_bitmap_2); ++i)
+        assert(finalized_d.slot_bitmap[i] ==
+            (uint8_t)(target_bitmap_2[i] | moved_bitmap_2[i]));
+    assert(finalized_d.mode == QIHSE_KV_CT_LANE_SOURCE && finalized_d.admitted &&
+        finalized_d.baseline_sealed && finalized_d.baseline_refresh_needed);
+
+    /* The source-side fence may replace a completed phase-4 receipt, but an
+     * unfinished phase-3 intent is never replaceable. */
+    qihse_kv_ct_lane_authority_claim_t claim_3 = {0};
+    claim_3.operation = QIHSE_KV_CT_LANE_AUTH_TRANSFER;
+    snprintf(claim_3.transfer_id, sizeof(claim_3.transfer_id), "move-next-3");
+    snprintf(claim_3.source_group_id, sizeof(claim_3.source_group_id), "%s", LANE_D);
+    snprintf(claim_3.target_group_id, sizeof(claim_3.target_group_id), "%s", LANE_E);
+    snprintf(claim_3.source_qkp_id, sizeof(claim_3.source_qkp_id), "target-d");
+    snprintf(claim_3.target_qkp_id, sizeof(claim_3.target_qkp_id), "target-e");
+    snprintf(claim_3.source_generation, sizeof(claim_3.source_generation), "%s", GEN_D);
+    snprintf(claim_3.target_generation, sizeof(claim_3.target_generation), "%s", GEN_E);
+    snprintf(claim_3.successor_qkp_id, sizeof(claim_3.successor_qkp_id),
+        "target-e-successor");
+    memcpy(claim_3.slots, target_bitmap_2, sizeof(target_bitmap_2));
+    claim_3.grant_epoch = 3u;
+    claim_3.reserve_index = 31u;
+    memset(claim_3.reserve_digest, 0x31, sizeof(claim_3.reserve_digest));
+    qihse_kv_ct_proof_t *proof_3 = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &claim_3, verify_reserved, NULL);
+    assert(proof_3);
+    uint64_t source_cut_3 = UINT64_MAX;
+    assert(qihse_kv_ct_lane_transfer_source_fence(store, operator_user,
+        operator_user, &claim_3, proof_3, verify_reserved, NULL,
+        target_token_2, &source_cut_3));
+    assert(source_cut_3 == 0u);
+    qihse_kv_ct_lane_transfer_status_t transfer_3 = {0};
+    assert(qihse_kv_ct_lane_transfer_status(store, operator_user, &transfer_3));
+    assert(transfer_3.active && transfer_3.phase == 1u &&
+        strcmp(transfer_3.claim.transfer_id, "move-next-3") == 0);
+
+    qihse_kv_ct_proof_destroy(proof_3);
+    qihse_kv_ct_proof_destroy(final_proof_2);
+    qihse_kv_ct_proof_destroy(image_proof_2);
+    qihse_kv_ct_proof_destroy(proof_2);
     qihse_kv_ct_proof_destroy(final_proof);
+    qihse_kv_ct_proof_destroy(image_proof);
     qihse_kv_ct_proof_destroy(proof);
     qihse_kv_store_destroy(store);
     qihse_auth_release_principal_scoped(low_user);

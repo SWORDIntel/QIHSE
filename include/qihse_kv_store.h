@@ -540,6 +540,14 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
     const unsigned char target_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
 bool qihse_kv_ct_lane_transfer_write_allowed(qihse_kv_store_t* store,
     qihse_user_t* principal, const char* key);
+/* Release a pre-activation intent only against the separate verifier for an
+ * actual committed ABORT. A normal reservation/final proof is insufficient. */
+bool qihse_kv_ct_lane_transfer_abort(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* aborted_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify_aborted, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
 bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_user_t* data_principal,
     const qihse_kv_ct_lane_authority_claim_t* claim,

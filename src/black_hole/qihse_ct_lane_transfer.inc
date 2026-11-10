@@ -319,7 +319,9 @@ int qihse_kv_ct_lane_transfer_source_export(qihse_kv_store_t* store,
         proof_claim.source_cut != claim->source_cut ||
         proof_claim.target_cursor != claim->target_cursor ||
         (!ct_digest_zero(claim->range_digest) && memcmp(claim->range_digest,
-            proof_claim.range_digest, 32u) != 0)) {
+            proof_claim.range_digest, 32u) != 0) ||
+        (!ct_digest_zero(claim->image_digest) && memcmp(claim->image_digest,
+            proof_claim.image_digest, 32u) != 0)) {
         errno = EACCES;
         return -1;
     }
@@ -540,12 +542,53 @@ bool qihse_kv_ct_lane_transfer_target_import_begin(qihse_kv_store_t* store,
         target_role_ok &&
         (receiver_is_staging || source_is_fenced_successor) &&
         receiver_slots && ct_lane_transfer_token_matches(target, owner_token);
-    if (ok && store->lane_transfer && store->lane_transfer->active) {
+    if (ok && store->lane_transfer && store->lane_transfer->active &&
+        store->lane_transfer->phase == 4u) {
+        qihse_kv_ct_lane_transfer_state_t* prior = store->lane_transfer;
+        if (ct_lane_transfer_claim_same_reservation(&prior->claim, claim)) {
+            ok = prior->target_imported &&
+                prior->source_cut == claim->source_cut &&
+                prior->target_cursor == claim->target_cursor &&
+                (ct_digest_zero(claim->image_digest) ||
+                 memcmp(prior->image_digest, claim->image_digest, 32u) == 0) &&
+                (ct_digest_zero(claim->range_digest) ||
+                 memcmp(prior->range_digest, claim->range_digest, 32u) == 0);
+        } else {
+            qihse_kv_ct_lane_transfer_state_t* next = calloc(1u, sizeof(*next));
+            if (!next) ok = false;
+            else {
+                next->active = true;
+                next->phase = 1u;
+                next->claim = *claim;
+                next->source_cut = claim->source_cut;
+                next->target_cursor = claim->target_cursor;
+                next->source_fenced = true;
+                memcpy(next->pending_slot_bitmap, claim->slots,
+                       sizeof(claim->slots));
+                store->lane_transfer = next;
+                if (!ct_lane_transfer_state_write(store)) {
+                    store->lane_transfer = prior;
+                    free(next);
+                    store->recovery_pending = true;
+                    ok = false;
+                } else {
+                    free(prior);
+                }
+            }
+        }
+    } else if (ok && store->lane_transfer && store->lane_transfer->active) {
         ok = ct_lane_transfer_state_matches(store->lane_transfer, claim) &&
             store->lane_transfer->source_cut == claim->source_cut &&
-            (store->lane_transfer->phase == 1u ||
+            ((store->lane_transfer->phase == 1u) ||
              (store->lane_transfer->phase == 2u &&
-              store->lane_transfer->target_imported));
+              store->lane_transfer->target_imported &&
+              store->lane_transfer->target_cursor == claim->target_cursor &&
+              (ct_digest_zero(claim->image_digest) ||
+               memcmp(store->lane_transfer->image_digest,
+                      claim->image_digest, 32u) == 0) &&
+              (ct_digest_zero(claim->range_digest) ||
+               memcmp(store->lane_transfer->range_digest,
+                      claim->range_digest, 32u) == 0)));
         if (ok && store->lane_transfer->phase == 1u) {
             store->lane_transfer->target_cursor = claim->target_cursor;
             if (!ct_lane_transfer_state_write(store)) {
@@ -602,6 +645,10 @@ bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
         !ct_lane_transfer_claim_same_reservation(claim, &proof_claim) ||
         proof_claim.source_cut != claim->source_cut ||
         proof_claim.target_cursor != claim->target_cursor ||
+        (!ct_digest_zero(claim->range_digest) && memcmp(claim->range_digest,
+            proof_claim.range_digest, 32u) != 0) ||
+        (!ct_digest_zero(claim->image_digest) && memcmp(claim->image_digest,
+            proof_claim.image_digest, 32u) != 0) ||
         !qihse_kv_replica_snapshot_size(snapshot, data_principal, &snapshot_size) ||
         !ct_fd_sha256(snapshot->fd, image_digest) ||
         memcmp(image_digest, expected_image_digest, 32u) != 0 ||
@@ -668,7 +715,7 @@ bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
            strcmp(receiver->status.source_id, claim->source_qkp_id) == 0 &&
            strcmp(receiver->status.peer_id, claim->target_qkp_id) == 0 &&
            strcmp(receiver->status.generation, claim->source_generation) == 0)
-        : (source_is_fenced_owner && receiver->status.admitted &&
+        : (source_is_fenced_owner && state && receiver->status.admitted &&
            state->source_cut <= receiver->status.durable_position &&
            state->source_cut <= receiver->status.acknowledged_position &&
            source_slots_owned &&
@@ -856,7 +903,11 @@ bool qihse_kv_ct_lane_transfer_target_seal(qihse_kv_store_t* store,
             data_principal, reserved_proof, &proof_claim) ||
         !ct_lane_transfer_claim_same_reservation(claim, &proof_claim) ||
         proof_claim.source_cut != claim->source_cut ||
-        proof_claim.target_cursor != claim->target_cursor) {
+        proof_claim.target_cursor != claim->target_cursor ||
+        (!ct_digest_zero(claim->range_digest) && memcmp(claim->range_digest,
+            proof_claim.range_digest, 32u) != 0) ||
+        (!ct_digest_zero(claim->image_digest) && memcmp(claim->image_digest,
+            proof_claim.image_digest, 32u) != 0)) {
         errno = EACCES; return false;
     }
     ct_range_image_t current = {0};
@@ -966,6 +1017,18 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
     }
     kv_store_wrlock(store);
     qihse_kv_ct_lane_transfer_state_t* state = store->lane_transfer;
+    if (!store->recovery_pending && state && state->active &&
+        state->phase == 4u && ct_lane_claim_equal(&state->claim, claim) &&
+        state->source_cut == claim->source_cut &&
+        state->target_cursor == claim->target_cursor &&
+        memcmp(state->image_digest, claim->image_digest, 32u) == 0 &&
+        memcmp(state->range_digest, claim->range_digest, 32u) == 0) {
+        /* The completed operation is already durable. Reopening disarms
+         * SOURCE admission, and later promotions can change live roles;
+         * neither condition turns an exact completed retry into new work. */
+        kv_store_unlock(store);
+        return true;
+    }
     qihse_kv_ct_lane_t* source = ct_lane_find(store, claim->source_group_id);
     qihse_kv_ct_lane_t* target = ct_lane_find(store, claim->target_group_id);
     bool source_is_owner = source && source->status.mode == QIHSE_KV_CT_LANE_SOURCE;
@@ -974,8 +1037,8 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
     bool target_is_receiver = target && target->status.mode == QIHSE_KV_CT_LANE_RECEIVER;
     bool source_role_ok = (source_is_owner || source_is_receiver) &&
         strcmp(source->status.generation, claim->source_generation) == 0 &&
-        (source_is_owner || (strcmp(source->status.source_id, claim->source_qkp_id) == 0 &&
-                             strcmp(source->status.peer_id, claim->target_qkp_id) == 0));
+        strcmp(source->status.source_id, claim->source_qkp_id) == 0 &&
+        (source_is_owner || strcmp(source->status.peer_id, claim->target_qkp_id) == 0);
     bool target_role_ok = !target || ((target_is_owner || target_is_receiver) &&
         (target_is_owner ? (target->status.durable_position >= claim->target_cursor &&
                             target->status.acknowledged_position >= claim->target_cursor) :
@@ -987,14 +1050,19 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
         ct_lane_transfer_token_matches(source, source_owner_token) &&
         (!target || (target_owner_token &&
                      ct_lane_transfer_token_matches(target, target_owner_token)));
+    bool exported_source = source_is_owner && state && state->source_fenced &&
+        state->source_cut <= source->status.durable_position &&
+        state->source_cut <= source->status.acknowledged_position;
     bool ok = !store->recovery_pending && state && state->active &&
-        state->phase >= 2u && state->phase <= 3u && state->target_imported &&
+        state->phase >= 1u && state->phase <= 3u &&
+        (state->target_imported || exported_source) &&
         ct_lane_transfer_state_matches(state, claim) && target_role_ok && token_ok &&
         state->source_fenced && state->source_cut == claim->source_cut &&
         state->target_cursor == claim->target_cursor &&
         !ct_digest_zero(state->image_digest) && !ct_digest_zero(state->range_digest) &&
         memcmp(state->image_digest, claim->image_digest, 32u) == 0 &&
-        memcmp(state->range_digest, claim->range_digest, 32u) == 0;
+        memcmp(state->range_digest, claim->range_digest, 32u) == 0 &&
+        (state->phase < 3u || ct_lane_claim_equal(&state->claim, claim));
     if (!ok) { kv_store_unlock(store); errno = EBUSY; return false; }
 
     bool source_has_all = true, source_has_none = true;
@@ -1018,7 +1086,7 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
     /* Persist the final quorum decision before publishing ownership changes.
      * Phase 3 is a replayable intent: after restart, the same final proof can
      * finish an interrupted idempotent bitmap update. */
-    if (state->phase != 3u) {
+    if (state->phase < 3u) {
         qihse_kv_ct_lane_authority_claim_t old_claim = state->claim;
         state->claim = *claim;
         state->phase = 3u;
@@ -1045,32 +1113,28 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
         *source = source_old; if (target) *target = target_old;
         kv_store_unlock(store); errno = EIO; return false;
     }
-    if (source_has_all) {
-        if (source_is_owner) {
-            /* Keep the established source/peer stream live for the slots that
-             * remain. The cached full snapshot is stale, but re-sealing it
-             * must not fence ordinary writes or discard its ACK identity. */
-            source->status.baseline_refresh_needed = true;
-        } else {
-            source->status.baseline_sealed = false;
-            source->status.baseline_refresh_needed = false;
-            source->status.baseline_row_seq = 0u;
-            source->status.baseline_stream_cut = source->status.durable_position;
-            memset(source->status.baseline_digest, 0,
-                   sizeof(source->status.baseline_digest));
-        }
+    if (source_is_owner) {
+        /* Set this on phase-3 replay too: membership can be durable before
+         * the cache marker is. Keep the established source stream live. */
+        source->status.baseline_refresh_needed = true;
+    } else if (source_has_all) {
+        source->status.baseline_sealed = false;
+        source->status.baseline_refresh_needed = false;
+        source->status.baseline_row_seq = 0u;
+        source->status.baseline_stream_cut = source->status.durable_position;
+        memset(source->status.baseline_digest, 0,
+               sizeof(source->status.baseline_digest));
     }
-    if (target && target_has_none) {
-        if (target_is_owner) {
-            target->status.baseline_refresh_needed = true;
-        } else {
-            target->status.baseline_sealed = false;
-            target->status.baseline_refresh_needed = false;
-            target->status.baseline_row_seq = 0u;
-            target->status.baseline_stream_cut = target->status.durable_position;
-            memset(target->status.baseline_digest, 0,
-                   sizeof(target->status.baseline_digest));
-        }
+    if (target && target_is_owner) {
+        /* Set this on phase-3 replay too, for the same crash window. */
+        target->status.baseline_refresh_needed = true;
+    } else if (target && target_has_none) {
+        target->status.baseline_sealed = false;
+        target->status.baseline_refresh_needed = false;
+        target->status.baseline_row_seq = 0u;
+        target->status.baseline_stream_cut = target->status.durable_position;
+        memset(target->status.baseline_digest, 0,
+               sizeof(target->status.baseline_digest));
     }
     if (!ct_lanes_state_write(store) || !ct_lane_marker_write(store)) {
         store->recovery_pending = true; kv_store_unlock(store); return false;
@@ -1085,12 +1149,74 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
         !ct_lane_transfer_baseline_invalidate(store, target)) {
         store->recovery_pending = true; kv_store_unlock(store); return false;
     }
-    state->target_imported = true;
+    state->phase = 4u;
     if (!ct_lane_transfer_state_write(store)) {
+        state->phase = 3u;
         store->recovery_pending = true; kv_store_unlock(store); return false;
     }
     kv_store_unlock(store);
     return true;
+}
+
+bool qihse_kv_ct_lane_transfer_abort(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* aborted_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify_aborted, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    qihse_kv_ct_lane_authority_claim_t proof_claim;
+    if (!store || !ct_admin(control_principal) ||
+        !ct_lane_transfer_system_principal(data_principal) ||
+        !claim || claim->operation != QIHSE_KV_CT_LANE_AUTH_TRANSFER ||
+        !owner_token || !verify_aborted ||
+        !qihse_kv_ct_lane_authority_proof_validate(store, control_principal,
+            data_principal, aborted_proof, verify_aborted, verify_context, true) ||
+        !qihse_kv_ct_lane_authority_proof_fields(store, control_principal,
+            data_principal, aborted_proof, &proof_claim) ||
+        !ct_lane_claim_equal(claim, &proof_claim)) {
+        errno = EACCES;
+        return false;
+    }
+    kv_store_wrlock(store);
+    if (store->recovery_pending || store->memory_snapshot) {
+        kv_store_unlock(store); errno = EIO; return false;
+    }
+    qihse_kv_ct_lane_transfer_state_t* state = store->lane_transfer;
+    if (!state || !state->active) {
+        /* A prior abort may have unlinked the intent before its reply was
+         * delivered. The immutable common ABORT is still required above. */
+        bool ok = ct_lane_transfer_state_write(store);
+        kv_store_unlock(store);
+        return ok;
+    }
+    qihse_kv_ct_lane_t* source = ct_lane_find(store, claim->source_group_id);
+    qihse_kv_ct_lane_t* target = ct_lane_find(store, claim->target_group_id);
+    bool source_token = source &&
+        strcmp(source->status.source_id, claim->source_qkp_id) == 0 &&
+        strcmp(source->status.generation, claim->source_generation) == 0 &&
+        ct_lane_transfer_token_matches(source, owner_token);
+    bool target_token = target &&
+        strcmp(target->status.source_id, claim->target_qkp_id) == 0 &&
+        strcmp(target->status.peer_id, claim->successor_qkp_id) == 0 &&
+        strcmp(target->status.generation, claim->target_generation) == 0 &&
+        ct_lane_transfer_token_matches(target, owner_token);
+    bool ok = state->phase >= 1u && state->phase <= 2u &&
+        ct_lane_transfer_state_matches(state, claim) &&
+        state->source_cut == claim->source_cut &&
+        (source_token || target_token);
+    if (!ok) { kv_store_unlock(store); errno = EBUSY; return false; }
+    /* Detaching makes state_write remove the private intent and sync its
+     * parent directory. Do not release the in-memory fence until both finish;
+     * a failed publication remains retryable with the same common ABORT. */
+    store->lane_transfer = NULL;
+    ok = ct_lane_transfer_state_write(store);
+    if (!ok) store->lane_transfer = state;
+    else {
+        OPENSSL_cleanse(state, sizeof(*state));
+        free(state);
+    }
+    kv_store_unlock(store);
+    return ok;
 }
 
 bool qihse_kv_ct_lane_transfer_write_allowed(qihse_kv_store_t* store,

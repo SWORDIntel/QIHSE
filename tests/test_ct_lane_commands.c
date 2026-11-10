@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LicenseRef-SRSL-1.1 */
 /* Command-level regression for per-lane CT ownership on one RESP process. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "qihse_auth.h"
 #include "qihse_ct_group_config.h"
 #include "qihse_kv_store.h"
@@ -21,6 +23,10 @@
 #define ID_B "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 #define ID_C "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 #define ID_LOCAL "1111111111111111111111111111111111111111111111111111111111111111"
+#define TOPO_LOCAL "1111111111111111111111111111111111111111"
+#define TOPO_A "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define TOPO_B "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+#define TOPO_C "cccccccccccccccccccccccccccccccccccccccc"
 #define GEN_A "11111111111111111111111111111111"
 #define GEN_B "22222222222222222222222222222222"
 #define GEN_C "33333333333333333333333333333333"
@@ -40,10 +46,10 @@ static bool topology_qkp_id(void *context, const char *topology_id,
                             char out[QIHSE_QKP_NODE_ID_LEN + 1u]) {
     (void)context;
     const char *id = NULL;
-    if (!strcmp(topology_id, "local")) id = ID_LOCAL;
-    else if (!strcmp(topology_id, "peer-a")) id = ID_A;
-    else if (!strcmp(topology_id, "peer-b")) id = ID_B;
-    else if (!strcmp(topology_id, "peer-c")) id = ID_C;
+    if (!strcmp(topology_id, TOPO_LOCAL)) id = ID_LOCAL;
+    else if (!strcmp(topology_id, TOPO_A)) id = ID_A;
+    else if (!strcmp(topology_id, TOPO_B)) id = ID_B;
+    else if (!strcmp(topology_id, TOPO_C)) id = ID_C;
     if (!id) return false;
     memcpy(out, id, QIHSE_QKP_NODE_ID_LEN);
     out[QIHSE_QKP_NODE_ID_LEN] = '\0';
@@ -104,6 +110,9 @@ static void check_reply(qihse_resp_server_t *server, qihse_user_t *user,
     assert(qihse_resp_server_execute(server, user, argc, args,
                                      &reply, &reply_len));
     assert(reply && reply_len > 0u);
+    if (reply[0] != (uint8_t)prefix[0])
+        fprintf(stderr, "%s expected prefix %s; received %.*s\n", argv[0],
+                prefix, (int)reply_len, (const char*)reply);
     assert(reply[0] == (uint8_t)prefix[0]);
     if (contains) {
         char *text = malloc(reply_len + 1u);
@@ -143,7 +152,7 @@ static void assert_value(qihse_kv_store_t *store, qihse_user_t *user,
 
 int main(void) {
     umask(0077);
-    char data_dir[] = "/tmp/qihse-ct-lane-commands-XXXXXX";
+    char data_dir[] = "./qihse-ct-lane-commands-XXXXXX";
     assert(mkdtemp(data_dir));
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
@@ -157,9 +166,9 @@ int main(void) {
 
     qihse_ct_group_config_t configs[3];
     char spec_a[256], spec_b[256], spec_c[256];
-    snprintf(spec_a, sizeof(spec_a), "%s,local,peer-a,%s,127", LANE_A, GEN_A);
-    snprintf(spec_b, sizeof(spec_b), "%s,local,peer-b,%s,12000", LANE_B, GEN_B);
-    snprintf(spec_c, sizeof(spec_c), "%s,peer-c,local,%s,14000", LANE_C, GEN_C);
+    snprintf(spec_a, sizeof(spec_a), "%s,%s,%s,%s,127", LANE_A, TOPO_LOCAL, TOPO_A, GEN_A);
+    snprintf(spec_b, sizeof(spec_b), "%s,%s,%s,%s,12000", LANE_B, TOPO_LOCAL, TOPO_B, GEN_B);
+    snprintf(spec_c, sizeof(spec_c), "%s,%s,%s,%s,14000", LANE_C, TOPO_C, TOPO_LOCAL, GEN_C);
     assert(qihse_ct_group_config_parse(spec_a, &configs[0]));
     assert(qihse_ct_group_config_parse(spec_b, &configs[1]));
     assert(qihse_ct_group_config_parse(spec_c, &configs[2]));
@@ -212,6 +221,7 @@ int main(void) {
     config.ct_topology_qkp_id = topology_qkp_id;
     config.ct_groups = configs;
     config.ct_group_count = 3u;
+    config.ct_ack_timeout_ms = ACK_TIMEOUT_MS;
     config.pqc.require = true;
     config.pqc.node_id = ID_LOCAL;
     qihse_resp_server_t *server = qihse_resp_server_create(&config);
