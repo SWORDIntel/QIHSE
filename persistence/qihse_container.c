@@ -253,10 +253,11 @@ static bool ctr_pwrite(int fd, const void* buf, size_t size, uint64_t offset) {
  *   [68..79] reserved
  */
 static bool ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
+                              uint32_t version,
                               uint32_t section_count) {
     memset(hdr, 0, QIHSE_CTR_HEADER_SIZE);
     memcpy(hdr, QIHSE_CTR_MAGIC, 8u);
-    qihse_le_write_u32(hdr + 8u,  QIHSE_CTR_VERSION);
+    qihse_le_write_u32(hdr + 8u,  version);
     qihse_le_write_u32(hdr + 12u, 0u); /* flags */
     qihse_le_write_u32(hdr + 16u, section_count);
     uint8_t hmac[48];
@@ -266,14 +267,17 @@ static bool ctr_encode_header(uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
 }
 
 static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
+                               uint32_t* version_out,
                                uint32_t* section_count_out) {
     uint8_t expected_hmac[48];
+    uint32_t version;
 
     if (memcmp(hdr, QIHSE_CTR_MAGIC, 8u) != 0) {
         errno = EINVAL;
         return false;
     }
-    if (qihse_le_read_u32(hdr + 8u) != QIHSE_CTR_VERSION) {
+    version = qihse_le_read_u32(hdr + 8u);
+    if (version != QIHSE_CTR_VERSION_V1 && version != QIHSE_CTR_VERSION) {
         errno = EINVAL;
         return false;
     }
@@ -282,6 +286,7 @@ static bool ctr_decode_header(const uint8_t hdr[QIHSE_CTR_HEADER_SIZE],
         errno = EINVAL;
         return false;
     }
+    *version_out = version;
     *section_count_out = qihse_le_read_u32(hdr + 16u);
     return true;
 }
@@ -327,16 +332,18 @@ static bool ctr_lock_release(int fd) {
 /* ── Internal: read section table from an open fd ─────────────────── */
 
 static bool ctr_read_table(int fd, qihse_ctr_section_t* sections,
+                            uint32_t* version_out,
                             uint32_t* count_out) {
     uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
     uint32_t count;
+    uint32_t version;
     uint32_t i;
     uint8_t entry[QIHSE_CTR_SECTION_ENTRY_SIZE];
 
     if (!ctr_pread(fd, hdr, sizeof(hdr), 0u)) {
         return false;
     }
-    if (!ctr_decode_header(hdr, &count)) {
+    if (!ctr_decode_header(hdr, &version, &count)) {
         return false;
     }
     if (count > QIHSE_CTR_MAX_SECTIONS) {
@@ -351,9 +358,8 @@ static bool ctr_read_table(int fd, qihse_ctr_section_t* sections,
         }
         ctr_read_section_entry(entry, &sections[i]);
     }
-    /* Header HMAC currently does not bind metadata in the section table.
-     * Until an authenticated v2 table exists, at minimum refuse malformed
-     * offsets, aliases and overlapping sections before any materialization. */
+    /* V1/V2 header HMAC does not bind section-table metadata. Bounds, unique
+     * IDs and nonoverlapping extents are therefore checked before exposure. */
     struct stat file_stat;
     if (fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode) ||
         file_stat.st_size < (off_t)QIHSE_CTR_PAYLOAD_BASE) {
@@ -361,6 +367,31 @@ static bool ctr_read_table(int fd, qihse_ctr_section_t* sections,
         return false;
     }
     const uint64_t file_size = (uint64_t)file_stat.st_size;
+    int wal_idx = -1;
+    uint64_t max_nonwal_end = QIHSE_CTR_PAYLOAD_BASE;
+    for (i = 0u; i < count; ++i) {
+        qihse_ctr_section_t* s = &sections[i];
+        if (s->section_id == QIHSE_CTR_SEC_WAL) {
+            wal_idx = (int)i;
+            continue;
+        }
+        if (s->length && s->offset <= file_size &&
+            s->length <= file_size - s->offset) {
+            uint64_t end = s->offset + s->length;
+            if (end > max_nonwal_end) max_nonwal_end = end;
+        }
+    }
+    if (version == QIHSE_CTR_VERSION && wal_idx >= 0) {
+        qihse_ctr_section_t* wal = &sections[wal_idx];
+        if (wal->offset < max_nonwal_end || wal->offset > file_size) {
+            errno = EINVAL;
+            return false;
+        }
+        wal->length = file_size - wal->offset;
+    } else if (version == QIHSE_CTR_VERSION && max_nonwal_end != file_size) {
+        errno = EINVAL;
+        return false;
+    }
     for (i = 0u; i < count; ++i) {
         const qihse_ctr_section_t* s = &sections[i];
         if (s->section_id == 0u ||
@@ -385,6 +416,7 @@ static bool ctr_read_table(int fd, qihse_ctr_section_t* sections,
             }
         }
     }
+    *version_out = version;
     *count_out = count;
     return true;
 }
@@ -392,24 +424,25 @@ static bool ctr_read_table(int fd, qihse_ctr_section_t* sections,
 /* ── Internal: write the full header + table to an open fd ─────────── */
 
 static bool ctr_write_table(int fd, const qihse_ctr_section_t* sections,
-                             uint32_t count) {
+                             uint32_t version, uint32_t count) {
     uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
     uint32_t i;
     uint8_t entry[QIHSE_CTR_SECTION_ENTRY_SIZE];
 
-    if (!ctr_encode_header(hdr, count)) return false;
-    if (!ctr_pwrite(fd, hdr, sizeof(hdr), 0u)) {
-        return false;
-    }
+    if (!ctr_encode_header(hdr, version, count)) return false;
     for (i = 0u; i < count; i++) {
         uint64_t entry_offset = QIHSE_CTR_TABLE_OFFSET +
                                 (uint64_t)i * QIHSE_CTR_SECTION_ENTRY_SIZE;
-        ctr_write_section_entry(entry, &sections[i]);
+        qihse_ctr_section_t stored = sections[i];
+        if (version == QIHSE_CTR_VERSION && stored.section_id == QIHSE_CTR_SEC_WAL)
+            stored.length = 0u;
+        ctr_write_section_entry(entry, &stored);
         if (!ctr_pwrite(fd, entry, sizeof(entry), entry_offset)) {
             return false;
         }
     }
-    return true;
+    /* Publish the header only after every table entry is complete. */
+    return ctr_pwrite(fd, hdr, sizeof(hdr), 0u);
 }
 
 /* ── Internal: find section index by ID ────────────────────────────── */
@@ -465,7 +498,7 @@ static bool ctr_sync_parent_directory(const char* path) {
 
 bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
     int fd;
-    uint32_t count = 0u;
+    uint32_t count = 0u, version = 0u;
 
     if (!path || !ctr) {
         errno = EINVAL;
@@ -480,13 +513,14 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
         return false;
     }
 
-    if (!ctr_read_table(fd, ctr->sections, &count)) {
+    if (!ctr_read_table(fd, ctr->sections, &version, &count)) {
         close(fd);
         return false;
     }
 
     ctr->fd = fd;
     ctr->section_count = count;
+    ctr->format_version = version;
     ctr->locked = false;
     ctr->read_only = true;
     ctr->path = NULL;
@@ -534,7 +568,7 @@ bool qihse_ctr_open_read(const char* path, qihse_container_t* ctr) {
 
 bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr) {
     int fd;
-    uint32_t count = 0u;
+    uint32_t count = 0u, version = 0u;
     size_t path_len;
     bool sync_file_and_parent = create;
 
@@ -594,22 +628,37 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
             close(fd);
             return false;
         }
-        if (st.st_size == 0) {
-            /* New file: write an empty table */
-            uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
-            uint8_t table[QIHSE_CTR_TABLE_SIZE];
-            memset(table, 0, sizeof(table));
-            if (!ctr_encode_header(hdr, 0u) ||
-                !ctr_pwrite(fd, hdr, sizeof(hdr), 0u) ||
-                !ctr_pwrite(fd, table, sizeof(table), QIHSE_CTR_TABLE_OFFSET)) {
+        bool initialize = st.st_size == 0;
+        if (!initialize && create && st.st_size <= (off_t)QIHSE_CTR_PAYLOAD_BASE) {
+            if (!ctr_read_table(fd, ctr->sections, &version, &count)) {
+                /* A failed first initialization cannot contain section data
+                 * below the payload base. Repair its metadata on create retry. */
+                memset(ctr->sections, 0, sizeof(ctr->sections));
+                count = 0u;
+                version = 0u;
+                initialize = true;
+                errno = 0;
+            }
+        }
+        if (initialize) {
+            /* New V2 file: reserve the final-extent WAL entry up front so its
+             * first append never needs an in-place section-table publication. */
+            uint8_t empty_table[QIHSE_CTR_TABLE_SIZE] = {0};
+            memset(&ctr->sections[0], 0, sizeof(ctr->sections[0]));
+            ctr->sections[0].section_id = QIHSE_CTR_SEC_WAL;
+            ctr->sections[0].offset = QIHSE_CTR_PAYLOAD_BASE;
+            if (!ctr_pwrite(fd, empty_table, sizeof(empty_table), QIHSE_CTR_TABLE_OFFSET) ||
+                !ctr_write_table(fd, ctr->sections, QIHSE_CTR_VERSION, 1u)) {
                 ctr_lock_release(fd);
                 close(fd);
                 return false;
             }
             sync_file_and_parent = true;
-            count = 0u;
+            count = 1u;
+            version = QIHSE_CTR_VERSION;
         } else {
-            if (!ctr_read_table(fd, ctr->sections, &count)) {
+            if (!(create && st.st_size <= (off_t)QIHSE_CTR_PAYLOAD_BASE) &&
+                !ctr_read_table(fd, ctr->sections, &version, &count)) {
                 ctr_lock_release(fd);
                 close(fd);
                 return false;
@@ -660,6 +709,7 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
 
     ctr->fd = fd;
     ctr->section_count = count;
+    ctr->format_version = version;
     ctr->locked = true;
     return true;
 }
@@ -829,9 +879,10 @@ uint64_t qihse_ctr_section_length(const qihse_container_t* ctr, uint16_t section
 /* Retain a lock on BOTH the old file and replacement inode through rename.
  * OFD record locks are inode-specific: keeping a lock on the old fd
  * alone would protect a now-unlinked file, not the published container. */
-bool qihse_ctr_flush(qihse_container_t* ctr,
-                     const qihse_ctr_section_buf_t* bufs,
-                     size_t buf_count) {
+static bool ctr_flush_version(qihse_container_t* ctr,
+                              const qihse_ctr_section_buf_t* bufs,
+                              size_t buf_count,
+                              uint32_t output_version) {
     char tmp_path[PATH_MAX] = {0};
     int tmp_fd = -1;
     bool ok = false, renamed = false;
@@ -840,10 +891,13 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     uint64_t write_offset = QIHSE_CTR_PAYLOAD_BASE;
 
     if (!ctr || !ctr->path || ctr->fd < 0 || !ctr->locked ||
+        (output_version != QIHSE_CTR_VERSION_V1 &&
+         output_version != QIHSE_CTR_VERSION) ||
         (!bufs && buf_count != 0u)) {
         errno = EINVAL;
         return false;
     }
+    if (ctr->write_uncertain) { errno = EIO; return false; }
     if (!load_hmac_key()) return false;
 
     /* A writer must never flush an inode already replaced by another writer. */
@@ -887,6 +941,8 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
 
     for (size_t i = 0; i < buf_count; ++i) {
         const qihse_ctr_section_buf_t* section = &bufs[i];
+        if (output_version == QIHSE_CTR_VERSION &&
+            section->section_id == QIHSE_CTR_SEC_WAL) continue;
         if (!section->data || section->size == 0u) continue;
         if (new_count >= QIHSE_CTR_MAX_SECTIONS ||
             section->size > INT64_MAX ||
@@ -911,6 +967,8 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     if (!copy_buf) { errno = ENOMEM; goto out; }
     for (uint32_t i = 0; i < ctr->section_count; ++i) {
         const qihse_ctr_section_t* old = &ctr->sections[i];
+        if (output_version == QIHSE_CTR_VERSION &&
+            old->section_id == QIHSE_CTR_SEC_WAL) continue;
         if (old->length == 0u) continue;
         bool replaced = false;
         for (size_t j = 0; j < buf_count; ++j) {
@@ -939,10 +997,80 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
         ++new_count;
         write_offset += old->length;
     }
+
+    if (output_version == QIHSE_CTR_VERSION) {
+        const qihse_ctr_section_buf_t* wal_buf = NULL;
+        const qihse_ctr_section_t* old_wal = NULL;
+        for (size_t i = 0; i < buf_count; ++i)
+            if (bufs[i].section_id == QIHSE_CTR_SEC_WAL) wal_buf = &bufs[i];
+        for (uint32_t i = 0; i < ctr->section_count; ++i)
+            if (ctr->sections[i].section_id == QIHSE_CTR_SEC_WAL) old_wal = &ctr->sections[i];
+
+        if (wal_buf) {
+            if (wal_buf->data && wal_buf->size) {
+                if (new_count >= QIHSE_CTR_MAX_SECTIONS ||
+                    wal_buf->size > INT64_MAX ||
+                    write_offset > (uint64_t)INT64_MAX - (uint64_t)wal_buf->size) {
+                    errno = EOVERFLOW;
+                    goto copy_failed;
+                }
+                if (!ctr_pwrite(tmp_fd, wal_buf->data, wal_buf->size, write_offset))
+                    goto copy_failed;
+                qihse_ctr_section_t* entry = &new_sections[new_count++];
+                memset(entry, 0, sizeof(*entry));
+                entry->section_id = QIHSE_CTR_SEC_WAL;
+                entry->offset = write_offset;
+                entry->length = (uint64_t)wal_buf->size;
+                write_offset += (uint64_t)wal_buf->size;
+            }
+        } else if (old_wal) {
+            if (new_count >= QIHSE_CTR_MAX_SECTIONS ||
+                old_wal->length > (uint64_t)INT64_MAX - write_offset) {
+                errno = EOVERFLOW;
+                goto copy_failed;
+            }
+            uint64_t done = 0u;
+            while (done < old_wal->length) {
+                size_t n = old_wal->length - done > 65536u
+                         ? 65536u : (size_t)(old_wal->length - done);
+                if (!ctr_pread(ctr->fd, copy_buf, n, old_wal->offset + done) ||
+                    !ctr_pwrite(tmp_fd, copy_buf, n, write_offset + done))
+                    goto copy_failed;
+                done += n;
+            }
+            new_sections[new_count] = *old_wal;
+            new_sections[new_count].offset = write_offset;
+            ++new_count;
+            write_offset += old_wal->length;
+        } else {
+            if (new_count >= QIHSE_CTR_MAX_SECTIONS) {
+                errno = ENOSPC;
+                goto copy_failed;
+            }
+            qihse_ctr_section_t* entry = &new_sections[new_count++];
+            memset(entry, 0, sizeof(*entry));
+            entry->section_id = QIHSE_CTR_SEC_WAL;
+            entry->offset = write_offset;
+        }
+    }
     free(copy_buf);
     copy_buf = NULL;
 
-    if (!ctr_write_table(tmp_fd, new_sections, new_count)) goto out;
+    if (output_version == QIHSE_CTR_VERSION) {
+        int wal_idx = -1;
+        uint64_t nonwal_end = QIHSE_CTR_PAYLOAD_BASE;
+        for (uint32_t i = 0; i < new_count; ++i) {
+            if (new_sections[i].section_id == QIHSE_CTR_SEC_WAL) wal_idx = (int)i;
+            else if (new_sections[i].offset + new_sections[i].length > nonwal_end)
+                nonwal_end = new_sections[i].offset + new_sections[i].length;
+        }
+        if (wal_idx >= 0 &&
+            (uint64_t)new_sections[wal_idx].offset < nonwal_end) {
+            errno = EINVAL;
+            goto out;
+        }
+    }
+    if (!ctr_write_table(tmp_fd, new_sections, output_version, new_count)) goto out;
 
     /* Acquire the new inode's lock BEFORE replacing the pathname. */
     if (!ctr_lock_acquire(tmp_fd)) goto out;
@@ -961,6 +1089,7 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
     tmp_fd = -1;
     memcpy(ctr->sections, new_sections, new_count * sizeof(new_sections[0]));
     ctr->section_count = new_count;
+    ctr->format_version = output_version;
     (void)ctr_lock_release(old_fd);
     close(old_fd);
     ok = true;
@@ -981,6 +1110,14 @@ out:
     return ok;
 }
 
+bool qihse_ctr_flush(qihse_container_t* ctr,
+                     const qihse_ctr_section_buf_t* bufs,
+                     size_t buf_count) {
+    if (!ctr) { errno = EINVAL; return false; }
+    uint32_t version = ctr->format_version ? ctr->format_version : QIHSE_CTR_VERSION;
+    return ctr_flush_version(ctr, bufs, buf_count, version);
+}
+
 /* ── WAL helpers ────────────────────────────────────────────────────── */
 
 bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size) {
@@ -989,27 +1126,19 @@ bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size)
         errno = EINVAL;
         return false;
     }
+    if (ctr->write_uncertain) { errno = EIO; return false; }
     if (!load_hmac_key()) return false;
     if (size == 0u) return true;
 
     int idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
-    bool is_new = idx < 0;
-    qihse_ctr_section_t next = {0};
-    if (is_new) {
-        if (ctr->section_count >= QIHSE_CTR_MAX_SECTIONS) {
-            errno = ENOSPC;
-            return false;
-        }
-        idx = (int)ctr->section_count;
-        next.section_id = QIHSE_CTR_SEC_WAL;
-        next.offset = QIHSE_CTR_PAYLOAD_BASE;
-        for (uint32_t i = 0; i < ctr->section_count; ++i) {
-            uint64_t end = ctr->sections[i].offset + ctr->sections[i].length;
-            if (end > next.offset) next.offset = end;
-        }
-    } else {
-        next = ctr->sections[idx];
+    if (ctr->format_version != QIHSE_CTR_VERSION || idx < 0) {
+        /* One-time atomic migration of legacy metadata, including all other
+         * sections. V2 WAL metadata is reserved before any append is written. */
+        if (!ctr_flush_version(ctr, NULL, 0u, QIHSE_CTR_VERSION)) return false;
+        idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
+        if (idx < 0) { errno = EIO; return false; }
     }
+    qihse_ctr_section_t next = ctr->sections[idx];
     if (next.offset > INT64_MAX || next.length > (uint64_t)INT64_MAX - next.offset ||
         size > (uint64_t)INT64_MAX - next.offset - next.length) {
         errno = EOVERFLOW;
@@ -1025,19 +1154,21 @@ bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size)
             return false;
         }
     }
+    if (!ctr_pwrite(ctr->fd, data, size, wal_end)) {
+        int saved_errno = errno ? errno : EIO;
+#ifndef _WIN32
+        int rc;
+        do { rc = ftruncate(ctr->fd, (off_t)wal_end); }
+        while (rc != 0 && errno == EINTR);
+#else
+        int rc = _chsize(ctr->fd, (long)wal_end);
+#endif
+        if (rc != 0) ctr->write_uncertain = true;
+        errno = saved_errno;
+        return false;
+    }
     next.length += size;
-    uint8_t hdr[QIHSE_CTR_HEADER_SIZE];
-    /* Prepare authentication before modifying either payload or metadata. */
-    if (is_new && !ctr_encode_header(hdr, ctr->section_count + 1u)) return false;
-    uint8_t entry[QIHSE_CTR_SECTION_ENTRY_SIZE];
-    ctr_write_section_entry(entry, &next);
-    uint64_t entry_off = QIHSE_CTR_TABLE_OFFSET +
-                        (uint64_t)idx * QIHSE_CTR_SECTION_ENTRY_SIZE;
-    if (!ctr_pwrite(ctr->fd, data, size, wal_end) ||
-        !ctr_pwrite(ctr->fd, entry, sizeof(entry), entry_off) ||
-        (is_new && !ctr_pwrite(ctr->fd, hdr, sizeof(hdr), 0u))) return false;
     ctr->sections[idx] = next;
-    if (is_new) ++ctr->section_count;
     return true;
 }
 
@@ -1050,52 +1181,50 @@ bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length) {
         errno = EINVAL;
         return false;
     }
+    if (ctr->write_uncertain) { errno = EIO; return false; }
 
     if (!load_hmac_key()) return false;
     idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
     if (idx < 0) return true; /* Nothing to truncate */
+
+    if (ctr->format_version != QIHSE_CTR_VERSION) {
+        if (!ctr_flush_version(ctr, NULL, 0u, QIHSE_CTR_VERSION)) return false;
+        idx = ctr_find_idx(ctr, QIHSE_CTR_SEC_WAL);
+        if (idx < 0) { errno = EIO; return false; }
+    }
 
     if (new_length > ctr->sections[idx].length) {
         errno = EINVAL;
         return false;
     }
 
-    /* Update length on disk before publishing it to this handle. */
+    /* V2 guarantees WAL is the final section. Persist its logical length as
+     * EOF, without an in-place table write that could tear during recovery. */
+    if (ctr->format_version == QIHSE_CTR_VERSION) {
+        uint64_t file_end = ctr->sections[idx].offset + new_length;
+#ifndef _WIN32
+        int rc;
+        do { rc = ftruncate(ctr->fd, (off_t)file_end); }
+        while (rc != 0 && errno == EINTR);
+        if (rc != 0) return false;
+#else
+        if (_chsize(ctr->fd, (long)file_end) != 0) return false;
+#endif
+        ctr->sections[idx].length = new_length;
+        return true;
+    }
+
     field_off = QIHSE_CTR_TABLE_OFFSET +
                 (uint64_t)idx * QIHSE_CTR_SECTION_ENTRY_SIZE + 16u;
     qihse_le_write_u64(len_bytes, new_length);
-    if (!ctr_pwrite(ctr->fd, len_bytes, 8u, field_off)) {
-        return false;
-    }
-
+    if (!ctr_pwrite(ctr->fd, len_bytes, 8u, field_off)) return false;
     ctr->sections[idx].length = new_length;
-
-    /* Physically truncate the file if WAL is the last section */
-    {
-        uint64_t file_end = ctr->sections[idx].offset + new_length;
-        /* Check no other section follows the WAL */
-        bool is_last = true;
-        uint32_t i;
-        for (i = 0u; i < ctr->section_count; i++) {
-            if ((uint32_t)i == (uint32_t)idx) continue;
-            if (ctr->sections[i].offset >= ctr->sections[idx].offset) {
-                is_last = false;
-                break;
-            }
-        }
-        if (is_last) {
-#ifndef _WIN32
-            if (ftruncate(ctr->fd, (off_t)file_end) != 0) return false;
-#else
-            if (_chsize(ctr->fd, (long)file_end) != 0) return false;
-#endif
-        }
-    }
     return true;
 }
 
 bool qihse_ctr_fsync(qihse_container_t* ctr) {
     if (!ctr || ctr->fd < 0) { errno = EINVAL; return false; }
+    if (ctr->write_uncertain) { errno = EIO; return false; }
 #ifndef _WIN32
     int rc;
     do { rc = fsync(ctr->fd); } while (rc != 0 && errno == EINTR);

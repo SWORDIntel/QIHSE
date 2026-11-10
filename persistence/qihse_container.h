@@ -7,6 +7,11 @@
  *   [Section payloads at declared offsets]
  *
  * All multi-byte values are little-endian.
+ * V1 stores WAL length in the section table. V2 makes WAL the final file
+ * extent and derives its length from EOF, so WAL appends do not rewrite
+ * section metadata. V1 remains readable and upgrades atomically on its first
+ * WAL mutation. V1-only binaries reject V2 files; upgrade all readers/writers
+ * before moving V2 containers back to an older deployment.
  * Atomic flush: mkstemp on private <path>.tmp.XXXXXX, fsync, rename over destination.
  * The writer lock uses fcntl(F_OFD_SETLK), tied to the open description.
  * Platforms without OFD locks fail closed; there is no F_SETLK fallback.
@@ -44,7 +49,8 @@ extern "C" {
 
 /* ── Layout constants ─────────────────────────────────────────────── */
 #define QIHSE_CTR_MAGIC         "QIHSEQDB"
-#define QIHSE_CTR_VERSION       1u
+#define QIHSE_CTR_VERSION_V1    1u
+#define QIHSE_CTR_VERSION       2u
 #define QIHSE_CTR_HEADER_SIZE   80u
 #define QIHSE_CTR_SECTION_ENTRY_SIZE 80u
 #define QIHSE_CTR_MAX_SECTIONS  QIHSE_CTR_NUM_SECTIONS
@@ -74,6 +80,8 @@ typedef struct qihse_container_s {
     char* path;            /* Owned copy of the file path */
     bool locked;
     bool read_only;        /* True when opened via qihse_ctr_open_read */
+    bool write_uncertain;  /* Failed WAL append could not be rolled back */
+    uint32_t format_version;
     bool skip_integrity;   /* Only in explicit QIHSE_ALLOW_INSECURE_CONTAINER=1 test mode */
     bool parallel_crc;     /* Use parallel fingerprint for CRC (production fast path) */
     bool use_crc32c;       /* Use CRC32C (SSE4.2) instead of FNV-1a for verification */
@@ -170,16 +178,16 @@ bool qihse_ctr_flush(qihse_container_t* ctr,
 
 /*
  * Append `size` bytes at the end of the WAL section, extending the
- * section.  Updates the section table entry (length only; HMAC is
- * intentionally not maintained for the legacy v1 WAL. Record checksums
- * are NOT cryptographic authentication; v1 WAL remains an integrity limitation).
+ * section. V1 containers are atomically upgraded to V2 on their first WAL
+ * mutation. V2 derives WAL length from EOF, so append does not rewrite section
+ * metadata. WAL record checksums are NOT cryptographic authentication.
  * Does NOT fsync; caller is responsible.
  */
 bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size);
 
 /*
- * Truncate the WAL section to `new_length` bytes.
- * If new_length == 0 the section entry length is zeroed.
+ * Truncate the WAL section to `new_length` bytes. V2 truncates the file because
+ * WAL is its final extent; V1 is atomically upgraded before truncation.
  */
 bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length);
 
