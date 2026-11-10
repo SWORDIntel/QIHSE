@@ -7,10 +7,11 @@
 #include "qihse_uwp.h"
 #include "qihse_resp_wire.h"
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_vector_db.h"
 
 #include <assert.h>
-#include <dirent.h>
+#include <ftw.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,9 +23,6 @@
 #define THREADS 8u
 #define WRITES_PER_THREAD 160u
 #define OPERATOR_PASSWORD "VectorAdapterConcurrencyPa1!"
-
-extern bool qihse_vector_db_adapter_lock(qihse_vector_db_t vdb);
-extern void qihse_vector_db_adapter_unlock(qihse_vector_db_t vdb);
 
 typedef struct {
     qihse_uwp_context_t* uwp;
@@ -88,19 +86,10 @@ static void* independent_lock_main(void* opaque) {
     return NULL;
 }
 
-static void remove_data_dir(const char* path) {
-    DIR* dir = opendir(path);
-    if (!dir) return;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        char item[512];
-        int n = snprintf(item, sizeof(item), "%s/%s", path, entry->d_name);
-        assert(n > 0 && (size_t)n < sizeof(item));
-        unlink(item);
-    }
-    closedir(dir);
-    rmdir(path);
+static int remove_entry(const char* path, const struct stat* st,
+                          int type, struct FTW* ftw) {
+    (void)st; (void)type; (void)ftw;
+    return remove(path);
 }
 
 int main(void) {
@@ -241,7 +230,10 @@ int main(void) {
     qihse_resp_server_destroy(resp);
     qihse_kv_store_destroy(store);
     qihse_vector_db_destroy(vdb);
-    remove_data_dir(data_dir);
+    qihse_auth_shutdown_rate_limiter();
+    qihse_auth_shutdown_volume_limiter();
+    qihse_audit_shutdown();
+    assert(nftw(data_dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS) == 0);
     puts("test_vector_adapter_concurrency: all assertions passed");
     return 0;
 }

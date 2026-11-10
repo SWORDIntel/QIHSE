@@ -89,6 +89,16 @@ static void resp_write_all(int fd, const char* buf, size_t len) {
     }
 }
 
+static void resp_write_bulk(int fd, const char* value) {
+    if (!value) { resp_write_all(fd, "$-1\r\n", 5u); return; }
+    size_t len = strlen(value);
+    char header[64];
+    int n = snprintf(header, sizeof(header), "$%zu\r\n", len);
+    resp_write_all(fd, header, (size_t)n);
+    resp_write_all(fd, value, len);
+    resp_write_all(fd, "\r\n", 2u);
+}
+
 void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
     if (qihse_resp_engine_handle_legacy(client_fd, store, vdb)) return;
 #ifndef _WIN32
@@ -105,22 +115,26 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
-    char buffer[65536];
+    enum { BUFFER_BYTES = 65536, MAX_ARGS = 2048 };
+    char* buffer = malloc(BUFFER_BYTES);
+    char** args = malloc(MAX_ARGS * sizeof(*args));
+    if (!buffer || !args) {
+        free(buffer); free(args); close(client_fd); return;
+    }
     qihse_user_t* current_user = NULL;
     while (1) {
-        ssize_t valread = read(client_fd, buffer, sizeof(buffer) - 1);
+        ssize_t valread = read(client_fd, buffer, BUFFER_BYTES - 1);
         if (valread <= 0) break;
         buffer[valread] = '\0';
         
-        char* args[2048];
         int argc = 0;
         
         if (buffer[0] == '*') {
-            argc = parse_resp_array(buffer, valread, args, 2048);
+            argc = parse_resp_array(buffer, valread, args, MAX_ARGS);
         } else {
             char* save_ptr = NULL;
             char* token = strtok_r(buffer, " \r\n", &save_ptr);
-            while (token && argc < 2048) {
+            while (token && argc < MAX_ARGS) {
                 args[argc++] = token;
                 token = strtok_r(NULL, " \r\n", &save_ptr);
             }
@@ -155,23 +169,18 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "GET") == 0 && argc >= 2) {
-                const char* val = qihse_kv_get_user(store, args[1], current_user);
+                char* val = qihse_kv_get_user(store, args[1], current_user);
                 
                 if (qihse_kv_store_is_under_attack(store)) {
+                    free(val);
 #ifndef _WIN32
                     qihse_qdd_execute_active_measure(client_fd);
 #endif
                     break;
                 }
                 
-                if (val) {
-                    char reply[1024];
-                    snprintf(reply, sizeof(reply), "$%zu\r\n%s\r\n", strlen(val), val);
-                    resp_write_all(client_fd, reply, strlen(reply));
-                } else {
-                    const char* reply = "$-1\r\n";
-                    resp_write_all(client_fd, reply, strlen(reply));
-                }
+                resp_write_bulk(client_fd, val);
+                free(val);
             } else if (strcasecmp(args[0], "DEL") == 0 && argc >= 2) {
                 if (qihse_kv_del_user(store, args[1], current_user)) {
                     const char* reply = ":1\r\n";
@@ -196,29 +205,14 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                 }
             } else if (strcasecmp(args[0], "MGET") == 0 && argc >= 2) {
-                char reply[65536];
-                int offset = snprintf(reply, sizeof(reply), "*%d\r\n", argc - 1);
-                if (offset < 0) offset = 0;
+                char header[64];
+                int n = snprintf(header, sizeof(header), "*%d\r\n", argc - 1);
+                resp_write_all(client_fd, header, (size_t)n);
                 for (int i = 1; i < argc; i++) {
-                    const char* val = qihse_kv_get_user(store, args[i], current_user);
-                    int remaining = sizeof(reply) - offset;
-                    if (remaining <= 0) break;
-                    int written;
-                    if (val) {
-                        written = snprintf(reply + offset, remaining, "$%zu\r\n%s\r\n", strlen(val), val);
-                    } else {
-                        written = snprintf(reply + offset, remaining, "$-1\r\n");
-                    }
-                    if (written > 0) {
-                        if (written >= remaining) {
-                            offset += remaining - 1;
-                            break;
-                        } else {
-                            offset += written;
-                        }
-                    }
+                    char* value = qihse_kv_get_user(store, args[i], current_user);
+                    resp_write_bulk(client_fd, value);
+                    free(value);
                 }
-                resp_write_all(client_fd, reply, offset);
             } else if (strcasecmp(args[0], "INFO") == 0) {
                 const char* info = "# Server\r\nredis_version:7.0.0 (QIHSE Wire Proxy)\r\n# Memory\r\nused_memory_human:0B\r\n";
                 char reply[1024];
@@ -336,6 +330,11 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                 } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
+                    if (!vec) {
+                        const char* reply = "-ERR out of memory\r\n";
+                        resp_write_all(client_fd, reply, strlen(reply));
+                        continue;
+                    }
                     for (int i = 0; i < dim; i++) {
                         vec[i] = strtof(args[3 + i], NULL);
                     }
@@ -348,6 +347,12 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     query.user = current_user;
                     
                     qihse_vector_result_t *results = malloc(top_k * sizeof(qihse_vector_result_t));
+                    if (!results) {
+                        free(vec);
+                        const char* reply = "-ERR out of memory\r\n";
+                        resp_write_all(client_fd, reply, strlen(reply));
+                        continue;
+                    }
                     int found = -1;
                     if (qihse_resp_vdb_access_lock(NULL, vdb)) {
                         found = qihse_vector_db_search(vdb, &query, results, top_k);
@@ -379,6 +384,8 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             }
         }
     }
+    free(args);
+    free(buffer);
     close(client_fd);
 }
 
