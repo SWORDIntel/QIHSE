@@ -1842,11 +1842,21 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
             txn->config_epoch, source_index, target_index, successor_index,
             &source, &target, &successor_node);
         promotion_roles_applied = apply_roles;
+        bool promotion_range_is_stale = !apply_roles &&
+            target.config_epoch > txn->config_epoch;
         if (apply_roles &&
             (!qihse_cluster_topology_upsert_node(c->topology, &source, NULL) ||
              !qihse_cluster_topology_upsert_node(c->topology, &successor_node, NULL))) {
             set_error(r->err, r->err_cap, "finalized CT1 promoted source is durable; successor role replay failed");
             r->failed = true; return false;
+        }
+        if (promotion_range_is_stale) {
+            /* A durable historical promotion proves its own transition only.
+             * Once the target's node epoch has advanced, replay must not use
+             * that old proof to fill slots still waiting for the newer chain. */
+            r->has_prepared = false;
+            memset(&r->prepared, 0, sizeof(r->prepared));
+            return true;
         }
     }
     bool update_target_node = !txn->next_generation[0] || promotion_roles_applied;
