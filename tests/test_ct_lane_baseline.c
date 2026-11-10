@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <openssl/evp.h>
 
 #include "qihse_auth.h"
 #include "qihse_cluster_slot.h"
@@ -22,7 +23,7 @@ static const char TARGET_LANE[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
 static const char OTHER_LANE[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static const char GEN_SOURCE[QIHSE_KV_CT_ID_MAX + 1u] =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static const char GEN_OTHER[QIHSE_KV_CT_ID_MAX + 1u] =
     "cccccccccccccccccccccccccccccccc";
 static const uint16_t SELECTED_SLOT = 313u;
@@ -217,7 +218,12 @@ static int target_process(const char *data_dir, const char *image_path,
         low_user, TARGET_LANE, selected_slots, image_path,
         (uint64_t)row_seq_text, 0u, digest, target_token));
     assert(errno == EACCES);
-    assert_value(store, operator_user, stale_key, "must-be-removed");
+    qihse_kv_ct_lane_status_t denied_status = {0};
+    assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE,
+                                   &denied_status));
+    assert(!denied_status.baseline_sealed &&
+           denied_status.durable_position == 0u &&
+           denied_status.acknowledged_position == 0u);
 
     assert(qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
         operator_user, TARGET_LANE, selected_slots, image_path,
@@ -289,6 +295,54 @@ static int target_process(const char *data_dir, const char *image_path,
     return 0;
 }
 
+static int empty_lane_process(const char *data_dir, const char *image_path) {
+    assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
+    assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
+    qihse_user_t *operator_user = make_operator();
+    qihse_kv_store_t *store = qihse_kv_store_create_user(operator_user);
+    assert(store);
+
+    /* Other local data may advance the row watermark before this group joins. */
+    assert(qihse_kv_set_user(store, "node-local", "outside-group", 0u, 0u,
+                             operator_user));
+    FILE *empty = fopen(image_path, "wb");
+    assert(empty && fclose(empty) == 0);
+    unsigned char digest[32];
+    unsigned int digest_len = 0u;
+    assert(EVP_Digest("", 0u, digest, &digest_len, EVP_sha256(), NULL) == 1);
+    assert(digest_len == sizeof(digest));
+
+    unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
+    uint8_t empty_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    assert(qihse_kv_ct_lane_receiver_bind(store, operator_user, TARGET_LANE,
+        empty_slots, "source-node", "joining-node", GEN_SOURCE,
+        QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 0u, token));
+    assert(qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
+        operator_user, TARGET_LANE, empty_slots, image_path,
+        7u, 0u, digest, token));
+
+    qihse_kv_ct_lane_status_t status = {0};
+    assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
+    assert(status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
+           status.baseline_sealed && !status.admitted &&
+           status.baseline_row_seq == 7u &&
+           status.baseline_stream_cut == 0u &&
+           status.durable_position == 0u &&
+           status.acknowledged_position == 0u);
+
+    qihse_kv_store_destroy(store);
+    store = qihse_kv_store_create_user(operator_user);
+    assert(store);
+    memset(&status, 0, sizeof(status));
+    assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
+    assert(status.baseline_sealed && !status.admitted &&
+           status.baseline_row_seq == 7u &&
+           status.baseline_stream_cut == 0u);
+    qihse_kv_store_destroy(store);
+    qihse_auth_release_principal_scoped(operator_user);
+    return 0;
+}
+
 static void run_child(const char *self, const char *role, const char *dir,
                       const char *image, const char *manifest,
                       const char *delta) {
@@ -310,24 +364,41 @@ int main(int argc, char **argv) {
         return target_process(argv[2], argv[3], argv[4], argv[5], false);
     if (argc == 6 && strcmp(argv[1], "--target-partial") == 0)
         return target_process(argv[2], argv[3], argv[4], argv[5], true);
+    if (argc == 4 && strcmp(argv[1], "--empty-lane") == 0)
+        return empty_lane_process(argv[2], argv[3]);
     assert(argc == 1);
     char source_dir[] = "./ct_lane_base_src_XXXXXX";
     char target_dir[] = "./ct_lane_base_dst_XXXXXX";
     char partial_dir[] = "./ct_lane_base_part_XXXXXX";
-    assert(mkdtemp(source_dir) && mkdtemp(target_dir) && mkdtemp(partial_dir));
+    char empty_dir[] = "./ct_lane_base_empty_XXXXXX";
+    assert(mkdtemp(source_dir) && mkdtemp(target_dir) && mkdtemp(partial_dir) &&
+           mkdtemp(empty_dir));
     char source_image[512], manifest[512], delta[512];
+    char empty_image[512];
     assert(snprintf(source_image, sizeof(source_image), "%s/source.qfs",
                     source_dir) > 0);
     assert(snprintf(manifest, sizeof(manifest), "%s/manifest.txt",
                     source_dir) > 0);
     assert(snprintf(delta, sizeof(delta), "%s/delta.qct", source_dir) > 0);
+    assert(snprintf(empty_image, sizeof(empty_image), "%s/empty.qfs",
+                    empty_dir) > 0);
     char self[4096];
     assert(realpath(argv[0], self));
     run_child(self, "--source", source_dir, source_image, manifest, delta);
     run_child(self, "--target-full", target_dir, source_image, manifest, delta);
     run_child(self, "--target-partial", partial_dir, source_image, manifest, delta);
+    pid_t empty_child = fork();
+    assert(empty_child >= 0);
+    if (empty_child == 0) {
+        execl(self, self, "--empty-lane", empty_dir, empty_image, (char *)NULL);
+        _exit(127);
+    }
+    int empty_status = 0;
+    assert(waitpid(empty_child, &empty_status, 0) == empty_child);
+    assert(WIFEXITED(empty_status) && WEXITSTATUS(empty_status) == 0);
     aimem_fixture_cleanup(source_dir);
     aimem_fixture_cleanup(target_dir);
     aimem_fixture_cleanup(partial_dir);
+    aimem_fixture_cleanup(empty_dir);
     return 0;
 }
