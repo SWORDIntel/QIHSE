@@ -12993,7 +12993,7 @@ static bool qihse_resp_ct2_parse_tuple(const qihse_resp_request_t* r,
         !qihse_resp_parse_u64_arg(&r->argv[10], &t->source_lsn) || !t->source_lsn ||
         !qihse_resp_parse_u64_arg(&r->argv[11], &t->config_epoch) || !t->config_epoch ||
         !qihse_resp_parse_u64_arg(&r->argv[12], &out->total_bytes) ||
-        !out->total_bytes || out->total_bytes > (64u << 20) ||
+        !out->total_bytes || out->total_bytes > (uint64_t)INT64_MAX ||
         !qihse_resp_ct2_copy_arg(&r->argv[13], 64u, image_hex, sizeof(image_hex)) ||
         !qihse_resp_ct2_copy_arg(&r->argv[14], 64u, range_hex, sizeof(range_hex)) ||
         strlen(image_hex) != 64u || strlen(range_hex) != 64u)
