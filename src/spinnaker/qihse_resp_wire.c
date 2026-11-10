@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -42,52 +43,116 @@ void* qihse_resp_client_thread(void* arg) {
 }
 
 
-static int parse_resp_array(char* buf, size_t buf_len, char** args, int max_args) {
-    if (buf_len == 0 || buf[0] != '*') return -1;
-    char *end = buf + buf_len;
-    char *endptr = NULL;
-    long argc_l = strtol(buf + 1, &endptr, 10);
-    if (endptr == buf + 1 || argc_l <= 0 || argc_l > max_args) return -1;
-    int argc = (int)argc_l;
-    
-    char* p = strstr(buf, "\r\n");
-    if (!p) return -1;
-    p += 2;
-    
-    for (int i = 0; i < argc; i++) {
-        if (p >= end || p[0] != '$') return -1;
-        char *len_endptr = NULL;
-        long len_l = strtol(p + 1, &len_endptr, 10);
-        if (len_endptr == p + 1 || len_l < 0 || len_l > 1024 * 1024) return -1;
-        int len = (int)len_l;
-        p = strstr(p, "\r\n");
-        if (!p) return -1;
-        p += 2;
-        args[i] = p;
-        if (len > end - p) return -1;
-        p += len;
-        if (p + 1 >= end) return -1;
-        if (p[0] == '\r' && p[1] == '\n') {
-            p[0] = '\0';
-            p += 2;
-        } else {
-            return -1;
-        }
+typedef enum {
+    RESP_FRAME_ERROR = -1,
+    RESP_FRAME_MORE = 0,
+    RESP_FRAME_READY = 1
+} resp_frame_status_t;
+
+static const char* resp_find_crlf(const char* p, const char* end) {
+    while ((size_t)(end - p) >= 2u) {
+        if (p[0] == '\r' && p[1] == '\n') return p;
+        ++p;
     }
-    return argc;
+    return NULL;
 }
 
-static void resp_write_all(int fd, const char* buf, size_t len) {
+static bool resp_parse_decimal(const char* p, size_t len, size_t limit,
+                               size_t* value) {
+    if (!p || !len || !value) return false;
+    size_t n = 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (p[i] < '0' || p[i] > '9') return false;
+        size_t digit = (size_t)(p[i] - '0');
+        if (digit > limit || n > (limit - digit) / 10u) return false;
+        n = n * 10u + digit;
+    }
+    *value = n;
+    return true;
+}
+
+/* Parse exactly the first RESP array frame. Incomplete input is retained by
+ * the socket loop; malformed framing and embedded NULs fail closed. */
+static resp_frame_status_t parse_resp_array(char* buf, size_t buf_len,
+                                             char** args, size_t max_args,
+                                             size_t* consumed, size_t* argc_out,
+                                             bool terminate_fields) {
+    if (!buf || !args || !consumed || !argc_out) return RESP_FRAME_ERROR;
+    *consumed = 0;
+    *argc_out = 0;
+    if (!buf_len) return RESP_FRAME_MORE;
+    if (buf[0] != '*') return RESP_FRAME_ERROR;
+    const char* end = buf + buf_len;
+    const char* line_end = resp_find_crlf(buf + 1, end);
+    if (!line_end) return buf_len > 32u ? RESP_FRAME_ERROR : RESP_FRAME_MORE;
+    size_t argc;
+    if (!resp_parse_decimal(buf + 1, (size_t)(line_end - (buf + 1)),
+                            max_args, &argc) || argc == 0u)
+        return RESP_FRAME_ERROR;
+    char* p = (char*)line_end + 2;
+    for (size_t i = 0; i < argc; ++i) {
+        if (p >= end) return RESP_FRAME_MORE;
+        if (*p != '$') return RESP_FRAME_ERROR;
+        line_end = resp_find_crlf(p + 1, end);
+        if (!line_end) return (size_t)(end - p) > 32u ? RESP_FRAME_ERROR : RESP_FRAME_MORE;
+        size_t field_len;
+        if (!resp_parse_decimal(p + 1, (size_t)(line_end - (p + 1)),
+                                1024u * 1024u, &field_len))
+            return RESP_FRAME_ERROR;
+        p = (char*)line_end + 2;
+        if (field_len > (size_t)(end - p) ||
+            (size_t)(end - p) - field_len < 2u)
+            return RESP_FRAME_MORE;
+        if (memchr(p, '\0', field_len) || p[field_len] != '\r' ||
+            p[field_len + 1u] != '\n')
+            return RESP_FRAME_ERROR;
+        args[i] = p;
+        if (terminate_fields) p[field_len] = '\0';
+        p += field_len + 2u;
+    }
+    *consumed = (size_t)(p - buf);
+    *argc_out = argc;
+    return RESP_FRAME_READY;
+}
+
+static bool resp_write_all(int fd, const char* buf, size_t len) {
     size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, buf + off, len - off);
+#ifdef _WIN32
+        int amount = len - off > INT_MAX ? INT_MAX : (int)(len - off);
+        int w = send(fd, buf + off, amount, 0);
+        if (w == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            if (error == WSAEINTR) continue;
+            shutdown(fd, SD_BOTH);
+            return false;
+        }
+        if (w == 0) { shutdown(fd, SD_BOTH); return false; }
+#else
+        ssize_t w = send(fd, buf + off, len - off,
+#ifdef MSG_NOSIGNAL
+                         MSG_NOSIGNAL
+#else
+                         0
+#endif
+        );
         if (w < 0) {
             if (errno == EINTR) continue;
-            break;
+            shutdown(fd, SHUT_RDWR);
+            return false;
         }
+        if (w == 0) { shutdown(fd, SHUT_RDWR); return false; }
+#endif
         off += (size_t)w;
     }
+    return true;
 }
+
+#ifdef QIHSE_RESP_WIRE_TESTING
+bool qihse_resp_wire_test_write_all(int fd, const char* buf, size_t len) {
+    return resp_write_all(fd, buf, len);
+}
+#endif
 
 static void resp_write_bulk(int fd, const char* value) {
     if (!value) { resp_write_all(fd, "$-1\r\n", 5u); return; }
@@ -101,9 +166,6 @@ static void resp_write_bulk(int fd, const char* value) {
 
 void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vector_db_t vdb) {
     if (qihse_resp_engine_handle_legacy(client_fd, store, vdb)) return;
-#ifndef _WIN32
-    signal(SIGPIPE, SIG_IGN);
-#endif
 #ifdef _WIN32
     DWORD timeout = 30000;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
@@ -114,31 +176,90 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
     tv.tv_usec = 0;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
+               sizeof(no_sigpipe));
 #endif
-    enum { BUFFER_BYTES = 65536, MAX_ARGS = 2048 };
-    char* buffer = malloc(BUFFER_BYTES);
+#endif
+    enum { MAX_FRAME_BYTES = 1024 * 1024, MAX_ARGS = 2048 };
+    char* buffer = malloc((size_t)MAX_FRAME_BYTES + 1u);
+    char* frame = malloc((size_t)MAX_FRAME_BYTES + 1u);
     char** args = malloc(MAX_ARGS * sizeof(*args));
-    if (!buffer || !args) {
-        free(buffer); free(args); close(client_fd); return;
+    if (!buffer || !frame || !args) {
+        free(buffer); free(frame); free(args); close(client_fd); return;
     }
+    size_t buffered = 0u;
     qihse_user_t* current_user = NULL;
     while (1) {
-        ssize_t valread = read(client_fd, buffer, BUFFER_BYTES - 1);
-        if (valread <= 0) break;
-        buffer[valread] = '\0';
-        
+        size_t consumed = 0u;
+        size_t parsed_argc = 0u;
+        resp_frame_status_t status = RESP_FRAME_MORE;
+        const char* line_end = NULL;
+        while (status == RESP_FRAME_MORE) {
+            if (buffered > 0u && buffer[0] != '*') {
+                line_end = resp_find_crlf(buffer, buffer + buffered);
+                if (line_end) {
+                    consumed = (size_t)(line_end - buffer) + 2u;
+                    status = RESP_FRAME_READY;
+                    break;
+                }
+                if (buffered == MAX_FRAME_BYTES) status = RESP_FRAME_ERROR;
+            } else {
+                status = parse_resp_array(buffer, buffered, args, MAX_ARGS,
+                                          &consumed, &parsed_argc, false);
+                if (status == RESP_FRAME_READY && consumed > MAX_FRAME_BYTES)
+                    status = RESP_FRAME_ERROR;
+            }
+            if (status != RESP_FRAME_MORE) break;
+            if (buffered == MAX_FRAME_BYTES) { status = RESP_FRAME_ERROR; break; }
+#ifdef _WIN32
+            int received = recv(client_fd, buffer + buffered,
+                                (int)((size_t)MAX_FRAME_BYTES - buffered), 0);
+#else
+            ssize_t received = recv(client_fd, buffer + buffered,
+                                    (size_t)MAX_FRAME_BYTES - buffered, 0);
+#endif
+            if (received <= 0) goto client_done;
+            buffered += (size_t)received;
+            buffer[buffered] = '\0';
+        }
+        if (status != RESP_FRAME_READY || consumed == 0u) {
+            const char* reply = "-ERR malformed RESP request\r\n";
+            resp_write_all(client_fd, reply, strlen(reply));
+            break;
+        }
+
+        memcpy(frame, buffer, consumed);
+        frame[consumed] = '\0';
         int argc = 0;
-        
         if (buffer[0] == '*') {
-            argc = parse_resp_array(buffer, valread, args, MAX_ARGS);
+            size_t frame_consumed = 0u;
+            status = parse_resp_array(frame, consumed, args, MAX_ARGS,
+                                      &frame_consumed, &parsed_argc, true);
+            if (status != RESP_FRAME_READY || frame_consumed != consumed ||
+                parsed_argc > INT_MAX) {
+                const char* reply = "-ERR malformed RESP request\r\n";
+                resp_write_all(client_fd, reply, strlen(reply));
+                break;
+            }
+            argc = (int)parsed_argc;
         } else {
+            if (memchr(frame, '\0', consumed - 2u)) {
+                const char* reply = "-ERR malformed inline request\r\n";
+                resp_write_all(client_fd, reply, strlen(reply));
+                break;
+            }
             char* save_ptr = NULL;
-            char* token = strtok_r(buffer, " \r\n", &save_ptr);
+            char* token = strtok_r(frame, " \r\n", &save_ptr);
             while (token && argc < MAX_ARGS) {
                 args[argc++] = token;
                 token = strtok_r(NULL, " \r\n", &save_ptr);
             }
         }
+
+        buffered -= consumed;
+        if (buffered) memmove(buffer, buffer + consumed, buffered);
         
         if (argc > 0) {
             // Require auth at every network protocol entrypoint
@@ -384,7 +505,9 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
             }
         }
     }
+client_done:
     free(args);
+    free(frame);
     free(buffer);
     close(client_fd);
 }
