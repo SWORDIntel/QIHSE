@@ -60,7 +60,7 @@ void qihse_mvcc_store_destroy(qihse_mvcc_store_t* store);
 /* ── Version chain operations ───────────────────────────────────────────── */
 
 /* Insert a new version of a row (creates a new version node and prepends
- * to the chain).  Sets xmax on the previous head if any.
+ * to the chain).
  * Returns 0 on success, -1 on failure. */
 int qihse_mvcc_insert(qihse_mvcc_store_t* store,
                       uint8_t engine_id,
@@ -105,14 +105,18 @@ int qihse_mvcc_update(qihse_mvcc_store_t* store,
  * could not see (xmin above that snapshot) is not hidden.
  *
  * is_committed_cb: callback to check if a txn_id is committed.
- *   (passed from the transaction manager)
+ *   (passed from the transaction manager). If read-your-own-writes is needed,
+ *   the caller's callback must also recognize its current transaction ID;
+ *   the snapshot alone does not identify the reader. Each ID is resolved once
+ *   per read, without holding the version-store lock.
  */
 typedef bool (*qihse_mvcc_committed_cb)(void* ctx, uint64_t txn_id);
 
 /* Read the visible version of a row for a given snapshot.
  * Returns true if a visible version exists, false otherwise.
  * On success, out_value points to internal memory (do not free) and
- * out_value_len is set. */
+ * out_value_len is set. Failure clears both outputs. Metadata-copy allocation
+ * failure returns false with errno=ENOMEM; payloads are not copied. */
 bool qihse_mvcc_read(qihse_mvcc_store_t* store,
                      uint8_t engine_id,
                      const void* key, size_t key_len,
@@ -136,15 +140,25 @@ bool qihse_mvcc_exists(qihse_mvcc_store_t* store,
  * can be garbage collected. */
 uint64_t qihse_mvcc_min_active_snapshot(qihse_mvcc_store_t* store);
 
-/* Garbage collect dead versions (xmax set and xmax < min_active_snapshot).
- * Delete intents are never reclaimed: removing one would resurrect the
- * versions it hides, and deciding whether it may go needs the commit context
- * the cutoff does not carry.  Returns the number of versions reclaimed. */
+/* Legacy cutoff-only entry points cannot determine whether xmax committed.
+ * They conservatively reclaim nothing; use the committed-aware forms below
+ * for a transactional store. Existing signatures remain available. */
 int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot);
 
-/* Vacuum: reclaim space from dead versions and compact chains.
- * Returns the number of versions removed. */
+/* Legacy conservative vacuum; like cutoff-only GC it reclaims nothing. */
 int qihse_mvcc_vacuum(qihse_mvcc_store_t* store, uint64_t min_snapshot);
+
+/* Reclaim versions only when xmax is below the oldest active snapshot AND
+ * the supplied transaction status confirms that xmax committed. The callback
+ * runs without the store lock. A missing callback is an error. Delete intents
+ * remain retained. Returns removed version count, or -1 on error.
+ * Arena storage is retained until store destruction; these unlink versions. */
+int qihse_mvcc_gc_committed(qihse_mvcc_store_t* store, uint64_t min_snapshot,
+                            qihse_mvcc_committed_cb is_committed,
+                            void* committed_ctx);
+int qihse_mvcc_vacuum_committed(qihse_mvcc_store_t* store, uint64_t min_snapshot,
+                                qihse_mvcc_committed_cb is_committed,
+                                void* committed_ctx);
 
 /* ── Debug / inspection ─────────────────────────────────────────────────── */
 

@@ -179,15 +179,14 @@ static void test_mvcc_visibility(void) {
     expect_value(store, mgr, key, t3->id, "v2");
     expect_value(store, mgr, key, t3->id + 100, "v2");
 
-    /* Vacuum reclaims versions whose xmax is below the cutoff.  v1 (xmax=2)
-     * and v2 (xmax=3) are dead at cutoff 4; the aborted v3 has no xmax and
-     * survives, but it is invisible because its xmin never committed. */
+    /* Only v1 (xmax=2, committed) is dead. v2's xmax belongs to the
+     * aborted t3, so vacuum must preserve the last committed value. */
     int before = qihse_mvcc_version_count(store);
     assert(before == 3);
-    assert(qihse_mvcc_vacuum(store, 4) == 2);
-    assert(qihse_mvcc_version_count(store) == 1);
-    assert(!qihse_mvcc_read(store, QIHSE_MVCC_ENGINE_KV, key, strlen(key),
-                            4, committed_cb, mgr, NULL, NULL));
+    assert(qihse_mvcc_vacuum(store, 4) == 0);
+    assert(qihse_mvcc_vacuum_committed(store, 4, committed_cb, mgr) == 1);
+    assert(qihse_mvcc_version_count(store) == 2);
+    expect_value(store, mgr, key, 4, "v2");
 
     /* A committed DELETE on a key with no aborted writer hides the row. */
     const char* key2 = "user:2";

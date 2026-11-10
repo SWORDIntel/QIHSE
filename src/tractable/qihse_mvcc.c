@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
+#include <limits.h>
 
 /* ── Internal structures ────────────────────────────────────────────────── */
 
@@ -61,38 +63,23 @@ static qihse_mvcc_row_t* row_lookup(qihse_mvcc_store_t* store,
     return NULL;
 }
 
-/* ── Row creation (must hold lock) ──────────────────────────────────────── */
-
-static qihse_mvcc_row_t* row_create(qihse_mvcc_store_t* store,
-                                    uint8_t engine_id,
-                                    const void* key, size_t key_len)
-{
-    if (key_len >= QIHSE_MVCC_MAX_KEY) return NULL;
-
-    size_t b = mvcc_hash(engine_id, key, key_len, store->n_buckets);
-    qihse_mvcc_row_t* row = qihse_arena_alloc(store->arena, sizeof(*row));
-    if (!row) return NULL;
-    memset(row, 0, sizeof(*row));
-    row->engine_id = engine_id;
-    row->key_len   = key_len;
-    memcpy(row->key, key, key_len);
-    row->key[key_len] = '\0';
-    row->head = NULL;
-    row->next = store->buckets[b];
-    store->buckets[b] = row;
-    store->total_rows++;
-    return row;
-}
-
 /* ── Version creation (must hold lock) ──────────────────────────────────── */
 
 static qihse_mvcc_version_t* version_create(qihse_mvcc_store_t* store,
                                             uint64_t txn_id,
-                                            const void* value, size_t value_len)
+                                            const void* value, size_t value_len,
+                                            qihse_mvcc_row_t** new_row)
 {
-    qihse_mvcc_version_t* v =
-        qihse_arena_alloc(store->arena, sizeof(*v));
-    if (!v) return NULL;
+    /* One reservation covers the optional new row, version and payload.
+     * No later allocation can strand a value-sized reservation. */
+    size_t align = sizeof(void*) == 8 ? 16u : 8u;
+    size_t row_bytes = new_row ? (sizeof(qihse_mvcc_row_t) + align - 1) & ~(align - 1) : 0;
+    size_t version_bytes = (sizeof(qihse_mvcc_version_t) + align - 1) & ~(align - 1);
+    if (value_len > SIZE_MAX - row_bytes - version_bytes) { errno = EOVERFLOW; return NULL; }
+    unsigned char* block = qihse_arena_alloc(store->arena, row_bytes + version_bytes + value_len);
+    if (!block) { errno = ENOMEM; return NULL; }
+    if (new_row) { *new_row = (qihse_mvcc_row_t*)block; memset(*new_row, 0, sizeof(**new_row)); }
+    qihse_mvcc_version_t* v = (qihse_mvcc_version_t*)(block + row_bytes);
     v->xmin = txn_id;
     v->xmax = QIHSE_MVCC_INVALID_XMAX;
     v->value_len = value_len;
@@ -101,8 +88,7 @@ static qihse_mvcc_version_t* version_create(qihse_mvcc_store_t* store,
     v->next = NULL;
 
     if (value_len > 0 && value) {
-        v->value = qihse_arena_alloc(store->arena, value_len);
-        if (!v->value) return NULL;
+        v->value = block + row_bytes + version_bytes;
         memcpy(v->value, value, value_len);
     } else {
         v->value = NULL;
@@ -111,10 +97,46 @@ static qihse_mvcc_version_t* version_create(qihse_mvcc_store_t* store,
     return v;
 }
 
+/* Prepare every allocation before publishing either a row or an xmax.
+ * An allocation failure must not hide the previous committed value. */
+static int write_version_locked(qihse_mvcc_store_t* store, uint8_t engine_id,
+                                const void* key, size_t key_len,
+                                const void* value, size_t value_len,
+                                uint64_t txn_id, bool supersede) {
+    if (store->total_versions == INT_MAX) { errno = EOVERFLOW; return -1; }
+    qihse_mvcc_row_t* row = row_lookup(store, engine_id, key, key_len);
+    if (!row && store->total_rows == INT_MAX) { errno = EOVERFLOW; return -1; }
+    qihse_mvcc_row_t* reserved_row = NULL;
+    qihse_mvcc_version_t* v = version_create(store, txn_id, value, value_len,
+                                             row ? NULL : &reserved_row);
+    if (!v) return -1;
+    if (!row) {
+        row = reserved_row;
+        row->engine_id = engine_id;
+        row->key_len = key_len;
+        memcpy(row->key, key, key_len);
+        row->key[key_len] = '\0';
+        size_t bucket = mvcc_hash(engine_id, key, key_len, store->n_buckets);
+        row->next = store->buckets[bucket];
+        store->buckets[bucket] = row;
+        store->total_rows++;
+    }
+    if (supersede) {
+        qihse_mvcc_version_t* prev = row->head;
+        while (prev && prev->is_delete) prev = prev->next;
+        if (prev && prev->xmax == QIHSE_MVCC_INVALID_XMAX) prev->xmax = txn_id;
+    }
+    v->next = row->head;
+    row->head = v;
+    store->total_versions++;
+    return 0;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
 qihse_mvcc_store_t* qihse_mvcc_store_create(size_t initial_buckets) {
     if (initial_buckets == 0) initial_buckets = 1024;
+    if (initial_buckets > SIZE_MAX / sizeof(void*)) { errno = EOVERFLOW; return NULL; }
 
     qihse_mvcc_store_t* store = calloc(1, sizeof(*store));
     if (!store) return NULL;
@@ -159,33 +181,15 @@ int qihse_mvcc_insert(qihse_mvcc_store_t* store,
                       const void* value, size_t value_len,
                       uint64_t txn_id)
 {
-    if (!store || !key) return -1;
-    if (key_len >= QIHSE_MVCC_MAX_KEY) return -1;
+    if (!store || !key || key_len >= QIHSE_MVCC_MAX_KEY ||
+        (!value && value_len) || !txn_id) { errno = EINVAL; return -1; }
 
     pthread_mutex_lock(&store->lock);
 
-    qihse_mvcc_row_t* row = row_lookup(store, engine_id, key, key_len);
-    if (!row) {
-        row = row_create(store, engine_id, key, key_len);
-        if (!row) {
-            pthread_mutex_unlock(&store->lock);
-            return -1;
-        }
-    }
-
-    qihse_mvcc_version_t* v = version_create(store, txn_id, value, value_len);
-    if (!v) {
-        pthread_mutex_unlock(&store->lock);
-        return -1;
-    }
-
-    /* Prepend to chain (newest version at head) */
-    v->next = row->head;
-    row->head = v;
-    store->total_versions++;
-
+    int rc = write_version_locked(store, engine_id, key, key_len,
+                                   value, value_len, txn_id, false);
     pthread_mutex_unlock(&store->lock);
-    return 0;
+    return rc;
 }
 
 /* ── Delete ─────────────────────────────────────────────────────────────── */
@@ -195,7 +199,9 @@ int qihse_mvcc_delete(qihse_mvcc_store_t* store,
                       const void* key, size_t key_len,
                       uint64_t txn_id)
 {
-    if (!store || !key) return -1;
+    if (!store || !key || key_len >= QIHSE_MVCC_MAX_KEY || !txn_id) {
+        errno = EINVAL; return -1;
+    }
 
     pthread_mutex_lock(&store->lock);
 
@@ -203,6 +209,9 @@ int qihse_mvcc_delete(qihse_mvcc_store_t* store,
     if (!row || !row->head) {
         pthread_mutex_unlock(&store->lock);
         return -1;
+    }
+    if (store->total_versions == INT_MAX) {
+        pthread_mutex_unlock(&store->lock); errno = EOVERFLOW; return -1;
     }
 
     /*
@@ -222,7 +231,7 @@ int qihse_mvcc_delete(qihse_mvcc_store_t* store,
      * delete uses).  qihse_mvcc_read() resolves it with commit context and
      * hides exactly the versions that were visible at that snapshot.
      */
-    qihse_mvcc_version_t* v = version_create(store, txn_id, NULL, 0);
+    qihse_mvcc_version_t* v = version_create(store, txn_id, NULL, 0, NULL);
     if (!v) {
         pthread_mutex_unlock(&store->lock);
         return -1;
@@ -246,40 +255,15 @@ int qihse_mvcc_update(qihse_mvcc_store_t* store,
                       const void* value, size_t value_len,
                       uint64_t txn_id)
 {
-    if (!store || !key) return -1;
-    if (key_len >= QIHSE_MVCC_MAX_KEY) return -1;
+    if (!store || !key || key_len >= QIHSE_MVCC_MAX_KEY ||
+        (!value && value_len) || !txn_id) { errno = EINVAL; return -1; }
 
     pthread_mutex_lock(&store->lock);
 
-    qihse_mvcc_row_t* row = row_lookup(store, engine_id, key, key_len);
-    if (!row) {
-        /* Row doesn't exist — treat as insert */
-        pthread_mutex_unlock(&store->lock);
-        return qihse_mvcc_insert(store, engine_id, key, key_len,
-                                 value, value_len, txn_id);
-    }
-
-    /* Mark the newest data version as superseded.  A delete intent is a
-     * marker, not a version: it carries no xmax and is never superseded. */
-    qihse_mvcc_version_t* prev = row->head;
-    while (prev && prev->is_delete) prev = prev->next;
-    if (prev && prev->xmax == QIHSE_MVCC_INVALID_XMAX) {
-        prev->xmax = txn_id;
-    }
-
-    /* Create new version and prepend */
-    qihse_mvcc_version_t* v = version_create(store, txn_id, value, value_len);
-    if (!v) {
-        pthread_mutex_unlock(&store->lock);
-        return -1;
-    }
-
-    v->next = row->head;
-    row->head = v;
-    store->total_versions++;
-
+    int rc = write_version_locked(store, engine_id, key, key_len,
+                                   value, value_len, txn_id, true);
     pthread_mutex_unlock(&store->lock);
-    return 0;
+    return rc;
 }
 
 /* ── Visibility check ───────────────────────────────────────────────────── */
@@ -348,6 +332,26 @@ static bool version_deleted_by_intent(const qihse_mvcc_version_t* head,
 
 /* ── Read ───────────────────────────────────────────────────────────────── */
 
+typedef struct {
+    uint64_t txn_id;
+    bool committed;
+} gc_txn_t;
+
+static int gc_txn_compare(const void* a, const void* b) {
+    uint64_t x = ((const gc_txn_t*)a)->txn_id, y = ((const gc_txn_t*)b)->txn_id;
+    return (x > y) - (x < y);
+}
+
+typedef struct { gc_txn_t* states; size_t count; } read_commit_view_t;
+
+static bool read_commit_cached(void* ctx, uint64_t id) {
+    read_commit_view_t* view = ctx;
+    gc_txn_t key = {.txn_id = id};
+    const gc_txn_t* state = view->count ? bsearch(&key, view->states,
+        view->count, sizeof(*view->states), gc_txn_compare) : NULL;
+    return state && state->committed;
+}
+
 bool qihse_mvcc_read(qihse_mvcc_store_t* store,
                      uint8_t engine_id,
                      const void* key, size_t key_len,
@@ -356,7 +360,11 @@ bool qihse_mvcc_read(qihse_mvcc_store_t* store,
                      void* committed_ctx,
                      const void** out_value, size_t* out_value_len)
 {
-    if (!store || !key) return false;
+    if (out_value) *out_value = NULL;
+    if (out_value_len) *out_value_len = 0;
+    if (!store || !key || key_len >= QIHSE_MVCC_MAX_KEY) {
+        errno = EINVAL; return false;
+    }
 
     pthread_mutex_lock(&store->lock);
 
@@ -366,12 +374,57 @@ bool qihse_mvcc_read(qihse_mvcc_store_t* store,
         return false;
     }
 
+    /* Commit callbacks may acquire the transaction-manager lock. Commit's
+     * engine callbacks can acquire this store lock in the opposite direction,
+     * so resolve status against a private metadata snapshot without our lock.
+     * Payloads remain arena-owned and stable until store destruction. */
+    qihse_mvcc_version_t* copies = NULL;
+    qihse_mvcc_version_t* head = row->head;
+    read_commit_view_t commit_view = {0};
+    if (is_committed) {
+        size_t count = 0;
+        for (qihse_mvcc_version_t* p = head; p; p = p->next) count++;
+        if (count > SIZE_MAX / sizeof(*copies) ||
+            (count && !(copies = malloc(count * sizeof(*copies))))) {
+            pthread_mutex_unlock(&store->lock); errno = ENOMEM; return false;
+        }
+        size_t i = 0;
+        for (qihse_mvcc_version_t* p = head; p; p = p->next, i++) {
+            copies[i] = *p;
+            copies[i].next = i + 1 < count ? &copies[i + 1] : NULL;
+        }
+        head = copies;
+        pthread_mutex_unlock(&store->lock);
+        /* Resolve each transaction once. A commit between two checks of the
+         * same ID must not make both the new and old versions invisible. */
+        if (count > SIZE_MAX / 2u / sizeof(*commit_view.states) ||
+            (count && !(commit_view.states = malloc(2u * count * sizeof(*commit_view.states))))) {
+            free(copies); errno = ENOMEM; return false;
+        }
+        size_t n = 0;
+        for (size_t j = 0; j < count; j++) {
+            commit_view.states[n++] = (gc_txn_t){.txn_id = copies[j].xmin};
+            if (copies[j].xmax)
+                commit_view.states[n++] = (gc_txn_t){.txn_id = copies[j].xmax};
+        }
+        if (n > 1) qsort(commit_view.states, n, sizeof(*commit_view.states), gc_txn_compare);
+        for (size_t j = 0; j < n; j++)
+            if (!commit_view.count || commit_view.states[j].txn_id !=
+                commit_view.states[commit_view.count - 1].txn_id)
+                commit_view.states[commit_view.count++] = commit_view.states[j];
+        for (size_t j = 0; j < commit_view.count; j++)
+            commit_view.states[j].committed = is_committed(committed_ctx,
+                commit_view.states[j].txn_id);
+        is_committed = read_commit_cached;
+        committed_ctx = &commit_view;
+    }
+
     /* Walk the chain from newest to oldest, return first visible version.
      * A delete intent is a marker rather than a version: it is never returned,
      * and it can hide the versions below it that were visible at the snapshot
      * it was evaluated at.  Chains with no delete intent (the common case) take
      * the same path as before -- no intent is ever consulted. */
-    qihse_mvcc_version_t* v = row->head;
+    qihse_mvcc_version_t* v = head;
     int intents_above = 0;
     while (v) {
         if (v->is_delete) {
@@ -381,18 +434,22 @@ bool qihse_mvcc_read(qihse_mvcc_store_t* store,
         }
         if (version_visible(v, snapshot, is_committed, committed_ctx) &&
             (intents_above == 0 ||
-             !version_deleted_by_intent(row->head, v, snapshot,
+             !version_deleted_by_intent(head, v, snapshot,
                                         is_committed, committed_ctx)))
         {
             if (out_value)     *out_value = v->value;
             if (out_value_len) *out_value_len = v->value_len;
-            pthread_mutex_unlock(&store->lock);
+            if (!is_committed) pthread_mutex_unlock(&store->lock);
+            free(copies);
+            free(commit_view.states);
             return true;
         }
         v = v->next;
     }
 
-    pthread_mutex_unlock(&store->lock);
+    if (!is_committed) pthread_mutex_unlock(&store->lock);
+    free(copies);
+    free(commit_view.states);
     return false;
 }
 
@@ -419,10 +476,35 @@ uint64_t qihse_mvcc_min_active_snapshot(qihse_mvcc_store_t* store) {
     return 0;
 }
 
-int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot) {
-    if (!store) return 0;
+int qihse_mvcc_gc_committed(qihse_mvcc_store_t* store, uint64_t min_snapshot,
+                            qihse_mvcc_committed_cb is_committed,
+                            void* committed_ctx) {
+    if (!store || !is_committed) { errno = EINVAL; return -1; }
 
     int reclaimed = 0;
+    pthread_mutex_lock(&store->lock);
+    size_t capacity = (size_t)store->total_versions;
+    if (capacity > SIZE_MAX / sizeof(gc_txn_t)) {
+        pthread_mutex_unlock(&store->lock); errno = EOVERFLOW; return -1;
+    }
+    gc_txn_t* states = capacity ? malloc(capacity * sizeof(*states)) : NULL;
+    if (capacity && !states) {
+        pthread_mutex_unlock(&store->lock); errno = ENOMEM; return -1;
+    }
+    size_t count = 0;
+    for (size_t b = 0; b < store->n_buckets; b++)
+        for (qihse_mvcc_row_t* row = store->buckets[b]; row; row = row->next)
+            for (qihse_mvcc_version_t* v = row->head; v; v = v->next)
+                if (!v->is_delete && v->xmax && v->xmax < min_snapshot)
+                    states[count++] = (gc_txn_t){.txn_id = v->xmax};
+    pthread_mutex_unlock(&store->lock);
+    if (count > 1) qsort(states, count, sizeof(*states), gc_txn_compare);
+    size_t unique = 0;
+    for (size_t i = 0; i < count; i++)
+        if (!unique || states[i].txn_id != states[unique - 1].txn_id)
+            states[unique++] = states[i];
+    for (size_t i = 0; i < unique; i++)
+        states[i].committed = is_committed(committed_ctx, states[i].txn_id);
     pthread_mutex_lock(&store->lock);
 
     for (size_t b = 0; b < store->n_buckets; b++) {
@@ -430,20 +512,23 @@ int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot) {
         while (row) {
             /* Walk the chain and remove dead versions.
              * A version is dead if xmax is set AND xmax < min_snapshot
-             * (i.e., the delete is visible to all active transactions). */
+             * AND its superseding transaction actually committed. An aborted
+             * or active xmax does not make the old data dead. */
             qihse_mvcc_version_t** pp = &row->head;
             while (*pp) {
                 qihse_mvcc_version_t* v = *pp;
                 if (v->is_delete) {
-                    /* A delete intent is a marker, not a version.  Removing it
-                     * would resurrect the versions it hides, and deciding that
-                     * it may go needs the commit context this cutoff does not
-                     * carry, so it is never reclaimed. */
+                    /* A delete intent is a marker, not a version. Removing it
+                     * can resurrect versions it hides; retain it until a
+                     * collector also proves those versions can be removed. */
                     pp = &v->next;
                     continue;
                 }
+                gc_txn_t key = {.txn_id = v->xmax};
+                const gc_txn_t* state = unique
+                    ? bsearch(&key, states, unique, sizeof(*states), gc_txn_compare) : NULL;
                 if (v->xmax != QIHSE_MVCC_INVALID_XMAX &&
-                    v->xmax < min_snapshot)
+                    v->xmax < min_snapshot && state && state->committed)
                 {
                     /* This version is dead — remove from chain */
                     *pp = v->next;
@@ -462,13 +547,27 @@ int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot) {
     }
 
     pthread_mutex_unlock(&store->lock);
+    free(states);
     return reclaimed;
+}
+
+int qihse_mvcc_gc(qihse_mvcc_store_t* store, uint64_t min_snapshot) {
+    /* This legacy signature has no commit knowledge. It cannot distinguish
+     * a dead version from a value preserved by an aborted update. */
+    (void)store; (void)min_snapshot;
+    return 0;
 }
 
 int qihse_mvcc_vacuum(qihse_mvcc_store_t* store, uint64_t min_snapshot) {
     /* Vacuum = GC + compact.  Since we use arena allocation, compaction
      * is limited to removing dead versions from chains. */
     return qihse_mvcc_gc(store, min_snapshot);
+}
+
+int qihse_mvcc_vacuum_committed(qihse_mvcc_store_t* store, uint64_t min_snapshot,
+                                qihse_mvcc_committed_cb is_committed,
+                                void* committed_ctx) {
+    return qihse_mvcc_gc_committed(store, min_snapshot, is_committed, committed_ctx);
 }
 
 /* ── Debug / inspection ─────────────────────────────────────────────────── */
