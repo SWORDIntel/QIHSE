@@ -48,8 +48,7 @@ static void test_builder_length_and_views(void) {
     bson_t serialized = {
         .data = (uint8_t*)data,
         .len = size,
-        .cap = size,
-        ._state = 2u /* internal serialized-view state */
+        .cap = size
     };
     assert(bson_size(&serialized) == size);
     assert(bson_data(&serialized) == data);
@@ -65,8 +64,7 @@ static void test_builder_length_and_views(void) {
     bson_t parsed = {
         .data = (uint8_t*)parent_data,
         .len = parent_size,
-        .cap = parent_size,
-        ._state = 2u
+        .cap = parent_size
     };
     bson_element_t nested;
     assert(bson_find_element(&parsed, "nested", &nested) == 0);

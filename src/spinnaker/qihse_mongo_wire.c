@@ -15,14 +15,11 @@
 
 /* ---- BSON implementation ---- */
 
-enum { BSON_STATE_LEGACY = 0u, BSON_STATE_BUILDER = 1u,
-       BSON_STATE_VIEW = 2u, BSON_STATE_FAILED = 3u };
-
 static int bson_is_view(const bson_t* b) {
     if (!b || !b->data) return 0;
-    if (b->_state == BSON_STATE_VIEW) return 1;
-    /* Source-compatible handling for pre-state aggregate-initialized views. */
-    if (b->_state == BSON_STATE_LEGACY && b->len >= 5u && b->len <= b->cap &&
+    /* A view's declared size equals len (including its terminator); a builder
+     * declares len + 1 because its len excludes the final terminator. */
+    if (b->len >= 5u && b->len <= b->cap &&
         b->len <= MONGO_MAX_BSON_SIZE && b->data[b->len - 1u] == 0) {
         int32_t declared; memcpy(&declared, b->data, 4u);
         return declared == (int32_t)b->len;
@@ -31,16 +28,15 @@ static int bson_is_view(const bson_t* b) {
 }
 
 static int bson_builder_valid(const bson_t* b) {
-    return b && b->data &&
-           (b->_state == BSON_STATE_BUILDER || b->_state == BSON_STATE_LEGACY) &&
+    return b && b->data && b->cap != 0 &&
            !bson_is_view(b) &&
            b->len >= 4u && b->len <= b->cap &&
            b->cap <= MONGO_MAX_BSON_SIZE;
 }
 
 static int bson_fail(bson_t* b) {
-    if (b && b->data && b->_state != BSON_STATE_VIEW)
-        b->_state = BSON_STATE_FAILED;
+    /* cap==0 is a sticky failure sentinel; data remains owned for destroy. */
+    if (b && b->data && !bson_is_view(b)) b->cap = 0;
     return -1;
 }
 
@@ -51,7 +47,6 @@ bson_t* bson_create(void) {
     b->data = (uint8_t*)calloc(b->cap, 1);
     if (!b->data) { free(b); return NULL; }
     b->len = 4; /* reserve for document size */
-    b->_state = BSON_STATE_BUILDER;
     int32_t initial_size = 5;
     memcpy(b->data, &initial_size, 4u);
     return b;
@@ -67,7 +62,7 @@ static int bson_ensure(bson_t* b, size_t need) {
     if (!bson_builder_valid(b)) return -1;
     if (b->len >= MONGO_MAX_BSON_SIZE ||
         need > MONGO_MAX_BSON_SIZE - b->len - 1u) {
-        b->_state = BSON_STATE_FAILED;
+        b->cap = 0;
         return -1;
     }
     size_t required = b->len + need + 1u;
@@ -76,11 +71,11 @@ static int bson_ensure(bson_t* b, size_t need) {
     while (cap < required) {
         size_t grown = cap > MONGO_MAX_BSON_SIZE / 2u
             ? MONGO_MAX_BSON_SIZE : cap * 2u;
-        if (grown <= cap) { b->_state = BSON_STATE_FAILED; return -1; }
+        if (grown <= cap) { b->cap = 0; return -1; }
         cap = grown;
     }
     uint8_t* next = (uint8_t*)realloc(b->data, cap);
-    if (!next) { b->_state = BSON_STATE_FAILED; return -1; }
+    if (!next) { b->cap = 0; return -1; }
     b->data = next;
     b->cap = cap;
     return 0;
@@ -126,7 +121,7 @@ static int bson_append_raw_value(bson_t* b, const char* key, uint8_t type,
  * the nested document does not itself end in a 0x00 byte. */
 static int bson_embed(bson_t* b, const char* key, uint8_t type, const bson_t* sub) {
     if (!b || !key || !sub || !sub->data || sub->len < 4) return bson_fail(b);
-    if (sub->_state == BSON_STATE_FAILED || sub->len > MONGO_MAX_BSON_SIZE ||
+    if (sub->cap == 0 || sub->len > MONGO_MAX_BSON_SIZE ||
         !bson_size(sub))
         return bson_fail(b);
     bool serialized = bson_is_view(sub);
@@ -249,7 +244,7 @@ int bson_append_maxkey(bson_t* b, const char* key) {
 }
 
 size_t bson_size(const bson_t* b) {
-    if (!b || !b->data || b->_state == BSON_STATE_FAILED || b->len < 4u ||
+    if (!b || !b->data || b->cap == 0 || b->len < 4u ||
         b->len > MONGO_MAX_BSON_SIZE) return 0;
     if (bson_is_view(b)) {
         if (b->len > b->cap || b->data[b->len - 1u] != 0) return 0;
@@ -263,7 +258,7 @@ size_t bson_size(const bson_t* b) {
 }
 
 const uint8_t* bson_data(const bson_t* b) {
-    if (!b || !b->data || b->_state == BSON_STATE_FAILED) return NULL;
+    if (!b || !b->data || b->cap == 0) return NULL;
     if (bson_is_view(b))
         return bson_size(b) ? b->data : NULL;
     if (!bson_size(b)) return NULL;
@@ -430,7 +425,6 @@ int bson_append_element(bson_t* b, const char* key, const bson_element_t* e, con
         case BSON_ARRAY: {
             bson_t view; view.data = (uint8_t*)e->v.doc.data;
             view.len = (size_t)e->v.doc.len; view.cap = (size_t)e->v.doc.len;
-            view._state = BSON_STATE_VIEW;
             return e->type == BSON_ARRAY ? bson_append_array(b, key, &view) :
                                            bson_append_document(b, key, &view);
         }
@@ -443,7 +437,7 @@ int bson_append_element(bson_t* b, const char* key, const bson_element_t* e, con
 }
 
 bson_t* bson_copy(const bson_t* src) {
-    if (!src || !src->data || src->_state == BSON_STATE_FAILED) return NULL;
+    if (!src || !src->data || src->cap == 0) return NULL;
     size_t serialized_size = bson_size(src);
     if (!serialized_size || serialized_size > MONGO_MAX_BSON_SIZE) return NULL;
     size_t payload_len = bson_is_view(src) ? src->len - 1u : src->len;
@@ -451,7 +445,6 @@ bson_t* bson_copy(const bson_t* src) {
     if (!b) return NULL;
     b->cap = payload_len + 1u;
     b->len = payload_len;
-    b->_state = BSON_STATE_BUILDER;
     b->data = (uint8_t*)malloc(b->cap);
     if (!b->data) { free(b); return NULL; }
     memcpy(b->data, src->data, payload_len);
@@ -476,7 +469,6 @@ static bson_t bson_view(const uint8_t* data, int32_t len) {
     v.data = (uint8_t*)data;
     v.len = len > 0 ? (size_t)len : 0u;
     v.cap = v.len;
-    v._state = BSON_STATE_VIEW;
     return v;
 }
 
@@ -1605,7 +1597,6 @@ static long mongo_doc_size(const uint8_t* buf, size_t limit, size_t off) {
     view.data = (uint8_t*)(uintptr_t)(const void*)(buf + off);
     view.len = (size_t)dlen;
     view.cap = (size_t)dlen;
-    view._state = BSON_STATE_VIEW;
     size_t walk = 0;
     bson_element_t e;
     while (bson_iter(&view, &walk, &e) == 0) { }
@@ -1721,7 +1712,6 @@ bson_t* mongo_msg_get_document(const mongo_msg_t* msg, size_t* offset) {
     view.data = (uint8_t*)(uintptr_t)(const void*)(msg->body + off);
     view.len = (size_t)dlen;
     view.cap = (size_t)dlen;
-    view._state = BSON_STATE_VIEW;
     bson_t* out = bson_copy(&view);
     if (!out) return NULL;
     *offset = off + (size_t)dlen;
