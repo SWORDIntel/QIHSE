@@ -3940,10 +3940,12 @@ static char* uwp_sql_execute_dml_on_table(qihse_uwp_context_t* ctx,
             if (update_rc < 0) goto done;
         }
     } else {
-        if (table_txn)
-            (void)qihse_table_txn_delete(table_txn, uwp_dml_pred, &scan);
-        else
-            (void)qihse_table_delete(table, uwp_dml_pred, &scan);
+        errno = 0;
+        bool deleted = table_txn
+            ? qihse_table_txn_delete(table_txn, uwp_dml_pred, &scan)
+            : qihse_table_delete(table, uwp_dml_pred, &scan);
+        int delete_error = errno;
+        if (!deleted && delete_error != 0) goto done;
     }
     reply = uwp_dml_replyf("OK stmt_type=%s rows=%zu\n", stmt, scan.matched);
 
@@ -5481,7 +5483,14 @@ static int uwp_sql_refresh_stats(qihse_uwp_context_t* ctx,
             view_name, strlen(view_name))) {
         uwp_sql_stats_destroy(&scan); return -1;
     }
-    qihse_table_txn_delete(view_txn, uwp_sql_stats_delete_pred, NULL);
+    errno = 0;
+    bool cleared = qihse_table_txn_delete(view_txn,
+        uwp_sql_stats_delete_pred, NULL);
+    int clear_error = errno;
+    if (!cleared && clear_error != 0) {
+        uwp_sql_stats_destroy(&scan);
+        return -1;
+    }
     for (size_t i = 0; i < scan.count; ++i) {
         uwp_sql_stats_group_t* g = &scan.groups[i];
         qihse_col_value_t values[7] = {

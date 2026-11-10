@@ -66,6 +66,11 @@ struct qihse_table_txn {
     uint64_t       base_generation;
 };
 
+#ifdef QIHSE_TABLE_STORE_TESTING
+static _Thread_local const char* ts_test_next_txn_table;
+static _Thread_local uint64_t ts_test_next_txn_generation;
+#endif
+
 #define TS_RETRY_MAX_ENTRIES 4096u
 typedef struct {
     char key[QIHSE_TS_RETRY_MAX_TEXT + 1];
@@ -1455,7 +1460,10 @@ int qihse_table_update(qihse_table_t* table,
 bool qihse_table_delete(qihse_table_t* table,
                         int (*pred)(const qihse_col_value_t*, size_t, void*),
                         void* pred_ctx) {
-    if (!table || table->owner->path || !pred) return false;
+    if (!table || table->owner->path || !pred) {
+        errno = EINVAL;
+        return false;
+    }
 
     pthread_rwlock_wrlock(&table->lock);
     bool any = false;
@@ -1477,6 +1485,7 @@ bool qihse_table_delete(qihse_table_t* table,
     if (any) table->generation++;
 
     pthread_rwlock_unlock(&table->lock);
+    if (!any) errno = 0;
     return any;
 }
 
@@ -1659,6 +1668,12 @@ static qihse_table_txn_t* ts_txn_begin_context(qihse_table_t* table,
     txn->shadow.num_rows = table->num_rows;
     txn->shadow.cap_rows = table->num_rows;
     txn->shadow.num_tomb = table->num_tomb;
+#ifdef QIHSE_TABLE_STORE_TESTING
+    if (ts_test_next_txn_table && !strcmp(ts_test_next_txn_table, table->name)) {
+        txn->shadow.generation = ts_test_next_txn_generation;
+        ts_test_next_txn_table = NULL;
+    }
+#endif
     pthread_rwlock_unlock(&table->lock);
     return txn;
 }
@@ -1861,9 +1876,15 @@ bool qihse_table_txn_delete(qihse_table_txn_t* txn,
                             int (*pred)(const qihse_col_value_t*, size_t,
                                         void*),
                             void* pred_ctx) {
-    if (!txn || !pred) return false;
+    if (!txn || !pred) {
+        errno = EINVAL;
+        return false;
+    }
     qihse_table_t* shadow = &txn->shadow;
-    if (shadow->generation == UINT64_MAX) return false;
+    if (shadow->generation == UINT64_MAX) {
+        errno = EOVERFLOW;
+        return false;
+    }
     bool any = false;
     for (size_t i = 0; i < shadow->num_rows; i++) {
         if (!shadow->rows[i] ||
@@ -1877,8 +1898,24 @@ bool qihse_table_txn_delete(qihse_table_txn_t* txn,
         shadow->num_tomb * 4 >= shadow->cap_rows)
         ts_compact(shadow);
     if (any) ++shadow->generation;
+    if (!any) errno = 0;
     return any;
 }
+
+#ifdef QIHSE_TABLE_STORE_TESTING
+/* Private fault-injection seam for deterministic generation-overflow tests.
+ * It is absent from production builds and intentionally not in public headers. */
+void qihse_table_txn_test_set_generation(qihse_table_txn_t* txn,
+                                         uint64_t generation) {
+    if (txn) txn->shadow.generation = generation;
+}
+
+void qihse_table_test_force_next_txn_generation(const char* table_name,
+                                               uint64_t generation) {
+    ts_test_next_txn_table = table_name;
+    ts_test_next_txn_generation = generation;
+}
+#endif
 
 size_t qihse_table_txn_row_count(const qihse_table_txn_t* txn) {
     return txn ? txn->shadow.num_rows - txn->shadow.num_tomb : 0;

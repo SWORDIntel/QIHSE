@@ -50,6 +50,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef QIHSE_TABLE_STORE_TESTING
+extern void qihse_table_test_force_next_txn_generation(const char*, uint64_t);
+#endif
+
 /* ── Reply capture ──────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -935,6 +939,60 @@ static void test_durable_keys(qihse_user_t* user) {
     assert(run_sql_txn(&ctx, user, "INSERT INTO ddefault (id, note) VALUES (NULL, 'invalid')", &txn, &out) != UWP_STS_OK);
     if (txn) assert(run_sql_txn(&ctx, user, "ROLLBACK", &txn, &out) == UWP_STS_OK);
     assert(qihse_table_row_count(qihse_table_store_find_table(qihse_uwp_sql_table_store(), "ddefault")) == 2);
+#ifdef QIHSE_TABLE_STORE_TESTING
+    assert(run_sql(&ctx, user, "CREATE TABLE delete_overflow (id INT)", &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user, "INSERT INTO delete_overflow VALUES (1)",
+                       &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
+    assert(txn == NULL);
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    qihse_table_test_force_next_txn_generation("delete_overflow", UINT64_MAX);
+    assert(run_sql_txn(&ctx, user, "DELETE FROM delete_overflow WHERE id = 1",
+                       &txn, &out) == UWP_STS_ERR_FAILED);
+    assert(txn == NULL);
+    assert(qihse_table_row_count(qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "delete_overflow")) == 1);
+
+    const char* create_stats_source =
+        "CREATE TABLE delete_stats_source (source TEXT, record_type TEXT, "
+        "data JSONB, created_at TIMESTAMPTZ)";
+    const char* stats_query =
+        "SELECT source, record_type, COUNT(*) AS record_count, "
+        "COUNT(DISTINCT data->>'email') AS unique_emails, "
+        "COUNT(DISTINCT data->>'phone') AS unique_phones, "
+        "COUNT(DISTINCT data->>'username') AS unique_usernames, "
+        "MAX(created_at) AS last_update FROM delete_stats_source "
+        "GROUP BY source, record_type";
+    assert(run_sql(&ctx, user, create_stats_source, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user,
+        "INSERT INTO delete_stats_source VALUES "
+        "('src', 'email', '{\"email\":\"a@example.test\"}', "
+        "'2026-11-10 12:00:00+00')", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
+    assert(txn == NULL);
+    char create_view[1024];
+    snprintf(create_view, sizeof(create_view),
+        "CREATE MATERIALIZED VIEW delete_stats AS %s", stats_query);
+    assert(run_sql(&ctx, user, create_view, &out) == UWP_STS_OK);
+    qihse_table_t* stats_view = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "delete_stats");
+    assert(stats_view && qihse_table_row_count(stats_view) == 1);
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user,
+        "INSERT INTO delete_stats_source VALUES "
+        "('src', 'email', '{\"email\":\"b@example.test\"}', "
+        "'2026-11-10 13:00:00+00')", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user, "COMMIT", &txn, &out) == UWP_STS_OK);
+    assert(txn == NULL);
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    qihse_table_test_force_next_txn_generation("delete_stats", UINT64_MAX);
+    assert(run_sql_txn(&ctx, user, "REFRESH MATERIALIZED VIEW delete_stats",
+                       &txn, &out) == UWP_STS_ERR_FAILED);
+    assert(txn == NULL);
+    assert(qihse_table_row_count(stats_view) == 1);
+#endif
     qihse_uwp_sql_close_durable(&ctx);
     qihse_schema_registry_destroy(ctx.schema);
     ctx.schema = NULL;

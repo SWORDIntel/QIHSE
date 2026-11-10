@@ -226,8 +226,9 @@ int qihse_table_update(qihse_table_t* table,
  * the table is compacted periodically.
  *   pred     — predicate function; returns non-zero if the row matches.
  *   pred_ctx — opaque context passed to the predicate.
- * Returns true if at least one row was deleted, false otherwise (including
- * durable tables, where direct deletion is rejected). */
+ * Returns true if at least one row was deleted. False with errno == 0 means
+ * no rows matched; false with nonzero errno is a failure (including durable
+ * tables, where direct deletion is rejected). */
 bool qihse_table_delete(qihse_table_t* table,
                         int (*pred)(const qihse_col_value_t* values,
                                     size_t num_cols, void* ctx),
@@ -303,6 +304,8 @@ typedef bool (*qihse_table_row_transform)(const qihse_col_value_t* old_values,
 int qihse_table_txn_transform(qihse_table_txn_t* txn, const qihse_user_t* user,
     int (*pred)(const qihse_col_value_t*, size_t, void*), void* pred_ctx,
     qihse_table_row_transform transform, void* transform_ctx);
+/* False with errno == 0 means no rows matched; false with nonzero errno is an
+ * operation failure. The implementation clears errno on a valid no-match. */
 bool qihse_table_txn_delete(qihse_table_txn_t* txn,
                             int (*pred)(const qihse_col_value_t* values,
                                         size_t num_cols, void* ctx),

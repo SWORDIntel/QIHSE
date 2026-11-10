@@ -17,6 +17,11 @@
 #include <math.h>
 #include <sys/syscall.h>
 
+#ifdef QIHSE_TABLE_STORE_TESTING
+/* Defined only in the test-instrumented table-store build. */
+extern void qihse_table_txn_test_set_generation(qihse_table_txn_t*, uint64_t);
+#endif
+
 /* Test-only fsync fault: fail exactly once after rename, on the directory. */
 static __thread int fail_directory_fsync;
 static __thread const char* verify_directory_fsync_target;
@@ -123,8 +128,26 @@ static void test_rollback_and_read_your_writes(qihse_table_t* table) {
     int score_col = 2;
     qihse_col_value_t score = { .type = QIHSE_TS_INT32, .v.i32 = 11 };
     assert(qihse_table_txn_update(txn, id_matches, &id, &score_col, &score, 1));
+    id = 999;
+    errno = EDOM;
+    assert(!qihse_table_txn_delete(txn, id_matches, &id));
+    assert(errno == 0); /* valid no-match is distinct from a mutation error */
+#ifdef QIHSE_TABLE_STORE_TESTING
+    qihse_table_txn_test_set_generation(txn, UINT64_MAX);
     id = 2;
+    errno = 0;
+    assert(!qihse_table_txn_delete(txn, id_matches, &id));
+    assert(errno == EOVERFLOW);
+    assert(qihse_table_txn_row_count(txn) == 3); /* failure leaves shadow intact */
+    qihse_table_txn_test_set_generation(txn, 1);
+#endif
+    errno = 0;
+    assert(!qihse_table_txn_delete(NULL, id_matches, &id));
+    assert(errno == EINVAL);
+    id = 2;
+    errno = 0;
     assert(qihse_table_txn_delete(txn, id_matches, &id));
+    assert(errno == 0);
 
     assert(qihse_table_txn_row_count(txn) == 2);
     assert_txn_row(txn, 1, "alice", 11);
