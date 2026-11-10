@@ -543,6 +543,13 @@ test-ct-storage: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_storage tests/test_ct_storage.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_storage
 
+.PHONY: test-ct-replication-lanes
+test-ct-replication-lanes: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_kv_ct_replication_lanes tests/test_kv_ct_replication_lanes.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_ct_replication_lanes
+
+test-serial: test-ct-replication-lanes
+
 test-ct-storage-crash: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
 	    -o tests/test_ct_storage_crash tests/test_ct_storage.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
