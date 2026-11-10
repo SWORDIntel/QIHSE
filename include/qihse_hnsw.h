@@ -83,6 +83,7 @@ typedef struct {
 } __attribute__((aligned(64))) qihse_hnsw_index_t;
 
 // Function prototypes
+qihse_hnsw_index_t* hnsw_create(void);
 void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vector, size_t dim);
 void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t ep, int ef, int level, uint32_t *results, size_t *num_results);
 void hnsw_select_neighbors(qihse_hnsw_index_t *index, const float *query, uint32_t *candidates, size_t num_candidates, uint32_t M, uint32_t *selected, size_t *num_selected);

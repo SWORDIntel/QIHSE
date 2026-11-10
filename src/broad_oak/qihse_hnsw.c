@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "qihse_hnsw.h"
 #include "qihse_keystone.h"
 #include "backends/cpu/qihse_cpu_detect.h"
@@ -9,6 +12,26 @@
 #include <immintrin.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
+
+/* These public structs promise over-alignment, which malloc/calloc only
+ * guarantee up to max_align_t. Keep the allocation size valid for aligned
+ * allocation as well, even though the current types are already padded. */
+static void *hnsw_aligned_calloc(size_t alignment, size_t size) {
+    if (!alignment || (alignment & (alignment - 1)) || alignment < sizeof(void *) ||
+        size > SIZE_MAX - (alignment - 1))
+        return NULL;
+    size_t padded = (size + alignment - 1) & ~(alignment - 1);
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, padded) != 0)
+        return NULL;
+    memset(ptr, 0, padded);
+    return ptr;
+}
+
+qihse_hnsw_index_t *hnsw_create(void) {
+    return hnsw_aligned_calloc(64, sizeof(qihse_hnsw_index_t));
+}
 
 /* Thread-local xoshiro256** PRNG state seeded once per thread from hardware RDRAND */
 static __thread uint64_t qihse_hnsw_xoshiro_state[4];
@@ -271,7 +294,7 @@ static qihse_hnsw_links_t* get_or_create_links(qihse_hnsw_layer_t *layer, uint32
     ensure_layer_capacity(layer, node_id);
     if (node_id >= layer->links_capacity) return NULL;
     if (!layer->links[node_id]) {
-        layer->links[node_id] = (qihse_hnsw_links_t*)calloc(1, sizeof(qihse_hnsw_links_t));
+        layer->links[node_id] = (qihse_hnsw_links_t*)hnsw_aligned_calloc(32, sizeof(qihse_hnsw_links_t));
         if (!layer->links[node_id]) return NULL;
         layer->links[node_id]->capacity = M;
         layer->links[node_id]->neighbors = (uint32_t*)malloc(M * sizeof(uint32_t));
@@ -642,7 +665,7 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
         }
         for (int i = index->max_level + 1; i <= target_level; i++) {
             if (!index->layers[i]) {
-                index->layers[i] = (qihse_hnsw_layer_t*)calloc(1, sizeof(qihse_hnsw_layer_t));
+                index->layers[i] = (qihse_hnsw_layer_t*)hnsw_aligned_calloc(64, sizeof(qihse_hnsw_layer_t));
                 index->layers[i]->level = i;
             }
         }

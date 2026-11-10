@@ -425,6 +425,8 @@ static char* qihse_vdb_strdup(const char* s) {
 /* Forward declarations for sidecar persistence */
 static void qihse_vdb_graph_destroy(qihse_vector_db_t vdb);
 static void qihse_vdb_int8_destroy(qihse_vector_db_t vdb);
+static void qihse_vdb_binary_destroy(qihse_vector_db_t vdb);
+static uint64_t qihse_vdb_live_generation(const qihse_vector_db_t vdb);
 static float qihse_vdb_euclidean_distance(const float* a, const float* b, size_t n);
 static const float* qihse_hnsw_vdb_get_vector(void* ctx, uint32_t node_id);
 static const float* qihse_vdb_vector_at(qihse_vector_db_t vdb, const qihse_index_row_t* row);
@@ -829,7 +831,8 @@ static bool qihse_vdb_graph_save(qihse_vector_db_t vdb) {
     uint64_t crc;
     bool ok;
 
-    if (!vdb || !vdb->db_path || vdb->graph_status != QIHSE_VDB_GRAPH_VALID ||
+    if (!vdb || !vdb->db_path || vdb->read_only ||
+        vdb->graph_status != QIHSE_VDB_GRAPH_VALID ||
         !vdb->graph_live_row_map) {
         return false;
     }
@@ -851,7 +854,7 @@ static bool qihse_vdb_graph_save(qihse_vector_db_t vdb) {
     memset(header, 0, sizeof(header));
     memcpy(header, QIHSE_VDB_GRAPH_MAGIC, 8u);
     qihse_le_write_u32(header + 8u, 2u);
-    qihse_le_write_u64(header + 12u, vdb->committed_generation);
+    qihse_le_write_u64(header + 12u, qihse_vdb_live_generation(vdb));
     qihse_le_write_u64(header + 20u, crc);
     qihse_le_write_u64(header + 28u, (uint64_t)payload_size);
     qihse_le_write_u64(header + 36u, (uint64_t)vdb->graph_entry_point);
@@ -928,7 +931,11 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
     generation = qihse_le_read_u64(header + 12u);
     crc = qihse_le_read_u64(header + 20u);
     payload_size = (size_t)qihse_le_read_u64(header + 28u);
-    (void)generation;
+    if (generation != qihse_vdb_live_generation(vdb)) {
+        vdb->graph_status = QIHSE_VDB_GRAPH_STALE;
+        free(section);
+        return false;
+    }
     if (payload_size == 0u || section_size != sizeof(header) + payload_size) {
         free(section);
         return false;
@@ -992,7 +999,7 @@ static bool qihse_vdb_graph_load(qihse_vector_db_t vdb) {
     if (vdb->graph_status == QIHSE_VDB_GRAPH_VALID && vdb->live_vectors > 0u && loaded_M > 0u) {
         /* Set up a lightweight HNSW index shell that references the
          * pre-built flat arrays instead of rebuilding from scratch. */
-        vdb->hnsw_index = (qihse_hnsw_index_t*)calloc(1, sizeof(qihse_hnsw_index_t));
+        vdb->hnsw_index = hnsw_create();
         if (vdb->hnsw_index) {
             vdb->hnsw_index->params.M = (uint32_t)loaded_M;
             vdb->hnsw_index->params.M0 = (uint32_t)(loaded_M * 2u);
@@ -1053,7 +1060,7 @@ static bool qihse_vdb_tier_save(qihse_vector_db_t vdb) {
     memset(header, 0, sizeof(header));
     memcpy(header, "QIHSEQTZ", 8u);
     qihse_le_write_u32(header + 8u, 1u);
-    qihse_le_write_u64(header + 12u, vdb->committed_generation);
+    qihse_le_write_u64(header + 12u, qihse_vdb_live_generation(vdb));
     qihse_le_write_u64(header + 20u, crc);
     qihse_le_write_u64(header + 28u, (uint64_t)payload_size);
     memcpy(section, header, sizeof(header));
@@ -1113,7 +1120,7 @@ static bool qihse_vdb_tier_load(qihse_vector_db_t vdb) {
     generation = qihse_le_read_u64(header + 12u);
     crc = qihse_le_read_u64(header + 20u);
     payload_size = (size_t)qihse_le_read_u64(header + 28u);
-    if (generation != vdb->committed_generation || payload_size == 0u ||
+    if (generation != qihse_vdb_live_generation(vdb) || payload_size == 0u ||
         section_size != sizeof(header) + payload_size) {
         free(section);
         return false;
@@ -1158,7 +1165,8 @@ static bool qihse_vdb_int8_save(qihse_vector_db_t vdb) {
     uint64_t crc;
     bool ok;
 
-    if (!vdb || !vdb->db_path || vdb->int8_status != QIHSE_VDB_INT8_VALID) {
+    if (!vdb || !vdb->db_path || vdb->read_only ||
+        vdb->int8_status != QIHSE_VDB_INT8_VALID) {
         return false;
     }
 
@@ -1180,7 +1188,7 @@ static bool qihse_vdb_int8_save(qihse_vector_db_t vdb) {
     memset(header, 0, sizeof(header));
     memcpy(header, QIHSE_VDB_INT8_MAGIC, 8u);
     qihse_le_write_u32(header + 8u, 1u);
-    qihse_le_write_u64(header + 12u, vdb->committed_generation);
+    qihse_le_write_u64(header + 12u, qihse_vdb_live_generation(vdb));
     qihse_le_write_u64(header + 20u, crc);
     qihse_le_write_u64(header + 28u, (uint64_t)payload_size);
     memcpy(section, header, sizeof(header));
@@ -1240,8 +1248,10 @@ static bool qihse_vdb_int8_load(qihse_vector_db_t vdb) {
     generation = qihse_le_read_u64(header + 12u);
     crc = qihse_le_read_u64(header + 20u);
     payload_size = (size_t)qihse_le_read_u64(header + 28u);
-    if (generation != vdb->committed_generation || payload_size == 0u ||
+    if (generation != qihse_vdb_live_generation(vdb) || payload_size == 0u ||
         section_size != sizeof(header) + payload_size) {
+        if (generation != qihse_vdb_live_generation(vdb))
+            vdb->int8_status = QIHSE_VDB_INT8_STALE;
         free(section);
         return false;
     }
@@ -1773,7 +1783,6 @@ static void qihse_vdb_finish_mutation_generation(qihse_vector_db_t vdb, uint64_t
     vdb->dirty = true;
     vdb->idmap_valid = false;
     vdb->idmap_dirty = true;
-    vdb->cache_generation++;
     qihse_vdb_set_trinary_stale(vdb);
 }
 
@@ -1781,6 +1790,17 @@ static void qihse_vdb_set_trinary_stale(qihse_vector_db_t vdb) {
     if (!vdb) {
         return;
     }
+    /* These sidecars are candidate selectors over a specific row/vector
+     * generation. Keeping them VALID after an add/update/delete can omit new
+     * rows or rank by superseded vector contents. The float rows remain the
+     * source of truth; callers can rebuild each accelerator on demand. */
+    vdb->cache_generation++;
+    qihse_vdb_graph_destroy(vdb);
+    vdb->graph_status = QIHSE_VDB_GRAPH_STALE;
+    qihse_vdb_int8_destroy(vdb);
+    vdb->int8_status = QIHSE_VDB_INT8_STALE;
+    qihse_vdb_binary_destroy(vdb);
+    vdb->binary_status = QIHSE_VDB_BINARY_STALE;
     vdb->trinary_status = QIHSE_VDB_TRINARY_STALE;
     qihse_vdb_clear_trinary_sign_cache(vdb);
     qihse_vdb_set_magnitude_stale(vdb);
@@ -1822,6 +1842,10 @@ static void qihse_vdb_clear_magnitude_cache(qihse_vector_db_t vdb) {
     vdb->magnitude = NULL;
     vdb->magnitude_bytes = 0u;
     qihse_vdb_clear_qmag_transposed_cache(vdb);
+}
+
+static uint64_t qihse_vdb_live_generation(const qihse_vector_db_t vdb) {
+    return vdb && vdb->next_generation != 0u ? vdb->next_generation - 1u : 0u;
 }
 
 static void qihse_vdb_clear_qmag_transposed_cache(qihse_vector_db_t vdb) {
@@ -2026,7 +2050,7 @@ static bool qihse_vdb_graph_build(qihse_vector_db_t vdb, size_t M, size_t ef_con
 
     vdb->graph_live_row_map = live_row_map;
 
-    vdb->hnsw_index = (qihse_hnsw_index_t*)calloc(1, sizeof(qihse_hnsw_index_t));
+    vdb->hnsw_index = hnsw_create();
     if (!vdb->hnsw_index) {
         vdb->graph_live_row_map = NULL;
         free(live_row_map);
@@ -6630,18 +6654,26 @@ int qihse_vector_db_search(
                                                          results, max_results);
     } else if (query && query->query_mode == QIHSE_VDB_QUERY_GRAPH) {
         size_t top_k = query->top_k > 0u ? query->top_k : 10u;
-        ret = qihse_vdb_search_graph_flat(vdb, query, results, max_results, top_k);
+        if (vdb->graph_status == QIHSE_VDB_GRAPH_STALE) {
+            ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, top_k);
+        } else {
+            ret = qihse_vdb_search_graph_flat(vdb, query, results, max_results, top_k);
+        }
     } else if (query && query->query_mode == QIHSE_VDB_QUERY_INT8) {
         size_t candidate_count;
-        if (vdb->int8_status != QIHSE_VDB_INT8_VALID) {
+        if (vdb->int8_status == QIHSE_VDB_INT8_STALE) {
+            size_t top_k = query->top_k > 0u ? query->top_k : max_results;
+            ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, top_k);
+        } else if (vdb->int8_status != QIHSE_VDB_INT8_VALID) {
             errno = ENOENT;
             return -1;
+        } else {
+            candidate_count = query->candidate_pool_size > 0u ? query->candidate_pool_size : query->top_k * 12u;
+            if (candidate_count > vdb->live_vectors) {
+                candidate_count = vdb->live_vectors;
+            }
+            ret = qihse_vdb_search_int8_candidates(vdb, query, candidate_count, results, max_results);
         }
-        candidate_count = query->candidate_pool_size > 0u ? query->candidate_pool_size : query->top_k * 12u;
-        if (candidate_count > vdb->live_vectors) {
-            candidate_count = vdb->live_vectors;
-        }
-        ret = qihse_vdb_search_int8_candidates(vdb, query, candidate_count, results, max_results);
     } else if (query && query->query_mode == QIHSE_VDB_QUERY_SPARSE) {
         if (!vdb->sparse_index) {
             errno = ENOENT;
@@ -6674,15 +6706,19 @@ int qihse_vector_db_search(
         ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, max_results);
     } else if (query && query->query_mode == QIHSE_VDB_QUERY_BINARY) {
         size_t candidate_count;
-        if (vdb->binary_status != QIHSE_VDB_BINARY_VALID) {
+        if (vdb->binary_status == QIHSE_VDB_BINARY_STALE) {
+            size_t top_k = query->top_k > 0u ? query->top_k : max_results;
+            ret = qihse_vdb_search_exact_rows(vdb, query, results, max_results, top_k);
+        } else if (vdb->binary_status != QIHSE_VDB_BINARY_VALID) {
             errno = ENOENT;
             return -1;
+        } else {
+            candidate_count = query->candidate_pool_size > 0u ? query->candidate_pool_size : query->top_k * 12u;
+            if (candidate_count > vdb->live_vectors) {
+                candidate_count = vdb->live_vectors;
+            }
+            ret = qihse_vdb_search_binary_candidates(vdb, query, candidate_count, results, max_results);
         }
-        candidate_count = query->candidate_pool_size > 0u ? query->candidate_pool_size : query->top_k * 12u;
-        if (candidate_count > vdb->live_vectors) {
-            candidate_count = vdb->live_vectors;
-        }
-        ret = qihse_vdb_search_binary_candidates(vdb, query, candidate_count, results, max_results);
     } else if (query && query->use_trinary_candidates) {
         ret = qihse_vector_db_search_trinary_candidates(vdb, query,
                                                          query->candidate_count,
@@ -8243,7 +8279,7 @@ bool qihse_vector_db_build_graph(
         return false;
     }
     ok = qihse_vdb_graph_build(vdb, M, ef_construction);
-    if (ok) {
+    if (ok && !vdb->read_only) {
         qihse_vdb_graph_save(vdb);
     }
     return ok;
@@ -8258,7 +8294,7 @@ bool qihse_vector_db_build_int8(
         return false;
     }
     ok = qihse_vdb_int8_build(vdb);
-    if (ok) {
+    if (ok && !vdb->read_only) {
         qihse_vdb_int8_save(vdb);
     }
     return ok;

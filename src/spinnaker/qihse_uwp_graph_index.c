@@ -265,7 +265,7 @@ static void* gi_hnsw_create(void) {
     gi_hnsw_wrapper_t* wrap = (gi_hnsw_wrapper_t*)calloc(1, sizeof(gi_hnsw_wrapper_t));
     if (!wrap) return NULL;
     wrap->dim = g_hnsw_pending_dim ? g_hnsw_pending_dim : 128;
-    wrap->index = (qihse_hnsw_index_t*)calloc(1, sizeof(qihse_hnsw_index_t));
+    wrap->index = hnsw_create();
     if (!wrap->index) {
         free(wrap);
         return NULL;

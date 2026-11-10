@@ -52,7 +52,7 @@ static float store_distance(const float *a, const float *b, size_t dim) {
 /* ---- Helpers ------------------------------------------------------------ */
 
 static qihse_hnsw_index_t *build_index(vector_store_t *store) {
-    qihse_hnsw_index_t *idx = (qihse_hnsw_index_t *)calloc(1, sizeof(*idx));
+    qihse_hnsw_index_t *idx = hnsw_create();
     assert(idx);
     idx->params.M = 16;
     idx->params.M0 = 32;
