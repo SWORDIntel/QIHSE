@@ -451,11 +451,16 @@ bool qihse_vector_db_run_memory_maintenance(
  *
  * Set budget_bytes to 0 to disable budgeting (unlimited, legacy behavior).
  * The budget only applies to the float32 vectors buffer, not to sidecars
- * (INT8, FP8, etc.) or metadata.
+ * (INT8, FP8, etc.) or metadata. This is best-effort logical payload residency,
+ * not a process RSS limit. File-backed writable handles can spill; snapshot,
+ * compaction and index construction may restore the complete payload to RAM.
+ * Spill backing is private to the live handle and is not restart state.
+ * Disabling the budget fails without deleting backing if any restore fails;
+ * the previous budget remains configured and the operation can be retried.
  *
  * @param vdb Vector database handle
  * @param budget_bytes Maximum bytes for in-RAM vectors (0=unlimited)
- * @return true on success, false if vdb is NULL
+ * @return true on success, false for invalid/read-only handles or storage failure
  */
 bool qihse_vector_db_set_memory_budget(
     qihse_vector_db_t vdb,

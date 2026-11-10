@@ -5315,13 +5315,12 @@ static bool test_memory_budget_spills_cold_rows(void) {
     TEST_ASSERT(spilled_count > 0u, "at least one row should be spilled");
     TEST_ASSERT(in_ram_bytes <= budget, "in-RAM bytes should be within budget");
 
-    /* Verify spill file exists */
+    /* Backing is private anonymous scratch, never a shared fixed pathname. */
     {
         char spill_path[512];
         snprintf(spill_path, sizeof(spill_path), "%s.spill", path);
         int fd = open(spill_path, O_RDONLY);
-        TEST_ASSERT(fd >= 0, "spill file should exist while DB is open");
-        close(fd);
+        TEST_ASSERT(fd < 0, "spill backing must not use a shared fixed pathname");
     }
 
     TEST_ASSERT(qihse_vector_db_close(db), "database should close");
@@ -5459,13 +5458,13 @@ static bool test_memory_budget_zero_restores_spilled(void) {
                 "get_memory_usage should succeed");
     TEST_ASSERT(spilled_count > 0u, "rows should be spilled");
 
-    /* Verify spill file exists */
+    /* Backing has no shared pathname while the handle is live. */
     {
         size_t spill_len = strlen(path) + 8u;
         char* spill_path = (char*)malloc(spill_len);
         TEST_ASSERT(spill_path != NULL, "malloc should succeed");
         snprintf(spill_path, spill_len, "%s.spill", path);
-        TEST_ASSERT(access(spill_path, F_OK) == 0, "spill file should exist while budget is set");
+        TEST_ASSERT(access(spill_path, F_OK) != 0, "spill backing must not use a shared fixed pathname");
         free(spill_path);
     }
 

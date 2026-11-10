@@ -332,6 +332,8 @@ static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx);
 static const float* qihse_vdb_spill_page_in(qihse_vector_db_t vdb,
                                              const qihse_index_row_t* row);
 static bool qihse_vdb_spill_restore_row(qihse_vector_db_t vdb, size_t row_idx);
+static bool qihse_vdb_spill_restore_all(qihse_vector_db_t vdb);
+static bool qihse_vdb_reserve_rows(qihse_vector_db_t vdb, size_t needed);
 static void qihse_vdb_spill_enforce_budget(qihse_vector_db_t vdb);
 static void qihse_vdb_spill_close(qihse_vector_db_t vdb);
 static void qihse_vdb_track_row_access(qihse_vector_db_t vdb, size_t row_idx);
@@ -1040,7 +1042,11 @@ static bool qihse_vdb_tier_save(qihse_vector_db_t vdb) {
         return false;
     }
 
-    memcpy(section + sizeof(header), vdb->row_tier, tier_bytes);
+    for (size_t i = 0u; i < vdb->total_vectors; i++) {
+        qihse_memory_tier_t tier = vdb->row_tier[i] == QIHSE_MEM_SPILLED
+            ? QIHSE_MEM_DRAM : vdb->row_tier[i];
+        memcpy(section + sizeof(header) + i * sizeof(tier), &tier, sizeof(tier));
+    }
     memcpy(section + sizeof(header) + tier_bytes, vdb->row_access_counts, count_bytes);
 
     crc = qihse_fnv1a64(section + sizeof(header), payload_size);
@@ -1125,22 +1131,14 @@ static bool qihse_vdb_tier_load(qihse_vector_db_t vdb) {
         return false;
     }
 
-    /* Ensure tracking arrays are allocated */
-    if (vdb->row_tracking_capacity < vdb->total_vectors) {
-        uint64_t* new_counts = (uint64_t*)realloc(vdb->row_access_counts, vdb->total_vectors * sizeof(*new_counts));
-        uint64_t* new_last = (uint64_t*)realloc(vdb->row_last_access_ns, vdb->total_vectors * sizeof(*new_last));
-        qihse_memory_tier_t* new_tier = (qihse_memory_tier_t*)realloc(vdb->row_tier, vdb->total_vectors * sizeof(*new_tier));
-        if (!new_counts || !new_last || !new_tier) {
-            free(section);
-            return false;
-        }
-        vdb->row_access_counts = new_counts;
-        vdb->row_last_access_ns = new_last;
-        vdb->row_tier = new_tier;
-        vdb->row_tracking_capacity = vdb->total_vectors;
+    if (!qihse_vdb_reserve_rows(vdb, vdb->total_vectors)) {
+        free(section);
+        return false;
     }
-
     memcpy(vdb->row_tier, payload, tier_bytes);
+    /* Spill is private scratch for one live handle, never restart state. */
+    for (size_t i = 0u; i < vdb->total_vectors; i++)
+        if (vdb->row_tier[i] == QIHSE_MEM_SPILLED) vdb->row_tier[i] = QIHSE_MEM_DRAM;
     memcpy(vdb->row_access_counts, payload + tier_bytes, count_bytes);
     free(section);
     return true;
@@ -1986,6 +1984,7 @@ static const float* qihse_hnsw_vdb_get_vector(void* user_context, uint32_t node_
 }
 
 static bool qihse_vdb_graph_build(qihse_vector_db_t vdb, size_t M, size_t ef_construction) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     size_t i;
     size_t* live_row_map = NULL;
     size_t capacity;
@@ -2114,6 +2113,7 @@ static void qihse_vdb_int8_destroy(qihse_vector_db_t vdb) {
 }
 
 static bool qihse_vdb_int8_build(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     size_t i, d, lv;
     float* dim_min = NULL;
     float* dim_max = NULL;
@@ -2808,6 +2808,7 @@ static inline int qihse_vdb_binary_hamming_distance(const uint64_t* a, const uin
 }
 
 static bool qihse_vdb_binary_build(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     size_t i;
     size_t n_rows;
     size_t dims;
@@ -3506,50 +3507,36 @@ static void qihse_vdb_run_memory_maintenance(qihse_vector_db_t vdb) {
  * vector_dims * sizeof(float). This means the spill file has the same
  * layout as the in-RAM vectors buffer, so page-in is a single pread().
  *
- * Security: the spill file inherits the same authorization as the parent
- * .qdb — it is created next to the .qdb with the same permissions and
- * is only accessed via the vdb handle (which was opened with a user
- * context). No context-free reads are performed.
+ * Backing is private anonymous scratch owned by the live handle, not an
+ * export or durable snapshot. Row readers enforce their principal/label
+ * checks before page-in; storage maintenance preserves the complete image.
  * ============================================================================ */
 
 static bool qihse_vdb_spill_open(qihse_vector_db_t vdb) {
-    /* Create the spill file next to the .qdb */
-    if (!vdb->db_path) {
-        errno = EINVAL;
-        return false;
+    if (!vdb || !vdb->db_path || !vdb->vector_dims) { errno = EINVAL; return false; }
+    if (vdb->read_only || vdb->mapped_vectors) { errno = EROFS; return false; }
+    if (vdb->spill_fd >= 0) return true;
+    size_t bytes, path_bytes;
+    if (!qihse_checked_mul_size(vdb->vector_dims, sizeof(float), &bytes) ||
+        !qihse_checked_add_size(strlen(vdb->db_path), sizeof(".spill.XXXXXX"), &path_bytes)) return false;
+    uint8_t* page = malloc(bytes);
+    char* path = malloc(path_bytes);
+    if (!page || !path) { free(page); free(path); errno = ENOMEM; return false; }
+    snprintf(path, path_bytes, "%s.spill.XXXXXX", vdb->db_path);
+    int fd = mkstemp(path);
+    if (fd < 0) { free(page); free(path); return false; }
+    /* A private anonymous file cannot truncate another handle's spill, follow
+     * a fixed-name symlink, or leave a large stale spill after process exit. */
+    bool detached = unlink(path) == 0;
+    int error = errno;
+    free(path);
+    if (!detached || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        if (detached) error = errno;
+        close(fd); free(page); errno = error; return false;
     }
-    if (vdb->spill_fd >= 0) {
-        return true;  /* Already open */
-    }
-
-    size_t path_len = strlen(vdb->db_path) + 8u;  /* ".spill" + NUL */
-    vdb->spill_path = (char*)malloc(path_len);
-    if (!vdb->spill_path) {
-        errno = ENOMEM;
-        return false;
-    }
-    snprintf(vdb->spill_path, path_len, "%s.spill", vdb->db_path);
-
-    /* Create/truncate the spill file */
-    vdb->spill_fd = open(vdb->spill_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (vdb->spill_fd < 0) {
-        free(vdb->spill_path);
-        vdb->spill_path = NULL;
-        return false;
-    }
-
-    /* Allocate a single-vector page-in buffer */
-    vdb->spill_page_buffer_bytes = vdb->vector_dims * sizeof(float);
-    vdb->spill_page_buffer = (uint8_t*)malloc(vdb->spill_page_buffer_bytes);
-    if (!vdb->spill_page_buffer) {
-        close(vdb->spill_fd);
-        vdb->spill_fd = -1;
-        free(vdb->spill_path);
-        vdb->spill_path = NULL;
-        errno = ENOMEM;
-        return false;
-    }
-
+    vdb->spill_fd = fd;
+    vdb->spill_page_buffer = page;
+    vdb->spill_page_buffer_bytes = bytes;
     return true;
 }
 
@@ -3557,8 +3544,7 @@ static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx) {
     /* Write a single row's vector data to the spill file and free its RAM. */
     qihse_index_row_t* row;
     size_t vec_bytes;
-    off_t offset;
-    ssize_t written;
+    qihse_file_t spill;
 
     if (!vdb || row_idx >= vdb->total_vectors || vdb->spill_fd < 0) {
         return false;
@@ -3573,7 +3559,7 @@ static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx) {
     }
 
     vec_bytes = vdb->vector_dims * sizeof(float);
-    offset = (off_t)row->vector_offset;
+    spill.fd = vdb->spill_fd;
 
     /* Write the vector data to the spill file at the same offset */
     {
@@ -3583,11 +3569,8 @@ static bool qihse_vdb_spill_row(qihse_vector_db_t vdb, size_t row_idx) {
         if (!base || row->vector_offset + vec_bytes > vdb->vector_bytes_used) {
             return false;
         }
-        written = pwrite(vdb->spill_fd, base + row->vector_offset,
-                         vec_bytes, offset);
-        if (written < 0 || (size_t)written != vec_bytes) {
-            return false;
-        }
+        if (!qihse_file_pwrite_exact(&spill, base + row->vector_offset,
+                                      vec_bytes, row->vector_offset)) return false;
     }
 
     /* Zero out the in-RAM copy (keeps the buffer allocated but frees
@@ -3629,8 +3612,7 @@ static const float* qihse_vdb_spill_page_in(qihse_vector_db_t vdb,
      * mutex held (or in a single-threaded context). The caller (search)
      * holds the mutex for the duration of the vector read. */
     size_t vec_bytes;
-    off_t offset;
-    ssize_t nread;
+    qihse_file_t spill;
 
     if (!vdb || !row || vdb->spill_fd < 0 || !vdb->spill_page_buffer) {
         return NULL;
@@ -3639,12 +3621,9 @@ static const float* qihse_vdb_spill_page_in(qihse_vector_db_t vdb,
     if (vdb->spill_page_buffer_bytes < vec_bytes) {
         return NULL;
     }
-    offset = (off_t)row->vector_offset;
-    nread = pread(vdb->spill_fd, vdb->spill_page_buffer,
-                  vec_bytes, offset);
-    if (nread < 0 || (size_t)nread != vec_bytes) {
-        return NULL;
-    }
+    spill.fd = vdb->spill_fd;
+    if (!qihse_file_pread_exact(&spill, vdb->spill_page_buffer,
+                                 vec_bytes, row->vector_offset)) return NULL;
     return (const float*)(const void*)vdb->spill_page_buffer;
 }
 
@@ -3653,8 +3632,7 @@ static bool qihse_vdb_spill_restore_row(qihse_vector_db_t vdb, size_t row_idx) {
      * vector buffer, restoring it to resident RAM. */
     qihse_index_row_t* row;
     size_t vec_bytes;
-    off_t offset;
-    ssize_t nread;
+    qihse_file_t spill;
     uint8_t* base;
 
     if (!vdb || row_idx >= vdb->total_vectors || vdb->spill_fd < 0) {
@@ -3666,7 +3644,6 @@ static bool qihse_vdb_spill_restore_row(qihse_vector_db_t vdb, size_t row_idx) {
     }
 
     vec_bytes = vdb->vector_dims * sizeof(float);
-    offset = (off_t)row->vector_offset;
 
     base = vdb->mapped_vectors
         ? (uint8_t*)vdb->mapped_vectors
@@ -3675,15 +3652,21 @@ static bool qihse_vdb_spill_restore_row(qihse_vector_db_t vdb, size_t row_idx) {
         return false;
     }
 
-    nread = pread(vdb->spill_fd, base + row->vector_offset,
-                  vec_bytes, offset);
-    if (nread < 0 || (size_t)nread != vec_bytes) {
-        return false;
-    }
+    spill.fd = vdb->spill_fd;
+    if (!qihse_file_pread_exact(&spill, base + row->vector_offset,
+                                 vec_bytes, row->vector_offset)) return false;
 
     vdb->row_tier[row_idx] = QIHSE_MEM_DRAM;
     vdb->spilled_count--;
     vdb->memory_vectors_in_ram += vec_bytes;
+    return true;
+}
+
+static bool qihse_vdb_spill_restore_all(qihse_vector_db_t vdb) {
+    if (!vdb || !vdb->spilled_count) return true;
+    if (vdb->spill_fd < 0) { errno = EIO; return false; }
+    for (size_t i = 0u; i < vdb->total_vectors; i++)
+        if (vdb->row_tier[i] == QIHSE_MEM_SPILLED && !qihse_vdb_spill_restore_row(vdb, i)) return false;
     return true;
 }
 
@@ -3900,6 +3883,7 @@ static bool qihse_vdb_sparse_index_add_term_posting(
 }
 
 static bool qihse_vdb_sparse_index_build(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     size_t i, d;
     size_t n_rows;
     size_t dims;
@@ -5520,6 +5504,10 @@ static bool qihse_vdb_load_snapshot(qihse_vector_db_t vdb, bool use_mmap) {
         vdb->magnitude_status = QIHSE_VDB_MAGNITUDE_ABSENT;
         qihse_vdb_clear_magnitude_cache(vdb);
     }
+    if (!qihse_vdb_reserve_rows(vdb, vdb->total_vectors)) {
+        qihse_vector_store_snapshot_free(&snapshot);
+        return false;
+    }
     if (use_mmap && (vdb->vector_bytes_used != 0u || vdb->metadata_bytes_used != 0u)) {
         if (qihse_vdb_map_vectors(vdb)) {
             free(vdb->vectors);
@@ -5623,9 +5611,13 @@ qihse_vector_db_t qihse_vector_db_open(
         if (!read_only && create) {
             /* Ensure the container file exists so WAL appends can succeed. */
             qihse_container_t init_ctr;
-            if (qihse_ctr_open_write(vdb->db_path, true, &init_ctr)) {
-                qihse_ctr_close(&init_ctr);
+            if (!qihse_ctr_open_write(vdb->db_path, true, &init_ctr)) {
+                int error = errno;
+                qihse_vector_db_destroy(vdb);
+                errno = error;
+                return NULL;
             }
+            qihse_ctr_close(&init_ctr);
         }
         
         {
@@ -5937,9 +5929,10 @@ bool qihse_vector_db_get_vector_by_id_user(
         return false;
     }
 
+    errno = 0;
     const float* vec = qihse_vdb_vector_at(vdb, row);
     if (!vec) {
-        errno = ENOENT;
+        if (!errno) errno = EIO;
         return false;
     }
 
@@ -7973,9 +7966,7 @@ bool qihse_vector_db_flush(qihse_vector_db_t vdb) {
     if (!vdb->dirty && !vdb->idmap_dirty) {
         return true;
     }
-    if (!qihse_vdb_rebuild_idmap(vdb, true)) {
-        return false;
-    }
+    if (!qihse_vdb_spill_restore_all(vdb) || !qihse_vdb_rebuild_idmap(vdb, true)) return false;
     if (vdb->vector_dims != 0u) {
         trinary = qihse_vdb_build_trinary(vdb, &trinary_bytes);
         if (!trinary) {
@@ -8091,6 +8082,7 @@ static bool qihse_vdb_compact_live_rows(qihse_vector_db_t vdb) {
         errno = EINVAL;
         return false;
     }
+    if (!qihse_vdb_spill_restore_all(vdb)) return false;
     if (vdb->total_vectors == vdb->live_vectors && !vdb->idmap_dirty &&
         vdb->trinary_status == QIHSE_VDB_TRINARY_VALID &&
         vdb->magnitude_status == QIHSE_VDB_MAGNITUDE_VALID) {
@@ -8185,6 +8177,13 @@ static bool qihse_vdb_compact_live_rows(qihse_vector_db_t vdb) {
         return false;
     }
 
+    qihse_vdb_spill_close(vdb);
+    for (size_t j = 0u; j < vdb->row_tracking_capacity; j++) {
+        vdb->row_tier[j] = QIHSE_MEM_DRAM;
+        vdb->row_access_counts[j] = 0u;
+        vdb->row_last_access_ns[j] = 0u;
+    }
+    vdb->memory_vectors_in_ram = compact_vector_bytes;
     qihse_vdb_clear_qmag_transposed_cache(vdb);
     free(vdb->rows);
     free(vdb->vectors);
@@ -8266,6 +8265,7 @@ bool qihse_vector_db_build_int8(
 }
 
 bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
         return false;
     }
@@ -8279,6 +8279,7 @@ bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb) {
         return false;
     }
 
+    vdb->fp16_status = QIHSE_VDB_FP16_ABSENT;
     if (vdb->fp16_vectors) {
         free(vdb->fp16_vectors);
     }
@@ -8291,7 +8292,8 @@ bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
-            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            const float* src = qihse_vdb_vector_at(vdb, row);
+            if (!src) return false;
             for (j = 0; j < dims; j++) {
                 uint32_t bits;
                 memcpy(&bits, &src[j], sizeof(float));
@@ -8312,6 +8314,7 @@ bool qihse_vector_db_build_fp16(qihse_vector_db_t vdb) {
 }
 
 bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
         return false;
     }
@@ -8324,6 +8327,7 @@ bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb) {
         return false;
     }
 
+    vdb->fp32_status = QIHSE_VDB_FP32_ABSENT;
     if (vdb->fp32_vectors) {
         free(vdb->fp32_vectors);
     }
@@ -8336,7 +8340,8 @@ bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
-            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            const float* src = qihse_vdb_vector_at(vdb, row);
+            if (!src) return false;
             memcpy(&vdb->fp32_vectors[i * dims], src, dims * sizeof(float));
         } else {
             memset(&vdb->fp32_vectors[i * dims], 0, dims * sizeof(float));
@@ -8350,6 +8355,7 @@ bool qihse_vector_db_build_fp32(qihse_vector_db_t vdb) {
 }
 
 bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
         return false;
     }
@@ -8362,6 +8368,7 @@ bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb) {
         return false;
     }
 
+    vdb->fp8_status = QIHSE_VDB_FP8_ABSENT;
     if (vdb->fp8_vectors) {
         free(vdb->fp8_vectors);
     }
@@ -8375,7 +8382,8 @@ bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
-            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            const float* src = qihse_vdb_vector_at(vdb, row);
+            if (!src) return false;
 #ifdef __x86_64__
             if (s_cpu_has_bmi2) {
                 size_t j = 0;
@@ -8417,6 +8425,7 @@ bool qihse_vector_db_build_fp8(qihse_vector_db_t vdb) {
 }
 
 bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
         return false;
     }
@@ -8430,6 +8439,7 @@ bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
         return false;
     }
 
+    vdb->fp4_status = QIHSE_VDB_FP4_ABSENT;
     if (vdb->fp4_vectors) {
         free(vdb->fp4_vectors);
     }
@@ -8443,7 +8453,8 @@ bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
-            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            const float* src = qihse_vdb_vector_at(vdb, row);
+            if (!src) return false;
 #ifdef __x86_64__
             if (s_cpu_has_bmi2) {
                 for (size_t j = 0; j < packed_dims; j++) {
@@ -8491,6 +8502,7 @@ bool qihse_vector_db_build_fp4(qihse_vector_db_t vdb) {
 }
 
 bool qihse_vector_db_build_int4(qihse_vector_db_t vdb) {
+    if (vdb && !qihse_vdb_spill_restore_all(vdb)) return false;
     if (!vdb || vdb->live_vectors == 0u || vdb->vector_dims == 0u) {
         return false;
     }
@@ -8504,6 +8516,7 @@ bool qihse_vector_db_build_int4(qihse_vector_db_t vdb) {
         return false;
     }
 
+    vdb->int4_status = QIHSE_VDB_INT4_ABSENT;
     if (vdb->int4_vectors) {
         free(vdb->int4_vectors);
     }
@@ -8516,7 +8529,8 @@ bool qihse_vector_db_build_int4(qihse_vector_db_t vdb) {
         const qihse_index_row_t* row = &vdb->rows[i];
         if ((row->row_flags & QIHSE_ROW_F_LIVE) != 0u &&
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
-            float* src = (float*)(vdb->vectors + i * dims * sizeof(float));
+            const float* src = qihse_vdb_vector_at(vdb, row);
+            if (!src) return false;
             for (size_t j = 0; j < packed_dims; j++) {
                 uint8_t packed = 0;
                 for (int k = 0; k < 2; k++) {
@@ -8663,37 +8677,18 @@ bool qihse_vector_db_run_memory_maintenance(
     return true;
 }
 
-bool qihse_vector_db_set_memory_budget(
-    qihse_vector_db_t vdb,
-    size_t budget_bytes
-) {
-    if (!vdb) {
-        errno = EINVAL;
-        return false;
+bool qihse_vector_db_set_memory_budget(qihse_vector_db_t vdb, size_t budget_bytes) {
+    if (!vdb) { errno = EINVAL; return false; }
+    if (!budget_bytes) {
+        if (!qihse_vdb_spill_restore_all(vdb)) return false;
+        qihse_vdb_spill_close(vdb);
+        vdb->memory_budget_bytes = 0u;
+        return true;
     }
+    if (vdb->read_only || vdb->mapped_vectors) { errno = EROFS; return false; }
+    if (vdb->db_path && vdb->vector_dims && !qihse_vdb_spill_open(vdb)) return false;
     vdb->memory_budget_bytes = budget_bytes;
-    if (budget_bytes > 0u) {
-        /* Budget enabled: open spill file if needed and enforce. */
-        if (vdb->spill_fd < 0 && vdb->db_path) {
-            if (qihse_vdb_spill_open(vdb)) {
-                qihse_vdb_spill_enforce_budget(vdb);
-            }
-        } else if (vdb->spill_fd >= 0) {
-            qihse_vdb_spill_enforce_budget(vdb);
-        }
-    } else {
-        /* Budget disabled: restore all spilled rows to RAM, then close
-         * and unlink the spill file. */
-        if (vdb->spill_fd >= 0) {
-            size_t i;
-            for (i = 0u; i < vdb->total_vectors; ++i) {
-                if (vdb->row_tier[i] == QIHSE_MEM_SPILLED) {
-                    (void)qihse_vdb_spill_restore_row(vdb, i);
-                }
-            }
-            qihse_vdb_spill_close(vdb);
-        }
-    }
+    if (vdb->spill_fd >= 0) qihse_vdb_spill_enforce_budget(vdb);
     return true;
 }
 
