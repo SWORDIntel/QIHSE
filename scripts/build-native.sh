@@ -244,11 +244,14 @@ for tool in cmake ninja; do
         exit 1
     fi
 done
-
 if [ "$CLEAN" -eq 1 ]; then
-    make clean
+    make -C "$ROOT_DIR" clean
 fi
+
+# Make does not track compiler flags as prerequisites, and a direct `make`
+# can alter the shared objects without updating any script-local stamp. Force
+# this native build to recompile every object with the resolved host flags.
 
 echo "Building with: make QIHSE_ENABLE_AVX=$EN_AVX QIHSE_ENABLE_F16C=$EN_F16C QIHSE_ENABLE_AVX2=$EN_AVX2 QIHSE_ENABLE_AVX512=$EN_AVX512 QIHSE_ENABLE_AVX_VNNI=$EN_AVX_VNNI QIHSE_ENABLE_AMX=$EN_AMX QIHSE_CFLAGS_EXTRA='$CFLAGS_EXTRA'"
 (cd "$ROOT_DIR" && \
-make -j"$(nproc 2>/dev/null || echo 4)" all QIHSE_ENABLE_AVX="$EN_AVX" QIHSE_ENABLE_F16C="$EN_F16C" QIHSE_ENABLE_AVX2="$EN_AVX2" QIHSE_ENABLE_AVX512="$EN_AVX512" QIHSE_ENABLE_AVX_VNNI="$EN_AVX_VNNI" QIHSE_ENABLE_AMX="$EN_AMX" QIHSE_CFLAGS_EXTRA="$CFLAGS_EXTRA")
+make -B -j"$(nproc 2>/dev/null || echo 4)" all QIHSE_ENABLE_AVX="$EN_AVX" QIHSE_ENABLE_F16C="$EN_F16C" QIHSE_ENABLE_AVX2="$EN_AVX2" QIHSE_ENABLE_AVX512="$EN_AVX512" QIHSE_ENABLE_AVX_VNNI="$EN_AVX_VNNI" QIHSE_ENABLE_AMX="$EN_AMX" QIHSE_CFLAGS_EXTRA="$CFLAGS_EXTRA")
