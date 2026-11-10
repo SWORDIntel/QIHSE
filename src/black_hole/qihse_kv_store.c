@@ -75,8 +75,22 @@ static bool aimem_durability_test_fail_once(const char* point) {
     }
     return false;
 }
+static bool wal_replay_test_fail_apply(void) {
+    static unsigned attempts;
+    static bool fired;
+    const char* selected = getenv("QIHSE_AIMEM_FAIL_AT");
+    if (!selected || fired) return false;
+    attempts++;
+    bool match = (!strcmp(selected, "wal-replay-apply") && attempts == 1u) ||
+                 (!strcmp(selected, "wal-replay-apply-second") && attempts == 2u);
+    if (!match) return false;
+    fired = true;
+    errno = EIO;
+    return true;
+}
 #else
 #define aimem_durability_test_fail_once(point) false
+#define wal_replay_test_fail_apply() false
 #endif
 #define KV_HEADER_LINE_MAX 256u
 
@@ -2562,47 +2576,55 @@ static int wal_replay_new_record(qihse_kv_store_t* store, FILE* f, bool has_sour
     if (has_source_seq && fread(&source_seq, sizeof(source_seq), 1u, f) != 1u) return false;
     if (fread(&crc, sizeof(crc), 1u, f) != 1u) return false;
     if ((op != KV_WAL_OP_SET && op != KV_WAL_OP_DEL) || key_len == 0u ||
-        val_len > KV_MAX_VALUE_LEN || (flags & ~KV_ALLOWED_FLAGS) != 0u) return false;
-    if (op == KV_WAL_OP_DEL && (val_len != 0u || (flags & KV_FLAG_TOMBSTONE) == 0u)) return false;
+        val_len > KV_MAX_VALUE_LEN || (flags & ~KV_ALLOWED_FLAGS) != 0u) return 0;
+    if (op == KV_WAL_OP_DEL && (val_len != 0u || (flags & KV_FLAG_TOMBSTONE) == 0u)) return 0;
     if (!kv_read_allowed(context, classification, sci)) return -2;
     char* key = (char*)malloc((size_t)key_len + 1u);
     char* val = (char*)malloc((size_t)val_len + 1u);
-    if (!key || !val) { free(key); free(val); return false; }
+    if (!key || !val) { free(key); free(val); errno = ENOMEM; return -1; }
     if (fread(key, 1u, key_len, f) != key_len || fread(val, 1u, val_len, f) != val_len) {
-        free(key); free(val); return false;
+        free(key); free(val); return 0;
     }
-    if (memchr(key, '\0', key_len) || memchr(val, '\0', val_len)) { free(key); free(val); return false; }
+    if (memchr(key, '\0', key_len) || memchr(val, '\0', val_len)) { free(key); free(val); return 0; }
     key[key_len] = '\0'; val[val_len] = '\0';
     uint64_t actual = has_source_seq
         ? wal_replica_record_crc(op, flags, key_len, val_len, classification, sci,
                                  expire, source_seq, key, val)
         : wal_record_crc(op, flags, key_len, val_len, classification, sci, expire, key, val);
-    if (actual != crc) { free(key); free(val); return false; }
+    if (actual != crc) { free(key); free(val); return 0; }
     if (has_source_seq) {
         if (source_seq == 0u ||
             (op == KV_WAL_OP_DEL && (val_len != 0u || expire != 0u || (flags & KV_FLAG_TOMBSTONE) == 0u)) ||
             (op == KV_WAL_OP_SET && flags != 0u)) {
-            free(key); free(val); return false;
+            free(key); free(val); return 0;
         }
         kv_payload_t* prior = (kv_payload_t*)qihse_trinary_trie_search(store->trie, key, NULL);
         if (prior && prior->change_seq >= source_seq) {
             bool duplicate = prior->change_seq == source_seq && prior->flags == flags &&
                              prior->expire_time_ms == expire && prior->classification == classification &&
                              prior->sci_compartment == sci && strcmp(prior->val, val) == 0;
-            free(key); free(val); return duplicate;
+            free(key); free(val);
+            if (!duplicate) errno = EINVAL;
+            return duplicate ? 1 : -1;
         }
-        bool ok = insert_internal(store, key, val, expire, classification, sci, flags, source_seq);
+        bool ok = !wal_replay_test_fail_apply() &&
+            insert_internal(store, key, val, expire, classification, sci, flags, source_seq);
         if (ok) kv_change_seq_floor(store, source_seq);
-        free(key); free(val); return ok;
+        free(key); free(val);
+        if (!ok) { if (errno == 0) errno = EIO; return -1; }
+        return 1;
     }
     /* The binary WAL format carries no sequence (unchanged, so existing
      * wal.log files keep decoding); recovery re-stamps each replayed
      * mutation with a fresh sequence.  Replay order is mutation order, so
      * relative order survives and the high-water only moves forward. */
     uint64_t seq = kv_change_seq_next(store);
-    if (seq == 0u) { free(key); free(val); return false; }
-    bool ok = insert_internal(store, key, val, expire, classification, sci, flags, seq);
-    free(key); free(val); return ok;
+    if (seq == 0u) { free(key); free(val); errno = EOVERFLOW; return -1; }
+    bool ok = !wal_replay_test_fail_apply() &&
+        insert_internal(store, key, val, expire, classification, sci, flags, seq);
+    free(key); free(val);
+    if (!ok) { if (errno == 0) errno = EIO; return -1; }
+    return 1;
 }
 
 static int wal_replay_delete_receipt(qihse_kv_store_t* store, FILE* f,
@@ -2834,6 +2856,7 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
             if (!sequenced && memcmp(magic, KV_WAL_MAGIC, 4u) != 0) break;
             int replay = wal_replay_new_record(store, f, sequenced, context);
             if (replay == -2) goto denied;
+            if (replay < 0) { fclose(f); return false; }
             if (!replay) break;
             last_good = ftello(f);
             continue;
@@ -2849,14 +2872,20 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
                     key_len == 0u || val_len > KV_MAX_VALUE_LEN) break;
                 if (!kv_read_allowed(context, classification, sci)) goto denied;
                 char* key = (char*)malloc((size_t)key_len + 1u); char* val = (char*)malloc((size_t)val_len + 1u);
-                if (!key || !val) { free(key); free(val); break; }
+                if (!key || !val) {
+                    free(key); free(val); errno = ENOMEM; fclose(f); return false;
+                }
                 if (fread(key, 1u, key_len, f) != key_len || fread(val, 1u, val_len, f) != val_len) {
                     free(key); free(val); break;
                 }
                 key[key_len] = '\0'; val[val_len] = '\0';
                 uint64_t seq = kv_change_seq_next(store);
-                if (seq == 0u || !insert_internal(store, key, val, 0u, classification, sci, 0u, seq)) {
-                    free(key); free(val); break;
+                bool applied = seq != 0u &&
+                    !wal_replay_test_fail_apply() &&
+                    insert_internal(store, key, val, 0u, classification, sci, 0u, seq);
+                if (!applied) {
+                    free(key); free(val); errno = seq == 0u ? EOVERFLOW : EIO;
+                    fclose(f); return false;
                 }
                 free(key); free(val); last_good = ftello(f); continue;
             }
@@ -2867,7 +2896,7 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
                 if (!line || !rest) {
                     free(line);
                     free(rest);
-                    break;
+                    errno = ENOMEM; fclose(f); return false;
                 }
                 if (!fgets(line, 65536, f)) {
                     free(line);
@@ -2889,9 +2918,12 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
                             free(line); free(rest); goto denied;
                         }
                         uint64_t seq = kv_change_seq_next(store);
-                        if (seq != 0u)
-                            (void)insert_internal(store, key, rest, 0u, (uint16_t)classif,
-                                                  (uint16_t)sci, 0u, seq);
+                        if (seq == 0u || wal_replay_test_fail_apply() ||
+                            !insert_internal(store, key, rest, 0u, (uint16_t)classif,
+                                             (uint16_t)sci, 0u, seq)) {
+                            free(line); free(rest); errno = seq == 0u ? EOVERFLOW : EIO;
+                            fclose(f); return false;
+                        }
                     }
                 }
                 free(line);
@@ -2931,9 +2963,12 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
                     }
                     if (!kv_read_allowed(context, cclass, csci)) goto denied;
                     uint64_t seq = kv_change_seq_next(store);
-                    if (seq != 0u)
-                        (void)insert_internal(store, line, "", 0u, cclass, csci,
-                                              KV_FLAG_TOMBSTONE, seq);
+                    if (seq == 0u || wal_replay_test_fail_apply() ||
+                        !insert_internal(store, line, "", 0u, cclass, csci,
+                                         KV_FLAG_TOMBSTONE, seq)) {
+                        errno = seq == 0u ? EOVERFLOW : EIO;
+                        fclose(f); return false;
+                    }
                 }
                 last_good = ftello(f);
                 continue;
