@@ -239,7 +239,8 @@ SRCS_BASE += src/spinnaker/qihse_aimem_onnx_embedder.c
 endif
 
 SRCS_BASE += src/black_hole/qihse_ct_codec.c src/spinnaker/qihse_cluster_ownership.c \
-    src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c
+    src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c \
+    src/spinnaker/qihse_cluster_range_authority.c
 SRCS=$(SRCS_BASE)
 
 ifeq ($(LIB_TARGET),qihse.dll)
@@ -549,6 +550,22 @@ test-ct-replication-lanes: lib
 	LD_LIBRARY_PATH=. ./tests/test_kv_ct_replication_lanes
 
 test-serial: test-ct-replication-lanes
+
+.PHONY: test-cluster-range-authority
+test-cluster-range-authority: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_cluster_range_authority tests/test_cluster_range_authority.c \
+	    src/spinnaker/qihse_cluster_range_authority.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_range_authority
+
+test-serial: test-cluster-range-authority
+
+.PHONY: test-ct-range-export-tenant
+test-ct-range-export-tenant: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_range_export_tenant tests/test_ct_range_export_tenant.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_range_export_tenant
+
+test-serial: test-ct-range-export-tenant
 
 test-ct-storage-crash: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \

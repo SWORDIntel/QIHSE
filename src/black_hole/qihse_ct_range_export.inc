@@ -37,6 +37,13 @@ struct qihse_kv_ct_range_snapshot {
 
 static bool ct_range_export_add(ct_range_export_collect_t* c, const char* key,
     kv_payload_t* memory, const sst_meta_entry_t* disk) {
+    uint32_t tenant = 0u;
+    if (!c || !key || !qihse_auth_user_is_active(c->principal) ||
+        !ct_resource_tenant(key, qihse_user_get_tenant_id(c->principal), &tenant)) {
+        if (c) c->authorized = false;
+        errno = EACCES;
+        return false;
+    }
     size_t key_len = strlen(key);
     if (key_len > SIZE_MAX - c->key_bytes || c->count == SIZE_MAX) {
         errno = EOVERFLOW; c->ok = false; return false;

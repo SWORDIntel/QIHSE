@@ -610,6 +610,12 @@ batch is not deployed and has not had a new full-suite run.
 
 **Active cluster implementation order (2026-11-10):**
 
+Integration and focused evidence are tracked in the
+[range-group repair record](docs/validation/cluster_range_groups_20261110.md).
+The group storage and quorum foundations are integrated; daemon, transfer and
+promotion-chain acceptance remain in progress. These foundations do not close
+CT.1 or CT.2 on their own.
+
 1. Repair the current path first: automatic CT2 balancing under `--brain-act`,
    durable retry independent of the observation journal, and local completion
    of an already FINALIZED transfer without requiring its old target online.
