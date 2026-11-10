@@ -541,6 +541,53 @@ struct qihse_resp_server {
     const char* redundancy_peer;
 };
 
+bool qihse_resp_vdb_access_lock(qihse_resp_server_t* owner,
+                                qihse_vector_db_t expected_vdb) {
+    pthread_mutex_t* owner_lock = NULL;
+    if (!expected_vdb) {
+        errno = EINVAL;
+        return false;
+    }
+    if (owner) {
+        if (owner->vdb == expected_vdb) owner_lock = &owner->vdb_lock;
+        else if (owner->forensic_vdb == expected_vdb) owner_lock = &owner->forensic_lock;
+        else { errno = EINVAL; return false; }
+        int rc = pthread_mutex_lock(owner_lock);
+        if (rc != 0) { errno = rc; return false; }
+    }
+    if (!qihse_vector_db_adapter_lock(expected_vdb)) {
+        if (owner_lock) pthread_mutex_unlock(owner_lock);
+        return false;
+    }
+    return true;
+}
+
+bool qihse_resp_main_vdb_access_lock(qihse_resp_server_t* owner,
+                                     qihse_vector_db_t expected_vdb) {
+    if (!owner || !expected_vdb || owner->vdb != expected_vdb) {
+        errno = EINVAL;
+        return false;
+    }
+    int rc = pthread_mutex_lock(&owner->vdb_lock);
+    if (rc != 0) { errno = rc; return false; }
+    if (!qihse_vector_db_adapter_lock(expected_vdb)) {
+        pthread_mutex_unlock(&owner->vdb_lock);
+        return false;
+    }
+    return true;
+}
+
+void qihse_resp_vdb_access_unlock(qihse_resp_server_t* owner,
+                                  qihse_vector_db_t expected_vdb) {
+    if (!expected_vdb) return;
+    qihse_vector_db_adapter_unlock(expected_vdb);
+    if (owner) {
+        if (owner->vdb == expected_vdb) pthread_mutex_unlock(&owner->vdb_lock);
+        else if (owner->forensic_vdb == expected_vdb)
+            pthread_mutex_unlock(&owner->forensic_lock);
+    }
+}
+
 typedef struct {
     size_t indexes[QIHSE_RESP_MAX_ARGS];
     size_t count;
@@ -3064,9 +3111,6 @@ static bool qihse_resp_handle_increment(qihse_resp_session_t* session, const qih
     return stored ? qihse_resp_integer(session, value) : qihse_resp_error(session, "ERR increment failed");
 }
 
-static bool qihse_resp_tenant_key_allowed(uint32_t tenant,
-                                          const qihse_resp_arg_t* key);
-
 static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 4 || !session->server->vdb) return request->argc < 4 ? qihse_resp_wrong_arity(session, "vecset") : qihse_resp_error(session, "ERR vector database is not configured");
     uint64_t id;
@@ -3102,7 +3146,10 @@ static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_
     }
     const void* metadata_values[1] = { metadata };
     size_t metadata_sizes[1] = { metadata_size };
-    pthread_mutex_lock(&session->server->vdb_lock);
+    if (!qihse_resp_vdb_access_lock(session->server, session->server->vdb)) {
+        free(vector);
+        return qihse_resp_error(session, "ERR vector database lock failed");
+    }
     uint32_t tenant = session->user ? qihse_user_get_tenant_id(session->user) :
                                       QIHSE_TENANT_INVALID;
     bool tenant_owned = true;
@@ -3118,12 +3165,20 @@ static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_
             tenant_owned = old_tag_size != 0u &&
                            qihse_resp_tenant_key_allowed(tenant, &old_tag);
             free(old_tag_bytes);
-        } else if (errno != ENOENT) {
+        } else if (errno != ENOENT || !metadata) {
             tenant_owned = false;
+        }
+        if (tenant_owned && metadata) {
+            qihse_resp_arg_t new_tag = {
+                .data = (const uint8_t*)metadata,
+                .len = metadata_size
+            };
+            tenant_owned = metadata_size != 0u &&
+                           qihse_resp_tenant_key_allowed(tenant, &new_tag);
         }
     }
     if (!tenant_owned) {
-        pthread_mutex_unlock(&session->server->vdb_lock);
+        qihse_resp_vdb_access_unlock(session->server, session->server->vdb);
         free(vector);
         return qihse_resp_error(session,
             "NOPERM vector ID belongs to another tenant collection");
@@ -3132,7 +3187,7 @@ static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_
                                                  session->user, &id, vector, 1u, dims,
                                                  metadata ? metadata_values : NULL,
                                                  metadata ? metadata_sizes : NULL, NULL, NULL);
-    pthread_mutex_unlock(&session->server->vdb_lock);
+    qihse_resp_vdb_access_unlock(session->server, session->server->vdb);
     free(vector);
     return result ? qihse_resp_simple(session, "OK") : qihse_resp_error(session, "ERR vector upsert failed");
 }
@@ -3143,11 +3198,12 @@ static bool qihse_resp_handle_vecget(qihse_resp_session_t* session, const qihse_
     if (request->argc == 4 && !qihse_resp_arg_equal(&request->argv[2], "TAG")) return qihse_resp_error(session, "ERR syntax error");
     uint64_t id;
     if (!qihse_resp_parse_u64_arg(&request->argv[1], &id)) return qihse_resp_error(session, "ERR invalid vector id");
-    pthread_mutex_lock(&session->server->vdb_lock);
+    if (!qihse_resp_vdb_access_lock(session->server, session->server->vdb))
+        return qihse_resp_null(session);
     size_t dims = qihse_vector_db_get_dims(session->server->vdb);
     float* vector = dims ? (float*)malloc(dims * sizeof(*vector)) : NULL;
     bool found = vector && qihse_vector_db_get_vector_by_id_user(session->server->vdb, session->user, id, vector, &dims);
-    pthread_mutex_unlock(&session->server->vdb_lock);
+    qihse_resp_vdb_access_unlock(session->server, session->server->vdb);
     if (!found) {
         free(vector);
         return qihse_resp_null(session);
@@ -3222,13 +3278,15 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
             query.metadata_filter = qihse_vec_tag_match;
             query.metadata_filter_opaque = &tag_filter;
         }
-        pthread_mutex_lock(&session->server->vdb_lock);
+        bool locked = qihse_resp_vdb_access_lock(session->server,
+                                                  session->server->vdb);
+        if (!locked) { free(vector); free(results); return qihse_resp_error(session, "ERR vector database lock failed"); }
         int local_found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
         if (local_found < 0 && errno == ENOENT) {
             query.query_mode = QIHSE_VDB_QUERY_FLOAT32; /* no graph — exact scan */
             local_found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
         }
-        pthread_mutex_unlock(&session->server->vdb_lock);
+        qihse_resp_vdb_access_unlock(session->server, session->server->vdb);
 
         /* Query remote peers and merge with RRF */
         qihse_vector_result_t* remote_results = (qihse_vector_result_t*)calloc(top_k, sizeof(*remote_results));
@@ -3295,13 +3353,16 @@ static bool qihse_resp_handle_vecsearch(qihse_resp_session_t* session, const qih
     query.top_k = top_k;
     query.query_mode = QIHSE_VDB_QUERY_GRAPH;
     query.user = session->user;
-    pthread_mutex_lock(&session->server->vdb_lock);
+    if (!qihse_resp_vdb_access_lock(session->server, session->server->vdb)) {
+        free(vector); free(results);
+        return qihse_resp_error(session, "ERR vector database lock failed");
+    }
     int found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
     if (found < 0 && errno == ENOENT) {
         query.query_mode = QIHSE_VDB_QUERY_FLOAT32; /* graph absent — exact scan */
         found = qihse_vector_db_search(session->server->vdb, &query, results, top_k);
     }
-    pthread_mutex_unlock(&session->server->vdb_lock);
+    qihse_resp_vdb_access_unlock(session->server, session->server->vdb);
     bool response = found >= 0 ? qihse_resp_array(session, (size_t)found) : qihse_resp_error(session, "ERR vector search failed");
     for (int i = 0; response && i < found; i++) {
         response = qihse_resp_array(session, 2u) && qihse_resp_integer(session, (int64_t)results[i].id) && qihse_resp_reply_double(session, results[i].score);
@@ -3415,11 +3476,16 @@ static bool qihse_resp_handle_vechybrid(qihse_resp_session_t* session, const qih
             ? "ERR full-text projection is not built for this tenant"
             : "ERR full-text index is not configured");
     }
-    pthread_mutex_lock(&session->server->vdb_lock);
+    if (!qihse_resp_vdb_access_lock(session->server, session->server->vdb)) {
+        pthread_mutex_unlock(&session->server->fts_meta_lock);
+        free(vector);
+        free(fts_query);
+        return qihse_resp_error(session, "ERR vector database lock failed");
+    }
     size_t n = 0;
     qihse_fusion_result_t* fused =
         qihse_vector_db_search_multimodal(session->server->vdb, &mreq, &n);
-    pthread_mutex_unlock(&session->server->vdb_lock);
+    qihse_resp_vdb_access_unlock(session->server, session->server->vdb);
     pthread_mutex_unlock(&session->server->fts_meta_lock);
     free(vector);
     free(fts_query);
@@ -5812,7 +5878,6 @@ static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const
 }
 
 /* ---- Key/generic commands ---- */
-static bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key);
 
 /* AIMEM's canonical rows and control records are accessed through the typed
  * AIMEM API. Raw KV commands must not read, manufacture or mutate them. */
@@ -10125,7 +10190,7 @@ static bool qihse_resp_handle_script(qihse_resp_session_t* session, const qihse_
  * operator) are exempt. This is defense in depth against a mis-prefixed or
  * malicious tenant client — per-record clearance checks still apply below.
  * ------------------------------------------------------------------------- */
-static bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key) {
+bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key) {
     static const char commons_prefix[] = "commons/";
     if (key->len >= sizeof(commons_prefix) - 1u &&
         memcmp(key->data, commons_prefix, sizeof(commons_prefix) - 1u) == 0) {
@@ -10368,11 +10433,12 @@ static bool qihse_resp_handle_forensic(qihse_resp_session_t* session,
             return qihse_resp_error(session, "ERR forensic metadata too long");
         const void* metas[1] = {metadata};
         size_t sizes[1] = {(size_t)n};
-        pthread_mutex_lock(&server->forensic_lock);
+        if (!qihse_resp_vdb_access_lock(server, server->forensic_vdb))
+            return qihse_resp_error(session, "ERR forensic vector lock failed");
         bool ok = qihse_vector_db_upsert_by_ids_user(server->forensic_vdb,
                            session->user, &id, vector, 1u, 1024u, metas, sizes, NULL, NULL) &&
                   qihse_vector_db_flush(server->forensic_vdb);
-        pthread_mutex_unlock(&server->forensic_lock);
+        qihse_resp_vdb_access_unlock(server, server->forensic_vdb);
         return ok ? qihse_resp_simple(session, "OK") :
                     qihse_resp_error(session, "ERR forensic vector publication failed");
     }
@@ -10399,9 +10465,10 @@ static bool qihse_resp_handle_forensic(qihse_resp_session_t* session,
         query.query_mode = QIHSE_VDB_QUERY_FLOAT32;
         query.include_metadata = true;
         query.user = session->user;
-        pthread_mutex_lock(&server->forensic_lock);
+        if (!qihse_resp_vdb_access_lock(server, server->forensic_vdb))
+            return qihse_resp_error(session, "ERR forensic vector lock failed");
         int count = qihse_vector_db_search(server->forensic_vdb, &query, results, (size_t)top);
-        pthread_mutex_unlock(&server->forensic_lock);
+        qihse_resp_vdb_access_unlock(server, server->forensic_vdb);
         if (count < 0) return qihse_resp_error(session, "ERR forensic search failed");
         bool ok = qihse_resp_array(session, (size_t)count);
         for (int i = 0; i < count; i++) {
@@ -10909,9 +10976,12 @@ static void qihse_resp_metrics_sample(qihse_resp_server_t* server) {
         size_t budget = 0;
         size_t in_ram = 0;
         size_t spilled = 0;
-        pthread_mutex_lock(&server->vdb_lock);
-        bool have = qihse_vector_db_get_memory_usage(server->vdb, &budget, &in_ram, &spilled);
-        pthread_mutex_unlock(&server->vdb_lock);
+        bool vdb_locked = qihse_resp_vdb_access_lock(server, server->vdb);
+        bool have = false;
+        if (vdb_locked) {
+            have = qihse_vector_db_get_memory_usage(server->vdb, &budget, &in_ram, &spilled);
+            qihse_resp_vdb_access_unlock(server, server->vdb);
+        }
         if (have) {
             if (t->vector_bytes_in_ram) qihse_metrics_series_set(t->vector_bytes_in_ram, (double)in_ram);
             if (t->vector_rows_spilled) qihse_metrics_series_set(t->vector_rows_spilled, (double)spilled);
@@ -10922,9 +10992,11 @@ static void qihse_resp_metrics_sample(qihse_resp_server_t* server) {
          * real footprint, not a fabricated estimate. */
         size_t ib = 0;
         if (server->vdb) {
-            pthread_mutex_lock(&server->vdb_lock);
-            ib = qihse_vector_db_index_bytes(server->vdb);
-            pthread_mutex_unlock(&server->vdb_lock);
+            bool vdb_locked = qihse_resp_vdb_access_lock(server, server->vdb);
+            if (vdb_locked) {
+                ib = qihse_vector_db_index_bytes(server->vdb);
+                qihse_resp_vdb_access_unlock(server, server->vdb);
+            }
         }
         qihse_metrics_series_set(t->index_bytes_hnsw, (double)ib);
     }

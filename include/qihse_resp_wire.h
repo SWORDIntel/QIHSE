@@ -30,6 +30,20 @@
 #include "qihse_resp_fts_namespace.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
+
+/* Serialize adapter access to a borrowed vector handle. With an owner, the
+ * owner must be the RESP server that owns the same VDB; its lock is acquired
+ * before the handle-wide adapter guard. A NULL owner uses only the handle
+ * guard (for legacy/raw adapters). */
+bool qihse_resp_vdb_access_lock(qihse_resp_server_t* owner,
+                                qihse_vector_db_t expected_vdb);
+bool qihse_resp_main_vdb_access_lock(qihse_resp_server_t* owner,
+                                     qihse_vector_db_t expected_vdb);
+void qihse_resp_vdb_access_unlock(qihse_resp_server_t* owner,
+                                  qihse_vector_db_t expected_vdb);
+/* Shared tenant namespace predicate for metadata-backed collection tags. */
+bool qihse_resp_tenant_key_allowed(uint32_t tenant,
+                                   const qihse_resp_arg_t* key);
 /* A receipt can only be produced by the pinned-QKP CT receipt verifier. The
  * type is opaque so callers cannot manufacture authenticated peer evidence. */
 typedef struct qihse_cluster_ct_peer_receipt qihse_cluster_ct_peer_receipt_t;

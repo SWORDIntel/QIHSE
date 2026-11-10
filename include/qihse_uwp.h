@@ -130,6 +130,13 @@ bool qihse_uwp_dispatch_streaming(qihse_uwp_context_t* ctx, qihse_user_t* user,
                                   uint8_t* out_response, size_t out_cap,
                                   size_t* out_len);
 
+#ifdef QIHSE_UWP_TESTING
+/* Private test build seam for the guarded socket VECSET operation. */
+bool qihse_uwp_test_vector_set_user(qihse_uwp_context_t* ctx,
+                                    qihse_user_t* user, uint64_t id,
+                                    const float* vector, size_t dims);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

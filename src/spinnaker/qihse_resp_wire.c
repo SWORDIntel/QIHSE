@@ -230,6 +230,11 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                     continue;
                 }
+                if (qihse_user_get_tenant_id(current_user) != QIHSE_TENANT_SYSTEM) {
+                    const char* reply = "-NOPERM tenant vector access requires the primary RESP adapter\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 uint64_t id = strtoull(args[1], NULL, 10);
                 if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_WRITE)) {
                     const char* reply = "-ERR Access denied\r\n";
@@ -250,8 +255,12 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     for (int i = 0; i < dim; i++) {
                         vec[i] = strtof(args[3 + i], NULL);
                     }
-                    bool stored = qihse_vector_db_upsert_by_ids_user(vdb,
-                        current_user, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
+                    bool stored = qihse_resp_vdb_access_lock(NULL, vdb);
+                    if (stored) {
+                        stored = qihse_vector_db_upsert_by_ids_user(vdb,
+                            current_user, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
+                        qihse_resp_vdb_access_unlock(NULL, vdb);
+                    }
                     const char* reply = stored ? "+OK\r\n" :
                                                  "-ERR vector upsert failed\r\n";
                     resp_write_all(client_fd, reply, strlen(reply));
@@ -266,9 +275,19 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                     continue;
                 }
+                if (qihse_user_get_tenant_id(current_user) != QIHSE_TENANT_SYSTEM) {
+                    const char* reply = "-NOPERM tenant vector access requires the primary RESP adapter\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 uint64_t id = strtoull(args[1], NULL, 10);
                 if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_READ)) {
                     const char* reply = "-ERR Access denied\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
+                if (!qihse_resp_vdb_access_lock(NULL, vdb)) {
+                    const char* reply = "-ERR vector database lock failed\r\n";
                     resp_write_all(client_fd, reply, strlen(reply));
                     continue;
                 }
@@ -281,7 +300,7 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     if (!vec) {
                         const char* reply = "-ERR out of memory\r\n";
                         resp_write_all(client_fd, reply, strlen(reply));
-                    } else if (qihse_vector_db_get_vector_by_id(vdb, id, vec, &dims)) {
+                    } else if (qihse_vector_db_get_vector_by_id_user(vdb, current_user, id, vec, &dims)) {
                         char header[64];
                         snprintf(header, sizeof(header), "*%zu\r\n", dims);
                         resp_write_all(client_fd, header, strlen(header));
@@ -298,7 +317,18 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     }
                     free(vec);
                 }
+                qihse_resp_vdb_access_unlock(NULL, vdb);
             } else if (strcasecmp(args[0], "VECSEARCH") == 0 && argc >= 3) {
+                if (!current_user) {
+                    const char* reply = "-NOAUTH Authentication required.\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
+                if (qihse_user_get_tenant_id(current_user) != QIHSE_TENANT_SYSTEM) {
+                    const char* reply = "-NOPERM tenant vector access requires the primary RESP adapter\r\n";
+                    resp_write_all(client_fd, reply, strlen(reply));
+                    continue;
+                }
                 int dim = (int)strtol(args[1], NULL, 10);
                 int top_k = (int)strtol(args[2], NULL, 10);
                 if (dim <= 0 || dim > 2048 || top_k <= 0 || top_k > 1000) {
@@ -318,7 +348,11 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     query.user = current_user;
                     
                     qihse_vector_result_t *results = malloc(top_k * sizeof(qihse_vector_result_t));
-                    int found = qihse_vector_db_search(vdb, &query, results, top_k);
+                    int found = -1;
+                    if (qihse_resp_vdb_access_lock(NULL, vdb)) {
+                        found = qihse_vector_db_search(vdb, &query, results, top_k);
+                        qihse_resp_vdb_access_unlock(NULL, vdb);
+                    }
                     
                     if (found >= 0) {
                         char reply[1024];

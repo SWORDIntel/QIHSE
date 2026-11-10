@@ -333,6 +333,61 @@ static uwp_route_result_t uwp_resp_target(qihse_uwp_context_t* ctx, qihse_user_t
     return UWP_ROUTE_OK;
 }
 
+static bool uwp_vector_set_user(qihse_uwp_context_t* ctx, qihse_user_t* user,
+                                uint64_t id, const float* vector, size_t dims) {
+    if (!ctx || !ctx->vdb || !user || !vector || dims == 0u ||
+        !qihse_auth_can_access_object(user, 0, id, QIHSE_ACL_WRITE)) {
+        errno = EACCES;
+        return false;
+    }
+    qihse_resp_server_t* owner = (qihse_resp_server_t*)ctx->resp_server;
+    bool locked = owner ?
+        qihse_resp_main_vdb_access_lock(owner, ctx->vdb) :
+        qihse_resp_vdb_access_lock(NULL, ctx->vdb);
+    if (!locked) return false;
+    bool tenant_owned = true;
+    uint32_t tenant = qihse_user_get_tenant_id(user);
+    if (tenant != QIHSE_TENANT_SYSTEM) {
+        void* old_tag_bytes = NULL;
+        size_t old_tag_size = 0u;
+        if (qihse_vector_db_get_metadata_by_id_user(ctx->vdb, user, id,
+                &old_tag_bytes, &old_tag_size)) {
+            qihse_resp_arg_t old_tag = {
+                .data = (const uint8_t*)old_tag_bytes,
+                .len = old_tag_size
+            };
+            tenant_owned = old_tag_size != 0u &&
+                           qihse_resp_tenant_key_allowed(tenant, &old_tag);
+            free(old_tag_bytes);
+        } else {
+            /* UWP's VECTOR write has no TAG field. A tenant can update an
+             * existing row in its namespace (metadata is preserved), but
+             * cannot create an unscoped row or claim another tenant's ID. */
+            tenant_owned = false;
+        }
+    }
+    if (!tenant_owned) {
+        qihse_resp_vdb_access_unlock(owner, ctx->vdb);
+        errno = EACCES;
+        return false;
+    }
+    bool ok = qihse_vector_db_upsert_by_ids_user(ctx->vdb, user, &id, vector,
+                                                  1u, dims, NULL, NULL,
+                                                  NULL, NULL);
+    qihse_resp_vdb_access_unlock(owner, ctx->vdb);
+    return ok;
+}
+
+#ifdef QIHSE_UWP_TESTING
+/* Test seam for the exact write helper used by the socket route. It retains
+ * object ACL checks and the caller's typed principal; it adds no bypass. */
+bool qihse_uwp_test_vector_set_user(qihse_uwp_context_t* ctx,
+                                    qihse_user_t* user, uint64_t id,
+                                    const float* vector, size_t dims) {
+    return uwp_vector_set_user(ctx, user, id, vector, dims);
+}
+#endif
+
 static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* conn,
                                              qihse_uwp_context_t* ctx,
                                              qihse_uwp_header_t* header, uint8_t* payload,
@@ -455,14 +510,14 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 uint64_t expected_len = 12 + ((uint64_t)dims * sizeof(float));
                 if (len < expected_len) break;
 
-                _Alignas(32) float staging[4096];
+                float* staging = malloc((size_t)dims * sizeof(float));
+                if (!staging) return UWP_ROUTE_ERR_DISPATCH;
                 memcpy(staging, payload + 12, (size_t)dims * sizeof(float));
-                if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_WRITE)) {
-                    return UWP_ROUTE_ERR_PERM;
-                }
-                if (!qihse_vector_db_upsert_by_ids_user(ctx->vdb, current_user,
-                                                   &id, staging, 1, dims,
-                                                   NULL, NULL, NULL, NULL)) {
+                bool stored = uwp_vector_set_user(ctx, current_user, id,
+                                                   staging, dims);
+                free(staging);
+                if (!stored) {
+                    if (errno == EACCES) return UWP_ROUTE_ERR_PERM;
                     return UWP_ROUTE_ERR_DISPATCH;
                 }
                 const char* reply = "OK\n";
