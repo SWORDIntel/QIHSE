@@ -314,6 +314,65 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
                                                state_digest, &state_index));
   assert(!strcmp(selected[500].owner_topology_id, "topology-b") &&
          selected[500].epoch == 101);
+
+  /* Exercise indexed ID and reserve lookups after a terminal-history tail.
+   * Keep the final owner on B because following cases use that source group. */
+  for (unsigned n = 0; n < 12; ++n) {
+    assert(qihse_consensus_mesh_range_state_user(
+        meshes[client], operator_user, bitmap, 5000u, selected,
+        state_digest, &state_index));
+    bool owner_a = !strcmp(selected[500].owner_topology_id, "topology-a");
+    assert(owner_a || !strcmp(selected[500].owner_topology_id, "topology-b"));
+    qihse_consensus_range_request_t history = {0};
+    history.op = QIHSE_RANGE_OP_TRANSFER;
+    snprintf(history.transfer_id, sizeof(history.transfer_id),
+             "transfer-history-%u", n);
+    snprintf(history.source_topology_id, sizeof(history.source_topology_id),
+             "topology-%c", owner_a ? 'a' : 'b');
+    snprintf(history.source_qkp_id, sizeof(history.source_qkp_id),
+             "mesh-node-%u", owner_a ? 0u : 2u);
+    snprintf(history.source_group_id, sizeof(history.source_group_id), "%s",
+             owner_a ? TEST_GROUP_A : TEST_GROUP_B);
+    snprintf(history.target_topology_id, sizeof(history.target_topology_id),
+             "topology-%c", owner_a ? 'b' : 'a');
+    snprintf(history.target_qkp_id, sizeof(history.target_qkp_id),
+             "mesh-node-%u", owner_a ? 2u : 0u);
+    snprintf(history.target_group_id, sizeof(history.target_group_id), "%s",
+             owner_a ? TEST_GROUP_B : TEST_GROUP_A);
+    snprintf(history.successor_topology_id,
+             sizeof(history.successor_topology_id), "topology-c");
+    snprintf(history.successor_qkp_id, sizeof(history.successor_qkp_id),
+             "mesh-node-1");
+    snprintf(history.source_generation, sizeof(history.source_generation),
+             "00000000000000000000000000000003");
+    snprintf(history.target_generation, sizeof(history.target_generation),
+             "00000000000000000000000000000004");
+    memcpy(history.slots, bitmap, sizeof(bitmap));
+    memcpy(history.expected_state_digest, state_digest, sizeof(state_digest));
+    qihse_consensus_range_grant_t history_grant;
+    assert(qihse_consensus_mesh_range_reserve_user(
+        meshes[client], operator_user, &history, 5000u, &history_grant));
+    uint8_t history_evidence[32];
+    memset(history_evidence, (int)(0x60u + n), sizeof(history_evidence));
+    qihse_consensus_range_decision_t history_decision;
+    assert(qihse_consensus_mesh_range_finalize_user(
+        meshes[client], operator_user, &history, &history_grant,
+        history_evidence, 5000u, &history_decision));
+  }
+  assert(qihse_consensus_mesh_range_state_user(
+      meshes[client], operator_user, bitmap, 5000u, selected, state_digest,
+      &state_index));
+  assert(!strcmp(selected[500].owner_topology_id, "topology-b") &&
+         selected[500].epoch == 113u);
+  for (unsigned n = 0; n < 12; n += 11) {
+    char history_id[65];
+    snprintf(history_id, sizeof(history_id), "transfer-history-%u", n);
+    assert(qihse_consensus_mesh_range_lookup_user(
+        meshes[client], operator_user, history_id, &observed_request,
+        &observed_grant, &observed_decision, &phase));
+    assert(phase == QIHSE_RANGE_PHASE_FINALIZED &&
+           observed_decision.decision_index > observed_grant.reserve_index);
+  }
   free(selected);
   free(genesis);
 }

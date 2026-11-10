@@ -1863,6 +1863,10 @@ typedef struct {
   uint64_t pending_terminal_index;
   uint8_t pending_evidence_digest[32];
   qihse_consensus_range_decision_t decision;
+  size_t active_prev; /* index + 1 in range_state.active_head/tail */
+  size_t active_next;
+  uint64_t transfer_hash;
+  uint64_t reserve_hash;
 } qcm_range_pending_t;
 
 typedef struct {
@@ -1870,6 +1874,12 @@ typedef struct {
   qcm_range_pending_t *pending;
   size_t pending_count;
   size_t pending_cap;
+  size_t *transfer_index; /* open-addressed pending index + 1 */
+  size_t *reserve_index;  /* open-addressed pending index + 1 */
+  size_t index_cap;
+  size_t *active_by_slot; /* pending index + 1; only nonterminal intents */
+  size_t active_head;     /* pending index + 1, in durable-log order */
+  size_t active_tail;
   bool initialized;
   uint64_t genesis_index;
   uint8_t genesis_digest[32];
@@ -2014,8 +2024,147 @@ static bool qcm_range_digest(const void *data, size_t n, uint8_t out[32]) {
   return qcm_sha256(data, n, out);
 }
 
+static uint64_t qcm_range_hash_id(const char *id) {
+  uint64_t h = UINT64_C(14695981039346656037);
+  for (const unsigned char *p = (const unsigned char *)id; *p; ++p) {
+    h ^= *p;
+    h *= UINT64_C(1099511628211);
+  }
+  return h ? h : 1u;
+}
+
+static uint64_t qcm_range_hash_u64(uint64_t v) {
+  v ^= v >> 30u;
+  v *= UINT64_C(0xbf58476d1ce4e5b9);
+  v ^= v >> 27u;
+  v *= UINT64_C(0x94d049bb133111eb);
+  v ^= v >> 31u;
+  return v ? v : 1u;
+}
+
+static bool qcm_range_selected(const uint8_t *bitmap, uint16_t slot);
+
+static bool qcm_range_index_insert(size_t *table, size_t cap,
+                                  const qcm_range_state_t *s, size_t index,
+                                  bool by_transfer) {
+  const qcm_range_pending_t *p = &s->pending[index];
+  uint64_t hash = by_transfer ? p->transfer_hash : p->reserve_hash;
+  size_t slot = (size_t)hash & (cap - 1u);
+  while (table[slot]) {
+    size_t existing = table[slot] - 1u;
+    if (by_transfer ? !strcmp(s->pending[existing].request.transfer_id,
+                              p->request.transfer_id)
+                    : s->pending[existing].grant.reserve_index ==
+                          p->grant.reserve_index)
+      return false;
+    slot = (slot + 1u) & (cap - 1u);
+  }
+  table[slot] = index + 1u;
+  return true;
+}
+
+static bool qcm_range_index_grow(qcm_range_state_t *s, size_t required) {
+  size_t cap = s->index_cap ? s->index_cap : 32u;
+  while (required >= cap - cap / 3u) {
+    if (cap > SIZE_MAX / 2u)
+      return false;
+    cap *= 2u;
+  }
+  if (cap == s->index_cap)
+    return true;
+  if (cap > SIZE_MAX / sizeof(size_t))
+    return false;
+  size_t *transfer = calloc(cap, sizeof(*transfer));
+  size_t *reserve = calloc(cap, sizeof(*reserve));
+  if (!transfer || !reserve) {
+    free(transfer);
+    free(reserve);
+    return false;
+  }
+  for (size_t i = 0; i < s->pending_count; ++i)
+    if (!qcm_range_index_insert(transfer, cap, s, i, true) ||
+        !qcm_range_index_insert(reserve, cap, s, i, false)) {
+      free(transfer);
+      free(reserve);
+      return false;
+    }
+  free(s->transfer_index);
+  free(s->reserve_index);
+  s->transfer_index = transfer;
+  s->reserve_index = reserve;
+  s->index_cap = cap;
+  return true;
+}
+
+static size_t qcm_range_find_transfer(const qcm_range_state_t *s,
+                                      const char *transfer_id) {
+  if (!s->index_cap || !s->transfer_index)
+    return SIZE_MAX;
+  uint64_t hash = qcm_range_hash_id(transfer_id);
+  size_t slot = (size_t)hash & (s->index_cap - 1u);
+  while (s->transfer_index[slot]) {
+    size_t index = s->transfer_index[slot] - 1u;
+    if (s->pending[index].transfer_hash == hash &&
+        !strcmp(s->pending[index].request.transfer_id, transfer_id))
+      return index;
+    slot = (slot + 1u) & (s->index_cap - 1u);
+  }
+  return SIZE_MAX;
+}
+
+static size_t qcm_range_find_reserve(const qcm_range_state_t *s,
+                                     uint64_t reserve_index) {
+  if (!s->index_cap || !s->reserve_index)
+    return SIZE_MAX;
+  uint64_t hash = qcm_range_hash_u64(reserve_index);
+  size_t slot = (size_t)hash & (s->index_cap - 1u);
+  while (s->reserve_index[slot]) {
+    size_t index = s->reserve_index[slot] - 1u;
+    if (s->pending[index].reserve_hash == hash &&
+        s->pending[index].grant.reserve_index == reserve_index)
+      return index;
+    slot = (slot + 1u) & (s->index_cap - 1u);
+  }
+  return SIZE_MAX;
+}
+
+static void qcm_range_active_add(qcm_range_state_t *s, size_t index) {
+  qcm_range_pending_t *p = &s->pending[index];
+  p->active_prev = s->active_tail;
+  p->active_next = 0u;
+  if (s->active_tail)
+    s->pending[s->active_tail - 1u].active_next = index + 1u;
+  else
+    s->active_head = index + 1u;
+  s->active_tail = index + 1u;
+  for (uint16_t slot = 0; slot < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++slot)
+    if (qcm_range_selected(p->request.slots, slot))
+      s->active_by_slot[slot] = index + 1u;
+}
+
+static void qcm_range_active_remove(qcm_range_state_t *s, size_t index) {
+  qcm_range_pending_t *p = &s->pending[index];
+  if (p->active_prev)
+    s->pending[p->active_prev - 1u].active_next = p->active_next;
+  else
+    s->active_head = p->active_next;
+  if (p->active_next)
+    s->pending[p->active_next - 1u].active_prev = p->active_prev;
+  else
+    s->active_tail = p->active_prev;
+  for (uint16_t slot = 0; slot < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++slot)
+    if (qcm_range_selected(p->request.slots, slot) &&
+        s->active_by_slot[slot] == index + 1u)
+      s->active_by_slot[slot] = 0u;
+  p->active_prev = 0u;
+  p->active_next = 0u;
+}
+
 static bool qcm_range_append_pending(qcm_range_state_t *s,
                                      const qcm_range_pending_t *p) {
+  if (s->pending_count == SIZE_MAX ||
+      !qcm_range_index_grow(s, s->pending_count + 1u))
+    return false;
   if (s->pending_count == s->pending_cap) {
     size_t cap = s->pending_cap ? s->pending_cap * 2u : 16u;
     if (cap <= s->pending_count || cap > SIZE_MAX / sizeof(*s->pending))
@@ -2026,7 +2175,17 @@ static bool qcm_range_append_pending(qcm_range_state_t *s,
     s->pending = n;
     s->pending_cap = cap;
   }
-  s->pending[s->pending_count++] = *p;
+  size_t index = s->pending_count;
+  s->pending[index] = *p;
+  s->pending[index].transfer_hash =
+      qcm_range_hash_id(s->pending[index].request.transfer_id);
+  s->pending[index].reserve_hash =
+      qcm_range_hash_u64(s->pending[index].grant.reserve_index);
+  if (!qcm_range_index_insert(s->transfer_index, s->index_cap, s, index, true) ||
+      !qcm_range_index_insert(s->reserve_index, s->index_cap, s, index, false))
+    return false;
+  s->pending_count++;
+  qcm_range_active_add(s, index);
   return true;
 }
 
@@ -2133,16 +2292,18 @@ static bool qcm_range_digest_state(const qcm_range_state_t *s,
       qcm_range_encode_slot(&s->slots[i], wire);
       ok = EVP_DigestUpdate(ctx, wire, sizeof(wire)) == 1;
     }
-  for (size_t j = 0; ok && j < s->pending_count; j++)
-    if (!s->pending[j].terminal &&
-        qcm_range_overlap(bitmap, s->pending[j].request.slots)) {
+  for (size_t link = s->active_head; ok && link;
+       link = s->pending[link - 1u].active_next) {
+    const qcm_range_pending_t *pending = &s->pending[link - 1u];
+    if (qcm_range_overlap(bitmap, pending->request.slots)) {
       uint8_t id[32];
       uint8_t req[QCM_RANGE_REQUEST_WIRE];
-      qcm_range_encode_request(&s->pending[j].request, req);
+      qcm_range_encode_request(&pending->request, req);
       ok = qcm_range_digest(req, sizeof(req), id) &&
            EVP_DigestUpdate(ctx, "P", 1) == 1 &&
            EVP_DigestUpdate(ctx, id, sizeof(id)) == 1;
     }
+  }
   unsigned int n = 0;
   if (ok)
     ok = EVP_DigestFinal_ex(ctx, out, &n) == 1 && n == 32;
@@ -2158,8 +2319,14 @@ static bool qcm_range_replay_locked(qihse_consensus_mesh_t *m,
                                     uint64_t *commit_out) {
   memset(s, 0, sizeof(*s));
   s->slots = calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*s->slots));
-  if (!s->slots)
+  s->active_by_slot = calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT,
+                             sizeof(*s->active_by_slot));
+  if (!s->slots || !s->active_by_slot) {
+    free(s->slots);
+    free(s->active_by_slot);
+    memset(s, 0, sizeof(*s));
     return false;
+  }
   uint64_t commit = qihse_consensus_commit_index(m->consensus);
   uint64_t last = qihse_consensus_last_log_index(m->consensus);
   if (commit_out)
@@ -2230,44 +2397,42 @@ static bool qcm_range_replay_locked(qihse_consensus_mesh_t *m,
         goto fail;
       }
       bool bad = false;
-      for (size_t z = 0; z < s->pending_count; z++) {
-        qcm_range_pending_t *old = &s->pending[z];
-        if (!strcmp(old->request.transfer_id, p.request.transfer_id)) {
-          uint8_t x[QCM_RANGE_REQUEST_WIRE], y[QCM_RANGE_REQUEST_WIRE];
-          qcm_range_encode_request(&old->request, x);
-          qcm_range_encode_request(&p.request, y);
-          if (memcmp(x, y, sizeof(x)))
-            bad = true;
-          else { /* exact retries share the first grant and its commit state */
-            old->committed = old->committed || committed;
-            if (old->grant.reserve_index < i)
-              p = *old;
-          }
-          break;
-        }
-        if (!old->terminal &&
-            qcm_range_overlap(old->request.slots, p.request.slots))
+      size_t prior_index = qcm_range_find_transfer(s, p.request.transfer_id);
+      if (prior_index != SIZE_MAX) {
+        qcm_range_pending_t *old = &s->pending[prior_index];
+        uint8_t x[QCM_RANGE_REQUEST_WIRE], y[QCM_RANGE_REQUEST_WIRE];
+        qcm_range_encode_request(&old->request, x);
+        qcm_range_encode_request(&p.request, y);
+        if (memcmp(x, y, sizeof(x)))
           bad = true;
+        else { /* exact retries share the first grant and its commit state */
+          old->committed = old->committed || committed;
+          if (old->grant.reserve_index < i)
+            p = *old;
+        }
+      } else {
+        for (uint16_t slot = 0; slot < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++slot)
+          if (qcm_range_selected(p.request.slots, slot) &&
+              s->active_by_slot[slot]) {
+            bad = true;
+            break;
+          }
       }
       if (bad) {
         free(b);
         goto fail;
       }
-      bool exists = false;
-      for (size_t z = 0; z < s->pending_count; z++)
-        if (!strcmp(s->pending[z].request.transfer_id, p.request.transfer_id))
-          exists = true;
-      if (!exists && !qcm_range_append_pending(s, &p)) {
+      if (prior_index == SIZE_MAX && !qcm_range_append_pending(s, &p)) {
         free(b);
         goto fail;
       }
     } else if (n == QCM_RANGE_TERMINAL_WIRE &&
                (!memcmp(b, "QRF1", 4) || !memcmp(b, "QRB1", 4))) {
       uint64_t reserve_idx = qcm_auth_get64(b + 4);
-      qcm_range_pending_t *p = NULL;
-      for (size_t z = 0; z < s->pending_count; z++)
-        if (s->pending[z].grant.reserve_index == reserve_idx)
-          p = &s->pending[z];
+      size_t pending_index = qcm_range_find_reserve(s, reserve_idx);
+      qcm_range_pending_t *p = pending_index == SIZE_MAX
+                                   ? NULL
+                                   : &s->pending[pending_index];
       if (!p || memcmp(p->grant.reserve_digest, b + 12, 32)) {
         free(b);
         goto fail;
@@ -2292,6 +2457,7 @@ static bool qcm_range_replay_locked(qihse_consensus_mesh_t *m,
         p->pending_terminal_index = i;
         memcpy(p->pending_evidence_digest, b + 76, 32);
       }
+      bool newly_terminal = committed && !p->terminal;
       p->terminal = committed;
       p->finalized = finalized;
       p->decision.decision_index = p->pending_terminal_index;
@@ -2316,9 +2482,15 @@ static bool qcm_range_replay_locked(qihse_consensus_mesh_t *m,
         memcpy(canonical_terminal, original, sizeof(canonical_terminal));
         free(original);
       }
-      (void)qcm_range_digest(canonical_terminal, sizeof(canonical_terminal),
-                             p->decision.decision_digest);
+      if (!qcm_range_digest(canonical_terminal, sizeof(canonical_terminal),
+                            p->decision.decision_digest)) {
+        free(b);
+        goto fail;
+      }
       /* Only committed terminal entries change the public owner map. */
+      if (newly_terminal) {
+        qcm_range_active_remove(s, pending_index);
+      }
       if (committed && p->finalized)
         for (uint16_t k = 0; k < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; k++)
           if (qcm_range_selected(p->request.slots, k)) {
@@ -2339,6 +2511,9 @@ static bool qcm_range_replay_locked(qihse_consensus_mesh_t *m,
 fail:
   free(s->pending);
   free(s->slots);
+  free(s->transfer_index);
+  free(s->reserve_index);
+  free(s->active_by_slot);
   memset(s, 0, sizeof(*s));
   return false;
 }
@@ -2346,6 +2521,9 @@ fail:
 static void qcm_range_state_free(qcm_range_state_t *s) {
   free(s->pending);
   free(s->slots);
+  free(s->transfer_index);
+  free(s->reserve_index);
+  free(s->active_by_slot);
   memset(s, 0, sizeof(*s));
 }
 
@@ -2518,19 +2696,18 @@ bool qihse_consensus_mesh_range_reserve_user(
       forwarded =
           qcm_range_replay_locked(m, u, &state, &commit) && commit >= idx;
       if (forwarded) {
+        size_t index = qcm_range_find_transfer(&state, request->transfer_id);
         forwarded = false;
-        for (size_t i = 0; i < state.pending_count; i++) {
-          qcm_range_pending_t *p = &state.pending[i];
+        if (index != SIZE_MAX) {
+          qcm_range_pending_t *p = &state.pending[index];
           uint8_t actual[QCM_RANGE_REQUEST_WIRE];
           qcm_range_encode_request(&p->request, actual);
-          if (!strcmp(p->request.transfer_id, request->transfer_id) &&
-              p->committed && p->grant.reserve_index == idx &&
+          if (p->committed && p->grant.reserve_index == idx &&
               p->grant.grant_epoch == epoch &&
               !memcmp(p->grant.reserve_digest, digest, 32) &&
               !memcmp(actual, encoded, sizeof(actual))) {
             *out = p->grant;
             forwarded = true;
-            break;
           }
         }
       }
@@ -2557,12 +2734,11 @@ bool qihse_consensus_mesh_range_reserve_user(
        s.genesis_index <= commit;
   bool exact = false;
   qcm_range_pending_t *existing = NULL;
-  if (ok)
-    for (size_t i = 0; i < s.pending_count; i++)
-      if (!strcmp(s.pending[i].request.transfer_id, request->transfer_id)) {
-        existing = &s.pending[i];
-        break;
-      }
+  if (ok) {
+    size_t index = qcm_range_find_transfer(&s, request->transfer_id);
+    if (index != SIZE_MAX)
+      existing = &s.pending[index];
+  }
   if (ok && existing) {
     uint8_t old[QCM_RANGE_REQUEST_WIRE];
     qcm_range_encode_request(&existing->request, old);
@@ -2594,13 +2770,10 @@ bool qihse_consensus_mesh_range_reserve_user(
       if (slot->epoch > max_epoch)
         max_epoch = slot->epoch;
     }
-  for (size_t i = 0; ok && !exact && i < s.pending_count; i++) {
-    qcm_range_pending_t *p = &s.pending[i];
-    if (!strcmp(p->request.transfer_id, request->transfer_id)) {
-    } else if (!p->terminal &&
-               qcm_range_overlap(p->request.slots, request->slots))
+  for (uint16_t i = 0; ok && !exact && i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT;
+       ++i)
+    if (qcm_range_selected(request->slots, i) && s.active_by_slot[i])
       ok = false;
-  }
   if (ok && !exact) {
     if (max_epoch == UINT64_MAX)
       ok = false;
@@ -2629,12 +2802,11 @@ bool qihse_consensus_mesh_range_reserve_user(
       uint64_t c = 0;
       ok = qcm_range_replay_locked(m, u, &after, &c);
       if (ok) {
-        for (size_t i = 0; i < after.pending_count; i++)
-          if (!strcmp(after.pending[i].request.transfer_id,
-                      request->transfer_id)) {
-            *out = after.pending[i].grant;
-            break;
-          }
+        size_t index = qcm_range_find_transfer(&after, request->transfer_id);
+        if (index == SIZE_MAX)
+          ok = false;
+        else
+          *out = after.pending[index].grant;
       }
       qcm_range_state_free(&after);
       pthread_mutex_unlock(&m->state_lock);
@@ -2685,15 +2857,15 @@ static bool qcm_range_terminal(qihse_consensus_mesh_t *m, const qihse_user_t *u,
       uint64_t commit = 0;
       bool replayed = qcm_range_replay_locked(m, u, &after, &commit);
       if (replayed && commit >= idx) {
-        for (size_t i = 0; i < after.pending_count; i++) {
-          qcm_range_pending_t *p = &after.pending[i];
+        size_t index = qcm_range_find_transfer(&after, request->transfer_id);
+        if (index != SIZE_MAX) {
+          qcm_range_pending_t *p = &after.pending[index];
           if (p->decision.decision_index == idx &&
               p->decision.grant_epoch == epoch &&
               !memcmp(p->decision.decision_digest, digest, 32) &&
               p->finalized == finalize && p->terminal) {
             *out = p->decision;
             ok = true;
-            break;
           }
         }
       }
@@ -2715,12 +2887,11 @@ static bool qcm_range_terminal(qihse_consensus_mesh_t *m, const qihse_user_t *u,
        s.genesis_index <= commit;
   qcm_range_pending_t *p = NULL;
   bool already = false;
-  if (ok)
-    for (size_t i = 0; i < s.pending_count; i++)
-      if (!strcmp(s.pending[i].request.transfer_id, request->transfer_id)) {
-        p = &s.pending[i];
-        break;
-      }
+  if (ok) {
+    size_t index = qcm_range_find_transfer(&s, request->transfer_id);
+    if (index != SIZE_MAX)
+      p = &s.pending[index];
+  }
   if (ok) {
     uint8_t stored[QCM_RANGE_REQUEST_WIRE];
     ok = p && p->grant.reserve_index == grant->reserve_index &&
@@ -2781,15 +2952,13 @@ static bool qcm_range_terminal(qihse_consensus_mesh_t *m, const qihse_user_t *u,
     uint64_t c = 0;
     ok = qcm_range_replay_locked(m, u, &after, &c);
     if (ok) {
-      for (size_t i = 0; i < after.pending_count; i++)
-        if (!strcmp(after.pending[i].request.transfer_id,
-                    request->transfer_id) &&
-            after.pending[i].terminal &&
-            after.pending[i].finalized == finalize &&
-            !memcmp(after.pending[i].decision.evidence_digest, evidence, 32)) {
-          *out = after.pending[i].decision;
-          break;
-        }
+      size_t index = qcm_range_find_transfer(&after, request->transfer_id);
+      if (index == SIZE_MAX || !after.pending[index].terminal ||
+          after.pending[index].finalized != finalize ||
+          memcmp(after.pending[index].decision.evidence_digest, evidence, 32))
+        ok = false;
+      else
+        *out = after.pending[index].decision;
     }
     qcm_range_state_free(&after);
     pthread_mutex_unlock(&m->state_lock);
@@ -2837,20 +3006,17 @@ bool qihse_consensus_mesh_range_lookup_user(
   bool ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
             s.genesis_index <= commit;
   if (ok) {
-    for (size_t i = 0; i < s.pending_count; i++)
-      if (!strcmp(s.pending[i].request.transfer_id, transfer_id)) {
-        if (!s.pending[i].committed)
-          break;
-        *request = s.pending[i].request;
-        *grant = s.pending[i].grant;
-        if (s.pending[i].terminal)
-          *decision = s.pending[i].decision;
-        *phase = !s.pending[i].terminal
-                     ? QIHSE_RANGE_PHASE_RESERVED
-                     : (s.pending[i].finalized ? QIHSE_RANGE_PHASE_FINALIZED
-                                               : QIHSE_RANGE_PHASE_ABORTED);
-        break;
-      }
+    size_t index = qcm_range_find_transfer(&s, transfer_id);
+    if (index != SIZE_MAX && s.pending[index].committed) {
+      *request = s.pending[index].request;
+      *grant = s.pending[index].grant;
+      if (s.pending[index].terminal)
+        *decision = s.pending[index].decision;
+      *phase = !s.pending[index].terminal
+                   ? QIHSE_RANGE_PHASE_RESERVED
+                   : (s.pending[index].finalized ? QIHSE_RANGE_PHASE_FINALIZED
+                                                 : QIHSE_RANGE_PHASE_ABORTED);
+    }
   }
   qcm_range_state_free(&s);
   pthread_mutex_unlock(&m->state_lock);
