@@ -1,9 +1,8 @@
 /*
  * test_brain_rebalance.c — Brain R5 (rebalance on join) and R6 (stale prune).
  *
- *   A. largest owner + healthy slotless joiner
- *      -> a proportional tail handoff is refused until an all-writer fence
- *         exists (REBALANCE records the refusal without moving data)
+ *   A. largest owner + healthy slotless joiner, without the CT2 transfer
+ *      adapter -> no legacy handoff is attempted and no data moves
  *   B. node unhealthy past the prune timeout, owns no slots
  *      -> pruned from the topology (PRUNE), and it disappears from
  *         qihse_cluster_topology_nodes()
@@ -305,10 +304,9 @@ int main(void) {
     sleep_ms(3500);
     qihse_cluster_brain_stop();
 
-    /* A — the brain records a refused handoff while all slots and values
-     * remain local. The target receives no SET and no owner journal exists. */
-    assert(journal_has_detail(dir_a, "REBALANCE", "all-writer fence"));
-    assert(journal_has_detail(dir_a, "REBALANCE", "\"ok\":false"));
+    /* A — without the durable CT2 adapter, act mode does not fall back to
+     * the legacy handoff. All slots and values remain local. */
+    assert(!journal_has(dir_a, "REBALANCE"));
     uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
     qihse_cluster_slot_state_t state;
     uint16_t peer_index = QIHSE_CLUSTER_NODE_NONE;

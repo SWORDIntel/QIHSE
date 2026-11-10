@@ -91,8 +91,9 @@ typedef struct {
     uint32_t act_cooldown_seconds;  /* per-range re-home cooldown (default 30) */
     uint32_t rollback_window_seconds; /* R4 evaluation window (default 60) */
     uint32_t prune_timeout_seconds;   /* prune a node unhealthy this long (0 = never) */
-    uint32_t rebalance_min_slots;     /* minimum donor ownership; configured CT2 also
-                                       * balances populated peers (0 = disabled) */
+    uint32_t rebalance_min_slots;     /* optional minimum donor ownership for automatic
+                                       * balancing (0 = no extra minimum). R5 only acts
+                                       * through the durable CT2 transfer callback. */
     const char* federation_journal_dir; /* federation event journal directory;
                                          * NULL = journal_dir (topic "federation") */
     const char* node_key_handle;        /* federation node identity private key

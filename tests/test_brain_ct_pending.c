@@ -37,7 +37,7 @@ static void dispose(brain_t* b) {
 static void test_populated_policy(qihse_user_t* op) {
     char dir[] = "./brain-ct-policy-XXXXXX"; assert(mkdtemp(dir));
     brain_t* b = calloc(1, sizeof(*b)); assert(b); init(b, dir, op);
-    b->act = true; b->rebalance_min_slots = 10;
+    b->act = true; b->rebalance_min_slots = 0; /* --brain-act uses no hidden slot threshold */
     b->journal = qihse_event_stream_create(dir); assert(b->journal);
     assert(!pthread_mutex_init(&b->journal_lock, NULL));
     uint16_t local = qihse_cluster_topology_local_node(b->topology), peer;
@@ -57,13 +57,37 @@ static void test_populated_policy(qihse_user_t* op) {
         b->obs.nodes[i].role = QIHSE_CLUSTER_NODE_PRIMARY;
         snprintf(b->obs.nodes[i].id, sizeof(b->obs.nodes[i].id), "%s", n.id);
     }
-    b->precondition.valid = true; b->precondition.observation_seq = 1;
-    b->precondition.hlc.physical_ms = 1;
-    b->precondition.observation_hash[0] = b->precondition.payload_digest[0] = 1;
+    /* CT2 acts from the captured topology even if the optional observation
+     * federation journal is unavailable. The durable pending tuple and
+     * adapter's fence/generation checks remain mandatory. */
+    b->precondition.valid = false;
     unsigned before = calls; next_result = QIHSE_BRAIN_TRANSFER_COMMITTED;
     brain_check_rebalance(b, &b->obs);
     assert(calls == before + 1); assert(last_first == 8192 && last_last == 11999);
     assert(!b->pending.active);
+
+    /* The actor follows the largest current owner: after ownership shifts,
+     * node 1 can act and transfer toward node 0. There is no permanent node-0
+     * coordinator. */
+    assert(qihse_cluster_topology_assign_range(b->topology, 0, 4383, local));
+    assert(qihse_cluster_topology_assign_range(b->topology, 4384, 16383, peer));
+    assert(qihse_cluster_topology_set_local_node(b->topology, peer));
+    b->obs.local_index = peer;
+    brain_obs_run_t shifted[] = {{local, 0, 4383}, {peer, 4384, 16383}};
+    b->obs.runs = shifted;
+    before = calls;
+    brain_check_rebalance(b, &b->obs);
+    assert(calls == before + 1);
+    assert(last_first == 12576 && last_last == 16383);
+    assert(!strcmp(b->pending.target, b->obs.nodes[0].id));
+
+    /* An actor with no durable CT2 callback cannot fall back to the legacy
+     * handoff path, even when its topology says it is the largest owner. */
+    b->transfer = NULL;
+    before = calls;
+    brain_check_rebalance(b, &b->obs);
+    assert(calls == before);
+    b->transfer = transfer;
     uint64_t cursor = 0; qihse_es_record_header_t h; uint8_t* payload = NULL;
     size_t size = 0; bool saw_outcome = false, saw_policy = false;
     while (qihse_event_stream_iterate(b->journal, "cluster.brain", &cursor, &h, &payload, &size)) {

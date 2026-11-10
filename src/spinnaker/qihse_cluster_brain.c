@@ -1946,12 +1946,11 @@ static bool brain_transfer_begin(brain_t* b, uint16_t first, uint16_t last,
  * its largest run to the least-owned primary; CT2 may subdivide oversized
  * ranges. Bytes/capacity weighting remains a separate policy enhancement. */
 static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
-    if (!brain->act || !brain->rebalance_min_slots || obs->node_count < 2u) return;
+    /* Rebalancing is an automatic part of act mode. A nonzero configured
+     * minimum is an optional donor floor; zero means no additional floor.
+     * Only the durable CT2 adapter may move ranges. */
+    if (!brain->act || !brain->transfer || obs->node_count < 2u) return;
     uint16_t local = obs->local_index;
-
-    size_t healthy = 0;
-    for (size_t i = 0; i < obs->node_count; i++)
-        if (obs->nodes[i].flags & BRAIN_OBS_F_HEALTHY) healthy++;
 
     /* Largest owner among healthy primaries (deterministic tie-break by index). */
     size_t best_slots = 0;
@@ -1972,7 +1971,8 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
             best_owner = obs->nodes[i].index;
         }
     }
-    if (best_owner != local || my_slots < brain->rebalance_min_slots) return;
+    if (best_owner != local ||
+        (brain->rebalance_min_slots && my_slots < brain->rebalance_min_slots)) return;
 
     for (size_t i = 0; i < obs->node_count; i++) {
         const brain_obs_node_t* joiner = &obs->nodes[i];
@@ -1983,7 +1983,6 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
             if (obs->runs[r].owner != joiner->index) continue;
             owned += (size_t)(obs->runs[r].end - obs->runs[r].start) + 1u;
         }
-        if (!brain->transfer && owned != 0) continue; /* legacy refusal fixture */
         /* Only the least loaded healthy primary receives (index tie-break). */
         bool least = true;
         for (size_t j = 0; j < obs->node_count; j++) {
@@ -1995,7 +1994,7 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
                     peer_owned += (size_t)(obs->runs[r].end - obs->runs[r].start) + 1u;
             if (peer_owned < owned || (peer_owned == owned && peer->index < joiner->index)) least = false;
         }
-        if (brain->transfer && (!least || my_slots <= owned + 1u)) continue;
+        if (!least || my_slots <= owned + 1u) continue;
 
         /* Evidence rule (same one R1 applies to owners): a joiner this bus
          * has never heard from directly is a stale entry, not a newcomer.
@@ -2015,9 +2014,8 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
                 pick_end = obs->runs[r].end;
             }
         }
-        size_t give = brain->transfer ? (my_slots - owned) / 2u :
-            my_slots / (healthy ? healthy : 1u);
-        size_t run_limit = brain->transfer ? pick_len : pick_len / 2u;
+        size_t give = (my_slots - owned) / 2u;
+        size_t run_limit = pick_len;
         if (give > run_limit) give = run_limit;
         if (give == 0) return;
         uint16_t first = (uint16_t)(pick_end - give + 1u);
@@ -2028,33 +2026,18 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
         snprintf(evidence, sizeof(evidence),
                  "{\"range\":\"%u-%u\",\"to\":\"%.12s\",\"my_slots\":%llu,\"joiner_slots\":%llu}",
                  first, pick_end, joiner->id, (unsigned long long)my_slots, (unsigned long long)owned);
-        /* No action without a journaled pre-condition. */
-        if (!brain_gate(brain, "rebalance", evidence)) return;
-
-        if (brain->transfer) {
-            bool begun = brain_transfer_begin(brain, first, pick_end, joiner->id);
-            char detail[256];
-            snprintf(detail, sizeof(detail),
-                "{\"range\":\"%u-%u\",\"to\":\"%s\",\"id\":\"%s\",\"started\":%s}",
-                first, pick_end, joiner->id, brain->pending.id, begun ? "true" : "false");
-            brain_journal(brain, "REBALANCE", detail);
-            brain_decision_record(brain, "rebalance", detail, true);
-            return;
-        }
-        uint64_t moved = 0, collected = 0;
-        char err[160];
-        int rc = qihse_cluster_handoff_range(brain->server, first, pick_end, joiner->index,
-                                             &moved, &collected, err, sizeof(err));
-        char detail[320];
+        /* The durable CT2 pending tuple is the authority for a balance move.
+         * Keep the observation as useful evidence, but do not make recovery
+         * or a validated fenced transfer depend on federation-journal
+         * availability. Legacy state actions remain behind brain_gate(). */
+        bool begun = brain_transfer_begin(brain, first, pick_end, joiner->id);
+        char detail[512];
         snprintf(detail, sizeof(detail),
-                 "{\"range\":\"%u-%u\",\"to\":\"%.12s\",\"moved\":%llu,\"collected\":%llu,"
-                 "\"ok\":%s,\"err\":\"%s\"}",
-                 first, pick_end, joiner->id, (unsigned long long)moved,
-                 (unsigned long long)collected, rc == 0 ? "true" : "false",
-                 rc == 0 ? "" : err);
+                 "{\"range\":\"%u-%u\",\"to\":\"%s\",\"id\":\"%s\",\"started\":%s,\"evidence\":%s}",
+                 first, pick_end, joiner->id, brain->pending.id,
+                 begun ? "true" : "false", evidence);
         brain_journal(brain, "REBALANCE", detail);
         brain_decision_record(brain, "rebalance", detail, true);
-        brain_range_cooldown(brain, first, pick_end, now);
         return; /* one action per cycle */
     }
 }
@@ -2076,11 +2059,15 @@ static void* brain_main(void* argument) {
             started = true;
         }
         brain_observe(brain);
+        /* A durable CT2 operation must be retried even when publication or
+         * readback of this cycle's optional observation failed. The pending
+         * tuple, active principals and CT2 generation/fence checks govern
+         * recovery; it takes precedence over any new placement this cycle. */
+        bool transfer_pending = brain_pending_run(brain);
         if (brain->obs.valid) {
             brain_check_isolation(brain, &brain->obs);
             brain_check_asymmetry(brain, &brain->obs);
-            /* Resume an uncertain operation before any new topology action. */
-            if (!brain_pending_run(brain)) {
+            if (!transfer_pending) {
                 brain_check_prune(brain, &brain->obs);
                 /* R1 and R5 both move data: at most one acts per cycle. */
                 if (!brain_check_rehome(brain, &brain->obs))
