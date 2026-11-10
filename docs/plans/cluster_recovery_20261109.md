@@ -368,6 +368,22 @@ new backup instead. Do not promise an automatic rollback after cutover.
   slot transfer does not distribute node-local AIMEM state. Do not retire the
   original stores until the live inventory comparison and AIMEM access path
   are reconciled.
+- Read-only authenticated recheck after rollout returned `cluster_state:ok`,
+  all 16,384 slots assigned/OK, zero failed or pending-fail slots, six known
+  nodes, and cluster size 3 from each of T420, T320, and 730xd. The owner
+  `DBSIZE` values remain 8,860, 52,661, and 209,941 (271,462 total); `AIMEM
+  COUNT` remains 0, 0, and 309. This confirms service health and preserves the
+  known 28-row difference from the 271,434-row union, but it does not explain
+  that difference or establish record-level equality.
+- Source inspection ruled out using the live replication snapshot as a
+  harmless backup shortcut: `REPL.SNAPSHOT.BEGIN` requires a marked namespace
+  and advances that peer's durable replication cursor. The underlying full
+  `qihse_kv_save_user` backup API explicitly rejects CT-enabled stores. No
+  live replica marks/cursors or data were changed for this investigation.
+  Until QIHSE exposes a supported authenticated full-owner inventory/export
+  that does not change replication state, retain the verified union and the
+  original backups and leave the 28 rows unresolved; do not re-merge or retire
+  source stores based on counts alone.
 - Automatic capacity-aware balancing, automatic failover promotion, and
   dynamic successor reassignment remain open roadmap items. Keep the current
   slot-count R5 automatic rebalancer disabled for this heterogeneous layout.
