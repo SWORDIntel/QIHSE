@@ -165,6 +165,10 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
   snprintf(request.target_qkp_id, sizeof(request.target_qkp_id), "mesh-node-2");
   snprintf(request.target_group_id, sizeof(request.target_group_id),
            TEST_GROUP_B);
+  snprintf(request.successor_topology_id,
+           sizeof(request.successor_topology_id), "topology-c");
+  snprintf(request.successor_qkp_id, sizeof(request.successor_qkp_id),
+           "mesh-node-1");
   snprintf(request.source_generation, sizeof(request.source_generation),
            "00000000000000000000000000000001");
   snprintf(request.target_generation, sizeof(request.target_generation),
@@ -181,6 +185,10 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
            "mesh-node-1");
   snprintf(competing.target_group_id, sizeof(competing.target_group_id),
            TEST_GROUP_C);
+  snprintf(competing.successor_topology_id,
+           sizeof(competing.successor_topology_id), "topology-d");
+  snprintf(competing.successor_qkp_id,
+           sizeof(competing.successor_qkp_id), "mesh-node-x");
 
   size_t current_leader = current_test_leader(meshes);
   assert(current_leader < NODE_COUNT && current_leader != client);
@@ -238,6 +246,19 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
                 i, stopped_leader);
   }
   assert(current_leader < NODE_COUNT && current_leader != stopped_leader);
+  qihse_consensus_range_request_t inherited_request;
+  qihse_consensus_range_grant_t inherited_grant;
+  qihse_consensus_range_decision_t inherited_decision;
+  qihse_consensus_range_phase_t inherited_phase;
+  assert(qihse_consensus_mesh_range_lookup_user(
+      meshes[current_leader], operator_user, request.transfer_id,
+      &inherited_request, &inherited_grant, &inherited_decision,
+      &inherited_phase));
+  assert(inherited_phase == QIHSE_RANGE_PHASE_RESERVED &&
+         inherited_decision.decision_index == 0u &&
+         inherited_decision.grant_epoch == 0u &&
+         memcmp(inherited_decision.decision_digest, (uint8_t[32]){0}, 32u) == 0 &&
+         memcmp(inherited_decision.evidence_digest, (uint8_t[32]){0}, 32u) == 0);
   uint8_t conflicting_abort_evidence[32];
   memset(conflicting_abort_evidence, 0xa5, sizeof(conflicting_abort_evidence));
   qihse_consensus_range_decision_t pending_decision;
@@ -268,6 +289,16 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
       state_digest, &state_index));
   assert(!strcmp(selected[500].owner_topology_id, "topology-b") &&
          selected[500].epoch == 101u);
+
+  qihse_consensus_range_request_t changed_successor = request;
+  snprintf(changed_successor.successor_topology_id,
+           sizeof(changed_successor.successor_topology_id), "topology-d");
+  snprintf(changed_successor.successor_qkp_id,
+           sizeof(changed_successor.successor_qkp_id), "mesh-node-x");
+  qihse_consensus_range_grant_t changed_grant;
+  assert(!qihse_consensus_mesh_range_reserve_user(
+      meshes[client], operator_user, &changed_successor, 500u,
+      &changed_grant));
 
   qihse_consensus_range_request_t observed_request;
   qihse_consensus_range_grant_t observed_grant;

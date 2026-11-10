@@ -1997,12 +1997,15 @@ static bool qcm_range_decode_request(const uint8_t *p, size_t len,
               sizeof(r->slots)))
     return false;
   bool promotion = r->op == QIHSE_RANGE_OP_PROMOTION;
-  if (promotion != !!r->successor_topology_id[0] ||
-      promotion != !!r->successor_qkp_id[0])
+  bool has_successor_topology = r->successor_topology_id[0] != '\0';
+  bool has_successor_qkp = r->successor_qkp_id[0] != '\0';
+  if (has_successor_topology != has_successor_qkp ||
+      (promotion && !has_successor_topology))
+    return false;
+  if (!strcmp(r->successor_topology_id, r->target_topology_id) ||
+      !strcmp(r->successor_qkp_id, r->target_qkp_id))
     return false;
   if (promotion && strcmp(r->source_group_id, r->target_group_id))
-    return false;
-  if (!promotion && (r->successor_topology_id[0] || r->successor_qkp_id[0]))
     return false;
   return true;
 }
@@ -2840,7 +2843,8 @@ bool qihse_consensus_mesh_range_lookup_user(
           break;
         *request = s.pending[i].request;
         *grant = s.pending[i].grant;
-        *decision = s.pending[i].decision;
+        if (s.pending[i].terminal)
+          *decision = s.pending[i].decision;
         *phase = !s.pending[i].terminal
                      ? QIHSE_RANGE_PHASE_RESERVED
                      : (s.pending[i].finalized ? QIHSE_RANGE_PHASE_FINALIZED
