@@ -1437,6 +1437,45 @@ test-repl-close-failure:
 	    tests/test_repl_close_wal.o -pthread
 	./tests/test_repl_close_failure
 
+.PHONY: test-repl-io-alloc test-vector-wal-admission
+test-repl-io-alloc:
+	$(CC) $(CFLAGS) -UNDEBUG -Dsend=qihse_test_send \
+	    -Drealloc=qihse_test_realloc -Dstrdup=qihse_test_strdup \
+	    -c src/spinnaker/qihse_repl.c -o tests/test_repl_io_impl.o
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_repl_io_alloc \
+	    tests/test_repl_io_alloc.c tests/test_repl_io_impl.o \
+	    src/tractable/qihse_wal.c -pthread
+	./tests/test_repl_io_alloc
+
+test-vector-wal-admission: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
+	    -Wl,--wrap=qihse_ctr_read_section_alloc,--wrap=qihse_ctr_wal_truncate \
+	    -o tests/test_vector_wal_admission tests/test_vector_wal_admission.c \
+	    src/broad_oak/qihse_vector_db.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_wal_admission
+
+test-serial: test-repl-io-alloc test-vector-wal-admission
+
+.PHONY: test-resp-raw-vector-tenant
+test-resp-raw-vector-tenant: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -Wl,--wrap=qihse_resp_engine_handle_legacy \
+	    -o tests/test_resp_raw_vector_tenant tests/test_resp_raw_vector_tenant.c \
+	    src/spinnaker/qihse_resp_wire.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_resp_raw_vector_tenant
+
+test-serial: test-resp-raw-vector-tenant
+
+.PHONY: test-vector-adapter-concurrency
+test-vector-adapter-concurrency: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_UWP_TESTING -Wl,--export-dynamic \
+	    -o tests/test_vector_adapter_concurrency tests/test_vector_adapter_concurrency.c \
+	    src/spinnaker/qihse_uwp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_adapter_concurrency
+
+test-serial: test-vector-adapter-concurrency
+
 test-backup-merge-concurrent: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_BACKUP_TEST -Wl,--export-dynamic \
 	    -o tests/test_backup_merge_concurrent tests/test_backup_merge_concurrent.c \

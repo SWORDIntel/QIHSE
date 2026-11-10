@@ -150,10 +150,10 @@ arena compaction, a durable transaction coordinator or an authenticated CT
 promotion chain. The additional targets are wired into the existing suite for
 future runs; the full suite remains stopped at the user's request.
 
-Vector handles still require callers to synchronize shared access. The primary
-RESP server holds its existing vector lock; adding authenticated mutation
-forms does not make the native handle or every legacy/UWP sharing arrangement
-internally thread-safe. Omitted batch metadata (`metadata_sizes == NULL`)
+Vector handles still require callers to synchronize shared access. The further
+pass below wires a shared handle guard through primary RESP, UWP and the raw
+fallback; native API users must also coordinate with that guard when sharing
+an adapter's handle. Omitted batch metadata (`metadata_sizes == NULL`)
 preserves existing bytes; supplied zero sizes explicitly clear them. The
 single-row form distinguishes omitted NULL/0 from a supplied pointer/0.
 
@@ -176,6 +176,56 @@ make -o lib test-arena-bounds test-mvcc-gc-failure test-file-posix-io \
   test-wal-durability test-repl-close-failure test-txn test-mvcc-delete \
   test-sql-delete-failures test-backup-merge-concurrent
 make -o lib test-persist test-resp-hybrid test-vector-tenant-isolation test-repl
+```
+
+### Further failure-path review (2026-11-10)
+
+The next pass repairs additional defects without changing the live services:
+
+| Area | Confirmed defect | Repair and evidence |
+| --- | --- | --- |
+| Vector ADD | An existing-ID or dimension rejection happened after writing a committed WAL pair. A reproduced rejected duplicate added 200 WAL bytes and prevented reopen. Individual row allocations could also fail after publishing part of a batch. | Validate IDs, dimensions, sizes and the full reservation before WAL publication; apply the reserved batch without further allocations. Rejection leaves the WAL unchanged and the original vector readable after reopen. Allocation-fault tests preserve counts and allow a valid retry with different dimensions. |
+| Vector row growth | Several independent reallocs could move old tracking arrays before another failed, leaving dangling pointers in the database handle. | Reserve tracking arrays together, copy existing state and publish only after the complete growth succeeds. Fault tests grow an existing eight-row database, retry failed growth, and check all previous vectors. |
+| Vector WAL recovery | A failed WAL read was treated as an empty WAL. Garbage after a complete commit was not always repaired, and required repair failures were ignored. Payload-length and writer framing arithmetic could wrap. | Reject failed reads and required repairs while preserving the WAL; repair from the last valid commit to the actual section length; check payload, frame and offset arithmetic. Read/repair fault, read-only prefix, garbage-tail, oversized-payload and subsequent-write/reopen checks pass. |
+| Replication stream | Single writes could leave incomplete frames; later sends could append to a failed frame, and peer closure could raise SIGPIPE. Slot growth could lose its original allocation on failure. | Loop through partial sends and EINTR, suppress SIGPIPE on supported sockets, close the stream after a failed frame, and advance the LSN only after complete transmission. Allocate slot names/capacity before publication. Deterministic send and allocation fixtures pass. |
+| Table publication | Live table generations could wrap from UINT64_MAX to zero, invalidating the stale-snapshot fence. | Reject direct mutations and write-transaction publication before overflow or any durable receipt/publication. The existing private fault seam verifies unchanged rows and failed commit at the maximum generation. |
+| CT transfer history | A source could start another transfer using an ID from an aborted or finalized operation; the target then rejected its conflicting immutable manifest after the source had fenced the range. | The existing locked source-journal replay rejects an ID already present in that journal before writing another intent or fencing. ABORTED/FINALIZED reuse cases preserve journal history; the source remains unfenced after rejection. This is source-history enforcement, not a new global ID registry. |
+| Shared vector adapters | Concurrent UWP socket workers and RESP could access one borrowed VDB under different locks, allowing mutation/reallocation to race. | A per-handle adapter guard is shared by primary RESP, UWP and legacy fallback. Existing owner locks precede the guard; independent handles retain independent guards. Eight mixed writer threads, tenant preimage denial, metadata preservation and independent-handle progress pass in the focused fixture. Native callers still own handle lifetime and external synchronization. |
+| Legacy RESP fallback | Vector fallback operations lacked tenant scoping, and direct protected reads omitted the supplied principal. Large fixed stack scratch and reply buffers truncated bulk GET/MGET output; owned KV result copies were leaked. | Tenant vector operations use the primary adapter; raw fallback rejects them explicitly while retaining system-domain classification checks and Operator access. Input scratch is heap-owned; bulk replies stream without the 1-KiB/64-KiB output ceiling and release every owned result. The raw connection frame drops from 147,824 to 1,440 bytes with GCC C99/O1 `-fstack-usage`; UWP socket routing is 448 bytes after heap staging. |
+
+The native vector fault fixture passes strict compilation and ASan/UBSan with
+leak detection enabled. Its instrumentation covers the changed vector unit;
+the linked shared library is not wholly instrumented. The replication fixture
+also passes a scoped ASan/UBSan run with leak detection disabled. These checks
+do not supply a full-suite result or change the outstanding durable 2PC and CT
+promotion-chain work.
+
+The combined library/daemon build and focused checks pass for vector
+admission/persistence, table/SQL publication, replication, mixed adapters,
+tenant isolation, hybrid RESP, UWP regression (29/29), ownership journal and
+abort/replay. A forced raw-fallback fixture verifies tenant/classification
+denial, Operator access, a 40,000-byte GET and an 80,000-byte MGET payload.
+That fixture passes ASan/UBSan with leak detection enabled. The mixed adapter
+fixture passes scoped ASan/UBSan (leak detection disabled) and ThreadSanitizer
+with the vector/UWP units instrumented; the whole linked library is not
+instrumented. No live data was read, migrated or restarted by this review.
+
+The first raw-fallback fixture teardown removed an active audit lock and
+correctly triggered continuity enforcement. Teardown now shuts down the audit
+writer before deleting its private test files. The leak check separately
+exposed the owned GET/MGET result leak above; it passes after freeing those
+results. The audit enforcement was kept intact.
+
+Additional focused targets are part of future suite discovery. From a built
+checkout, reproduce this pass with:
+
+```sh
+make -j8 lib cluster-daemon
+make -o lib test-repl-io-alloc test-vector-wal-admission test-persist \
+  test-sql-delete-failures test-repl test-resp-raw-vector-tenant \
+  test-vector-adapter-concurrency test-vector-tenant-isolation \
+  test-resp-hybrid test-uwp-regression test-ownership-journal \
+  test-ownership-abort-replay
 ```
 
 ## Resolved: expiry sweep and SSTable compaction
