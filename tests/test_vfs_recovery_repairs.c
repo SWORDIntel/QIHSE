@@ -37,7 +37,7 @@ static void remove_tree(const char* path)
 
 static void test_vfs_wal(void)
 {
-    char dir[] = "/tmp/qihse_vfs_recovery_XXXXXX";
+    char dir[] = "./tests/vfs_recovery_XXXXXX";
     assert(mkdtemp(dir));
     qihse_vfs_wal_t* wal = qihse_vfs_wal_create(dir);
     assert(wal);
@@ -108,16 +108,20 @@ static void test_sparse_cache_eviction(void)
     uint8_t got = 0;
     qihse_vfs_cache_put(cache, 0, a, sizeof(a));
     qihse_vfs_cache_put(cache, 10, b, sizeof(b));
+    assert(qihse_kv_set(cache->kv, "P000000000000000g", "unrelated", 0u, 0u));
     assert(qihse_vfs_cache_get(cache, 0, &got, 1) && got == a[0]);
     qihse_vfs_cache_evict_above(cache, 5);
     assert(qihse_vfs_cache_get(cache, 0, &got, 1) && got == a[0]);
     assert(!qihse_vfs_cache_get(cache, 10, &got, 1));
+    char* unrelated = qihse_kv_get(cache->kv, "P000000000000000g");
+    assert(unrelated && strcmp(unrelated, "unrelated") == 0);
+    free(unrelated);
     qihse_vfs_cache_destroy(cache);
 }
 
 int main(void)
 {
-    char data_dir[] = "/tmp/qihse_vfs_cache_XXXXXX";
+    char data_dir[] = "./tests/vfs_cache_XXXXXX";
     assert(mkdtemp(data_dir));
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
     qihse_audit_init();

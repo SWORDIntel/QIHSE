@@ -328,7 +328,7 @@ int main(void) {
      * and secret/SCI neighbor share a graph edge, but only the Operator may
      * see the protected vector-backed node. */
     {
-        char path[] = "/tmp/qihse-graph-vector-protected-XXXXXX";
+        char path[] = "./tests/graph-vector-protected-XXXXXX";
         int fd = mkstemp(path);
         assert(fd >= 0);
         close(fd);

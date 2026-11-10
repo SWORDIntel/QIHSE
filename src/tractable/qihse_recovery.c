@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 /* ── Analysis phase data ────────────────────────────────────────────────── */
 
@@ -211,6 +212,7 @@ void qihse_recovery_destroy(qihse_recovery_t* rec) {
 
 static bool rec_add_committed(qihse_recovery_t* rec, uint64_t txn_id) {
     if (rec->committed_count >= rec->committed_capacity) {
+        if (rec->committed_capacity > INT_MAX / 2) return false;
         int new_cap = rec->committed_capacity == 0 ? 64 : rec->committed_capacity * 2;
         if (new_cap < rec->committed_capacity ||
             (size_t)new_cap > SIZE_MAX / sizeof(uint64_t)) return false;
@@ -226,6 +228,7 @@ static bool rec_add_committed(qihse_recovery_t* rec, uint64_t txn_id) {
 
 static bool rec_add_aborted(qihse_recovery_t* rec, uint64_t txn_id) {
     if (rec->aborted_count >= rec->aborted_capacity) {
+        if (rec->aborted_capacity > INT_MAX / 2) return false;
         int new_cap = rec->aborted_capacity == 0 ? 64 : rec->aborted_capacity * 2;
         if (new_cap < rec->aborted_capacity ||
             (size_t)new_cap > SIZE_MAX / sizeof(uint64_t)) return false;
@@ -274,12 +277,20 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
                 goto replay_cleanup;
             }
             qihse_txn_register_committed(rec->txn_mgr, analysis.txns[i].txn_id);
+            if (!qihse_txn_is_committed(rec->txn_mgr, analysis.txns[i].txn_id)) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
         } else if (analysis.txns[i].status == 2) {
             if (!rec_add_aborted(rec, analysis.txns[i].txn_id)) {
                 rec->replay_failed = true;
                 goto replay_cleanup;
             }
             qihse_txn_register_aborted(rec->txn_mgr, analysis.txns[i].txn_id);
+            if (!qihse_txn_is_aborted(rec->txn_mgr, analysis.txns[i].txn_id)) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
         } else {
             /* Active (uncommitted) — treat as aborted (undo phase) */
             if (!rec_add_aborted(rec, analysis.txns[i].txn_id)) {
@@ -287,6 +298,10 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
                 goto replay_cleanup;
             }
             qihse_txn_register_aborted(rec->txn_mgr, analysis.txns[i].txn_id);
+            if (!qihse_txn_is_aborted(rec->txn_mgr, analysis.txns[i].txn_id)) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
         }
     }
 

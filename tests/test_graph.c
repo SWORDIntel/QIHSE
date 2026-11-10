@@ -497,7 +497,13 @@ static void test_ingest_edges_jsonl(void) {
 
 static void test_ingest_rejects_bad_jsonl_and_limits(void) {
     TEST("JSON ingest rejects malformed and over-limit records");
-    const char *path = "/tmp/test_ingest_rejects_graph.jsonl";
+    char fixture[] = "./tests/graph_ingest_XXXXXX";
+    ASSERT(mkdtemp(fixture), "create private ingest fixture");
+    char path[512], fifo[512];
+    ASSERT(snprintf(path, sizeof(path), "%s/input.jsonl", fixture) > 0,
+           "format input path");
+    ASSERT(snprintf(fifo, sizeof(fifo), "%s/input.fifo", fixture) > 0,
+           "format FIFO path");
     FILE *fp = fopen(path, "w"); ASSERT(fp, "create malformed fixture");
     fputs("{\"id\":\"valid\"}\n{bad json}\n", fp); fclose(fp);
     qihse_graph_t *g = qihse_graph_create(); ASSERT(g, "graph alloc");
@@ -559,8 +565,6 @@ static void test_ingest_rejects_bad_jsonl_and_limits(void) {
     ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
            "over-limit label record not reported/rejected");
 
-    const char *fifo = "/tmp/test_ingest_nonseekable_graph.jsonl";
-    unlink(fifo);
     ASSERT(mkfifo(fifo, 0600) == 0, "create FIFO fixture");
     pid_t writer = fork(); ASSERT(writer >= 0, "fork FIFO writer");
     if (writer == 0) {
@@ -579,7 +583,7 @@ static void test_ingest_rejects_bad_jsonl_and_limits(void) {
     ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
            "non-seekable input partially modified graph");
     unlink(fifo);
-    qihse_graph_destroy(g); remove(path); PASS();
+    qihse_graph_destroy(g); remove(path); rmdir(fixture); PASS();
 }
 
 static void test_indexed_incident_edges(void) {

@@ -781,6 +781,13 @@ test-graph-vector: lib
 	$(CC) $(CFLAGS) -o tests/test_graph_vector tests/test_graph_vector.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_graph_vector
 
+.PHONY: test-vfs-recovery-repairs
+test-vfs-recovery-repairs: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_vfs_recovery_repairs tests/test_vfs_recovery_repairs.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vfs_recovery_repairs
+
+test-serial: test-vfs-recovery-repairs
+
 test-zen-epyc-simd: lib
 ifeq ($(filter AMD,$(HOST_CPU_VENDOR)),AMD)
 	$(CC) $(CFLAGS) -o tests/test_zen_epyc_simd tests/test_zen_epyc_simd.c -L. -lqihse $(LDFLAGS)

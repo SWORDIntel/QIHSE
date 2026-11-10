@@ -12,8 +12,8 @@
  * an interim measure until qihse_kv_set_binary() is available in the Black
  * Hole API.
  *
- * The KV store is configured with classification 0 / SCI 0 so no auth
- * checks are performed on page reads; the caller (the VFS) is trusted.
+ * Cache entries use classification 0 / SCI 0. The legacy NULL context reads
+ * only that unclassified view; it does not confer Operator authority.
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -159,7 +159,7 @@ bool qihse_vfs_cache_get(qihse_vfs_page_cache_t* cache,
     char key[18];
     fmt_page_key(key, page_id);
 
-    /* qihse_kv_get_user with NULL user → uses OPERATOR access (classification 0). */
+    /* The cache uses the legacy unclassified-only view. */
     char* hex_val = qihse_kv_get_user(cache->kv, key, NULL);
     if (!hex_val) return false;
 
@@ -230,14 +230,15 @@ void qihse_vfs_cache_evict_above(qihse_vfs_page_cache_t* cache,
     bool ok = true;
     for (size_t i = 0; i < copy.count; i++) {
         uint64_t page_id = 0u;
+        bool valid = true;
         for (size_t j = 1; j < 17u; j++) {
             unsigned char c = (unsigned char)keys[i][j];
             unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
                              c >= 'a' && c <= 'f' ? (unsigned)(c - 'a') + 10u : 16u;
-            if (digit > 15u) { page_id = UINT64_MAX; break; }
+            if (digit > 15u) { valid = false; break; }
             page_id = (page_id << 4) | digit;
         }
-        if (page_id >= cutoff_id && !qihse_kv_del_user(cache->kv, keys[i], NULL))
+        if (valid && page_id >= cutoff_id && !qihse_kv_del_user(cache->kv, keys[i], NULL))
             ok = false;
     }
     free(keys);
