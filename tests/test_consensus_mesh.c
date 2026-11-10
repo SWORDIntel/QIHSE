@@ -19,25 +19,283 @@
 #include <sys/wait.h>
 
 #define NODE_COUNT 3u
+#define TEST_GROUP_A "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define TEST_GROUP_B                                                           \
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"                                           \
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+#define TEST_GROUP_C                                                           \
+  "cccccccccccccccccccccccccccccccc"                                           \
+  "cccccccccccccccccccccccccccccccc"
+#define TEST_GROUP_D                                                           \
+  "dddddddddddddddddddddddddddddddd"                                           \
+  "dddddddddddddddddddddddddddddddd"
 
 /* Elections continue while the RESP checks run. Never infer that a member
  * remains leader from an earlier assertion in this long crash/restart test. */
-static size_t current_test_leader(qihse_consensus_mesh_t* meshes[NODE_COUNT]) {
-    for (size_t i = 0; i < NODE_COUNT; ++i)
-        if (meshes[i] &&
-            qihse_consensus_mesh_role(meshes[i]) == QIHSE_CONSENSUS_LEADER)
-            return i;
-    return NODE_COUNT;
+static size_t current_test_leader(qihse_consensus_mesh_t *meshes[NODE_COUNT]) {
+  for (size_t i = 0; i < NODE_COUNT; ++i)
+    if (meshes[i] &&
+        qihse_consensus_mesh_role(meshes[i]) == QIHSE_CONSENSUS_LEADER)
+      return i;
+  return NODE_COUNT;
 }
 
-static void log_test_leader_change(const char* phase, size_t previous,
+static size_t wait_test_leader(qihse_consensus_mesh_t *meshes[NODE_COUNT]) {
+  for (unsigned attempt = 0; attempt < 1500u; ++attempt) {
+    size_t leader = current_test_leader(meshes);
+    if (leader < NODE_COUNT)
+      return leader;
+    usleep(10000u);
+  }
+  return NODE_COUNT;
+}
+
+static void restart_test_voter(qihse_consensus_mesh_t *meshes[NODE_COUNT],
+                               const qihse_consensus_mesh_config_t *configs,
+                               size_t index, uint64_t required_index) {
+  meshes[index] = qihse_consensus_mesh_create(&configs[index]);
+  assert(meshes[index]);
+  assert(qihse_consensus_mesh_start(meshes[index]));
+  bool caught_up = false;
+  for (unsigned attempt = 0; attempt < 1500u && !caught_up; ++attempt) {
+    size_t leader = current_test_leader(meshes);
+    caught_up = qihse_consensus_mesh_commit_index(meshes[index]) >= required_index &&
+                leader < NODE_COUNT;
+    if (!caught_up)
+      usleep(10000u);
+  }
+  assert(caught_up);
+}
+
+static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
+                                   const qihse_consensus_mesh_config_t *configs,
+                                   qihse_user_t *operator_user,
+                                   qihse_user_t *analyst) {
+  uint64_t required_index = 0;
+  for (size_t i = 0; i < NODE_COUNT; ++i)
+    if (meshes[i] &&
+        qihse_consensus_mesh_commit_index(meshes[i]) > required_index)
+      required_index = qihse_consensus_mesh_commit_index(meshes[i]);
+  for (size_t i = 0; i < NODE_COUNT; ++i)
+    if (!meshes[i])
+      restart_test_voter(meshes, configs, i, required_index);
+
+  size_t leader = current_test_leader(meshes);
+  assert(leader < NODE_COUNT);
+  size_t client = NODE_COUNT;
+  for (size_t i = 0; i < NODE_COUNT; ++i)
+    if (meshes[i] && i != leader) {
+      client = i;
+      break;
+    }
+  assert(client < NODE_COUNT);
+  qihse_consensus_range_slot_t *genesis =
+      calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*genesis));
+  qihse_consensus_range_slot_t *selected =
+      calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*selected));
+  assert(genesis && selected);
+  for (uint16_t i = 0; i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++i)
+    genesis[i].slot = i;
+  snprintf(genesis[500].owner_topology_id,
+           sizeof(genesis[500].owner_topology_id), "topology-a");
+  snprintf(genesis[500].owner_qkp_id, sizeof(genesis[500].owner_qkp_id),
+           "mesh-node-0");
+  snprintf(genesis[500].group_id, sizeof(genesis[500].group_id), TEST_GROUP_A);
+  genesis[500].epoch = 100;
+  uint8_t genesis_digest[32];
+  uint64_t genesis_index = 0;
+  assert(qihse_consensus_mesh_range_genesis_user(meshes[client], operator_user,
+                                                 genesis, 5000u, &genesis_index,
+                                                 genesis_digest));
+  assert(genesis_index > 0);
+  qihse_consensus_entry_t genesis_entry;
+  size_t genesis_entry_count = 0;
+  assert(qihse_consensus_mesh_read_committed(
+      meshes[client], operator_user, genesis_index, &genesis_entry, 1u,
+      &genesis_entry_count));
+  assert(genesis_entry_count == 1u &&
+         genesis_entry.payload_len == QIHSE_CONSENSUS_BLOB_REF_BYTES &&
+         !memcmp(genesis_entry.payload, "QBR1", 4u));
+  uint64_t raw_ref_index = 0;
+  assert(!qihse_consensus_mesh_propose(
+      meshes[client], operator_user, genesis_entry.journal_generation + 1u,
+      (qihse_hlc_t){.physical_ms = 1800000000001u, .logical = 0u}, 0u, 0u,
+      genesis_entry.payload, genesis_entry.payload_len, 500u, &raw_ref_index));
+  uint64_t denied_index = 0;
+  size_t genesis_wire_bytes = 4u +
+      (size_t)QIHSE_CONSENSUS_RANGE_SLOT_COUNT * 181u;
+  uint8_t *forged_genesis = calloc(genesis_wire_bytes, 1u);
+  assert(forged_genesis);
+  memcpy(forged_genesis, "QRG1", 4u);
+  for (uint32_t i = 0; i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++i) {
+    uint8_t *slot = forged_genesis + 4u + (size_t)i * 181u;
+    slot[0] = (uint8_t)(i >> 8u);
+    slot[1] = (uint8_t)i;
+  }
+  qihse_hlc_t denied_hlc = {0};
+  assert(!qihse_consensus_mesh_propose_transaction(
+      meshes[client], analyst, 100u, denied_hlc, 0u, 0u, forged_genesis,
+      genesis_wire_bytes, 500u, 500u, &denied_index));
+  free(forged_genesis);
+  assert(!qihse_consensus_mesh_range_genesis_user(
+      meshes[client], analyst, genesis, 500u, &denied_index, genesis_digest));
+
+  uint8_t bitmap[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES] = {0};
+  bitmap[500 / 8] |= (uint8_t)(1u << (500 % 8));
+  uint8_t state_digest[32];
+  uint64_t state_index = 0;
+  assert(qihse_consensus_mesh_range_state_user(meshes[client], operator_user,
+                                               bitmap, 5000u, selected,
+                                               state_digest, &state_index));
+  assert(selected[500].epoch == 100 &&
+         !strcmp(selected[500].group_id, TEST_GROUP_A));
+
+  qihse_consensus_range_request_t request = {0};
+  request.op = QIHSE_RANGE_OP_TRANSFER;
+  snprintf(request.transfer_id, sizeof(request.transfer_id),
+           "transfer-range-500");
+  snprintf(request.source_topology_id, sizeof(request.source_topology_id),
+           "topology-a");
+  snprintf(request.source_qkp_id, sizeof(request.source_qkp_id), "mesh-node-0");
+  snprintf(request.source_group_id, sizeof(request.source_group_id),
+           TEST_GROUP_A);
+  snprintf(request.target_topology_id, sizeof(request.target_topology_id),
+           "topology-b");
+  snprintf(request.target_qkp_id, sizeof(request.target_qkp_id), "mesh-node-2");
+  snprintf(request.target_group_id, sizeof(request.target_group_id),
+           TEST_GROUP_B);
+  snprintf(request.source_generation, sizeof(request.source_generation),
+           "00000000000000000000000000000001");
+  snprintf(request.target_generation, sizeof(request.target_generation),
+           "00000000000000000000000000000002");
+  memcpy(request.slots, bitmap, sizeof(bitmap));
+  memcpy(request.expected_state_digest, state_digest, sizeof(state_digest));
+
+  qihse_consensus_range_request_t competing = request;
+  snprintf(competing.transfer_id, sizeof(competing.transfer_id),
+           "transfer-conflict");
+  snprintf(competing.target_topology_id, sizeof(competing.target_topology_id),
+           "topology-c");
+  snprintf(competing.target_qkp_id, sizeof(competing.target_qkp_id),
+           "mesh-node-1");
+  snprintf(competing.target_group_id, sizeof(competing.target_group_id),
+           TEST_GROUP_C);
+
+  size_t current_leader = current_test_leader(meshes);
+  assert(current_leader < NODE_COUNT && current_leader != client);
+  size_t stopped_leader = current_leader;
+  assert(qihse_consensus_mesh_test_hold_append_replies(meshes[stopped_leader],
+                                                       true));
+  qihse_consensus_range_grant_t uncertain_grant;
+  assert(!qihse_consensus_mesh_range_reserve_user(
+      meshes[stopped_leader], operator_user, &request, 500u, &uncertain_grant));
+  qihse_consensus_range_request_t hidden_request;
+  qihse_consensus_range_grant_t hidden_grant;
+  qihse_consensus_range_decision_t hidden_decision;
+  qihse_consensus_range_phase_t hidden_phase;
+  assert(qihse_consensus_mesh_range_lookup_user(
+      meshes[stopped_leader], operator_user, request.transfer_id,
+      &hidden_request, &hidden_grant, &hidden_decision, &hidden_phase));
+  assert(hidden_phase == QIHSE_RANGE_PHASE_NONE &&
+         hidden_grant.reserve_index == 0 && hidden_request.transfer_id[0] == '\0');
+  assert(qihse_consensus_mesh_test_hold_append_replies(meshes[stopped_leader],
+                                                       false));
+
+  qihse_consensus_range_grant_t grant;
+  assert(qihse_consensus_mesh_range_reserve_user(meshes[client], operator_user,
+                                                 &request, 5000u, &grant));
+  assert(grant.reserve_index > 0 && grant.grant_epoch == 101);
+
+  qihse_consensus_range_grant_t rejected;
+  assert(!qihse_consensus_mesh_range_reserve_user(meshes[client], operator_user,
+                                                  &competing, 500u, &rejected));
+
+  uint8_t evidence[32];
+  memset(evidence, 0x5a, sizeof(evidence));
+  qihse_consensus_range_decision_t decision;
+  current_leader = current_test_leader(meshes);
+  assert(current_leader < NODE_COUNT);
+  stopped_leader = current_leader;
+  assert(qihse_consensus_mesh_test_hold_append_replies(meshes[stopped_leader],
+                                                       true));
+  assert(!qihse_consensus_mesh_range_finalize_user(
+      meshes[stopped_leader], operator_user, &request, &grant, evidence, 500u,
+      &decision));
+  qihse_consensus_mesh_stop(meshes[stopped_leader]);
+  qihse_consensus_mesh_destroy(meshes[stopped_leader]);
+  meshes[stopped_leader] = NULL;
+  current_leader = wait_test_leader(meshes);
+  if (current_leader == NODE_COUNT) {
+    for (size_t i = 0; i < NODE_COUNT; ++i)
+      if (meshes[i])
+        fprintf(stderr, "range terminal failover diagnostic node=%zu role=%d term=%llu commit=%llu\n",
+                i, (int)qihse_consensus_mesh_role(meshes[i]),
+                (unsigned long long)qihse_consensus_mesh_term(meshes[i]),
+                (unsigned long long)qihse_consensus_mesh_commit_index(meshes[i]));
+      else
+        fprintf(stderr, "range terminal failover diagnostic node=%zu absent (stopped=%zu)\n",
+                i, stopped_leader);
+  }
+  assert(current_leader < NODE_COUNT && current_leader != stopped_leader);
+  uint8_t conflicting_abort_evidence[32];
+  memset(conflicting_abort_evidence, 0xa5, sizeof(conflicting_abort_evidence));
+  qihse_consensus_range_decision_t pending_decision;
+  assert(!qihse_consensus_mesh_range_abort_user(
+      meshes[current_leader], operator_user, &request, &grant,
+      conflicting_abort_evidence, 500u, &pending_decision));
+  assert(qihse_consensus_mesh_range_finalize_user(meshes[current_leader], operator_user,
+                                                  &request, &grant, evidence,
+                                                  5000u, &decision));
+  restart_test_voter(meshes, configs, stopped_leader, decision.decision_index);
+  assert(decision.decision_index > grant.reserve_index);
+  assert(qihse_consensus_mesh_range_finalize_user(meshes[client], operator_user,
+                                                  &request, &grant, evidence,
+                                                  5000u, &decision));
+  qihse_consensus_range_request_t recovered_request;
+  qihse_consensus_range_grant_t recovered_grant;
+  qihse_consensus_range_decision_t recovered_decision;
+  qihse_consensus_range_phase_t recovered_phase;
+  assert(qihse_consensus_mesh_range_lookup_user(
+      meshes[stopped_leader], operator_user, request.transfer_id,
+      &recovered_request, &recovered_grant, &recovered_decision,
+      &recovered_phase));
+  assert(recovered_phase == QIHSE_RANGE_PHASE_FINALIZED &&
+         recovered_grant.reserve_index == grant.reserve_index &&
+         recovered_decision.decision_index == decision.decision_index);
+  assert(qihse_consensus_mesh_range_state_user(
+      meshes[stopped_leader], operator_user, bitmap, 5000u, selected,
+      state_digest, &state_index));
+  assert(!strcmp(selected[500].owner_topology_id, "topology-b") &&
+         selected[500].epoch == 101u);
+
+  qihse_consensus_range_request_t observed_request;
+  qihse_consensus_range_grant_t observed_grant;
+  qihse_consensus_range_decision_t observed_decision;
+  qihse_consensus_range_phase_t phase;
+  assert(qihse_consensus_mesh_range_lookup_user(
+      meshes[client], operator_user, request.transfer_id, &observed_request,
+      &observed_grant, &observed_decision, &phase));
+  assert(phase == QIHSE_RANGE_PHASE_FINALIZED &&
+         observed_grant.grant_epoch == 101);
+  assert(qihse_consensus_mesh_range_state_user(meshes[client], operator_user,
+                                               bitmap, 5000u, selected,
+                                               state_digest, &state_index));
+  assert(!strcmp(selected[500].owner_topology_id, "topology-b") &&
+         selected[500].epoch == 101);
+  free(selected);
+  free(genesis);
+}
+
+static void log_test_leader_change(const char *phase, size_t previous,
                                    size_t next,
-                                   qihse_consensus_mesh_t* meshes[NODE_COUNT]) {
-    fprintf(stderr, "mesh %s leader transition: %zu -> %zu", phase, previous, next);
-    if (next < NODE_COUNT)
-        fprintf(stderr, " term=%llu", (unsigned long long)
-                qihse_consensus_mesh_term(meshes[next]));
-    fputc('\n', stderr);
+                                   qihse_consensus_mesh_t *meshes[NODE_COUNT]) {
+  fprintf(stderr, "mesh %s leader transition: %zu -> %zu", phase, previous,
+          next);
+  if (next < NODE_COUNT)
+    fprintf(stderr, " term=%llu",
+            (unsigned long long)qihse_consensus_mesh_term(meshes[next]));
+  fputc('\n', stderr);
 }
 
 extern char** environ;
@@ -80,6 +338,8 @@ static int run_mesh_leader_child(const char* root, uint16_t ports[NODE_COUNT]) {
     consensus->self = members[0];
     consensus->member_count = NODE_COUNT;
     memcpy(consensus->members, members, sizeof(members));
+    memset(consensus->history_id, 0x5c, sizeof(consensus->history_id));
+    consensus->writer_epoch_floor = 1u;
     consensus->election_timeout_base_ms = 800u;
     consensus->election_timeout_spread_ms = 600u;
     consensus->heartbeat_interval_ms = 100u;
@@ -468,6 +728,8 @@ int main(int argc, char** argv) {
         consensus->self = members[i];
         consensus->member_count = NODE_COUNT;
         memcpy(consensus->members, members, sizeof(members));
+        memset(consensus->history_id, 0x5c, sizeof(consensus->history_id));
+        consensus->writer_epoch_floor = 1u;
         consensus->election_timeout_base_ms = 800u;
         consensus->election_timeout_spread_ms = 600u;
         consensus->heartbeat_interval_ms = 100u;
@@ -1042,9 +1304,80 @@ int main(int argc, char** argv) {
         assert(qihse_consensus_blob_validate(&blob_contexts[i], &entries[0]));
     }
 
+    test_range_arbitration(meshes, mesh_configs, operator_user, analyst);
+    /* The arbitration failover test reopens the voter it killed. Restore the
+     * two-voter topology expected by the following no-quorum assertion. */
+    if (meshes[0u]) {
+        qihse_consensus_mesh_destroy(meshes[0u]);
+        meshes[0u] = NULL;
+    }
+    bool range_test_secondary_leader = false;
+    for (unsigned attempt = 0; attempt < 1500u && !range_test_secondary_leader;
+         ++attempt) {
+        qihse_uuid_t leader_id;
+        range_test_secondary_leader =
+            qihse_consensus_mesh_role(meshes[2u]) == QIHSE_CONSENSUS_LEADER &&
+            qihse_consensus_mesh_leader_id(meshes[1u], &leader_id) &&
+            qihse_uuid_equal(&leader_id, &members[2u]);
+        if (!range_test_secondary_leader)
+            usleep(10000u);
+    }
+    assert(range_test_secondary_leader);
+    leader_index = (int)current_test_leader(meshes);
+    assert(leader_index >= 0 && leader_index < (int)NODE_COUNT);
+    pair_index = qihse_consensus_mesh_commit_index(meshes[leader_index]);
+    bool ranges_caught_up = false;
+    for (unsigned attempt = 0; attempt < 500u && !ranges_caught_up; attempt++) {
+        ranges_caught_up = true;
+        for (size_t i = 0; i < NODE_COUNT; i++)
+            if (meshes[i] && qihse_consensus_mesh_commit_index(meshes[i]) < pair_index)
+                ranges_caught_up = false;
+        if (!ranges_caught_up) usleep(10000u);
+    }
+    assert(ranges_caught_up);
+
     size_t remaining_index = 2u;
     qihse_consensus_mesh_destroy(meshes[1u]);
     meshes[1u] = NULL;
+    uint8_t range_bitmap[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES] = {0};
+    range_bitmap[500 / 8] |= (uint8_t)(1u << (500 % 8));
+    qihse_consensus_range_slot_t* range_state =
+        calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*range_state));
+    assert(range_state);
+    uint8_t range_digest[32];
+    uint64_t range_state_index = 0;
+    assert(qihse_consensus_mesh_range_state_user(
+        meshes[remaining_index], operator_user, range_bitmap, 1000u,
+        range_state, range_digest, &range_state_index));
+    qihse_consensus_range_request_t no_quorum_range = {0};
+    no_quorum_range.op = QIHSE_RANGE_OP_TRANSFER;
+    snprintf(no_quorum_range.transfer_id, sizeof(no_quorum_range.transfer_id),
+             "range-no-quorum");
+    snprintf(no_quorum_range.source_topology_id,
+             sizeof(no_quorum_range.source_topology_id), "topology-b");
+    snprintf(no_quorum_range.source_qkp_id,
+             sizeof(no_quorum_range.source_qkp_id), "mesh-node-2");
+    snprintf(no_quorum_range.source_group_id,
+             sizeof(no_quorum_range.source_group_id), TEST_GROUP_B);
+    snprintf(no_quorum_range.target_topology_id,
+             sizeof(no_quorum_range.target_topology_id), "topology-d");
+    snprintf(no_quorum_range.target_qkp_id,
+             sizeof(no_quorum_range.target_qkp_id), "mesh-node-1");
+    snprintf(no_quorum_range.target_group_id,
+             sizeof(no_quorum_range.target_group_id), TEST_GROUP_D);
+    snprintf(no_quorum_range.source_generation,
+             sizeof(no_quorum_range.source_generation),
+             "00000000000000000000000000000002");
+    snprintf(no_quorum_range.target_generation,
+             sizeof(no_quorum_range.target_generation),
+             "00000000000000000000000000000003");
+    memcpy(no_quorum_range.slots, range_bitmap, sizeof(range_bitmap));
+    memcpy(no_quorum_range.expected_state_digest, range_digest, sizeof(range_digest));
+    qihse_consensus_range_grant_t no_quorum_grant;
+    assert(!qihse_consensus_mesh_range_reserve_user(
+        meshes[remaining_index], operator_user, &no_quorum_range, 500u,
+        &no_quorum_grant));
+    free(range_state);
     static const uint8_t solo_transaction[] = "must-not-commit-alone";
     uint64_t solo_index = 0u;
     hlc.physical_ms++;

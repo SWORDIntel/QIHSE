@@ -490,6 +490,7 @@ static void qcm_rx_done(qcm_rx_ctx_t* ctx) {
 }
 
 static bool qcm_authority_receive(qcm_rx_ctx_t* ctx, const uint8_t* wire, size_t size);
+static bool qcm_range_receive(qcm_rx_ctx_t* ctx, const uint8_t* wire, size_t size);
 
 static void* qcm_rx_main(void* opaque) {
     qcm_rx_ctx_t* ctx = opaque;
@@ -522,6 +523,10 @@ static void* qcm_rx_main(void* opaque) {
         if ((size_t)received >= 4u && memcmp(wire, "QAF1", 4u) == 0) {
             (void)qcm_authority_receive(ctx, wire, (size_t)received);
             break; /* Dedicated request stream; ordinary ACK stream stays live. */
+        }
+        if ((size_t)received >= 4u && memcmp(wire, "QRF2", 4u) == 0) {
+            (void)qcm_range_receive(ctx, wire, (size_t)received);
+            break; /* Range authority forwarding uses a dedicated request stream. */
         }
         if ((size_t)received >= 4u &&
             (memcmp(wire, "QBT1", 4u) == 0 || memcmp(wire, "QBT2", 4u) == 0)) {
@@ -1329,6 +1334,17 @@ bool qihse_consensus_mesh_propose_membership(
     return committed;
 }
 
+static bool qcm_mesh_reserved_record(const void *payload, size_t payload_len) {
+  if (!payload || payload_len < 4u)
+    return false;
+  static const char *const reserved[] = {"QCA3", "QRG1", "QRR1",
+                                         "QRF1", "QRB1", "QBR1"};
+  for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+    if (memcmp(payload, reserved[i], 4u) == 0)
+      return true;
+  return false;
+}
+
 static bool qcm_mesh_propose_locked(qihse_consensus_mesh_t* mesh,
                                     const qihse_user_t* principal,
                                     uint64_t generation, qihse_hlc_t hlc,
@@ -1359,7 +1375,7 @@ bool qihse_consensus_mesh_propose(qihse_consensus_mesh_t* mesh,
                                   uint16_t classification, uint16_t sci,
                                   const void* payload, size_t payload_len,
                                   uint32_t timeout_ms, uint64_t* out_index) {
-    if (!mesh || !out_index) return false;
+    if (!mesh || !out_index || qcm_mesh_reserved_record(payload, payload_len)) return false;
     pthread_mutex_lock(&mesh->proposal_lock);
     bool ok = qcm_mesh_propose_locked(mesh, principal, generation, hlc,
         classification, sci, payload, payload_len, timeout_ms, out_index);
@@ -1461,7 +1477,7 @@ bool qihse_consensus_mesh_propose_transaction(
     uint64_t generation, qihse_hlc_t hlc, uint16_t classification,
     uint16_t sci, const void* transaction, size_t transaction_len,
     uint32_t stage_timeout_ms, uint32_t commit_timeout_ms, uint64_t* out_index) {
-    if (transaction && transaction_len >= 4u && !memcmp(transaction, "QCA3", 4u)) {
+    if (qcm_mesh_reserved_record(transaction, transaction_len)) {
         if (out_index) *out_index = 0u;
         return false;
     }
@@ -1481,7 +1497,7 @@ bool qihse_consensus_mesh_propose_transaction_auto_generation(
     const void* transaction, size_t transaction_len,
     uint32_t stage_timeout_ms, uint32_t commit_timeout_ms,
     uint64_t* out_generation, uint64_t* out_index) {
-    if (transaction && transaction_len >= 4u && !memcmp(transaction, "QCA3", 4u)) {
+    if (qcm_mesh_reserved_record(transaction, transaction_len)) {
         if (out_index) *out_index = 0u;
         return false;
     }
@@ -1513,7 +1529,7 @@ bool qihse_consensus_mesh_propose_transaction_if_generation(
     const void* transaction, size_t transaction_len,
     uint32_t stage_timeout_ms, uint32_t commit_timeout_ms,
     uint64_t* out_generation, uint64_t* out_index) {
-    if (transaction && transaction_len >= 4u && !memcmp(transaction, "QCA3", 4u)) {
+    if (qcm_mesh_reserved_record(transaction, transaction_len)) {
         if (out_index) *out_index = 0u;
         return false;
     }
@@ -1804,18 +1820,1345 @@ bool qihse_consensus_mesh_propose_authority(qihse_consensus_mesh_t* mesh,
     close(cancel[1]);
     (void)pthread_join(guard_thread, NULL);
     close(cancel[0]);
-    if (session) qihse_qkp_session_free(session);
+    if (session)
+      qihse_qkp_session_free(session);
     close(fd);
-    if (!ok || !index) return false;
+    if (!ok || !index)
+      return false;
     *out_index = index;
     do {
-        pthread_mutex_lock(&mesh->state_lock);
-        ok = qcm_authority_operator(principal) &&
-            qcm_authority_exact_locked(mesh, principal, index, record);
-        pthread_mutex_unlock(&mesh->state_lock);
-        if (ok) return true;
-        if (qcm_stopping(mesh)) return false;
-        struct timespec pause = {0, 5000000L}; nanosleep(&pause, NULL);
+      pthread_mutex_lock(&mesh->state_lock);
+      ok = qcm_authority_operator(principal) &&
+           qcm_authority_exact_locked(mesh, principal, index, record);
+      pthread_mutex_unlock(&mesh->state_lock);
+      if (ok)
+        return true;
+      if (qcm_stopping(mesh))
+        return false;
+      struct timespec pause = {0, 5000000L};
+      nanosleep(&pause, NULL);
     } while (qcm_now_ms() < deadline);
     return false;
+}
+
+/* Range authority uses ordinary quorum-staged QBR1 transactions. The records
+ * below are byte codecs (never native C layouts) so they remain portable. */
+#define QCM_RANGE_SLOT_WIRE (2u + 41u + 65u + 65u + 8u)
+#define QCM_RANGE_REQUEST_WIRE                                                 \
+  (1u + 65u + 41u + 65u + 65u + 41u + 65u + 65u + 41u + 65u + 33u + 33u + 8u + \
+   QIHSE_CONSENSUS_RANGE_BITMAP_BYTES + 32u)
+#define QCM_RANGE_GENESIS_WIRE                                                 \
+  (4u + QIHSE_CONSENSUS_RANGE_SLOT_COUNT * QCM_RANGE_SLOT_WIRE)
+#define QCM_RANGE_RESERVE_WIRE (4u + QCM_RANGE_REQUEST_WIRE + 8u)
+#define QCM_RANGE_TERMINAL_WIRE (4u + 8u + 32u + 32u + 32u)
+
+typedef struct {
+  qihse_consensus_range_request_t request;
+  qihse_consensus_range_grant_t grant;
+  bool committed;
+  bool terminal;
+  bool finalized;
+  bool pending_terminal;
+  bool pending_finalized;
+  uint64_t pending_terminal_index;
+  uint8_t pending_evidence_digest[32];
+  qihse_consensus_range_decision_t decision;
+} qcm_range_pending_t;
+
+typedef struct {
+  qihse_consensus_range_slot_t *slots;
+  qcm_range_pending_t *pending;
+  size_t pending_count;
+  size_t pending_cap;
+  bool initialized;
+  uint64_t genesis_index;
+  uint8_t genesis_digest[32];
+  uint64_t last_index;
+} qcm_range_state_t;
+
+static bool qcm_range_operator(const qihse_user_t *user) {
+  return qcm_authority_operator(user);
+}
+
+static bool qcm_range_mesh_valid(const qihse_consensus_mesh_t *mesh) {
+  if (!mesh || !mesh->started || !mesh->consensus_config.writer_epoch_floor ||
+      !mesh->consensus_config.group_id[0])
+    return false;
+  uint8_t nonzero = 0;
+  for (size_t i = 0; i < sizeof(mesh->consensus_config.history_id); ++i)
+    nonzero |= mesh->consensus_config.history_id[i];
+  return nonzero != 0;
+}
+
+static bool qcm_range_lower_hex(const char *text, size_t length) {
+  if (!text || strlen(text) != length)
+    return false;
+  for (size_t i = 0; i < length; ++i)
+    if (!((text[i] >= '0' && text[i] <= '9') ||
+          (text[i] >= 'a' && text[i] <= 'f')))
+      return false;
+  return true;
+}
+
+static void qcm_range_put16(uint8_t *p, uint16_t v) {
+  p[0] = (uint8_t)(v >> 8u);
+  p[1] = (uint8_t)v;
+}
+static uint16_t qcm_range_get16(const uint8_t *p) {
+  return (uint16_t)(((uint16_t)p[0] << 8u) | p[1]);
+}
+static void qcm_range_put64(uint8_t *p, uint64_t v) { qcm_auth_put64(p, v); }
+
+static bool qcm_range_text(const char *s, size_t width, bool allow_empty) {
+  size_t n = strnlen(s, width);
+  if (n == width || (!allow_empty && !n))
+    return false;
+  for (size_t i = 0; i < n; ++i)
+    if ((unsigned char)s[i] < 33u || (unsigned char)s[i] > 126u)
+      return false;
+  return true;
+}
+
+static void qcm_range_put_text(uint8_t **p, const char *s, size_t width) {
+  size_t n = strnlen(s, width);
+  memset(*p, 0, width);
+  memcpy(*p, s, n);
+  *p += width;
+}
+static bool qcm_range_get_text(const uint8_t **p, char *out, size_t width,
+                               bool allow_empty) {
+  const uint8_t *src = *p;
+  const uint8_t *z = memchr(src, 0, width);
+  if (!z || (!allow_empty && z == src))
+    return false;
+  size_t n = (size_t)(z - src);
+  for (size_t i = 0; i < n; ++i)
+    if (src[i] < 33u || src[i] > 126u)
+      return false;
+  memcpy(out, src, n);
+  out[n] = 0;
+  *p += width;
+  return true;
+}
+
+static void qcm_range_encode_request(const qihse_consensus_range_request_t *r,
+                                     uint8_t *out) {
+  uint8_t *p = out;
+  *p++ = (uint8_t)r->op;
+  qcm_range_put_text(&p, r->transfer_id, 65);
+  qcm_range_put_text(&p, r->source_topology_id, 41);
+  qcm_range_put_text(&p, r->source_qkp_id, 65);
+  qcm_range_put_text(&p, r->source_group_id, 65);
+  qcm_range_put_text(&p, r->target_topology_id, 41);
+  qcm_range_put_text(&p, r->target_qkp_id, 65);
+  qcm_range_put_text(&p, r->target_group_id, 65);
+  qcm_range_put_text(&p, r->successor_topology_id, 41);
+  qcm_range_put_text(&p, r->successor_qkp_id, 65);
+  qcm_range_put_text(&p, r->source_generation, 33);
+  qcm_range_put_text(&p, r->target_generation, 33);
+  qcm_range_put64(p, r->durable_cursor);
+  p += 8;
+  memcpy(p, r->slots, sizeof(r->slots));
+  p += sizeof(r->slots);
+  memcpy(p, r->expected_state_digest, 32);
+}
+
+static bool qcm_range_decode_request(const uint8_t *p, size_t len,
+                                     qihse_consensus_range_request_t *r) {
+  if (!p || !r || len != QCM_RANGE_REQUEST_WIRE)
+    return false;
+  memset(r, 0, sizeof(*r));
+  r->op = (qihse_consensus_range_op_t)*p++;
+  if (r->op != QIHSE_RANGE_OP_TRANSFER && r->op != QIHSE_RANGE_OP_PROMOTION)
+    return false;
+  if (!qcm_range_get_text(&p, r->transfer_id, 65, false) ||
+      !qcm_range_get_text(&p, r->source_topology_id, 41, false) ||
+      !qcm_range_get_text(&p, r->source_qkp_id, 65, false) ||
+      !qcm_range_get_text(&p, r->source_group_id, 65, false) ||
+      !qcm_range_get_text(&p, r->target_topology_id, 41, false) ||
+      !qcm_range_get_text(&p, r->target_qkp_id, 65, false) ||
+      !qcm_range_get_text(&p, r->target_group_id, 65, false) ||
+      !qcm_range_get_text(&p, r->successor_topology_id, 41, true) ||
+      !qcm_range_get_text(&p, r->successor_qkp_id, 65, true) ||
+      !qcm_range_get_text(&p, r->source_generation, 33, false) ||
+      !qcm_range_get_text(&p, r->target_generation, 33, false))
+    return false;
+  if (!qcm_range_lower_hex(r->source_generation, 32) ||
+      !qcm_range_lower_hex(r->target_generation, 32) ||
+      !qcm_range_lower_hex(r->source_group_id, 64) ||
+      !qcm_range_lower_hex(r->target_group_id, 64))
+    return false;
+  r->durable_cursor = qcm_auth_get64(p);
+  p += 8;
+  memcpy(r->slots, p, sizeof(r->slots));
+  p += sizeof(r->slots);
+  memcpy(r->expected_state_digest, p, 32);
+  if (!memcmp(r->slots, (uint8_t[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES]){0},
+              sizeof(r->slots)))
+    return false;
+  bool promotion = r->op == QIHSE_RANGE_OP_PROMOTION;
+  if (promotion != !!r->successor_topology_id[0] ||
+      promotion != !!r->successor_qkp_id[0])
+    return false;
+  if (promotion && strcmp(r->source_group_id, r->target_group_id))
+    return false;
+  if (!promotion && (r->successor_topology_id[0] || r->successor_qkp_id[0]))
+    return false;
+  return true;
+}
+
+static bool qcm_range_digest(const void *data, size_t n, uint8_t out[32]) {
+  return qcm_sha256(data, n, out);
+}
+
+static bool qcm_range_append_pending(qcm_range_state_t *s,
+                                     const qcm_range_pending_t *p) {
+  if (s->pending_count == s->pending_cap) {
+    size_t cap = s->pending_cap ? s->pending_cap * 2u : 16u;
+    if (cap <= s->pending_count || cap > SIZE_MAX / sizeof(*s->pending))
+      return false;
+    qcm_range_pending_t *n = realloc(s->pending, cap * sizeof(*n));
+    if (!n)
+      return false;
+    s->pending = n;
+    s->pending_cap = cap;
+  }
+  s->pending[s->pending_count++] = *p;
+  return true;
+}
+
+static bool qcm_range_get_transaction(qihse_consensus_mesh_t *m,
+                                      const qihse_user_t *u, uint64_t index,
+                                      bool durable, uint8_t **out,
+                                      size_t *out_len) {
+  qihse_consensus_entry_t e;
+  memset(&e, 0, sizeof(e));
+  size_t count = 0;
+  bool ok = durable
+                ? qihse_consensus_read_durable_entry_user(
+                      m->consensus, (qihse_user_t *)u, index, &e)
+                : qihse_consensus_read_committed_exact(
+                      m->consensus, (qihse_user_t *)u, index, &e, 1, &count);
+  if (!ok || e.index != index || e.type != QIHSE_CONSENSUS_ENTRY_DATA ||
+      e.payload_len != QIHSE_CONSENSUS_BLOB_REF_BYTES ||
+      memcmp(e.payload, "QBR1", 4u))
+    return false;
+  uint64_t cap = qcm_auth_get64(e.payload + 112u);
+  if (cap < QIHSE_CONSENSUS_BLOB_HEADER_BYTES || cap > QIHSE_BLOB_MAX_SIZE)
+    return false;
+  size_t n = (size_t)cap - QIHSE_CONSENSUS_BLOB_HEADER_BYTES;
+  uint8_t *b = malloc(n ? n : 1u);
+  if (!b)
+    return false;
+  size_t got = 0;
+  ok = durable ? qihse_consensus_blob_read_durable_transaction_user(
+                     m->blob_context, m->consensus, (qihse_user_t *)u, index, b,
+                     n, &got)
+               : qihse_consensus_blob_read_committed_transaction_user(
+                     m->blob_context, m->consensus, (qihse_user_t *)u, index, b,
+                     n, &got);
+  if (!ok || got != n) {
+    free(b);
+    return false;
+  }
+  *out = b;
+  *out_len = n;
+  return true;
+}
+
+static bool qcm_range_slot_valid(const qihse_consensus_range_slot_t *s,
+                                 uint16_t i) {
+  return s && s->slot == i &&
+         qcm_range_text(s->owner_topology_id, sizeof(s->owner_topology_id),
+                        true) &&
+         qcm_range_text(s->owner_qkp_id, sizeof(s->owner_qkp_id), true) &&
+         qcm_range_text(s->group_id, sizeof(s->group_id), true) &&
+         (!s->group_id[0] || qcm_range_lower_hex(s->group_id, 64)) &&
+         ((s->owner_topology_id[0] && s->owner_qkp_id[0] && s->group_id[0]) ||
+          (!s->owner_topology_id[0] && !s->owner_qkp_id[0] && !s->group_id[0]));
+}
+
+static void qcm_range_encode_slot(const qihse_consensus_range_slot_t *s,
+                                  uint8_t *out) {
+  uint8_t *p = out;
+  qcm_range_put16(p, s->slot);
+  p += 2;
+  qcm_range_put_text(&p, s->owner_topology_id, 41);
+  qcm_range_put_text(&p, s->owner_qkp_id, 65);
+  qcm_range_put_text(&p, s->group_id, 65);
+  qcm_range_put64(p, s->epoch);
+}
+static bool qcm_range_decode_slot(const uint8_t *b,
+                                  qihse_consensus_range_slot_t *s, uint16_t i) {
+  const uint8_t *p = b;
+  memset(s, 0, sizeof(*s));
+  s->slot = qcm_range_get16(p);
+  p += 2;
+  return qcm_range_get_text(&p, s->owner_topology_id, 41, true) &&
+         qcm_range_get_text(&p, s->owner_qkp_id, 65, true) &&
+         qcm_range_get_text(&p, s->group_id, 65, true) &&
+         ((s->epoch = qcm_auth_get64(p)), qcm_range_slot_valid(s, i));
+}
+
+static bool qcm_range_selected(const uint8_t *bitmap, uint16_t slot) {
+  return (bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u))) != 0;
+}
+static bool qcm_range_any(const uint8_t *bitmap) {
+  for (size_t i = 0; i < QIHSE_CONSENSUS_RANGE_BITMAP_BYTES; i++)
+    if (bitmap[i])
+      return true;
+  return false;
+}
+static bool qcm_range_overlap(const uint8_t *a, const uint8_t *b) {
+  for (size_t i = 0; i < QIHSE_CONSENSUS_RANGE_BITMAP_BYTES; i++)
+    if (a[i] & b[i])
+      return true;
+  return false;
+}
+
+static bool qcm_range_digest_state(const qcm_range_state_t *s,
+                                   const uint8_t *bitmap, uint8_t out[32]) {
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  if (!ctx)
+    return false;
+  bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
+  static const uint8_t tag[] = "QIHSE-RANGE-STATE-1";
+  ok = ok && EVP_DigestUpdate(ctx, tag, sizeof(tag)) == 1;
+  uint8_t wire[QCM_RANGE_SLOT_WIRE];
+  for (uint16_t i = 0; ok && i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; i++)
+    if (qcm_range_selected(bitmap, i)) {
+      qcm_range_encode_slot(&s->slots[i], wire);
+      ok = EVP_DigestUpdate(ctx, wire, sizeof(wire)) == 1;
+    }
+  for (size_t j = 0; ok && j < s->pending_count; j++)
+    if (!s->pending[j].terminal &&
+        qcm_range_overlap(bitmap, s->pending[j].request.slots)) {
+      uint8_t id[32];
+      uint8_t req[QCM_RANGE_REQUEST_WIRE];
+      qcm_range_encode_request(&s->pending[j].request, req);
+      ok = qcm_range_digest(req, sizeof(req), id) &&
+           EVP_DigestUpdate(ctx, "P", 1) == 1 &&
+           EVP_DigestUpdate(ctx, id, sizeof(id)) == 1;
+    }
+  unsigned int n = 0;
+  if (ok)
+    ok = EVP_DigestFinal_ex(ctx, out, &n) == 1 && n == 32;
+  EVP_MD_CTX_free(ctx);
+  return ok;
+}
+
+/* Replay committed state and durable uncommitted intent together. An intent
+ * in the durable tail blocks conflicting reservations because a later
+ * current-term append can commit that inherited prefix. */
+static bool qcm_range_replay_locked(qihse_consensus_mesh_t *m,
+                                    const qihse_user_t *u, qcm_range_state_t *s,
+                                    uint64_t *commit_out) {
+  memset(s, 0, sizeof(*s));
+  s->slots = calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*s->slots));
+  if (!s->slots)
+    return false;
+  uint64_t commit = qihse_consensus_commit_index(m->consensus);
+  uint64_t last = qihse_consensus_last_log_index(m->consensus);
+  if (commit_out)
+    *commit_out = commit;
+  for (uint64_t i = 1; i <= last; i++) {
+    uint8_t *b = NULL;
+    size_t n = 0;
+    bool committed = i <= commit;
+    qihse_consensus_entry_t e;
+    memset(&e, 0, sizeof(e));
+    if (!qihse_consensus_read_durable_entry_user(m->consensus,
+                                                 (qihse_user_t *)u, i, &e) ||
+        e.index != i)
+      goto fail;
+    if (e.type != QIHSE_CONSENSUS_ENTRY_DATA ||
+        e.payload_len != QIHSE_CONSENSUS_BLOB_REF_BYTES ||
+        memcmp(e.payload, "QBR1", 4))
+      continue;
+    uint64_t blob_len = qcm_auth_get64(e.payload + 112u);
+    if (blob_len !=
+            QIHSE_CONSENSUS_BLOB_HEADER_BYTES + QCM_RANGE_GENESIS_WIRE &&
+        blob_len !=
+            QIHSE_CONSENSUS_BLOB_HEADER_BYTES + QCM_RANGE_RESERVE_WIRE &&
+        blob_len != QIHSE_CONSENSUS_BLOB_HEADER_BYTES + QCM_RANGE_TERMINAL_WIRE)
+      continue;
+    if (!qcm_range_get_transaction(m, u, i, !committed, &b, &n))
+      goto fail;
+    if (n >= 4 && !memcmp(b, "QRG1", 4)) {
+      uint8_t gd[32];
+      if (n != QCM_RANGE_GENESIS_WIRE || !qcm_range_digest(b, n, gd)) {
+        free(b);
+        goto fail;
+      }
+      if (s->initialized) {
+        if (memcmp(gd, s->genesis_digest, 32)) {
+          free(b);
+          goto fail;
+        }
+      } else {
+        for (uint16_t k = 0; k < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; k++)
+          if (!qcm_range_decode_slot(b + 4u + (size_t)k * QCM_RANGE_SLOT_WIRE,
+                                     &s->slots[k], k)) {
+            free(b);
+            goto fail;
+          }
+        s->initialized = true;
+        s->genesis_index = i;
+        memcpy(s->genesis_digest, gd, 32);
+      }
+    } else if (n == QCM_RANGE_RESERVE_WIRE && !memcmp(b, "QRR1", 4)) {
+      if (!s->initialized) {
+        free(b);
+        goto fail;
+      }
+      qcm_range_pending_t p;
+      memset(&p, 0, sizeof(p));
+      if (!qcm_range_decode_request(b + 4, QCM_RANGE_REQUEST_WIRE,
+                                    &p.request)) {
+        free(b);
+        goto fail;
+      }
+      p.grant.reserve_index = i;
+      p.grant.grant_epoch = qcm_auth_get64(b + 4u + QCM_RANGE_REQUEST_WIRE);
+      p.committed = committed;
+      if (!qcm_range_digest(b, QCM_RANGE_RESERVE_WIRE,
+                            p.grant.reserve_digest)) {
+        free(b);
+        goto fail;
+      }
+      bool bad = false;
+      for (size_t z = 0; z < s->pending_count; z++) {
+        qcm_range_pending_t *old = &s->pending[z];
+        if (!strcmp(old->request.transfer_id, p.request.transfer_id)) {
+          uint8_t x[QCM_RANGE_REQUEST_WIRE], y[QCM_RANGE_REQUEST_WIRE];
+          qcm_range_encode_request(&old->request, x);
+          qcm_range_encode_request(&p.request, y);
+          if (memcmp(x, y, sizeof(x)))
+            bad = true;
+          else { /* exact retries share the first grant and its commit state */
+            old->committed = old->committed || committed;
+            if (old->grant.reserve_index < i)
+              p = *old;
+          }
+          break;
+        }
+        if (!old->terminal &&
+            qcm_range_overlap(old->request.slots, p.request.slots))
+          bad = true;
+      }
+      if (bad) {
+        free(b);
+        goto fail;
+      }
+      bool exists = false;
+      for (size_t z = 0; z < s->pending_count; z++)
+        if (!strcmp(s->pending[z].request.transfer_id, p.request.transfer_id))
+          exists = true;
+      if (!exists && !qcm_range_append_pending(s, &p)) {
+        free(b);
+        goto fail;
+      }
+    } else if (n == QCM_RANGE_TERMINAL_WIRE &&
+               (!memcmp(b, "QRF1", 4) || !memcmp(b, "QRB1", 4))) {
+      uint64_t reserve_idx = qcm_auth_get64(b + 4);
+      qcm_range_pending_t *p = NULL;
+      for (size_t z = 0; z < s->pending_count; z++)
+        if (s->pending[z].grant.reserve_index == reserve_idx)
+          p = &s->pending[z];
+      if (!p || memcmp(p->grant.reserve_digest, b + 12, 32)) {
+        free(b);
+        goto fail;
+      }
+      uint8_t reqwire[QCM_RANGE_REQUEST_WIRE], reqdigest[32];
+      qcm_range_encode_request(&p->request, reqwire);
+      if (!qcm_range_digest(reqwire, sizeof(reqwire), reqdigest) ||
+          memcmp(reqdigest, b + 44, 32)) {
+        free(b);
+        goto fail;
+      }
+      bool finalized = !memcmp(b, "QRF1", 4);
+      if (p->pending_terminal &&
+          (p->pending_finalized != finalized ||
+           memcmp(p->pending_evidence_digest, b + 76, 32))) {
+        free(b);
+        goto fail;
+      }
+      if (!p->pending_terminal) {
+        p->pending_terminal = true;
+        p->pending_finalized = finalized;
+        p->pending_terminal_index = i;
+        memcpy(p->pending_evidence_digest, b + 76, 32);
+      }
+      p->terminal = committed;
+      p->finalized = finalized;
+      p->decision.decision_index = p->pending_terminal_index;
+      p->decision.grant_epoch = p->grant.grant_epoch;
+      memcpy(p->decision.evidence_digest, p->pending_evidence_digest, 32);
+      uint8_t canonical_terminal[QCM_RANGE_TERMINAL_WIRE];
+      memcpy(canonical_terminal, b, sizeof(canonical_terminal));
+      if (p->pending_terminal_index != i) {
+        /* The original record in an inherited tail is at an earlier index;
+         * its exact bytes are the authority reference for an idempotent retry.
+         */
+        uint8_t *original = NULL;
+        size_t original_len = 0;
+        if (!qcm_range_get_transaction(m, u, p->pending_terminal_index,
+                                       p->pending_terminal_index > commit,
+                                       &original, &original_len) ||
+            original_len != QCM_RANGE_TERMINAL_WIRE) {
+          free(original);
+          free(b);
+          goto fail;
+        }
+        memcpy(canonical_terminal, original, sizeof(canonical_terminal));
+        free(original);
+      }
+      (void)qcm_range_digest(canonical_terminal, sizeof(canonical_terminal),
+                             p->decision.decision_digest);
+      /* Only committed terminal entries change the public owner map. */
+      if (committed && p->finalized)
+        for (uint16_t k = 0; k < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; k++)
+          if (qcm_range_selected(p->request.slots, k)) {
+            qihse_consensus_range_slot_t *dst = &s->slots[k];
+            dst->epoch = p->grant.grant_epoch;
+            snprintf(dst->owner_topology_id, sizeof(dst->owner_topology_id),
+                     "%s", p->request.target_topology_id);
+            snprintf(dst->owner_qkp_id, sizeof(dst->owner_qkp_id), "%s",
+                     p->request.target_qkp_id);
+            snprintf(dst->group_id, sizeof(dst->group_id), "%s",
+                     p->request.target_group_id);
+          }
+    }
+    free(b);
+    s->last_index = i;
+  }
+  return true;
+fail:
+  free(s->pending);
+  free(s->slots);
+  memset(s, 0, sizeof(*s));
+  return false;
+}
+
+static void qcm_range_state_free(qcm_range_state_t *s) {
+  free(s->pending);
+  free(s->slots);
+  memset(s, 0, sizeof(*s));
+}
+
+static bool qcm_range_is_local_leader(qihse_consensus_mesh_t *mesh);
+static bool qcm_range_forward(qihse_consensus_mesh_t *mesh,
+                              const qihse_user_t *principal, uint8_t operation,
+                              const uint8_t *payload, size_t payload_len,
+                              uint32_t timeout_ms, uint64_t *out_index,
+                              uint64_t *out_epoch, uint8_t out_digest[32]);
+
+bool qihse_consensus_mesh_range_genesis_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u,
+    const qihse_consensus_range_slot_t slots[QIHSE_CONSENSUS_RANGE_SLOT_COUNT],
+    uint32_t timeout, uint64_t *out_index, uint8_t out_digest[32]) {
+  if (out_index)
+    *out_index = 0;
+  if (!qcm_range_mesh_valid(m) || !slots || !timeout || !out_index ||
+      !out_digest || !qcm_range_operator(u))
+    return false;
+  uint8_t *wire = malloc(QCM_RANGE_GENESIS_WIRE);
+  if (!wire)
+    return false;
+  memcpy(wire, "QRG1", 4);
+  bool ok = true;
+  for (uint16_t i = 0; i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; i++) {
+    if (!qcm_range_slot_valid(&slots[i], i)) {
+      ok = false;
+      break;
+    }
+    qcm_range_encode_slot(&slots[i],
+                          wire + 4u + (size_t)i * QCM_RANGE_SLOT_WIRE);
+  }
+  if (ok)
+    ok = qcm_range_digest(wire, QCM_RANGE_GENESIS_WIRE, out_digest);
+  if (ok && !qcm_range_is_local_leader(m)) {
+    size_t payload_len = QCM_RANGE_GENESIS_WIRE + 1u;
+    uint8_t *payload = malloc(payload_len);
+    if (!payload) {
+      free(wire);
+      return false;
+    }
+    payload[0] = 1u;
+    memcpy(payload + 1u, wire, QCM_RANGE_GENESIS_WIRE);
+    uint64_t committed = 0, ignored_epoch = 0;
+    uint8_t ignored_digest[32];
+    ok = qcm_range_forward(m, u, 1u, payload, payload_len, timeout, &committed,
+                           &ignored_epoch, ignored_digest);
+    free(payload);
+    uint64_t verify_deadline = qcm_now_ms() + timeout;
+    while (ok) {
+      pthread_mutex_lock(&m->state_lock);
+      qcm_range_state_t state;
+      uint64_t local_commit = 0;
+      ok = qcm_range_replay_locked(m, u, &state, &local_commit);
+      bool verified = ok && state.initialized &&
+                      !memcmp(state.genesis_digest, out_digest, 32) &&
+                      local_commit >= committed;
+      if (verified)
+        *out_index = state.genesis_index;
+      qcm_range_state_free(&state);
+      pthread_mutex_unlock(&m->state_lock);
+      if (verified)
+        break;
+      if (!ok || qcm_now_ms() >= verify_deadline) {
+        ok = false;
+        break;
+      }
+      struct timespec pause = {0, 5000000L};
+      nanosleep(&pause, NULL);
+    }
+    free(wire);
+    return ok;
+  }
+  pthread_mutex_lock(&m->proposal_lock);
+  bool already = false;
+  if (ok) {
+    pthread_mutex_lock(&m->state_lock);
+    qcm_range_state_t state;
+    uint64_t c = 0;
+    ok = qcm_range_replay_locked(m, u, &state, &c);
+    if (ok && state.initialized) {
+      if (memcmp(state.genesis_digest, out_digest, 32))
+        ok = false;
+      else {
+        *out_index = state.genesis_index;
+        already = state.genesis_index <= c;
+      }
+    }
+    qcm_range_state_free(&state);
+    pthread_mutex_unlock(&m->state_lock);
+  }
+  if (ok && !already) {
+    pthread_mutex_lock(&m->state_lock);
+    uint64_t gen = qihse_consensus_last_journal_generation(m->consensus);
+    pthread_mutex_unlock(&m->state_lock);
+    if (gen == UINT64_MAX)
+      ok = false;
+    else {
+      qihse_hlc_t hlc = {0};
+      hlc.physical_ms = qcm_now_ms();
+      ok = qcm_mesh_propose_transaction_locked(m, u, gen + 1u, hlc, 0, 0, wire,
+                                               QCM_RANGE_GENESIS_WIRE, timeout,
+                                               timeout, out_index);
+    }
+  }
+  pthread_mutex_unlock(&m->proposal_lock);
+  free(wire);
+  return ok;
+}
+
+bool qihse_consensus_mesh_range_state_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u,
+    const uint8_t bitmap[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES], uint32_t timeout,
+    qihse_consensus_range_slot_t out_slots[QIHSE_CONSENSUS_RANGE_SLOT_COUNT],
+    uint8_t out_digest[32], uint64_t *out_index) {
+  if (out_index)
+    *out_index = 0;
+  if (out_digest)
+    memset(out_digest, 0, 32);
+  if (out_slots)
+    memset(out_slots, 0, QIHSE_CONSENSUS_RANGE_SLOT_COUNT * sizeof(*out_slots));
+  if (!qcm_range_mesh_valid(m) || !bitmap || !out_slots || !out_digest ||
+      !out_index || !timeout || !qcm_range_operator(u))
+    return false;
+  pthread_mutex_lock(&m->state_lock);
+  qcm_range_state_t s;
+  uint64_t commit = 0;
+  bool ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
+            s.genesis_index <= commit && qcm_range_any(bitmap) &&
+            qcm_range_digest_state(&s, bitmap, out_digest);
+  if (ok) {
+    for (uint16_t i = 0; i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; i++)
+      if (qcm_range_selected(bitmap, i))
+        out_slots[i] = s.slots[i];
+      else
+        memset(&out_slots[i], 0, sizeof(out_slots[i]));
+    *out_index = commit;
+  }
+  qcm_range_state_free(&s);
+  pthread_mutex_unlock(&m->state_lock);
+  return ok;
+}
+
+bool qihse_consensus_mesh_range_reserve_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u,
+    const qihse_consensus_range_request_t *request, uint32_t timeout,
+    qihse_consensus_range_grant_t *out) {
+  if (out)
+    memset(out, 0, sizeof(*out));
+  if (!qcm_range_mesh_valid(m) || !request || !out || !timeout ||
+      !qcm_range_operator(u))
+    return false;
+  uint8_t encoded[QCM_RANGE_REQUEST_WIRE];
+  qcm_range_encode_request(request, encoded);
+  qihse_consensus_range_request_t checked;
+  if (!qcm_range_decode_request(encoded, sizeof(encoded), &checked))
+    return false;
+  if (!qcm_range_is_local_leader(m)) {
+    uint64_t idx = 0, epoch = 0;
+    uint8_t digest[32];
+    if (!qcm_range_forward(m, u, 2u, encoded, sizeof(encoded), timeout, &idx,
+                           &epoch, digest))
+      return false;
+    uint64_t verify_deadline = qcm_now_ms() + timeout;
+    bool forwarded = false;
+    do {
+      pthread_mutex_lock(&m->state_lock);
+      qcm_range_state_t state;
+      uint64_t commit = 0;
+      forwarded =
+          qcm_range_replay_locked(m, u, &state, &commit) && commit >= idx;
+      if (forwarded) {
+        forwarded = false;
+        for (size_t i = 0; i < state.pending_count; i++) {
+          qcm_range_pending_t *p = &state.pending[i];
+          uint8_t actual[QCM_RANGE_REQUEST_WIRE];
+          qcm_range_encode_request(&p->request, actual);
+          if (!strcmp(p->request.transfer_id, request->transfer_id) &&
+              p->committed && p->grant.reserve_index == idx &&
+              p->grant.grant_epoch == epoch &&
+              !memcmp(p->grant.reserve_digest, digest, 32) &&
+              !memcmp(actual, encoded, sizeof(actual))) {
+            *out = p->grant;
+            forwarded = true;
+            break;
+          }
+        }
+      }
+      qcm_range_state_free(&state);
+      pthread_mutex_unlock(&m->state_lock);
+      if (forwarded || qcm_now_ms() >= verify_deadline)
+        break;
+      struct timespec pause = {0, 5000000L};
+      nanosleep(&pause, NULL);
+    } while (!forwarded);
+    return forwarded;
+  }
+  uint8_t *tx = malloc(QCM_RANGE_RESERVE_WIRE);
+  if (!tx)
+    return false;
+  memcpy(tx, "QRR1", 4);
+  memcpy(tx + 4, encoded, sizeof(encoded));
+  bool ok = false, do_propose = true;
+  pthread_mutex_lock(&m->proposal_lock);
+  pthread_mutex_lock(&m->state_lock);
+  qcm_range_state_t s;
+  uint64_t commit = 0;
+  ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
+       s.genesis_index <= commit;
+  bool exact = false;
+  qcm_range_pending_t *existing = NULL;
+  if (ok)
+    for (size_t i = 0; i < s.pending_count; i++)
+      if (!strcmp(s.pending[i].request.transfer_id, request->transfer_id)) {
+        existing = &s.pending[i];
+        break;
+      }
+  if (ok && existing) {
+    uint8_t old[QCM_RANGE_REQUEST_WIRE];
+    qcm_range_encode_request(&existing->request, old);
+    ok = !memcmp(old, encoded, sizeof(old));
+    if (ok) {
+      exact = true;
+      *out = existing->grant;
+      qcm_range_put64(tx + 4 + sizeof(encoded), existing->grant.grant_epoch);
+      if (existing->terminal)
+        do_propose = false;
+      else if (existing->committed)
+        do_propose = false;
+    }
+  }
+  if (ok && !exact) {
+    uint8_t digest[32];
+    ok = qcm_range_digest_state(&s, request->slots, digest) &&
+         !memcmp(digest, request->expected_state_digest, 32);
+  }
+  uint64_t max_epoch = 0;
+  for (uint16_t i = 0; ok && i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; i++)
+    if (qcm_range_selected(request->slots, i)) {
+      qihse_consensus_range_slot_t *slot = &s.slots[i];
+      if (!exact &&
+          (strcmp(slot->owner_topology_id, request->source_topology_id) ||
+           strcmp(slot->owner_qkp_id, request->source_qkp_id) ||
+           strcmp(slot->group_id, request->source_group_id)))
+        ok = false;
+      if (slot->epoch > max_epoch)
+        max_epoch = slot->epoch;
+    }
+  for (size_t i = 0; ok && !exact && i < s.pending_count; i++) {
+    qcm_range_pending_t *p = &s.pending[i];
+    if (!strcmp(p->request.transfer_id, request->transfer_id)) {
+    } else if (!p->terminal &&
+               qcm_range_overlap(p->request.slots, request->slots))
+      ok = false;
+  }
+  if (ok && !exact) {
+    if (max_epoch == UINT64_MAX)
+      ok = false;
+    else
+      qcm_range_put64(tx + 4 + sizeof(encoded), max_epoch + 1u);
+  }
+  qcm_range_state_free(&s);
+  pthread_mutex_unlock(&m->state_lock);
+  if (ok && do_propose) {
+    uint64_t idx = 0;
+    pthread_mutex_lock(&m->state_lock);
+    uint64_t gen = qihse_consensus_last_journal_generation(m->consensus);
+    pthread_mutex_unlock(&m->state_lock);
+    if (gen == UINT64_MAX)
+      ok = false;
+    else {
+      qihse_hlc_t hlc = {0};
+      hlc.physical_ms = qcm_now_ms();
+      ok = qcm_mesh_propose_transaction_locked(m, u, gen + 1u, hlc, 0, 0, tx,
+                                               QCM_RANGE_RESERVE_WIRE, timeout,
+                                               timeout, &idx);
+    }
+    if (ok) {
+      pthread_mutex_lock(&m->state_lock);
+      qcm_range_state_t after;
+      uint64_t c = 0;
+      ok = qcm_range_replay_locked(m, u, &after, &c);
+      if (ok) {
+        for (size_t i = 0; i < after.pending_count; i++)
+          if (!strcmp(after.pending[i].request.transfer_id,
+                      request->transfer_id)) {
+            *out = after.pending[i].grant;
+            break;
+          }
+      }
+      qcm_range_state_free(&after);
+      pthread_mutex_unlock(&m->state_lock);
+    }
+  }
+  pthread_mutex_unlock(&m->proposal_lock);
+  free(tx);
+  return ok;
+}
+
+static bool qcm_range_terminal(qihse_consensus_mesh_t *m, const qihse_user_t *u,
+                               const qihse_consensus_range_request_t *request,
+                               const qihse_consensus_range_grant_t *grant,
+                               const uint8_t evidence[32], uint32_t timeout,
+                               bool finalize,
+                               qihse_consensus_range_decision_t *out) {
+  if (out)
+    memset(out, 0, sizeof(*out));
+  if (!qcm_range_mesh_valid(m) || !request || !grant || !evidence || !timeout ||
+      !out || !qcm_range_operator(u))
+    return false;
+  uint8_t reqwire[QCM_RANGE_REQUEST_WIRE];
+  qcm_range_encode_request(request, reqwire);
+  if (!qcm_range_is_local_leader(m)) {
+    uint8_t payload[1u + QCM_RANGE_REQUEST_WIRE + 72u + 32u];
+    size_t pos = 0;
+    payload[pos++] = finalize ? 3u : 4u;
+    memcpy(payload + pos, reqwire, sizeof(reqwire));
+    pos += sizeof(reqwire);
+    qcm_auth_put64(payload + pos, grant->reserve_index);
+    pos += 8;
+    qcm_auth_put64(payload + pos, grant->grant_epoch);
+    pos += 8;
+    memcpy(payload + pos, grant->reserve_digest, 32);
+    pos += 32;
+    memcpy(payload + pos, evidence, 32);
+    pos += 32;
+    uint64_t idx = 0, epoch = 0;
+    uint8_t digest[32];
+    if (!qcm_range_forward(m, u, payload[0], payload, pos, timeout, &idx,
+                           &epoch, digest))
+      return false;
+    uint64_t verify_deadline = qcm_now_ms() + timeout;
+    bool ok = false;
+    do {
+      pthread_mutex_lock(&m->state_lock);
+      qcm_range_state_t after;
+      uint64_t commit = 0;
+      bool replayed = qcm_range_replay_locked(m, u, &after, &commit);
+      if (replayed && commit >= idx) {
+        for (size_t i = 0; i < after.pending_count; i++) {
+          qcm_range_pending_t *p = &after.pending[i];
+          if (p->decision.decision_index == idx &&
+              p->decision.grant_epoch == epoch &&
+              !memcmp(p->decision.decision_digest, digest, 32) &&
+              p->finalized == finalize && p->terminal) {
+            *out = p->decision;
+            ok = true;
+            break;
+          }
+        }
+      }
+      qcm_range_state_free(&after);
+      pthread_mutex_unlock(&m->state_lock);
+      if (ok || !replayed || qcm_now_ms() >= verify_deadline)
+        break;
+      struct timespec pause = {0, 5000000L};
+      nanosleep(&pause, NULL);
+    } while (!ok);
+    return ok;
+  }
+  qcm_range_state_t s;
+  bool ok;
+  pthread_mutex_lock(&m->proposal_lock);
+  pthread_mutex_lock(&m->state_lock);
+  uint64_t commit = 0;
+  ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
+       s.genesis_index <= commit;
+  qcm_range_pending_t *p = NULL;
+  bool already = false;
+  if (ok)
+    for (size_t i = 0; i < s.pending_count; i++)
+      if (!strcmp(s.pending[i].request.transfer_id, request->transfer_id)) {
+        p = &s.pending[i];
+        break;
+      }
+  if (ok) {
+    uint8_t stored[QCM_RANGE_REQUEST_WIRE];
+    ok = p && p->grant.reserve_index == grant->reserve_index &&
+         p->grant.grant_epoch == grant->grant_epoch &&
+         !memcmp(p->grant.reserve_digest, grant->reserve_digest, 32);
+    if (ok) {
+      qcm_range_encode_request(&p->request, stored);
+      ok = !memcmp(stored, reqwire, sizeof(stored));
+    }
+    if (ok && p->pending_terminal) {
+      ok = (p->pending_finalized == finalize &&
+            !memcmp(p->pending_evidence_digest, evidence, 32));
+      if (ok && p->terminal) {
+        *out = p->decision;
+        already = true;
+      }
+    }
+  }
+  if (ok && !already && p->committed && !p->terminal) {
+    for (uint16_t i = 0; i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; i++)
+      if (qcm_range_selected(request->slots, i)) {
+        qihse_consensus_range_slot_t *slot = &s.slots[i];
+        if (strcmp(slot->owner_topology_id, request->source_topology_id) ||
+            strcmp(slot->owner_qkp_id, request->source_qkp_id) ||
+            strcmp(slot->group_id, request->source_group_id)) {
+          ok = false;
+          break;
+        }
+      }
+  }
+  qcm_range_state_free(&s);
+  pthread_mutex_unlock(&m->state_lock);
+  uint8_t tx[QCM_RANGE_TERMINAL_WIRE];
+  if (ok && !already) {
+    memcpy(tx, finalize ? "QRF1" : "QRB1", 4);
+    qcm_auth_put64(tx + 4, grant->reserve_index);
+    memcpy(tx + 12, grant->reserve_digest, 32);
+    ok = qcm_range_digest(reqwire, sizeof(reqwire), tx + 44);
+    memcpy(tx + 76, evidence, 32);
+  }
+  uint64_t idx = 0;
+  if (ok && !already) {
+    pthread_mutex_lock(&m->state_lock);
+    uint64_t gen = qihse_consensus_last_journal_generation(m->consensus);
+    pthread_mutex_unlock(&m->state_lock);
+    if (gen == UINT64_MAX)
+      ok = false;
+    else {
+      qihse_hlc_t hlc = {0};
+      hlc.physical_ms = qcm_now_ms();
+      ok = qcm_mesh_propose_transaction_locked(
+          m, u, gen + 1u, hlc, 0, 0, tx, sizeof(tx), timeout, timeout, &idx);
+    }
+  }
+  if (ok && !already) {
+    pthread_mutex_lock(&m->state_lock);
+    qcm_range_state_t after;
+    uint64_t c = 0;
+    ok = qcm_range_replay_locked(m, u, &after, &c);
+    if (ok) {
+      for (size_t i = 0; i < after.pending_count; i++)
+        if (!strcmp(after.pending[i].request.transfer_id,
+                    request->transfer_id) &&
+            after.pending[i].terminal &&
+            after.pending[i].finalized == finalize &&
+            !memcmp(after.pending[i].decision.evidence_digest, evidence, 32)) {
+          *out = after.pending[i].decision;
+          break;
+        }
+    }
+    qcm_range_state_free(&after);
+    pthread_mutex_unlock(&m->state_lock);
+  }
+  pthread_mutex_unlock(&m->proposal_lock);
+  return ok;
+}
+
+bool qihse_consensus_mesh_range_finalize_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u,
+    const qihse_consensus_range_request_t *r,
+    const qihse_consensus_range_grant_t *g, const uint8_t evidence[32],
+    uint32_t timeout, qihse_consensus_range_decision_t *out) {
+  return qcm_range_terminal(m, u, r, g, evidence, timeout, true, out);
+}
+bool qihse_consensus_mesh_range_abort_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u,
+    const qihse_consensus_range_request_t *r,
+    const qihse_consensus_range_grant_t *g, const uint8_t evidence[32],
+    uint32_t timeout, qihse_consensus_range_decision_t *out) {
+  return qcm_range_terminal(m, u, r, g, evidence, timeout, false, out);
+}
+
+bool qihse_consensus_mesh_range_lookup_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u, const char *transfer_id,
+    qihse_consensus_range_request_t *request,
+    qihse_consensus_range_grant_t *grant,
+    qihse_consensus_range_decision_t *decision,
+    qihse_consensus_range_phase_t *phase) {
+  if (phase)
+    *phase = QIHSE_RANGE_PHASE_NONE;
+  if (request)
+    memset(request, 0, sizeof(*request));
+  if (grant)
+    memset(grant, 0, sizeof(*grant));
+  if (decision)
+    memset(decision, 0, sizeof(*decision));
+  if (!qcm_range_mesh_valid(m) || !transfer_id || !request || !grant ||
+      !decision || !phase || !qcm_range_text(transfer_id, 65, false) ||
+      !qcm_range_operator(u))
+    return false;
+  pthread_mutex_lock(&m->state_lock);
+  qcm_range_state_t s;
+  uint64_t commit = 0;
+  bool ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
+            s.genesis_index <= commit;
+  if (ok) {
+    for (size_t i = 0; i < s.pending_count; i++)
+      if (!strcmp(s.pending[i].request.transfer_id, transfer_id)) {
+        if (!s.pending[i].committed)
+          break;
+        *request = s.pending[i].request;
+        *grant = s.pending[i].grant;
+        *decision = s.pending[i].decision;
+        *phase = !s.pending[i].terminal
+                     ? QIHSE_RANGE_PHASE_RESERVED
+                     : (s.pending[i].finalized ? QIHSE_RANGE_PHASE_FINALIZED
+                                               : QIHSE_RANGE_PHASE_ABORTED);
+        break;
+      }
+  }
+  qcm_range_state_free(&s);
+  pthread_mutex_unlock(&m->state_lock);
+  return ok;
+}
+
+bool qihse_consensus_mesh_range_transition_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u, uint64_t decision_index,
+    qihse_consensus_range_request_t *request,
+    qihse_consensus_range_decision_t *decision) {
+  if (request)
+    memset(request, 0, sizeof(*request));
+  if (decision)
+    memset(decision, 0, sizeof(*decision));
+  if (!qcm_range_mesh_valid(m) || !decision_index || !request || !decision ||
+      !qcm_range_operator(u))
+    return false;
+  pthread_mutex_lock(&m->state_lock);
+  qcm_range_state_t s;
+  uint64_t commit = 0;
+  bool ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
+            s.genesis_index <= commit && decision_index <= commit;
+  if (ok) {
+    ok = false;
+    for (size_t i = 0; i < s.pending_count; i++)
+      if (s.pending[i].terminal && s.pending[i].committed &&
+          s.pending[i].decision.decision_index == decision_index) {
+        *request = s.pending[i].request;
+        *decision = s.pending[i].decision;
+        ok = true;
+        break;
+      }
+  }
+  qcm_range_state_free(&s);
+  pthread_mutex_unlock(&m->state_lock);
+  return ok;
+}
+
+#define QCM_RANGE_FORWARD_HEADER 153u
+#define QCM_RANGE_FORWARD_REPLY 53u
+#define QCM_RANGE_CHUNK_HEADER 16u
+
+static bool qcm_range_is_local_leader(qihse_consensus_mesh_t *mesh) {
+  if (!mesh || !mesh->started)
+    return false;
+  pthread_mutex_lock(&mesh->state_lock);
+  bool local = qihse_consensus_role(mesh->consensus) == QIHSE_CONSENSUS_LEADER;
+  pthread_mutex_unlock(&mesh->state_lock);
+  return local;
+}
+
+static bool qcm_range_read_exact(qihse_qkp_session_t *session, int fd,
+                                 void *out, size_t n) {
+  uint8_t *p = out;
+  size_t done = 0;
+  while (done < n) {
+    ssize_t got = qihse_qkp_recv_sealed(session, fd, p + done, n - done);
+    if (got <= 0)
+      return false;
+    done += (size_t)got;
+  }
+  return true;
+}
+
+static bool qcm_range_receive(qcm_rx_ctx_t *ctx, const uint8_t *wire,
+                              size_t size) {
+  qihse_consensus_mesh_t *m = ctx->mesh;
+  uint8_t group_hash[32], digest[32], reply[QCM_RANGE_FORWARD_REPLY] = {0};
+  memcpy(reply, "QRR2", 4);
+  if (size != QCM_RANGE_FORWARD_HEADER ||
+      !m->consensus_config.writer_epoch_floor ||
+      !qcm_range_operator(m->principal) || memcmp(wire, "QRF2", 4) ||
+      memcmp(wire + 4, m->consensus_config.history_id, 32) ||
+      qcm_auth_get64(wire + 36) != m->consensus_config.writer_epoch_floor ||
+      !qcm_sha256(m->consensus_config.group_id,
+                  strlen(m->consensus_config.group_id), group_hash) ||
+      memcmp(wire + 44, group_hash, 32) ||
+      memcmp(wire + 76, m->peers[ctx->peer_index].uuid.bytes, 16) ||
+      memcmp(wire + 92, m->consensus_config.self.bytes, 16) ||
+      !qcm_authority_voter(m, &m->peers[ctx->peer_index].uuid)) {
+    qcm_debug("range forward header rejected (size=%zu op=%u peer=%zu)", size,
+              size > 112u ? (unsigned)wire[112] : 0u, ctx->peer_index);
+    return false;
+  }
+  uint32_t timeout = ((uint32_t)wire[108] << 24) | ((uint32_t)wire[109] << 16) |
+                     ((uint32_t)wire[110] << 8) | wire[111];
+  uint8_t operation = wire[112];
+  uint64_t length = qcm_auth_get64(wire + 113);
+  if (!timeout || timeout > 30000u || length > QIHSE_BLOB_MAX_SIZE ||
+      (operation < 1u || operation > 4u))
+    return false;
+  struct timeval tv = {(time_t)(timeout / 1000u),
+                       (suseconds_t)((timeout % 1000u) * 1000u)};
+  (void)setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  uint8_t *payload = malloc(length ? (size_t)length : 1u);
+  if (!payload)
+    return false;
+  size_t copied = 0;
+  bool ok = true;
+  while (copied < (size_t)length) {
+    uint8_t chunk[QIHSE_QKP_MAX_PAYLOAD];
+    ssize_t got =
+        qihse_qkp_recv_sealed(ctx->session, ctx->fd, chunk, sizeof(chunk));
+    if (got < (ssize_t)QCM_RANGE_CHUNK_HEADER || memcmp(chunk, "QRC2", 4)) {
+      ok = false;
+      break;
+    }
+    uint64_t offset = qcm_auth_get64(chunk + 4);
+    uint32_t amount = ((uint32_t)chunk[12] << 24) |
+                      ((uint32_t)chunk[13] << 16) | ((uint32_t)chunk[14] << 8) |
+                      chunk[15];
+    if (offset != copied ||
+        amount != (uint32_t)((size_t)got - QCM_RANGE_CHUNK_HEADER) || !amount ||
+        amount > (size_t)length - copied) {
+      ok = false;
+      break;
+    }
+    memcpy(payload + copied, chunk + QCM_RANGE_CHUNK_HEADER, amount);
+    copied += amount;
+  }
+  uint8_t end[44];
+  if (ok)
+    ok = qcm_range_read_exact(ctx->session, ctx->fd, end, sizeof(end)) &&
+         !memcmp(end, "QRE2", 4) && qcm_auth_get64(end + 4) == length &&
+         qcm_range_digest(payload, (size_t)length, digest) &&
+         !memcmp(digest, wire + 121, 32) && !memcmp(end + 12, digest, 32);
+  uint64_t index = 0, epoch = 0;
+  uint8_t result_digest[32] = {0};
+  if (ok && operation == 1u && length == QCM_RANGE_GENESIS_WIRE + 1u &&
+      payload[0] == 1u && !memcmp(payload + 1, "QRG1", 4)) {
+    qihse_consensus_range_slot_t *slots =
+        calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*slots));
+    if (!slots)
+      ok = false;
+    for (uint16_t i = 0; ok && i < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; i++)
+      if (!qcm_range_decode_slot(payload + 5u + (size_t)i * QCM_RANGE_SLOT_WIRE,
+                                 &slots[i], i))
+        ok = false;
+    if (ok)
+      ok = qihse_consensus_mesh_range_genesis_user(
+          m, m->principal, slots, timeout, &index, result_digest);
+    free(slots);
+  } else if (ok && operation == 2u && length == QCM_RANGE_REQUEST_WIRE) {
+    qihse_consensus_range_request_t request;
+    qihse_consensus_range_grant_t grant;
+    ok = qcm_range_decode_request(payload, (size_t)length, &request) &&
+         qihse_consensus_mesh_range_reserve_user(m, m->principal, &request,
+                                                 timeout, &grant);
+    if (ok) {
+      index = grant.reserve_index;
+      epoch = grant.grant_epoch;
+      memcpy(result_digest, grant.reserve_digest, 32);
+    }
+  } else if (ok && (operation == 3u || operation == 4u) &&
+             length == 1u + QCM_RANGE_REQUEST_WIRE + 80u &&
+             payload[0] == operation) {
+    qihse_consensus_range_request_t request;
+    qihse_consensus_range_grant_t grant;
+    qihse_consensus_range_decision_t decision;
+    ok =
+        qcm_range_decode_request(payload + 1, QCM_RANGE_REQUEST_WIRE, &request);
+    size_t off = 1u + QCM_RANGE_REQUEST_WIRE;
+    if (ok) {
+      grant.reserve_index = qcm_auth_get64(payload + off);
+      off += 8;
+      grant.grant_epoch = qcm_auth_get64(payload + off);
+      off += 8;
+      memcpy(grant.reserve_digest, payload + off, 32);
+      off += 32;
+    }
+    if (ok)
+      ok = (operation == 3u) ? qihse_consensus_mesh_range_finalize_user(
+                                   m, m->principal, &request, &grant,
+                                   payload + off, timeout, &decision)
+                             : qihse_consensus_mesh_range_abort_user(
+                                   m, m->principal, &request, &grant,
+                                   payload + off, timeout, &decision);
+    if (ok) {
+      index = decision.decision_index;
+      epoch = decision.grant_epoch;
+      memcpy(result_digest, decision.decision_digest, 32);
+    }
+  } else
+    ok = false;
+  qcm_debug("range forward operation %u %s at index %llu", operation,
+            ok ? "committed" : "failed", (unsigned long long)index);
+  free(payload);
+  reply[4] = ok ? 1u : 0u;
+  qcm_auth_put64(reply + 5, index);
+  qcm_auth_put64(reply + 13, epoch);
+  memcpy(reply + 21, result_digest, 32);
+  return qihse_qkp_send_sealed(ctx->session, ctx->fd, reply, sizeof(reply));
+}
+
+static bool qcm_range_forward(qihse_consensus_mesh_t *m,
+                              const qihse_user_t *principal, uint8_t operation,
+                              const uint8_t *payload, size_t payload_len,
+                              uint32_t timeout_ms, uint64_t *out_index,
+                              uint64_t *out_epoch, uint8_t out_digest[32]) {
+  if (out_index)
+    *out_index = 0;
+  if (out_epoch)
+    *out_epoch = 0;
+  if (!qcm_range_mesh_valid(m) || !payload || !payload_len ||
+      payload_len > QIHSE_BLOB_MAX_SIZE || !timeout_ms || timeout_ms > 30000u ||
+      !out_index || !out_epoch || !out_digest ||
+      !qcm_range_operator(principal) || operation < 1u || operation > 4u)
+    return false;
+  uint64_t deadline = qcm_now_ms() + timeout_ms;
+  qihse_uuid_t leader;
+  pthread_mutex_lock(&m->state_lock);
+  bool known = qihse_consensus_leader_id(m->consensus, &leader);
+  pthread_mutex_unlock(&m->state_lock);
+  if (!known) {
+    qcm_debug("range forward operation %u has no known leader", operation);
+    return false;
+  }
+  int peer = qcm_peer_index(m, &leader);
+  if (peer < 0 || !qcm_authority_voter(m, &leader)) {
+    qcm_debug("range forward operation %u leader unavailable/voter denied",
+              operation);
+    return false;
+  }
+  int fd = qcm_connect(m->peers[peer].ipv4, m->peers[peer].port);
+  if (fd < 0) {
+    qcm_debug("range forward operation %u connect failed: %s", operation,
+              strerror(errno));
+    return false;
+  }
+  int cancel[2];
+  if (pipe(cancel) != 0) {
+    close(fd);
+    return false;
+  }
+  qcm_authority_guard_t guard = {fd, cancel[0], deadline};
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, qcm_authority_deadline, &guard) != 0) {
+    close(cancel[0]);
+    close(cancel[1]);
+    close(fd);
+    return false;
+  }
+  struct timeval tv = {(time_t)(timeout_ms / 1000u),
+                       (suseconds_t)((timeout_ms % 1000u) * 1000u)};
+  (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  qihse_qkp_session_t *session = NULL;
+  bool ok = qihse_qkp_client_negotiate(fd, &m->qkp_config, &session) ==
+                QIHSE_QKP_SECURE &&
+            session &&
+            qihse_qkp_client_session_is_replication_peer(
+                session, m->peers[peer].node_id, m->peers[peer].public_key);
+  qihse_consensus_channel_config_t channel = qcm_channel(m, (size_t)peer);
+  uint8_t header[QCM_RANGE_FORWARD_HEADER] = {0};
+  memcpy(header, "QRF2", 4);
+  memcpy(header + 4, m->consensus_config.history_id, 32);
+  qcm_auth_put64(header + 36, m->consensus_config.writer_epoch_floor);
+  ok = ok && qcm_sha256(m->consensus_config.group_id,
+                        strlen(m->consensus_config.group_id), header + 44);
+  memcpy(header + 76, m->consensus_config.self.bytes, 16);
+  memcpy(header + 92, leader.bytes, 16);
+  header[108] = (uint8_t)(timeout_ms >> 24);
+  header[109] = (uint8_t)(timeout_ms >> 16);
+  header[110] = (uint8_t)(timeout_ms >> 8);
+  header[111] = (uint8_t)timeout_ms;
+  header[112] = operation;
+  qcm_auth_put64(header + 113, (uint64_t)payload_len);
+  uint8_t digest[32];
+  ok = ok && qcm_range_digest(payload, payload_len, digest);
+  if (ok)
+    memcpy(header + 121, digest, 32);
+  ok = ok &&
+       qihse_consensus_channel_send_hello(session, fd, &channel, principal) &&
+       qihse_qkp_send_sealed(session, fd, header, sizeof(header));
+  size_t offset = 0;
+  while (ok && offset < payload_len) {
+    size_t amount = payload_len - offset;
+    if (amount > QIHSE_QKP_MAX_PAYLOAD - QCM_RANGE_CHUNK_HEADER)
+      amount = QIHSE_QKP_MAX_PAYLOAD - QCM_RANGE_CHUNK_HEADER;
+    uint8_t chunk[QIHSE_QKP_MAX_PAYLOAD];
+    memcpy(chunk, "QRC2", 4);
+    qcm_auth_put64(chunk + 4, offset);
+    chunk[12] = (uint8_t)(amount >> 24);
+    chunk[13] = (uint8_t)(amount >> 16);
+    chunk[14] = (uint8_t)(amount >> 8);
+    chunk[15] = (uint8_t)amount;
+    memcpy(chunk + QCM_RANGE_CHUNK_HEADER, payload + offset, amount);
+    ok = qihse_qkp_send_sealed(session, fd, chunk,
+                               QCM_RANGE_CHUNK_HEADER + amount);
+    offset += amount;
+  }
+  uint8_t end[44] = {0};
+  memcpy(end, "QRE2", 4);
+  qcm_auth_put64(end + 4, payload_len);
+  memcpy(end + 12, digest, 32);
+  ok = ok && qihse_qkp_send_sealed(session, fd, end, sizeof(end));
+  uint8_t reply[QCM_RANGE_FORWARD_REPLY];
+  ok = ok && qcm_range_read_exact(session, fd, reply, sizeof(reply)) &&
+       !memcmp(reply, "QRR2", 4) && reply[4] == 1u;
+  if (ok) {
+    *out_index = qcm_auth_get64(reply + 5);
+    *out_epoch = qcm_auth_get64(reply + 13);
+    memcpy(out_digest, reply + 21, 32);
+    ok = *out_index > 0;
+  }
+    qcm_debug("range forward operation %u %s; remote index %llu", operation,
+              ok ? "verified reply" : "failed", (unsigned long long)*out_index);
+    close(cancel[1]);
+  (void)pthread_join(thread, NULL);
+  close(cancel[0]);
+  if (session)
+    qihse_qkp_session_free(session);
+  close(fd);
+  return ok;
 }

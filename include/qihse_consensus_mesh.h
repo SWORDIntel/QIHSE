@@ -15,6 +15,8 @@ extern "C" {
 #endif
 
 #define QIHSE_CONSENSUS_MESH_MAX_PEERS (QIHSE_CONSENSUS_MAX_MEMBERS - 1u)
+#define QIHSE_CONSENSUS_RANGE_SLOT_COUNT 16384u
+#define QIHSE_CONSENSUS_RANGE_BITMAP_BYTES (QIHSE_CONSENSUS_RANGE_SLOT_COUNT / 8u)
 
 typedef struct {
     qihse_uuid_t member_uuid;
@@ -156,6 +158,103 @@ bool qihse_consensus_mesh_propose_authority(
     qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
     const void* payload, size_t payload_len, uint32_t timeout_ms,
     uint64_t* out_index);
+
+/* Quorum-committed per-slot ownership authority. The adapter supplies one
+ * operator-provisioned genesis map and validates operation-specific durable
+ * receipts before FINALIZE/ABORT. These APIs never accept an authorization
+ * bypass. IDs remain textual because existing topology/QKP identifiers are
+ * not fixed-width binary values. All digests are raw SHA-256 bytes. */
+/* timeout_ms bounds each blocking mesh phase, not the complete API call:
+ * blob staging and consensus commit are sequential phases and local replay
+ * follows them, so total elapsed time may exceed timeout_ms. */
+typedef enum {
+    QIHSE_RANGE_OP_TRANSFER = 1,
+    QIHSE_RANGE_OP_PROMOTION = 2
+} qihse_consensus_range_op_t;
+
+typedef struct {
+    uint16_t slot;
+    char owner_topology_id[41];
+    char owner_qkp_id[65];
+    char group_id[65];
+    uint64_t epoch;
+} qihse_consensus_range_slot_t;
+
+typedef struct {
+    qihse_consensus_range_op_t op;
+    char transfer_id[65];
+    char source_topology_id[41];
+    char source_qkp_id[65];
+    char source_group_id[65];
+    char target_topology_id[41];
+    char target_qkp_id[65];
+    char target_group_id[65];
+    char successor_topology_id[41];
+    char successor_qkp_id[65];
+    char source_generation[33];
+    char target_generation[33];
+    uint64_t durable_cursor;
+    uint8_t slots[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES];
+    uint8_t expected_state_digest[32];
+} qihse_consensus_range_request_t;
+
+typedef struct {
+    uint64_t reserve_index;
+    uint64_t grant_epoch;
+    uint8_t reserve_digest[32];
+} qihse_consensus_range_grant_t;
+
+typedef struct {
+    uint64_t decision_index;
+    uint64_t grant_epoch;
+    uint8_t decision_digest[32];
+    uint8_t evidence_digest[32];
+} qihse_consensus_range_decision_t;
+
+typedef enum {
+    QIHSE_RANGE_PHASE_NONE = 0,
+    QIHSE_RANGE_PHASE_RESERVED = 1,
+    QIHSE_RANGE_PHASE_FINALIZED = 2,
+    QIHSE_RANGE_PHASE_ABORTED = 3
+} qihse_consensus_range_phase_t;
+
+bool qihse_consensus_mesh_range_genesis_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const qihse_consensus_range_slot_t slots[QIHSE_CONSENSUS_RANGE_SLOT_COUNT],
+    uint32_t timeout_ms, uint64_t* out_index, uint8_t out_digest[32]);
+bool qihse_consensus_mesh_range_state_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const uint8_t bitmap[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES],
+    uint32_t timeout_ms,
+    qihse_consensus_range_slot_t out_slots[QIHSE_CONSENSUS_RANGE_SLOT_COUNT],
+    uint8_t out_digest[32], uint64_t* out_index);
+bool qihse_consensus_mesh_range_reserve_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const qihse_consensus_range_request_t* request, uint32_t timeout_ms,
+    qihse_consensus_range_grant_t* out_grant);
+bool qihse_consensus_mesh_range_finalize_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const qihse_consensus_range_request_t* request,
+    const qihse_consensus_range_grant_t* grant,
+    const uint8_t verified_evidence_digest[32], uint32_t timeout_ms,
+    qihse_consensus_range_decision_t* out_decision);
+bool qihse_consensus_mesh_range_abort_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const qihse_consensus_range_request_t* request,
+    const qihse_consensus_range_grant_t* grant,
+    const uint8_t verified_abort_evidence_digest[32], uint32_t timeout_ms,
+    qihse_consensus_range_decision_t* out_decision);
+bool qihse_consensus_mesh_range_transition_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    uint64_t decision_index, qihse_consensus_range_request_t* out_request,
+    qihse_consensus_range_decision_t* out_decision);
+bool qihse_consensus_mesh_range_lookup_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const char* transfer_id,
+    qihse_consensus_range_request_t* out_request,
+    qihse_consensus_range_grant_t* out_grant,
+    qihse_consensus_range_decision_t* out_decision,
+    qihse_consensus_range_phase_t* out_phase);
 
 /* Stage a transaction on this node and a voter quorum, then propose its QBR1
  * reference and wait for the normal consensus commit. principal is the
