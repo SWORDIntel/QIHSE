@@ -6,6 +6,12 @@
 static unsigned calls;
 static qihse_brain_transfer_result_t next_result;
 static char last_id[33];
+static char last_generation[33];
+static char adapter_generation[33];
+static char finalized_id[33];
+static bool finalized_receipt_available;
+static bool selector_returns_invalid_range;
+static uint16_t select_range_ceiling = UINT16_MAX;
 static uint16_t last_first, last_last;
 static qihse_brain_transfer_result_t transfer(void* ctx, qihse_user_t* control,
     qihse_user_t* data, const char* id, const char* generation, const char* target,
@@ -13,8 +19,23 @@ static qihse_brain_transfer_result_t transfer(void* ctx, qihse_user_t* control,
     (void)ctx; (void)target; assert(strlen(generation) == 32); (void)error; (void)cap;
     assert(control && data && qihse_auth_user_is_active(control));
     calls++; snprintf(last_id, sizeof(last_id), "%s", id);
+    snprintf(last_generation, sizeof(last_generation), "%s", generation);
     last_first = first; last_last = last;
+    if (finalized_receipt_available && !strcmp(finalized_id, id))
+        return QIHSE_BRAIN_TRANSFER_COMMITTED;
+    if (strcmp(adapter_generation, generation)) return QIHSE_BRAIN_TRANSFER_REJECTED;
     return next_result;
+}
+static bool select_range(void* ctx, qihse_user_t* data, uint16_t proposed_first,
+    uint16_t proposed_last, uint16_t* selected_first, uint16_t* selected_last,
+    char generation[33]) {
+    (void)ctx;
+    if (!qihse_auth_user_is_active(data) || proposed_first > proposed_last) return false;
+    *selected_first = selector_returns_invalid_range && proposed_first > 0
+        ? (uint16_t)(proposed_first - 1u) : proposed_first;
+    *selected_last = proposed_last < select_range_ceiling ? proposed_last : select_range_ceiling;
+    memset(generation, 'c', 32); generation[32] = 0;
+    return true;
 }
 static void init(brain_t* b, const char* dir, qihse_user_t* op) {
     memset(b, 0, sizeof(*b)); b->pending_lock = -1;
@@ -27,6 +48,9 @@ static void init(brain_t* b, const char* dir, qihse_user_t* op) {
     assert(qihse_cluster_topology_set_local_node(b->topology, idx));
     snprintf(b->journal_dir, sizeof(b->journal_dir), "%s", dir);
     memset(b->transfer_generation, 'a', 32);
+    b->transfer_generation[32] = 0;
+    memcpy(adapter_generation, b->transfer_generation, 33);
+    finalized_receipt_available = false;
     b->control_principal = op; b->data_principal = op; b->transfer = transfer;
     b->pending_ready = brain_pending_open(b); assert(b->pending_ready);
 }
@@ -61,10 +85,19 @@ static void test_populated_policy(qihse_user_t* op) {
      * federation journal is unavailable. The durable pending tuple and
      * adapter's fence/generation checks remain mandatory. */
     b->precondition.valid = false;
+    b->transfer_range_select = select_range;
+    select_range_ceiling = 10000;
+    memset(adapter_generation, 'c', 32); adapter_generation[32] = 0;
     unsigned before = calls; next_result = QIHSE_BRAIN_TRANSFER_COMMITTED;
     brain_check_rebalance(b, &b->obs);
-    assert(calls == before + 1); assert(last_first == 8192 && last_last == 11999);
+    assert(calls == before + 1); assert(last_first == 8192 && last_last == 10000);
+    assert(!strcmp(last_generation, "cccccccccccccccccccccccccccccccc"));
     assert(!b->pending.active);
+    unsigned rejected_calls = calls;
+    selector_returns_invalid_range = true;
+    assert(!brain_transfer_begin(b, 8192, 11999, b->obs.nodes[1].id));
+    assert(calls == rejected_calls && !b->pending.active);
+    selector_returns_invalid_range = false;
 
     /* The actor follows the largest current owner: after ownership shifts,
      * node 1 can act and transfer toward node 0. There is no permanent node-0
@@ -75,6 +108,7 @@ static void test_populated_policy(qihse_user_t* op) {
     b->obs.local_index = peer;
     brain_obs_run_t shifted[] = {{local, 0, 4383}, {peer, 4384, 16383}};
     b->obs.runs = shifted;
+    select_range_ceiling = UINT16_MAX;
     before = calls;
     brain_check_rebalance(b, &b->obs);
     assert(calls == before + 1);
@@ -143,16 +177,28 @@ int main(void) {
     dispose(recovered); init(b, dir, op); assert(!b->pending.active);
     dispose(b);
 
-    /* A source-generation change cannot replay an old pending ID. */
+    /* A changed source generation is rejected by the adapter without changing
+     * the durable tuple. A later finalized local receipt can still complete
+     * the same tuple after topology/generation advancement. */
     init(b, dir, op); next_result = QIHSE_BRAIN_TRANSFER_PENDING;
     assert(brain_transfer_begin(b, 30, 30, target)); dispose(b);
     memset(recovered, 0, sizeof(*recovered)); recovered->pending_lock = -1;
     snprintf(recovered->journal_dir, sizeof(recovered->journal_dir), "%s", dir);
     memset(recovered->transfer_generation, 'b', 32);
+    recovered->transfer_generation[32] = 0;
     assert(brain_pending_open(recovered));
     recovered->control_principal = recovered->data_principal = op; recovered->transfer = transfer;
     recovered->pending_ready = true; unsigned previous = calls;
-    assert(brain_pending_run(recovered)); assert(calls == previous);
+    memset(adapter_generation, 'c', 32); adapter_generation[32] = 0;
+    snprintf(finalized_id, sizeof(finalized_id), "%s", recovered->pending.id);
+    char saved_id[33]; snprintf(saved_id, sizeof(saved_id), "%s", recovered->pending.id);
+    assert(brain_pending_run(recovered)); assert(calls == previous + 1);
+    assert(!strcmp(last_id, saved_id) && last_first == 30 && last_last == 30);
+    assert(!strcmp(last_generation, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert(recovered->pending.active && !strcmp(recovered->pending.id, saved_id));
+    finalized_receipt_available = true;
+    assert(brain_pending_run(recovered)); assert(calls == previous + 2);
+    assert(!recovered->pending.active);
     close(recovered->pending_lock);
 
     /* A valid-looking bit flip cannot change the pending operation. */

@@ -191,6 +191,7 @@ typedef struct {
     qihse_cluster_maintenance_t* maintenance_gate;
     qihse_brain_transfer_fn transfer;
     void* transfer_context;
+    qihse_brain_transfer_range_select_fn transfer_range_select;
     char transfer_generation[33];
     bool (*transfer_generation_get)(void*, qihse_user_t*, char[33]);
     brain_pending_t pending;
@@ -1877,15 +1878,21 @@ static bool brain_current_generation(brain_t* b, char out[33]) {
     return true;
 }
 
+static bool brain_generation_valid(const char generation[33]) {
+    if (!generation || strnlen(generation, 33) != 32) return false;
+    for (size_t i = 0; i < 32; i++)
+        if (!((generation[i] >= '0' && generation[i] <= '9') ||
+              (generation[i] >= 'a' && generation[i] <= 'f'))) return false;
+    return true;
+}
+
 static bool brain_pending_run(brain_t* b) {
     if (!b->pending.active) return false;
     if (!b->pending_ready || !brain_transfer_authorized(b) || !b->transfer) return true;
-    char generation[33];
-    if (!brain_current_generation(b, generation) || strcmp(generation, b->pending.generation)) return true;
-    qihse_cluster_node_t self;
-    if (!qihse_cluster_topology_get_node(b->topology,
-            qihse_cluster_topology_local_node(b->topology), &self) ||
-        strcmp(self.id, b->pending.source)) return true;
+    /* The recorded generation and source are immutable CT2 identity fields.
+     * The adapter decides whether this is a new preparation (which must match
+     * current source state) or a local finalized receipt (which may be
+     * completed after topology/generation has advanced). */
     char error[160] = {0};
     qihse_brain_transfer_result_t result = b->transfer(b->transfer_context,
         b->control_principal, b->data_principal, b->pending.id, b->pending.generation, b->pending.target,
@@ -1922,14 +1929,24 @@ static bool brain_transfer_begin(brain_t* b, uint16_t first, uint16_t last,
     if (!b->pending_ready || !brain_transfer_authorized(b) || !b->transfer || b->pending.active)
         return false;
     char generation[33];
-    if (!brain_current_generation(b, generation)) return false;
+    uint16_t selected_first = first, selected_last = last;
+    if (first > last || last >= QIHSE_CLUSTER_SLOT_COUNT) return false;
+    if (b->transfer_range_select) {
+        selected_first = 0; selected_last = 0;
+        memset(generation, 0, sizeof(generation));
+        if (!b->transfer_range_select(b->transfer_context, b->data_principal,
+                first, last, &selected_first, &selected_last, generation) ||
+            selected_first < first || selected_last > last || selected_first > selected_last ||
+            selected_last >= QIHSE_CLUSTER_SLOT_COUNT || !brain_generation_valid(generation))
+            return false;
+    } else if (!brain_current_generation(b, generation)) return false;
     qihse_cluster_node_t self;
     if (!qihse_cluster_topology_get_node(b->topology,
             qihse_cluster_topology_local_node(b->topology), &self)) return false;
     unsigned char random[16];
     if (RAND_bytes(random, sizeof(random)) != 1) return false;
     memset(&b->pending, 0, sizeof(b->pending));
-    b->pending.active = true; b->pending.first = first; b->pending.last = last;
+    b->pending.active = true; b->pending.first = selected_first; b->pending.last = selected_last;
     snprintf(b->pending.generation, sizeof(b->pending.generation), "%s", generation);
     snprintf(b->pending.source, sizeof(b->pending.source), "%s", self.id);
     snprintf(b->pending.target, sizeof(b->pending.target), "%s", target);
@@ -2034,7 +2051,7 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
         char detail[512];
         snprintf(detail, sizeof(detail),
                  "{\"range\":\"%u-%u\",\"to\":\"%s\",\"id\":\"%s\",\"started\":%s,\"evidence\":%s}",
-                 first, pick_end, joiner->id, brain->pending.id,
+                 brain->pending.first, brain->pending.last, joiner->id, brain->pending.id,
                  begun ? "true" : "false", evidence);
         brain_journal(brain, "REBALANCE", detail);
         brain_decision_record(brain, "rebalance", detail, true);
@@ -2110,6 +2127,7 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
     brain->maintenance_gate = config->maintenance_gate;
     brain->transfer = config->transfer;
     brain->transfer_context = config->transfer_context;
+    brain->transfer_range_select = config->transfer_range_select;
     brain->transfer_generation_get = config->transfer_generation_get;
     if (config->transfer_generation && strlen(config->transfer_generation) == 32u)
         memcpy(brain->transfer_generation, config->transfer_generation, 33u);
@@ -2138,7 +2156,8 @@ bool qihse_cluster_brain_start(const qihse_brain_config_t* config) {
     }
     if (brain->transfer) {
         brain->pending_ready = brain_transfer_authorized(brain) &&
-            (brain->transfer_generation_get || strlen(brain->transfer_generation) == 32u) && brain_pending_open(brain);
+            (brain->transfer_range_select || brain->transfer_generation_get ||
+             strlen(brain->transfer_generation) == 32u) && brain_pending_open(brain);
         if (!brain->pending_ready) {
             if (brain->pending_lock >= 0) close(brain->pending_lock);
             qihse_event_stream_destroy(brain->journal);

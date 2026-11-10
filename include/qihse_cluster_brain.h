@@ -67,9 +67,12 @@
 extern "C" {
 #endif
 
-/* The adapter must call the fenced CT2 implementation. PENDING and REJECTED
- * retain the durable tuple: neither result proves that the source is unfenced.
- * TOO_LARGE is permitted only before preparation or after a proven abort. */
+/* The adapter must call the fenced CT2 implementation. On an initial call it
+ * must reject preparation when expected_generation is not current. On retry,
+ * it may complete a matching locally finalized receipt even after current
+ * topology/generation has advanced. PENDING and REJECTED retain the durable
+ * tuple: neither result proves that the source is unfenced. TOO_LARGE is
+ * permitted only before preparation or after a proven abort. */
 typedef enum {
     QIHSE_BRAIN_TRANSFER_COMMITTED = 0,
     QIHSE_BRAIN_TRANSFER_PENDING,
@@ -80,6 +83,14 @@ typedef qihse_brain_transfer_result_t (*qihse_brain_transfer_fn)(
     void* context, qihse_user_t* control_principal, qihse_user_t* data_principal,
     const char* transfer_id, const char* expected_generation, const char* target_topology_id,
     uint16_t first, uint16_t last, char* error, size_t error_cap);
+
+/* Select one non-empty, contained subrange admitted by a single source CT
+ * group and return that group's exact generation. This runs before the brain
+ * persists the immutable pending tuple and transfer ID. */
+typedef bool (*qihse_brain_transfer_range_select_fn)(
+    void* context, qihse_user_t* data_principal,
+    uint16_t proposed_first, uint16_t proposed_last,
+    uint16_t* out_first, uint16_t* out_last, char out_generation[33]);
 
 typedef struct {
     qihse_resp_server_t* server;
@@ -105,6 +116,9 @@ typedef struct {
     qihse_cluster_maintenance_t* maintenance_gate;
     qihse_brain_transfer_fn transfer;
     void* transfer_context;
+    qihse_brain_transfer_range_select_fn transfer_range_select;
+    /* Optional one-group selector takes precedence. Without it, the existing
+     * transfer_generation_get / fixed HEX32 generation behavior is retained. */
     const char* transfer_generation; /* fixed-generation adapters only, HEX32 */
     bool (*transfer_generation_get)(void* context, qihse_user_t* data_principal,
                                     char out_generation[33]);
