@@ -94,6 +94,14 @@ typedef struct {
     bool admitted;
 } qihse_kv_ct_lane_status_t;
 
+typedef struct {
+    bool active;
+    uint8_t phase; /* 0 none, 1 reserved, 2 imported, 3 finalized intent */
+    bool source_fenced;
+    bool target_imported;
+    qihse_kv_ct_lane_authority_claim_t claim;
+} qihse_kv_ct_lane_transfer_status_t;
+
 typedef enum {
     QIHSE_KV_CT_ACTOR_USER = 1,
     QIHSE_KV_CT_ACTOR_EXPIRY = 2,
@@ -202,7 +210,8 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
 bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     qihse_user_t* operator_principal, qihse_user_t* data_principal,
     const char* lane_id, const char* snapshot_filepath,
-    uint64_t baseline_row_seq, const unsigned char expected_digest[32],
+    uint64_t baseline_row_seq, uint64_t source_cut,
+    const unsigned char expected_digest[32],
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
 bool qihse_kv_ct_lane_source_reconcile_peer(qihse_kv_store_t* store,
     qihse_user_t* operator_principal, qihse_user_t* replication_principal,
@@ -238,6 +247,10 @@ bool qihse_kv_ct_writer_scope_enter_lane(qihse_kv_store_t* store,
     qihse_user_t* principal, const char* lane_id,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
     qihse_kv_ct_writer_scope_t** out_scope);
+/* Explicit native-WAL scope for the existing node-local metadata namespace.
+ * It never grants slot-owned writes and carries no lane token/cursor. */
+bool qihse_kv_ct_node_local_scope_enter(qihse_kv_store_t* store,
+    qihse_user_t* principal, qihse_kv_ct_writer_scope_t** out_scope);
 
 /* Source capture and exact bounded ordered history. A successful read never
  * coalesces intermediate overwrites. The active principal is checked at the
@@ -470,6 +483,12 @@ bool qihse_kv_ct_lane_transfer_target_import_begin(qihse_kv_store_t* store,
     const qihse_kv_ct_proof_t* reserved_proof,
     qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Reports authenticated persisted transfer intent only. Phase 3 is not an
+ * ownership grant; callers must revalidate the common final decision before
+ * calling membership_finalize after restart. */
+bool qihse_kv_ct_lane_transfer_status(qihse_kv_store_t* store,
+    qihse_user_t* control_principal,
+    qihse_kv_ct_lane_transfer_status_t* out_status);
 bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_user_t* replication_principal,
     qihse_user_t* data_principal,
