@@ -387,10 +387,14 @@ new backup instead. Do not promise an automatic rollback after cutover.
   and advances that peer's durable replication cursor. The underlying full
   `qihse_kv_save_user` backup API explicitly rejects CT-enabled stores. No
   live replica marks/cursors or data were changed for this investigation.
-  Until QIHSE exposes a supported authenticated full-owner inventory/export
-  that does not change replication state, retain the verified union and the
-  original backups and leave the 28 rows unresolved; do not re-merge or retire
-  source stores based on counts alone.
+  Source now contains an authenticated `OWNER.SNAPSHOT.*` read-only inventory
+  endpoint: it captures locally owned live rows plus node-local rows and a
+  change-sequence watermark under one snapshot lock, without changing
+  replication state. This is an inventory source, not a complete recovery
+  backup: tombstones and expired rows are omitted. The change is not yet
+  deployed to the three owners. Retain the verified union and all original
+  backups; after native rollout, export each owner and reconcile record
+  identities to explain the 28-row gap before changing or retiring any source.
 - Automatic capacity-aware balancing, automatic failover promotion, and
   dynamic successor reassignment remain open roadmap items. Keep the current
   slot-count R5 automatic rebalancer disabled for this heterogeneous layout.

@@ -163,9 +163,23 @@ int main(int argc, char** argv) {
     assert(qihse_kv_replica_snapshot_create(s, high, "*", &high_snapshot) == 0);
     assert(high_snapshot);
     uint64_t high_size = 0u;
+    uint64_t high_snapshot_seq = 0u;
+    uint64_t expected_snapshot_seq = qihse_kv_change_seq(s);
     assert(qihse_kv_replica_snapshot_size(high_snapshot, high, &high_size));
+    assert(qihse_kv_replica_snapshot_change_seq(high_snapshot, high,
+                                                &high_snapshot_seq));
+    assert(high_snapshot_seq == expected_snapshot_seq);
+    assert(qihse_kv_set_user(s, "commons/after-snapshot", "later", 0u, 0u, op));
+    uint64_t still_snapshot_seq = 0u;
+    assert(qihse_kv_replica_snapshot_change_seq(high_snapshot, high,
+                                                &still_snapshot_seq));
+    assert(still_snapshot_seq == high_snapshot_seq &&
+           qihse_kv_change_seq(s) > high_snapshot_seq);
     size_t denied_bytes = 99u;
     unsigned char denied_data[16] = {0};
+    uint64_t denied_seq = 99u;
+    assert(!qihse_kv_replica_snapshot_change_seq(high_snapshot, low, &denied_seq));
+    assert(denied_seq == 0u);
     assert(!qihse_kv_replica_snapshot_read(high_snapshot, low, 0u,
                                             denied_data, sizeof(denied_data),
                                             &denied_bytes));

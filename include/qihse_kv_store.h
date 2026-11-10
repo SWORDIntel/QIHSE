@@ -378,17 +378,22 @@ bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store);
 void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
                                                  uint32_t principal_id);
 
-/* Immutable, private snapshot artifact for a consistent replica bootstrap.
- * The caller must exclude writers while creating it and capture
- * qihse_kv_change_seq() under the same lock. The artifact is unlinked as soon
- * as it is opened and is readable only through this handle. Full-export
- * authorization semantics apply: a principal unable to read any live row is
- * refused rather than receiving a partial baseline. */
+/* Immutable, private snapshot artifact for a consistent replica bootstrap or
+ * operator inventory. The artifact is unlinked as soon as it is opened and is
+ * readable only through this handle. Its change-sequence watermark is
+ * captured under the same store lock as the bytes. Full-export authorization
+ * semantics apply: a principal unable to read any live row is refused rather
+ * than receiving a partial snapshot. */
 int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user,
                                      const char* namespace_glob,
                                      qihse_kv_replica_snapshot_t** out_snapshot);
 bool qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot,
     qihse_user_t* principal, uint64_t* out_size);
+/* Change-sequence watermark captured while the immutable snapshot bytes were
+ * written under the store lock. It is principal-bound like size/read. */
+bool qihse_kv_replica_snapshot_change_seq(
+    const qihse_kv_replica_snapshot_t* snapshot, qihse_user_t* principal,
+    uint64_t* out_change_seq);
 bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
                                     qihse_user_t* principal, uint64_t offset, void* out, size_t capacity,
                                     size_t* out_read);

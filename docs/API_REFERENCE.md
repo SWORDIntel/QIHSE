@@ -69,7 +69,7 @@ above):
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 12 | 12 |
-| `include/qihse_kv_store.h` | 98 | 95 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 99 | 96 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
@@ -1591,7 +1591,8 @@ if any writer coverage is incomplete.
 
 During `STARTUP_PENDING` and startup-created `HELD`, RESP additionally admits
 `AUTH`/`HELLO` for control-session setup. All HELD states admit `PING`, `INFO`,
-`CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and `REPL.SNAPSHOT.*`; other commands
+`CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS`, `REPL.SNAPSHOT.*`, and
+`OWNER.SNAPSHOT.*`; other commands
 are rejected with `BUSY cluster maintenance is held` except authenticated
 maintenance controls. Ordinary finite-lease holds do not admit `AUTH`/`HELLO`.
 `DBSIZE` is
@@ -1941,6 +1942,19 @@ does not return a separate missing-record total. `REPL.PULL <glob> <host:port>`
 returns the number of records pulled. Missing records are repaired by the
 anti-entropy path; conflicting values and local-only records are reported, not
 automatically overwritten or deleted by that path.
+
+For a point-in-time inventory of a CT range owner, a full-ceiling SYSTEM
+Operator may use `OWNER.SNAPSHOT.BEGIN`, `OWNER.SNAPSHOT.READ <offset>
+<length>`, and `OWNER.SNAPSHOT.END` on one authenticated session. BEGIN returns
+`[byte_length, source_change_seq]`; READ returns at most 512 KiB and must stay
+on the same session. The result contains locally owned live rows plus
+node-local rows, with their normal KV snapshot metadata. It is refused as a
+whole if any row is outside the Operator's clearance/SCI. The immutable
+snapshot's sequence watermark is captured with its bytes. These commands do
+not require or change `REPL.MARKS` or replication cursors. The inventory omits
+tombstones and expired rows, so it supports current live-state comparison; it
+is not a cross-node deletion-history backup. It is available only when the
+server is a configured CT range owner with a usable CT source.
 
 On the currently published RESP server, `INFO` reports storage-index state via
 `qihse_sst_live_files` and `qihse_sst_index_degraded`; it does not expose a

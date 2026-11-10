@@ -136,6 +136,11 @@ typedef struct {
     qihse_kv_replica_snapshot_t* repl_snapshot;
     uint64_t repl_snapshot_seq;
     uint64_t repl_snapshot_generation;
+    qihse_kv_replica_snapshot_t* owner_snapshot;
+    qihse_user_t* owner_snapshot_user; /* scoped borrow held through END */
+    uint64_t owner_snapshot_generation;
+    uint64_t owner_snapshot_size;
+    uint64_t owner_snapshot_seq;
     qihse_user_t* user;
     qihse_resp_auth_kind_t auth_kind;
     uint32_t user_id;            /* numeric user id for federation attribution */
@@ -13645,8 +13650,10 @@ static bool qihse_resp_handle_repl_snapshot_begin(qihse_resp_session_t* s,
     if (generation_ok) {
         pthread_rwlock_wrlock(&s->server->kv_lock);
         rc = qihse_kv_replica_snapshot_create(s->server->store, principal, glob, &snapshot);
-        source_seq = rc == 0 ? qihse_kv_change_seq(s->server->store) : 0u;
-        baseline_ok = rc == 0 && qihse_auth_validate_handle_generation(principal, generation) &&
+        bool snapshot_watermark_ok = rc == 0 &&
+            qihse_kv_replica_snapshot_change_seq(snapshot, s->user, &source_seq);
+        baseline_ok = rc == 0 && snapshot_watermark_ok &&
+            qihse_auth_validate_handle_generation(principal, generation) &&
             qihse_kv_replica_cursor_advance(s->server->store,
                 qihse_resp_replication_peer_id(s->server, s->qkp), glob, source_seq, principal);
         pthread_rwlock_unlock(&s->server->kv_lock);
@@ -13721,6 +13728,140 @@ static bool qihse_resp_handle_repl_snapshot_end(qihse_resp_session_t* s,
     s->repl_snapshot = NULL;
     s->repl_snapshot_seq = 0u;
     s->repl_snapshot_generation = 0u;
+    return qihse_resp_simple(s, "OK");
+}
+
+/* Owner inventory is authenticated and read-only. Unlike REPL.SNAPSHOT it
+ * requires no mark and never advances a peer cursor. The KV snapshot filters
+ * to locally owned slots and refuses partial results on authorization gaps. */
+#define QIHSE_OWNER_SNAPSHOT_READ_MAX (512u * 1024u)
+
+static bool qihse_resp_owner_snapshot_allowed(qihse_resp_session_t* s) {
+    return s && s->server && s->server->auth_required && s->user &&
+        (s->auth_kind == QIHSE_RESP_AUTH_LOCAL_PRINCIPAL ||
+         s->auth_kind == QIHSE_RESP_AUTH_QKP_ADMIN) &&
+        qihse_auth_user_is_active(s->user) &&
+        qihse_user_get_tenant_id(s->user) == QIHSE_TENANT_SYSTEM &&
+        qihse_user_get_role(s->user) == QIHSE_ROLE_OPERATOR &&
+        qihse_auth_can_access(s->user, UINT16_MAX, UINT16_MAX);
+}
+
+static void qihse_resp_owner_snapshot_clear(qihse_resp_session_t* s) {
+    if (!s) return;
+    qihse_kv_replica_snapshot_destroy(s->owner_snapshot);
+    s->owner_snapshot = NULL;
+    if (s->owner_snapshot_user)
+        qihse_auth_release_principal_scoped(s->owner_snapshot_user);
+    s->owner_snapshot_user = NULL;
+    s->owner_snapshot_generation = 0u;
+    s->owner_snapshot_size = 0u;
+    s->owner_snapshot_seq = 0u;
+}
+
+static bool qihse_resp_handle_owner_snapshot_begin(qihse_resp_session_t* s,
+                                                    const qihse_resp_request_t* r) {
+    if (r->argc != 1u) return qihse_resp_wrong_arity(s, "owner.snapshot.begin");
+    if (!qihse_resp_owner_snapshot_allowed(s))
+        return qihse_resp_error(s, "NOPERM active full-ceiling system Operator required");
+    if (!s->server->store || !s->server->ct_role ||
+        strcmp(s->server->ct_role, "primary") != 0)
+        return qihse_resp_error(s, "ERR owner snapshot requires a CT range owner");
+    if (s->in_multi) return qihse_resp_error(s, "ERR owner snapshot is not allowed in MULTI");
+    if (s->owner_snapshot)
+        return qihse_resp_error(s, "ERR owner snapshot already active on this session");
+
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(s->user), &generation);
+    if (!principal || !generation || !qihse_resp_owner_snapshot_allowed(s) ||
+        qihse_user_get_id(principal) != qihse_user_get_id(s->user)) {
+        if (principal) qihse_auth_release_principal_scoped(principal);
+        return qihse_resp_error(s, "NOPERM owner snapshot principal is no longer active");
+    }
+
+    qihse_kv_replica_snapshot_t* snapshot = NULL;
+    qihse_kv_ct_source_status_t ct_status = {0};
+    pthread_rwlock_wrlock(&s->server->kv_lock);
+    bool source_ready = qihse_kv_ct_source_status(s->server->store, principal,
+                                                   &ct_status);
+    int rc = source_ready
+        ? qihse_kv_replica_snapshot_create(s->server->store, principal, "*", &snapshot)
+        : -1;
+    pthread_rwlock_unlock(&s->server->kv_lock);
+    uint64_t snapshot_size = 0u, source_seq = 0u;
+    bool ok = rc == 0 && snapshot &&
+        qihse_auth_validate_handle_generation(principal, generation) &&
+        qihse_kv_replica_snapshot_size(snapshot, principal, &snapshot_size) &&
+        qihse_kv_replica_snapshot_change_seq(snapshot, principal, &source_seq) &&
+        qihse_resp_owner_snapshot_allowed(s) &&
+        qihse_auth_validate_handle_generation(principal, generation);
+    if (!ok) {
+        qihse_kv_replica_snapshot_destroy(snapshot);
+        qihse_auth_release_principal_scoped(principal);
+        return qihse_resp_error(s, rc == -2
+            ? "NOPERM owner snapshot principal cannot read the complete owner view"
+            : "ERR owner snapshot creation or authorization check failed");
+    }
+    s->owner_snapshot = snapshot;
+    s->owner_snapshot_user = principal;
+    s->owner_snapshot_generation = generation;
+    s->owner_snapshot_size = snapshot_size;
+    s->owner_snapshot_seq = source_seq;
+    char size_buf[32], seq_buf[32];
+    int size_len = snprintf(size_buf, sizeof(size_buf), "%llu",
+        (unsigned long long)snapshot_size);
+    int seq_len = snprintf(seq_buf, sizeof(seq_buf), "%llu",
+        (unsigned long long)source_seq);
+    bool sent = size_len > 0 && (size_t)size_len < sizeof(size_buf) &&
+        seq_len > 0 && (size_t)seq_len < sizeof(seq_buf) &&
+        qihse_resp_array(s, 2u) &&
+        qihse_resp_bulk(s, size_buf, (size_t)size_len) &&
+        qihse_resp_bulk(s, seq_buf, (size_t)seq_len);
+    if (!sent) qihse_resp_owner_snapshot_clear(s);
+    return sent;
+}
+
+static bool qihse_resp_handle_owner_snapshot_read(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    uint64_t offset = 0u, length = 0u;
+    if (r->argc != 3u || !qihse_resp_parse_u64_arg(&r->argv[1], &offset) ||
+        !qihse_resp_parse_u64_arg(&r->argv[2], &length) || length == 0u ||
+        length > QIHSE_OWNER_SNAPSHOT_READ_MAX)
+        return qihse_resp_error(s, "ERR usage: OWNER.SNAPSHOT.READ offset length (length <= 524288)");
+    if (!qihse_resp_owner_snapshot_allowed(s))
+        return qihse_resp_error(s, "NOPERM active full-ceiling system Operator required");
+    if (!s->owner_snapshot || !s->owner_snapshot_user)
+        return qihse_resp_error(s, "ERR begin owner snapshot on this session first");
+    if (!qihse_auth_validate_handle_generation(s->owner_snapshot_user,
+                                                s->owner_snapshot_generation))
+        return qihse_resp_error(s, "NOPERM owner snapshot principal generation changed");
+    size_t capacity = (size_t)length;
+    char* data = malloc(capacity);
+    if (!data) return qihse_resp_error(s, "ERR owner snapshot read allocation failed");
+    size_t got = 0u;
+    bool ok = offset <= s->owner_snapshot_size &&
+        qihse_kv_replica_snapshot_read(s->owner_snapshot, s->owner_snapshot_user,
+            offset, data, capacity, &got) &&
+        qihse_auth_validate_handle_generation(s->owner_snapshot_user,
+                                               s->owner_snapshot_generation) &&
+        qihse_resp_owner_snapshot_allowed(s);
+    if (!ok) {
+        if (got) OPENSSL_cleanse(data, got);
+        free(data);
+        return qihse_resp_error(s, "ERR owner snapshot read failed or authorization changed");
+    }
+    bool sent = qihse_resp_bulk(s, data, got);
+    OPENSSL_cleanse(data, got);
+    free(data);
+    return sent;
+}
+
+static bool qihse_resp_handle_owner_snapshot_end(qihse_resp_session_t* s,
+                                                  const qihse_resp_request_t* r) {
+    if (r->argc != 1u) return qihse_resp_wrong_arity(s, "owner.snapshot.end");
+    if (!qihse_resp_owner_snapshot_allowed(s))
+        return qihse_resp_error(s, "NOPERM active full-ceiling system Operator required");
+    qihse_resp_owner_snapshot_clear(s);
     return qihse_resp_simple(s, "OK");
 }
 
@@ -14145,6 +14286,9 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     /* New commands must be appended: the SWAR fast-path uses stable indices. */
     {"repl.ct1", qihse_resp_handle_ct1, 0},
     {"repl.ct2", qihse_resp_handle_ct2, DSP_BUSY_WRITE},
+    {"owner.snapshot.begin", qihse_resp_handle_owner_snapshot_begin, 0},
+    {"owner.snapshot.read", qihse_resp_handle_owner_snapshot_read, 0},
+    {"owner.snapshot.end", qihse_resp_handle_owner_snapshot_end, 0},
 };
 
 #define RESP_DISPATCH_MAP_CAP 256u
@@ -18023,6 +18167,7 @@ static void qihse_resp_qtype_map_build(void) {
  * bounded while the vocabulary grows.  The list is fixed and short, and only
  * consulted for names the table above does not cover. */
 static const struct { const char* prefix; uint8_t type; } g_qtype_prefixes[] = {
+    {"OWNER.SNAPSHOT.", QIHSE_QUERY_TYPE_SCAN},
     {"KEYSTONE.FEED.", QIHSE_QUERY_TYPE_KEYSTONE},
     {"TASK.", QIHSE_QUERY_TYPE_FABRIC},
     {"SCHEDULE.", QIHSE_QUERY_TYPE_FABRIC},
@@ -18119,7 +18264,9 @@ static bool qihse_resp_dispatch_unscoped(qihse_resp_session_t* session,
                       qihse_resp_arg_equal(&request->argv[1], "NODES") ||
                       qihse_resp_arg_equal(&request->argv[1], "SLOTS"))) ||
                     (request->argv[0].len >= 14u &&
-                     memcmp(request->argv[0].data, "REPL.SNAPSHOT.", 14u) == 0);
+                     memcmp(request->argv[0].data, "REPL.SNAPSHOT.", 14u) == 0) ||
+                    (request->argv[0].len >= 15u &&
+                     memcmp(request->argv[0].data, "OWNER.SNAPSHOT.", 15u) == 0);
         if (status.state != QIHSE_MAINT_OPEN && !safe)
             return qihse_resp_error(session, "BUSY cluster maintenance is held");
         if (status.state == QIHSE_MAINT_OPEN) {
@@ -19228,6 +19375,7 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
     qihse_kv_replica_snapshot_destroy(session.repl_snapshot);
     session.repl_snapshot = NULL;
     session.repl_snapshot_generation = 0u;
+    qihse_resp_owner_snapshot_clear(&session);
     /* R5 §13: unregister any stream watches while the session is still valid. */
     qihse_resp_watch_detach(&session);
     pthread_mutex_destroy(&session.io_lock);

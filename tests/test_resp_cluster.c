@@ -575,6 +575,22 @@ int main(void) {
                 strncmp(response, "-NOPERM ", 8u) == 0) &&
                strstr(response, "HIGH_CLUSTER_SECRET") == NULL);
         free(response);
+        const char* owner_snapshot_begin[] = { "OWNER.SNAPSHOT.BEGIN" };
+        send_command(auth_client.fd, 1u, owner_snapshot_begin);
+        response = read_response(&auth_client);
+        assert(strcmp(response,
+            "-NOPERM active full-ceiling system Operator required\r\n") == 0);
+        assert(strstr(response, protected_key) == NULL &&
+               strstr(response, "HIGH_CLUSTER_SECRET") == NULL);
+        free(response);
+        const char* owner_snapshot_read[] = { "OWNER.SNAPSHOT.READ", "0", "64" };
+        send_command(auth_client.fd, 3u, owner_snapshot_read);
+        response = read_response(&auth_client);
+        assert(strcmp(response,
+            "-NOPERM active full-ceiling system Operator required\r\n") == 0);
+        assert(strstr(response, protected_key) == NULL &&
+               strstr(response, "HIGH_CLUSTER_SECRET") == NULL);
+        free(response);
         char slot_text[16];
         snprintf(slot_text, sizeof slot_text, "%u", (unsigned)protected_slot);
         const char* unsafe_node[] = { "CLUSTER", "SETSLOT", slot_text,
@@ -680,6 +696,13 @@ int main(void) {
     send_command(auth_client.fd, 2u, read_copy);
     response = read_response(&auth_client);
     assert(strcmp(response, "$13\r\nunproven-copy\r\n") == 0);
+    free(response);
+    const char* owner_snapshot_begin[] = { "OWNER.SNAPSHOT.BEGIN" };
+    send_command(auth_client.fd, 1u, owner_snapshot_begin);
+    response = read_response(&auth_client);
+    assert(strcmp(response, "-ERR owner snapshot requires a CT range owner\r\n") == 0);
+    assert(strstr(response, protected_key) == NULL &&
+           strstr(response, "HIGH_CLUSTER_SECRET") == NULL);
     free(response);
     const char* quit_operator[] = { "QUIT" };
     send_command(auth_client.fd, 1u, quit_operator);

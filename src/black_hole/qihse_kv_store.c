@@ -393,6 +393,7 @@ struct qihse_kv_store {
 struct qihse_kv_replica_snapshot {
     int fd;
     uint64_t size;
+    uint64_t source_change_seq;
     qihse_user_t* principal;
     uint32_t principal_id;
     uint32_t tenant_id;
@@ -5982,6 +5983,9 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
     kv_store_wrlock(store);
     int save_rc = store->recovery_pending ? -1 :
         qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob);
+    /* The data file and this watermark must describe the same locked store
+     * view. Callers can safely resume delta replication after this value. */
+    uint64_t source_change_seq = save_rc == 0 ? store->change_seq : 0u;
     kv_store_unlock(store);
     if (save_rc != 0) {
         int saved_errno = errno;
@@ -6003,6 +6007,7 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
     if (!snapshot) { close(fd); return -1; }
     snapshot->fd = fd;
     snapshot->size = (uint64_t)st.st_size;
+    snapshot->source_change_seq = source_change_seq;
     snapshot->principal = user;
     snapshot->principal_id = qihse_user_get_id(user);
     snapshot->tenant_id = qihse_user_get_tenant_id(user);
@@ -6028,6 +6033,18 @@ bool qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot,
         errno = EACCES; return false;
     }
     *out_size = snapshot->size;
+    return true;
+}
+
+bool qihse_kv_replica_snapshot_change_seq(
+    const qihse_kv_replica_snapshot_t* snapshot, qihse_user_t* principal,
+    uint64_t* out_change_seq) {
+    if (out_change_seq) *out_change_seq = 0u;
+    if (!out_change_seq || !replica_snapshot_authorized(snapshot, principal)) {
+        errno = EACCES;
+        return false;
+    }
+    *out_change_seq = snapshot->source_change_seq;
     return true;
 }
 

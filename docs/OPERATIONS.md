@@ -844,7 +844,7 @@ rejected SLOT_UPDATE/GROUP/federation counters and the failover-paused flag.
 
 While HELD, RESP admits `AUTH`/`HELLO` for control-session setup and only
 `PING`, `INFO`, `CLUSTER HEALTH/TOPOLOGY/INFO/NODES/SLOTS` and
-`REPL.SNAPSHOT.*`; everything else gets
+`REPL.SNAPSHOT.*` and `OWNER.SNAPSHOT.*`; everything else gets
 `BUSY cluster maintenance is held`. `BEGIN` also refuses while a pending
 failback ledger exists, and `DBSIZE` is excluded from the held whitelist
 (it can take a compaction fallback if metadata is degraded).
