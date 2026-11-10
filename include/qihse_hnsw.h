@@ -84,6 +84,12 @@ typedef struct {
 
 // Function prototypes
 qihse_hnsw_index_t* hnsw_create(void);
+bool hnsw_try_insert(qihse_hnsw_index_t *index, uint32_t node_id,
+                    const float *vector, size_t dim);
+/* A false return can follow partial link edits. Callers must discard/destroy
+ * that index; it must not be published or queried as a completed build. */
+/* Compatibility wrapper. New builders should use hnsw_try_insert so an
+ * allocation failure cannot be mistaken for a completed insertion. */
 void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vector, size_t dim);
 void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t ep, int ef, int level, uint32_t *results, size_t *num_results);
 void hnsw_select_neighbors(qihse_hnsw_index_t *index, const float *query, uint32_t *candidates, size_t num_candidates, uint32_t M, uint32_t *selected, size_t *num_selected);

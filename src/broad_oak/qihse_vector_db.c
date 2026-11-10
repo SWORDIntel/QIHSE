@@ -2024,6 +2024,11 @@ static bool qihse_vdb_graph_build(qihse_vector_db_t vdb, size_t M, size_t ef_con
     if (ef_construction == 0u) {
         ef_construction = 200u;
     }
+    if (M > UINT32_MAX / 2u || ef_construction > INT_MAX ||
+        vdb->live_vectors > UINT32_MAX) {
+        errno = EOVERFLOW;
+        return false;
+    }
 
     capacity = vdb->live_vectors;
     if (capacity == 0u) {
@@ -2076,12 +2081,26 @@ static bool qihse_vdb_graph_build(qihse_vector_db_t vdb, size_t M, size_t ef_con
         const qihse_index_row_t* row_i = &vdb->rows[actual_i];
         const float* vec_i = qihse_vdb_vector_at(vdb, row_i);
         if (vec_i) {
-            hnsw_insert(vdb->hnsw_index, (uint32_t)i, vec_i, vdb->vector_dims);
+            if (!hnsw_try_insert(vdb->hnsw_index, (uint32_t)i, vec_i,
+                                 vdb->vector_dims)) {
+                qihse_vdb_graph_destroy(vdb);
+                return false;
+            }
         }
     }
 
-    vdb->graph_neighbors = (size_t*)calloc(capacity * M, sizeof(size_t));
-    vdb->graph_neighbor_counts = (size_t*)calloc(capacity, sizeof(size_t));
+    size_t graph_neighbor_slots, graph_neighbor_bytes, graph_count_bytes;
+    if (!qihse_checked_mul_size(capacity, M, &graph_neighbor_slots) ||
+        !qihse_checked_mul_size(graph_neighbor_slots, sizeof(size_t),
+                                &graph_neighbor_bytes) ||
+        !qihse_checked_mul_size(capacity, sizeof(size_t),
+                                &graph_count_bytes)) {
+        qihse_vdb_graph_destroy(vdb);
+        errno = EOVERFLOW;
+        return false;
+    }
+    vdb->graph_neighbors = (size_t*)calloc(1u, graph_neighbor_bytes);
+    vdb->graph_neighbor_counts = (size_t*)calloc(1u, graph_count_bytes);
     if (!vdb->graph_neighbors || !vdb->graph_neighbor_counts) {
         free(vdb->graph_neighbors); vdb->graph_neighbors = NULL;
         free(vdb->graph_neighbor_counts); vdb->graph_neighbor_counts = NULL;

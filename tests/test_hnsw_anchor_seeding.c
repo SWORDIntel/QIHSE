@@ -69,7 +69,8 @@ static qihse_hnsw_index_t *build_index(vector_store_t *store) {
     qihse_hnsw_enable_anchor_seeding(idx, true);
 
     for (uint32_t i = 0; i < store->n; i++) {
-        hnsw_insert(idx, i, &store->data[(size_t)i * store->dim], store->dim);
+        assert(hnsw_try_insert(idx, i, &store->data[(size_t)i * store->dim],
+                               store->dim));
     }
     return idx;
 }

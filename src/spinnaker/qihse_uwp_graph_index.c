@@ -308,7 +308,14 @@ static bool gi_hnsw_insert(void* handle, uint64_t row_id, const void* data, size
         wrap->vector_cap = new_cap;
     }
     memcpy(&wrap->vectors[(size_t)node_id * wrap->dim], data, wrap->dim * sizeof(float));
-    hnsw_insert(wrap->index, node_id, (const float*)data, wrap->dim);
+    if (!hnsw_try_insert(wrap->index, node_id, (const float*)data,
+                         wrap->dim)) {
+        /* Insertion can fail after changing a subset of links. Retire the
+         * incomplete graph rather than allowing later calls to query it. */
+        hnsw_destroy(wrap->index);
+        wrap->index = NULL;
+        return false;
+    }
     return true;
 }
 

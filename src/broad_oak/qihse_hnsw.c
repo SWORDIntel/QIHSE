@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <errno.h>
+#include <limits.h>
 
 /* These public structs promise over-alignment, which malloc/calloc only
  * guarantee up to max_align_t. Keep the allocation size valid for aligned
@@ -27,6 +29,15 @@ static void *hnsw_aligned_calloc(size_t alignment, size_t size) {
         return NULL;
     memset(ptr, 0, padded);
     return ptr;
+}
+
+static bool hnsw_size_mul(size_t count, size_t item_size, size_t *bytes) {
+    if (!bytes || (item_size && count > SIZE_MAX / item_size)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    *bytes = count * item_size;
+    return true;
 }
 
 qihse_hnsw_index_t *hnsw_create(void) {
@@ -231,12 +242,28 @@ static int compare_cand_asc(const void *a, const void *b) {
     return (d1 < d2) ? -1 : (d1 > d2 ? 1 : 0);
 }
 
-void hnsw_select_neighbors(qihse_hnsw_index_t *index, const float *query, uint32_t *candidates, size_t num_candidates, uint32_t M, uint32_t *selected, size_t *num_selected) {
-    if (num_selected) *num_selected = 0;
-    if (num_candidates == 0) return;
+static bool hnsw_select_neighbors_checked(qihse_hnsw_index_t *index,
+                                          const float *query,
+                                          uint32_t *candidates,
+                                          size_t num_candidates, uint32_t M,
+                                          uint32_t *selected,
+                                          size_t *num_selected) {
+    if (!num_selected || (num_candidates && (!candidates || !selected))) {
+        errno = EINVAL;
+        return false;
+    }
+    *num_selected = 0;
+    if (num_candidates == 0) return true;
+    if (num_candidates > SIZE_MAX / sizeof(cand_t)) {
+        errno = EOVERFLOW;
+        return false;
+    }
 
     cand_t *sorted_c = (cand_t *)malloc(num_candidates * sizeof(cand_t));
-    if (!sorted_c) return;
+    if (!sorted_c) {
+        errno = ENOMEM;
+        return false;
+    }
 
     for (size_t i = 0; i < num_candidates; i++) {
         sorted_c[i].id = candidates[i];
@@ -273,68 +300,120 @@ void hnsw_select_neighbors(qihse_hnsw_index_t *index, const float *query, uint32
         *num_selected = sel_count;
     }
     free(sorted_c);
+    return true;
 }
 
-static void ensure_layer_capacity(qihse_hnsw_layer_t *layer, uint32_t node_id) {
+void hnsw_select_neighbors(qihse_hnsw_index_t *index, const float *query,
+                          uint32_t *candidates, size_t num_candidates,
+                          uint32_t M, uint32_t *selected,
+                          size_t *num_selected) {
+    (void)hnsw_select_neighbors_checked(index, query, candidates,
+                                        num_candidates, M, selected,
+                                        num_selected);
+}
+
+static bool ensure_layer_capacity(qihse_hnsw_layer_t *layer, uint32_t node_id) {
+    if (!layer || node_id == UINT32_MAX) {
+        errno = EOVERFLOW;
+        return false;
+    }
     if (node_id >= layer->links_capacity) {
         uint32_t new_cap = node_id + 1;
-        if (new_cap < layer->links_capacity * 2) new_cap = layer->links_capacity * 2;
+        if (layer->links_capacity <= UINT32_MAX / 2u &&
+            new_cap < layer->links_capacity * 2u)
+            new_cap = layer->links_capacity * 2u;
         if (new_cap < 16) new_cap = 16;
-        qihse_hnsw_links_t **new_links = (qihse_hnsw_links_t**)realloc(layer->links, new_cap * sizeof(qihse_hnsw_links_t*));
-        if (!new_links) return;
+        size_t bytes;
+        if (!hnsw_size_mul((size_t)new_cap, sizeof(qihse_hnsw_links_t *),
+                           &bytes)) return false;
+        qihse_hnsw_links_t **new_links = (qihse_hnsw_links_t**)realloc(
+            layer->links, bytes);
+        if (!new_links) {
+            errno = ENOMEM;
+            return false;
+        }
         layer->links = new_links;
         for (uint32_t i = layer->links_capacity; i < new_cap; i++) {
             layer->links[i] = NULL;
         }
         layer->links_capacity = new_cap;
     }
+    return true;
 }
 
 static qihse_hnsw_links_t* get_or_create_links(qihse_hnsw_layer_t *layer, uint32_t node_id, uint32_t M) {
-    ensure_layer_capacity(layer, node_id);
-    if (node_id >= layer->links_capacity) return NULL;
+    if (!ensure_layer_capacity(layer, node_id)) return NULL;
     if (!layer->links[node_id]) {
-        layer->links[node_id] = (qihse_hnsw_links_t*)hnsw_aligned_calloc(32, sizeof(qihse_hnsw_links_t));
-        if (!layer->links[node_id]) return NULL;
-        layer->links[node_id]->capacity = M;
-        layer->links[node_id]->neighbors = (uint32_t*)malloc(M * sizeof(uint32_t));
-        if (!layer->links[node_id]->neighbors) {
-            free(layer->links[node_id]);
-            layer->links[node_id] = NULL;
+        qihse_hnsw_links_t *links = (qihse_hnsw_links_t*)hnsw_aligned_calloc(
+            32, sizeof(qihse_hnsw_links_t));
+        if (!links) {
+            errno = ENOMEM;
             return NULL;
         }
+        size_t bytes;
+        if (!M) {
+            free(links);
+            errno = EINVAL;
+            return NULL;
+        }
+        if (!hnsw_size_mul((size_t)M, sizeof(uint32_t), &bytes)) {
+            free(links);
+            return NULL;
+        }
+        links->neighbors = (uint32_t*)malloc(bytes);
+        if (!links->neighbors) {
+            free(links);
+            errno = ENOMEM;
+            return NULL;
+        }
+        links->capacity = M;
+        layer->links[node_id] = links;
     }
     return layer->links[node_id];
 }
 
-static void add_link_and_prune(qihse_hnsw_index_t *index, int level, uint32_t from, uint32_t to, uint32_t M) {
-    if (!index || level > index->max_level || level < 0) return;
+static bool add_link_and_prune(qihse_hnsw_index_t *index, int level, uint32_t from, uint32_t to, uint32_t M) {
+    if (!index || level > index->max_level || level < 0) {
+        errno = EINVAL;
+        return false;
+    }
     qihse_hnsw_layer_t *layer = index->layers[level];
-    if (!layer) return;
+    if (!layer) {
+        errno = EINVAL;
+        return false;
+    }
     
     qihse_hnsw_links_t *links = get_or_create_links(layer, from, M);
-    if (!links) return;
+    if (!links) return false;
 
     for (uint32_t i = 0; i < links->count; i++) {
-        if (links->neighbors[i] == to) return;
+        if (links->neighbors[i] == to) return true;
     }
 
     if (links->count < links->capacity) {
         links->neighbors[links->count++] = to;
+        return true;
     } else {
+        size_t candidates_bytes, selected_bytes;
+        if (links->count == UINT32_MAX ||
+            !hnsw_size_mul((size_t)links->count + 1u, sizeof(uint32_t),
+                           &candidates_bytes) ||
+            !hnsw_size_mul((size_t)M, sizeof(uint32_t), &selected_bytes))
+            return false;
         uint32_t num_cands = links->count + 1;
-        uint32_t *cands = (uint32_t *)malloc(num_cands * sizeof(uint32_t));
-        if (!cands) return;
+        uint32_t *cands = (uint32_t *)malloc(candidates_bytes);
+        if (!cands) { errno = ENOMEM; return false; }
         
         for (uint32_t i = 0; i < links->count; i++) {
             cands[i] = links->neighbors[i];
         }
         cands[links->count] = to;
 
-        uint32_t *sel = (uint32_t *)malloc(M * sizeof(uint32_t));
+        uint32_t *sel = (uint32_t *)malloc(selected_bytes);
         if (!sel) {
             free(cands);
-            return;
+            errno = ENOMEM;
+            return false;
         }
         
         size_t sel_cnt = 0;
@@ -342,7 +421,13 @@ static void add_link_and_prune(qihse_hnsw_index_t *index, int level, uint32_t fr
         if (index->params.get_vector_fn) {
             from_vec = index->params.get_vector_fn(index->params.user_context, from);
         }
-        hnsw_select_neighbors(index, from_vec, cands, num_cands, M, sel, &sel_cnt);
+        if (!hnsw_select_neighbors_checked(index, from_vec, cands, num_cands,
+                                           M, sel, &sel_cnt) || sel_cnt == 0) {
+            free(cands);
+            free(sel);
+            if (errno == 0) errno = EINVAL;
+            return false;
+        }
         
         links->count = (uint32_t)sel_cnt;
         for (size_t i = 0; i < sel_cnt; i++) {
@@ -351,6 +436,7 @@ static void add_link_and_prune(qihse_hnsw_index_t *index, int level, uint32_t fr
         
         free(cands);
         free(sel);
+        return true;
     }
 }
 
@@ -378,7 +464,7 @@ static void visited_set_free(visited_set_t *set) {
 }
 
 static bool is_visited(visited_set_t *set, uint32_t node) {
-    uint32_t h = (node * 2654435761u) % set->capacity;
+    size_t h = ((size_t)node * 2654435761u) % set->capacity;
     while (set->keys[h] != 0) {
         if (set->keys[h] == node + 1) return true;
         h = (h + 1) % set->capacity;
@@ -386,36 +472,46 @@ static bool is_visited(visited_set_t *set, uint32_t node) {
     return false;
 }
 
-static void mark_visited(visited_set_t *set, uint32_t node) {
-    if (set->count * 2 >= set->capacity) {
+static bool mark_visited(visited_set_t *set, uint32_t node) {
+    if (set->count >= set->capacity / 2u) {
         size_t old_cap = set->capacity;
         uint32_t *old_keys = set->keys;
-        
-        set->capacity *= 2;
-        set->keys = (uint32_t*)calloc(set->capacity, sizeof(uint32_t));
-        set->count = 0;
+        size_t new_bytes;
+        if (old_cap > SIZE_MAX / 2u ||
+            !hnsw_size_mul(old_cap * 2u, sizeof(uint32_t), &new_bytes)) {
+            errno = EOVERFLOW;
+            return false;
+        }
+        size_t capacity = old_cap * 2u;
+        uint32_t *new_keys = (uint32_t*)calloc(1u, new_bytes);
+        if (!new_keys) {
+            errno = ENOMEM;
+            return false;
+        }
         
         for (size_t i = 0; i < old_cap; i++) {
             if (old_keys[i] != 0) {
                 uint32_t n = old_keys[i] - 1;
-                uint32_t h = (n * 2654435761u) % set->capacity;
-                while (set->keys[h] != 0) {
-                    h = (h + 1) % set->capacity;
+                size_t h = ((size_t)n * 2654435761u) % capacity;
+                while (new_keys[h] != 0) {
+                    h = (h + 1) % (uint32_t)capacity;
                 }
-                set->keys[h] = old_keys[i];
-                set->count++;
+                new_keys[h] = old_keys[i];
             }
         }
         free(old_keys);
+        set->keys = new_keys;
+        set->capacity = capacity;
     }
 
-    uint32_t h = (node * 2654435761u) % set->capacity;
+    size_t h = ((size_t)node * 2654435761u) % set->capacity;
     while (set->keys[h] != 0) {
-        if (set->keys[h] == node + 1) return;
+        if (set->keys[h] == node + 1) return true;
         h = (h + 1) % set->capacity;
     }
     set->keys[h] = node + 1;
     set->count++;
+    return true;
 }
 
 /* --- Binary min-heap for candidate extraction (O(log n) per pop) --- */
@@ -488,9 +584,16 @@ static void max_heap_replace_max(cand_t *heap, size_t count, cand_t item) {
     }
 }
 
-void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t ep, int ef, int level, uint32_t *results, size_t *num_results) {
+static bool hnsw_search_layer_checked(qihse_hnsw_index_t *index,
+                                      const float *query, uint32_t ep, int ef,
+                                      int level, uint32_t *results,
+                                      size_t *num_results) {
     if (num_results) *num_results = 0;
-    if (!index || level > index->max_level || level < 0 || ef <= 0 || !index->layers[level]) return;
+    if (!index || !num_results || level > index->max_level || level < 0 ||
+        ef <= 0 || !index->layers[level]) {
+        errno = EINVAL;
+        return false;
+    }
     qihse_hnsw_layer_t *layer = index->layers[level];
 
     bool use_f16c = (level == 0 && hnsw_has_f16c());
@@ -507,6 +610,11 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
     size_t target_ef = (size_t)ef;
     size_t ef_search_layer = target_ef;
     if (use_f16c) {
+        if (target_ef > SIZE_MAX / 2u) {
+            errno = EOVERFLOW;
+            free(query_fp16);
+            return false;
+        }
         /* Re-rank top-M (M = max(2*k, 64)) candidates against master FP32 vectors */
         size_t M_prom = target_ef * 2;
         if (M_prom < 64) M_prom = 64;
@@ -514,13 +622,27 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
     }
 
     visited_set_t *vset = visited_set_create();
-    if (!vset) { free(query_fp16); return; }
-    size_t cand_capacity = ef_search_layer * 10;
-    if (cand_capacity == 0) { free(query_fp16); visited_set_free(vset); return; }
-    cand_t *cand_heap = (cand_t*)malloc(cand_capacity * sizeof(cand_t));
-    cand_t *top_heap = (cand_t*)malloc(ef_search_layer * sizeof(cand_t));
+    if (!vset) {
+        errno = ENOMEM;
+        free(query_fp16);
+        return false;
+    }
+    size_t cand_capacity, cand_bytes, top_bytes;
+    if (ef_search_layer == 0u || ef_search_layer > SIZE_MAX / 10u ||
+        !hnsw_size_mul(ef_search_layer * 10u, sizeof(cand_t), &cand_bytes) ||
+        !hnsw_size_mul(ef_search_layer, sizeof(cand_t), &top_bytes)) {
+        errno = EOVERFLOW;
+        free(query_fp16);
+        visited_set_free(vset);
+        return false;
+    }
+    cand_capacity = ef_search_layer * 10u;
+    cand_t *cand_heap = (cand_t*)malloc(cand_bytes);
+    cand_t *top_heap = (cand_t*)malloc(top_bytes);
     if (!cand_heap || !top_heap) {
-        free(cand_heap); free(top_heap); free(query_fp16); visited_set_free(vset); return;
+        errno = ENOMEM;
+        free(cand_heap); free(top_heap); free(query_fp16); visited_set_free(vset);
+        return false;
     }
 
     size_t cand_count = 0;
@@ -529,7 +651,10 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
     float d = hnsw_node_dist(index, query, query_fp16, ep, use_f16c);
     min_heap_push(cand_heap, &cand_count, (cand_t){ep, d});
     max_heap_push(top_heap, &top_count, (cand_t){ep, d});
-    mark_visited(vset, ep);
+    if (!mark_visited(vset, ep)) {
+        free(cand_heap); free(top_heap); free(query_fp16); visited_set_free(vset);
+        return false;
+    }
 
     while (cand_count > 0) {
         /* Extract min from candidate heap — O(log n) instead of O(n) */
@@ -545,7 +670,11 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
             for (size_t i = 0; i < links->count; i++) {
                 uint32_t e = links->neighbors[i];
                 if (!is_visited(vset, e)) {
-                    mark_visited(vset, e);
+                    if (!mark_visited(vset, e)) {
+                        free(cand_heap); free(top_heap); free(query_fp16);
+                        visited_set_free(vset);
+                        return false;
+                    }
 
                     if (use_f16c) {
                         const uint16_t *neighbor_vec = get_layer0_fp16_vector(index, e);
@@ -562,9 +691,27 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                     float dist_e = hnsw_node_dist(index, query, query_fp16, e, use_f16c);
                     if (top_count < ef_search_layer || dist_e < top_heap[0].dist) {
                         if (cand_count >= cand_capacity) {
+                            if (cand_capacity > SIZE_MAX / 2u) {
+                                errno = EOVERFLOW;
+                                free(cand_heap); free(top_heap); free(query_fp16);
+                                visited_set_free(vset);
+                                return false;
+                            }
                             cand_capacity *= 2;
-                            cand_t *new_cands = (cand_t*)realloc(cand_heap, cand_capacity * sizeof(cand_t));
-                            if (!new_cands) break;
+                            size_t new_bytes;
+                            if (!hnsw_size_mul(cand_capacity, sizeof(cand_t),
+                                               &new_bytes)) {
+                                free(cand_heap); free(top_heap); free(query_fp16);
+                                visited_set_free(vset);
+                                return false;
+                            }
+                            cand_t *new_cands = (cand_t*)realloc(cand_heap, new_bytes);
+                            if (!new_cands) {
+                                errno = ENOMEM;
+                                free(cand_heap); free(top_heap); free(query_fp16);
+                                visited_set_free(vset);
+                                return false;
+                            }
                             cand_heap = new_cands;
                         }
                         min_heap_push(cand_heap, &cand_count, (cand_t){e, dist_e});
@@ -602,6 +749,10 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                 }
             }
             free(promoted);
+        } else if (top_count) {
+            errno = ENOMEM;
+            free(query_fp16); visited_set_free(vset); free(cand_heap); free(top_heap);
+            return false;
         }
         free(query_fp16);
     } else {
@@ -619,17 +770,37 @@ void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query, uint32_t e
                 }
             }
             free(sorted);
+        } else if (top_count) {
+            errno = ENOMEM;
+            free(query_fp16); visited_set_free(vset); free(cand_heap); free(top_heap);
+            return false;
         }
     }
 
     visited_set_free(vset);
     free(cand_heap);
     free(top_heap);
+    return true;
 }
 
-void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vector, size_t dim) {
-    (void)dim;
-    if (!index) return;
+void hnsw_search_layer(qihse_hnsw_index_t *index, const float *query,
+                       uint32_t ep, int ef, int level, uint32_t *results,
+                       size_t *num_results) {
+    (void)hnsw_search_layer_checked(index, query, ep, ef, level, results,
+                                    num_results);
+}
+
+bool hnsw_try_insert(qihse_hnsw_index_t *index, uint32_t node_id,
+                     const float *vector, size_t dim) {
+    if (!index || !vector || !index->params.dim || dim != index->params.dim ||
+        !index->params.M || !index->params.M0 ||
+        !index->params.ef_construction || !isfinite(index->params.mult) ||
+        index->params.mult < 0.0f || node_id == UINT32_MAX ||
+        index->num_nodes == UINT32_MAX ||
+        index->params.ef_construction > INT_MAX) {
+        errno = EINVAL;
+        return false;
+    }
 
     if (hnsw_has_f16c() && vector) {
         store_layer0_fp16_vector(index, node_id, vector, index->params.dim);
@@ -641,7 +812,11 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
      * seeding has been enabled by the caller, so unaware callers pay zero
      * overhead. */
     if (index->anchor_seeding_enabled) {
-        qihse_hnsw_register_projection(index, node_id, vector, index->params.dim);
+        if (qihse_hnsw_register_projection(index, node_id, vector,
+                                          index->params.dim) != 0) {
+            if (errno == 0) errno = ENOMEM;
+            return false;
+        }
     }
 
     qihse_hnsw_xoshiro_init_tls();
@@ -649,15 +824,36 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
     if (__builtin_expect(rng_val == 0, 0)) {
         rng_val = 1;
     }
-    int l = (int)(__builtin_clzll(rng_val) * index->params.mult * 0.693147f);
+    double raw_level = (double)__builtin_clzll(rng_val) *
+                       (double)index->params.mult * 0.693147;
+    if (!isfinite(raw_level) || raw_level < 0.0 || raw_level > INT_MAX) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    int l = (int)raw_level;
 
     // Expand layers array if needed
     if (l > index->max_level || index->max_level == -1) {
         int target_level = l > index->max_level ? l : index->max_level;
+        if (target_level < 0 || (uint64_t)target_level >= UINT32_MAX) {
+            errno = EOVERFLOW;
+            return false;
+        }
         if (target_level >= (int)index->layers_capacity) {
-            uint32_t new_cap = target_level + 1;
-            if (new_cap < index->layers_capacity * 2) new_cap = index->layers_capacity * 2;
-            index->layers = (qihse_hnsw_layer_t**)realloc(index->layers, new_cap * sizeof(qihse_hnsw_layer_t*));
+            uint32_t new_cap = (uint32_t)target_level + 1u;
+            if (index->layers_capacity <= UINT32_MAX / 2u &&
+                new_cap < index->layers_capacity * 2u)
+                new_cap = index->layers_capacity * 2u;
+            size_t bytes;
+            if (!hnsw_size_mul((size_t)new_cap, sizeof(qihse_hnsw_layer_t *),
+                               &bytes)) return false;
+            qihse_hnsw_layer_t **new_layers = (qihse_hnsw_layer_t**)realloc(
+                index->layers, bytes);
+            if (!new_layers) {
+                errno = ENOMEM;
+                return false;
+            }
+            index->layers = new_layers;
             for (uint32_t i = index->layers_capacity; i < new_cap; i++) {
                 index->layers[i] = NULL;
             }
@@ -666,6 +862,10 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
         for (int i = index->max_level + 1; i <= target_level; i++) {
             if (!index->layers[i]) {
                 index->layers[i] = (qihse_hnsw_layer_t*)hnsw_aligned_calloc(64, sizeof(qihse_hnsw_layer_t));
+                if (!index->layers[i]) {
+                    errno = ENOMEM;
+                    return false;
+                }
                 index->layers[i]->level = i;
             }
         }
@@ -678,7 +878,9 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
         for (int lc = max_level; lc > l; lc--) {
             uint32_t closest = ep;
             size_t num_closest = 0;
-            hnsw_search_layer(index, vector, ep, 1, lc, &closest, &num_closest);
+            if (!hnsw_search_layer_checked(index, vector, ep, 1, lc,
+                                           &closest, &num_closest))
+                return false;
             if (num_closest > 0) {
                 ep = closest;
             }
@@ -690,31 +892,58 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
         index->enter_point = node_id;
         index->max_level = l;
         index->num_nodes++;
-        return;
+        return true;
     }
 
     for (int lc = start_level; lc >= 0; lc--) {
         uint32_t M = (lc == 0) ? index->params.M0 : index->params.M;
         
-        uint32_t *candidates = (uint32_t *)malloc(index->params.ef_construction * sizeof(uint32_t));
-        if (!candidates) break;
+        size_t candidates_bytes, selected_bytes;
+        if (!hnsw_size_mul((size_t)index->params.ef_construction,
+                           sizeof(uint32_t), &candidates_bytes) ||
+            !hnsw_size_mul((size_t)M, sizeof(uint32_t), &selected_bytes))
+            return false;
+        uint32_t *candidates = (uint32_t *)malloc(candidates_bytes);
+        if (!candidates) { errno = ENOMEM; return false; }
         
         size_t num_candidates = 0;
-        hnsw_search_layer(index, vector, ep, index->params.ef_construction, lc, candidates, &num_candidates);
+        if (!hnsw_search_layer_checked(index, vector, ep,
+                                       (int)index->params.ef_construction, lc,
+                                       candidates, &num_candidates)) {
+            free(candidates);
+            return false;
+        }
+        if (!num_candidates) {
+            free(candidates);
+            errno = EINVAL;
+            return false;
+        }
         
-        uint32_t *selected = (uint32_t *)malloc(M * sizeof(uint32_t));
+        uint32_t *selected = (uint32_t *)malloc(selected_bytes);
         if (!selected) {
             free(candidates);
-            break;
+            errno = ENOMEM;
+            return false;
         }
         
         size_t num_selected = 0;
-        hnsw_select_neighbors(index, vector, candidates, num_candidates, M, selected, &num_selected);
+        if (!hnsw_select_neighbors_checked(index, vector, candidates,
+                                           num_candidates, M, selected,
+                                           &num_selected) || !num_selected) {
+            free(candidates);
+            free(selected);
+            if (errno == 0) errno = EINVAL;
+            return false;
+        }
         
         for (size_t i = 0; i < num_selected; i++) {
             uint32_t neighbor = selected[i];
-            add_link_and_prune(index, lc, node_id, neighbor, M);
-            add_link_and_prune(index, lc, neighbor, node_id, M);
+            if (!add_link_and_prune(index, lc, node_id, neighbor, M) ||
+                !add_link_and_prune(index, lc, neighbor, node_id, M)) {
+                free(candidates);
+                free(selected);
+                return false;
+            }
         }
         
         if (num_selected > 0) {
@@ -731,6 +960,12 @@ void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id, const float *vecto
     }
     
     index->num_nodes++;
+    return true;
+}
+
+void hnsw_insert(qihse_hnsw_index_t *index, uint32_t node_id,
+                 const float *vector, size_t dim) {
+    (void)hnsw_try_insert(index, node_id, vector, dim);
 }
 
 void hnsw_destroy(qihse_hnsw_index_t *index) {
