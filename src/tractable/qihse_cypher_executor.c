@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <errno.h>
 
 /* ---- CSV line parser (for LOAD CSV) ---- */
 
@@ -1231,10 +1232,143 @@ static void exec_projection(qihse_graph_t* g, const qihse_cypher_clause_t* c, ta
 
 /* ---- ORDER BY / SKIP / LIMIT applied to result set ---- */
 
-static void apply_order_skip_limit(cypher_result_set_t* rs, qihse_cypher_clause_t* order,
+static char* order_expr_name(const cypher_expr_t* expr) {
+    if (!expr) return NULL;
+    if (expr->type == CEXPR_VAR) return strdup(expr->s_val ? expr->s_val : "");
+    if (expr->type == CEXPR_PROP_ACCESS && expr->left &&
+        expr->left->type == CEXPR_VAR) {
+        size_t n = strlen(expr->left->s_val ? expr->left->s_val : "") +
+                   strlen(expr->s_val ? expr->s_val : "") + 2;
+        char* name = malloc(n);
+        if (name) snprintf(name, n, "%s.%s", expr->left->s_val, expr->s_val);
+        return name;
+    }
+    return NULL;
+}
+
+static int compare_order_values(const cypher_res_t* a, const cypher_res_t* b) {
+    if (a->type == CRES_NULL || b->type == CRES_NULL)
+        return (a->type == CRES_NULL) - (b->type == CRES_NULL);
+    if (a->type == CRES_STRING && b->type == CRES_STRING)
+        return strcmp(a->val.s ? a->val.s : "", b->val.s ? b->val.s : "");
+    bool a_integer = a->type == CRES_INT64 || a->type == CRES_BOOL;
+    bool b_integer = b->type == CRES_INT64 || b->type == CRES_BOOL;
+    bool a_number = a_integer || a->type == CRES_DOUBLE;
+    bool b_number = b_integer || b->type == CRES_DOUBLE;
+    if (a_number && b_number) {
+        if (a_integer && b_integer) {
+            int64_t av = a->type == CRES_BOOL ? (int64_t)a->val.b : a->val.i;
+            int64_t bv = b->type == CRES_BOOL ? (int64_t)b->val.b : b->val.i;
+            return (av > bv) - (av < bv);
+        }
+        long double av = a->type == CRES_DOUBLE ? (long double)a->val.d :
+            (long double)(a->type == CRES_BOOL ? (int64_t)a->val.b : a->val.i);
+        long double bv = b->type == CRES_DOUBLE ? (long double)b->val.d :
+            (long double)(b->type == CRES_BOOL ? (int64_t)b->val.b : b->val.i);
+        return (av > bv) - (av < bv);
+    }
+    if (a->type == b->type && (a->type == CRES_VERTEX || a->type == CRES_EDGE))
+        return (a->val.id > b->val.id) - (a->val.id < b->val.id);
+    return (a->type > b->type) - (a->type < b->type);
+}
+
+static int compare_result_rows(const cypher_result_set_t* rs, size_t a, size_t b,
+                               const qihse_cypher_clause_t* order,
+                               const size_t* order_cols) {
+    for (size_t i = 0; i < order->num_order_items; ++i) {
+        const cypher_order_item_t* item = order->order_items[i];
+        const cypher_res_t* av = &rs->values[a * rs->num_cols + order_cols[i]];
+        const cypher_res_t* bv = &rs->values[b * rs->num_cols + order_cols[i]];
+        int cmp;
+        if (av->type == CRES_NULL || bv->type == CRES_NULL) {
+            if (av->type == bv->type) cmp = 0;
+            else if (item->nulls_first) cmp = av->type == CRES_NULL ? -1 : 1;
+            else if (item->nulls_last) cmp = av->type == CRES_NULL ? 1 : -1;
+            else cmp = item->descending
+                ? (av->type == CRES_NULL ? -1 : 1)
+                : (av->type == CRES_NULL ? 1 : -1);
+        } else {
+            cmp = compare_order_values(av, bv);
+            if (item->descending) cmp = -cmp;
+        }
+        if (cmp) return cmp;
+    }
+    return (a > b) - (a < b); /* stable deterministic tie-break */
+}
+
+static bool apply_order_skip_limit(cypher_result_set_t* rs,
+                                   const qihse_cypher_clause_t* order,
+                                   const qihse_cypher_clause_t* projection,
                                    int64_t skip, int64_t limit) {
-    (void)order; (void)rs; (void)skip; (void)limit;
-    /* ORDER BY on result set not fully wired; pass-through */
+    if (!rs || skip < -1 || limit < -1) return false;
+    size_t* order_cols = NULL;
+    size_t* indices = NULL;
+    cypher_res_t* sorted = NULL;
+    if (order && order->num_order_items) {
+        order_cols = calloc(order->num_order_items, sizeof(*order_cols));
+        if (!order_cols) return false;
+        for (size_t i = 0; i < order->num_order_items; ++i) {
+            char* name = order_expr_name(order->order_items[i]->expr);
+            if (!name) { free(order_cols); return false; }
+            size_t col;
+            for (col = 0; col < rs->num_cols; ++col)
+                if (rs->names[col] && !strcmp(rs->names[col], name)) break;
+            if (col == rs->num_cols && projection) {
+                for (size_t iret = 0; iret < projection->num_items; ++iret) {
+                    char* source = order_expr_name(projection->items[iret]->expr);
+                    bool same = source && !strcmp(source, name);
+                    free(source);
+                    if (same) { col = iret; break; }
+                }
+            }
+            free(name);
+            if (col == rs->num_cols) {
+                free(order_cols);
+                errno = EINVAL;
+                return false;
+            }
+            order_cols[i] = col;
+        }
+        indices = malloc((rs->num_rows ? rs->num_rows : 1) * sizeof(*indices));
+        if (!indices) { free(order_cols); return false; }
+        for (size_t i = 0; i < rs->num_rows; ++i) indices[i] = i;
+        /* Stable insertion sort; result sets are bounded and this avoids global qsort state. */
+        for (size_t i = 1; i < rs->num_rows; ++i) {
+            size_t value = indices[i], j = i;
+            while (j && compare_result_rows(rs, value, indices[j - 1], order,
+                                             order_cols) < 0) {
+                indices[j] = indices[j - 1];
+                --j;
+            }
+            indices[j] = value;
+        }
+        size_t cells = rs->num_rows * rs->num_cols;
+        sorted = malloc((cells ? cells : 1) * sizeof(*sorted));
+        if (!sorted) { free(indices); free(order_cols); return false; }
+        for (size_t row = 0; row < rs->num_rows; ++row)
+            for (size_t col = 0; col < rs->num_cols; ++col)
+                sorted[row * rs->num_cols + col] =
+                    rs->values[indices[row] * rs->num_cols + col];
+        free(rs->values);
+        rs->values = sorted;
+        free(indices);
+        free(order_cols);
+    }
+    size_t start = skip > 0 ? ((uint64_t)skip >= rs->num_rows ? rs->num_rows : (size_t)skip) : 0;
+    size_t end = rs->num_rows;
+    if (limit >= 0 && (uint64_t)limit < end - start) end = start + (size_t)limit;
+    size_t kept = end - start;
+    for (size_t row = 0; row < start; ++row)
+        for (size_t col = 0; col < rs->num_cols; ++col)
+            cypher_res_free(&rs->values[row * rs->num_cols + col]);
+    for (size_t row = end; row < rs->num_rows; ++row)
+        for (size_t col = 0; col < rs->num_cols; ++col)
+            cypher_res_free(&rs->values[row * rs->num_cols + col]);
+    if (start && kept)
+        memmove(rs->values, rs->values + start * rs->num_cols,
+                kept * rs->num_cols * sizeof(*rs->values));
+    rs->num_rows = kept;
+    return true;
 }
 
 /* ---- main execution ---- */
@@ -1245,9 +1379,18 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
     cypher_result_set_t* rs = NULL;
     qihse_cypher_clause_t* pending_order = NULL;
     int64_t pending_skip = -1, pending_limit = -1;
+    bool failed = false;
+    bool projected = false;
+    bool with_projection = false;
+    const qihse_cypher_clause_t* projection = NULL;
 
     qihse_cypher_clause_t* c = q->first;
-    while (c) {
+    while (c && !failed) {
+        if (with_projection && c->type != CYPHER_ORDER_BY &&
+            c->type != CYPHER_SKIP && c->type != CYPHER_LIMIT)
+            with_projection = false;
+        if (projected && c->type != CYPHER_ORDER_BY &&
+            c->type != CYPHER_SKIP && c->type != CYPHER_LIMIT) break;
         switch (c->type) {
             case CYPHER_MATCH: {
                 for (size_t p = 0; p < c->num_paths; ++p) {
@@ -1294,10 +1437,9 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
             case CYPHER_RETURN: {
                 rs = calloc(1, sizeof(cypher_result_set_t));
                 exec_projection(g, c, &cur, rs);
-                if (pending_order || pending_skip >= 0 || pending_limit >= 0)
-                    apply_order_skip_limit(rs, pending_order, pending_skip, pending_limit);
-                /* stop clause chain for this query */
-                goto done;
+                projected = true;
+                projection = c;
+                break;
             }
             case CYPHER_WITH: {
                 /* project into a new table where columns become bindings */
@@ -1311,11 +1453,21 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
                     table_add(&cur, nr);
                 }
                 qihse_cypher_result_free(tmp);
+                with_projection = true;
                 break;
             }
-            case CYPHER_ORDER_BY: pending_order = c; break;
-            case CYPHER_SKIP: pending_skip = c->skip; break;
-            case CYPHER_LIMIT: pending_limit = c->limit; break;
+            case CYPHER_ORDER_BY:
+                if (with_projection) failed = true;
+                else pending_order = c;
+                break;
+            case CYPHER_SKIP:
+                if (with_projection) failed = true;
+                else pending_skip = c->skip;
+                break;
+            case CYPHER_LIMIT:
+                if (with_projection) failed = true;
+                else pending_limit = c->limit;
+                break;
             case CYPHER_UNION: {
                 /* result set already built by preceding RETURN; combine with next query's RETURN */
                 /* simplified: leave rs as-is for first branch */
@@ -1325,8 +1477,15 @@ static cypher_result_set_t* execute_query(qihse_graph_t* g, qihse_cypher_query_t
         }
         c = c->next;
     }
-done:
+    if (rs && (pending_order || pending_skip >= 0 || pending_limit >= 0) &&
+        !apply_order_skip_limit(rs, pending_order, projection,
+                                pending_skip, pending_limit))
+        failed = true;
     table_free(&cur);
+    if (failed) {
+        qihse_cypher_result_free(rs);
+        return NULL;
+    }
     if (!rs) {
         rs = calloc(1, sizeof(cypher_result_set_t));
         rs->num_cols = 0; rs->num_rows = 0;

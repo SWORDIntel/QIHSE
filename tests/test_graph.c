@@ -256,6 +256,58 @@ static void test_cypher_exec_match(void) {
     PASS();
 }
 
+static void test_cypher_order_skip_limit(void) {
+    TEST("Cypher ORDER BY / SKIP / LIMIT affect returned rows");
+    qihse_graph_t* g = qihse_graph_create();
+    const char* labels[] = {"Person"};
+    const char* keys[] = {"name"};
+    const char* names[] = {"Charlie", "Alice", "Bob"};
+    for (size_t i = 0; i < 3; ++i) {
+        graph_prop_t value = graph_prop_make_string(names[i]);
+        ASSERT(qihse_graph_vertex_create(g, labels, 1, keys, &value, 1) != 0,
+               "create person vertex");
+    }
+
+    cypher_result_set_t* rs = qihse_cypher_run(g,
+        "MATCH (n:Person) RETURN n.name AS name ORDER BY name ASC SKIP 1 LIMIT 1");
+    ASSERT(rs != NULL, "ordered paginated query succeeds");
+    ASSERT(rs->num_cols == 1 && rs->num_rows == 1, "skip/limit row count");
+    ASSERT(rs->values[0].type == CRES_STRING &&
+           strcmp(rs->values[0].val.s, "Bob") == 0,
+           "ORDER BY then SKIP selects Bob");
+    qihse_cypher_result_free(rs);
+
+    rs = qihse_cypher_run(g,
+        "MATCH (n:Person) RETURN n.name AS name ORDER BY name DESC LIMIT 1");
+    ASSERT(rs != NULL && rs->num_rows == 1, "descending limit query succeeds");
+    ASSERT(strcmp(rs->values[0].val.s, "Charlie") == 0,
+           "descending order selects Charlie");
+    qihse_cypher_result_free(rs);
+
+    rs = qihse_cypher_run(g,
+        "MATCH (n:Person) RETURN n.name AS alias ORDER BY n.name DESC LIMIT 1");
+    ASSERT(rs != NULL && rs->num_rows == 1, "source expression order query succeeds");
+    ASSERT(strcmp(rs->values[0].val.s, "Charlie") == 0,
+           "ORDER BY source expression maps to projected alias");
+    qihse_cypher_result_free(rs);
+
+    rs = qihse_cypher_run(g,
+        "MATCH (n:Person) RETURN n.name AS alias ORDER BY missing ASC");
+    ASSERT(rs == NULL, "unprojected sort key is rejected instead of ignored");
+
+    rs = qihse_cypher_run(g, "MATCH (n:Person) RETURN n.name SKIP -1");
+    ASSERT(rs == NULL, "negative SKIP is rejected");
+    rs = qihse_cypher_run(g, "MATCH (n:Person) RETURN n.name LIMIT -2");
+    ASSERT(rs == NULL, "negative LIMIT is rejected");
+    rs = qihse_cypher_run(g,
+        "MATCH (n:Person) WITH n ORDER BY n.name LIMIT 1 "
+        "MATCH (n)-[:KNOWS]->(m) RETURN m");
+    ASSERT(rs == NULL, "unsupported WITH pagination is rejected, not deferred");
+
+    qihse_graph_destroy(g);
+    PASS();
+}
+
 static void test_triangle_count(void) {
     TEST("triangle counting");
     qihse_graph_t* g = qihse_graph_create();
@@ -489,6 +541,7 @@ int main(void) {
     test_cypher_parse_create();
     test_cypher_parse_relationship();
     test_cypher_exec_match();
+    test_cypher_order_skip_limit();
     test_triangle_count();
     
     test_load_csv_with_headers();

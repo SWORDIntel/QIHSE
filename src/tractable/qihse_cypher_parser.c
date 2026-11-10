@@ -1178,6 +1178,12 @@ static qihse_cypher_clause_t* parse_skip_limit(parser_t* p, qihse_cypher_clause_
     if (t == CYPHER_SKIP) expect_kw(p, "SKIP"); else expect_kw(p, "LIMIT");
     qihse_cypher_clause_t* c = clause_new(t);
     if (p->L.cur.kind != TOK_INT) { p_error(p, "expected integer"); clause_free(c); return NULL; }
+    if (p->L.cur.i_val < 0) {
+        p_error(p, t == CYPHER_SKIP ? "SKIP must be non-negative" :
+                                     "LIMIT must be non-negative");
+        clause_free(c);
+        return NULL;
+    }
     if (t == CYPHER_SKIP) c->skip = p->L.cur.i_val; else c->limit = p->L.cur.i_val;
     lex_advance(&p->L);
     return c;
@@ -1796,6 +1802,9 @@ qihse_cypher_ast_t* qihse_cypher_parse(const char* text) {
         accept_tok(&p, TOK_SEMI);
         if (p.L.cur.kind == TOK_EOF) break;
     }
-    if (ast->num_queries == 0) { qihse_cypher_ast_free(ast); return NULL; }
+    if (ast->num_queries == 0 || g_error[0]) {
+        qihse_cypher_ast_free(ast);
+        return NULL;
+    }
     return ast;
 }

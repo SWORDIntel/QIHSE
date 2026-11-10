@@ -649,6 +649,10 @@ typedef struct {
     int commits;
     int aborts;
     int fail_prepare;
+    int fail_commit_attempts;
+    int commit_successes;
+    int fail_abort_attempts;
+    int abort_successes;
 } participant_state_t;
 
 static int part_prepare(void* ctx, uint64_t txn_id) {
@@ -659,12 +663,24 @@ static int part_prepare(void* ctx, uint64_t txn_id) {
 }
 static int part_commit(void* ctx, uint64_t txn_id) {
     (void)txn_id;
-    ((participant_state_t*)ctx)->commits++;
+    participant_state_t* s = (participant_state_t*)ctx;
+    s->commits++;
+    if (s->fail_commit_attempts > 0) {
+        s->fail_commit_attempts--;
+        return -1;
+    }
+    s->commit_successes++;
     return 0;
 }
 static int part_abort(void* ctx, uint64_t txn_id) {
     (void)txn_id;
-    ((participant_state_t*)ctx)->aborts++;
+    participant_state_t* s = (participant_state_t*)ctx;
+    s->aborts++;
+    if (s->fail_abort_attempts > 0) {
+        s->fail_abort_attempts--;
+        return -1;
+    }
+    s->abort_successes++;
     return 0;
 }
 
@@ -761,25 +777,59 @@ static void test_two_phase_commit(void) {
     assert(qihse_txn_prepare(mgr, t) == 0);
     assert(t->state == QIHSE_TXN_PREPARED);
     assert(p1.prepares == 1 && p2.prepares == 1);
+    p2.fail_commit_attempts = 1;
+    participant_state_t late = {0};
+    qihse_txn_participant_t e3 = e1;
+    e3.engine_id = QIHSE_MVCC_ENGINE_VECTOR;
+    e3.engine_ctx = &late;
+    assert(qihse_txn_commit_prepared(mgr, t) == -1);
+    assert(t->state == QIHSE_TXN_COMMITTING);
+    assert(!qihse_txn_is_committed(mgr, t->id));
+    assert(qihse_txn_abort_prepared(mgr, t) == -1);
+    assert(qihse_txn_rollback(mgr, t) == -1);
+    assert(qihse_txn_register_participant(mgr, e3) == 0);
+    assert(p1.commits == 1 && p1.commit_successes == 1);
+    assert(p2.commits == 1 && p2.commit_successes == 0);
+    assert(late.commits == 0); /* participant set was frozen at PREPARE */
+    qihse_txn_t* blocked = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
+    assert(blocked);
+    assert(qihse_txn_commit(mgr, blocked) == -1);
+    assert(blocked->state == QIHSE_TXN_ACTIVE);
     assert(qihse_txn_commit_prepared(mgr, t) == 0);
     assert(t->state == QIHSE_TXN_COMMITTED);
-    assert(p1.commits == 1 && p2.commits == 1);
+    assert(p1.commits == 1 && p1.commit_successes == 1);
+    assert(p2.commits == 2 && p2.commit_successes == 1);
+    assert(late.commits == 0);
     assert(qihse_txn_is_committed(mgr, t->id));
+    assert(qihse_txn_commit(mgr, blocked) == 0);
 
     /* A participant that refuses to prepare aborts the transaction. */
-    p1.fail_prepare = 1;
+    p2.fail_prepare = 1;
+    p1.fail_abort_attempts = 1;
     qihse_txn_t* u = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
     assert(u);
     assert(qihse_txn_prepare(mgr, u) == -1);
+    assert(u->state == QIHSE_TXN_ABORTING);
+    assert(!qihse_txn_is_aborted(mgr, u->id));
+    assert(p1.aborts == 1 && p1.abort_successes == 0);
+    assert(p2.aborts == 1 && p2.abort_successes == 1);
+    assert(late.aborts == 0); /* prepare was never attempted for late participant */
+    assert(qihse_txn_abort_prepared(mgr, u) == 0);
     assert(u->state == QIHSE_TXN_ABORTED);
     assert(qihse_txn_is_aborted(mgr, u->id));
+    assert(p1.aborts == 2 && p1.abort_successes == 1);
+    assert(p2.aborts == 1);
 
     /* Explicit abort of a prepared transaction calls every participant. */
-    p1.fail_prepare = 0;
+    p2.fail_prepare = 0;
+    p2.fail_abort_attempts = 1;
     int aborts_before = p1.aborts;
     qihse_txn_t* v = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
     assert(v);
     assert(qihse_txn_prepare(mgr, v) == 0);
+    assert(qihse_txn_abort_prepared(mgr, v) == -1);
+    assert(v->state == QIHSE_TXN_ABORTING);
+    assert(p1.aborts == aborts_before + 1);
     assert(qihse_txn_abort_prepared(mgr, v) == 0);
     assert(v->state == QIHSE_TXN_ABORTED);
     assert(p1.aborts == aborts_before + 1);

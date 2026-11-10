@@ -23,7 +23,13 @@ typedef enum qihse_txn_state_e {
     QIHSE_TXN_ACTIVE     = 0,
     QIHSE_TXN_PREPARED   = 1,
     QIHSE_TXN_COMMITTED  = 2,
-    QIHSE_TXN_ABORTED    = 3
+    QIHSE_TXN_ABORTED    = 3,
+    /* COMMIT is irrevocable and still being delivered to one or more 2PC
+     * participants. Retry qihse_txn_commit_prepared() to finish it. */
+    QIHSE_TXN_COMMITTING = 4,
+    /* An ABORT decision is pending participant acknowledgements. Retry
+     * qihse_txn_abort_prepared() until it reaches ABORTED. */
+    QIHSE_TXN_ABORTING   = 5
 } qihse_txn_state_t;
 
 /* ── Isolation level ────────────────────────────────────────────────────── */
@@ -65,7 +71,9 @@ typedef void (*qihse_txn_resource_rollback_fn)(void* resource_ctx);
 typedef struct qihse_txn_participant_s {
     uint8_t  engine_id;
     void*    engine_ctx;
-    /* Returns 0 on success, non-zero on failure (abort) */
+    /* Participants must durably deduplicate decisions by txn_id: a non-zero
+     * return can mean the effect happened but its acknowledgement was lost.
+     * Failed callbacks are retried; COMMIT is never followed by ABORT. */
     int  (*prepare)(void* engine_ctx, uint64_t txn_id);
     int  (*commit)(void* engine_ctx, uint64_t txn_id);
     int  (*abort)(void* engine_ctx, uint64_t txn_id);
@@ -98,6 +106,9 @@ typedef struct qihse_txn_manager qihse_txn_manager_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
+/* The manager has no durable 2PC decision journal. Callers must resolve all
+ * COMMITTING/ABORTING transactions before destroying it or pending participant
+ * work will require external recovery. */
 qihse_txn_manager_t* qihse_txn_manager_create(void);
 void qihse_txn_manager_destroy(qihse_txn_manager_t* mgr);
 
@@ -163,10 +174,17 @@ int qihse_txn_register_participant(qihse_txn_manager_t* mgr,
  * Returns 0 if all participants prepared successfully, -1 otherwise. */
 int qihse_txn_prepare(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
-/* After PREPARE succeeds, COMMIT phase calls commit() on all participants. */
+/* After PREPARE succeeds, COMMIT calls participants. If any callback fails,
+ * returns -1 with txn->state == QIHSE_TXN_COMMITTING. The commit decision is
+ * irrevocable; call this function again to retry only unfinished callbacks.
+ * This pending decision is in-memory only and is not recovered after manager
+ * process loss. Participants must deduplicate retries by txn_id. */
 int qihse_txn_commit_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
-/* After PREPARE fails (or coordinator decides to abort), call abort(). */
+/* After PREPARE fails (or coordinator decides to abort), call abort(). A
+ * failed abort leaves state ABORTING; retry this function until acknowledged.
+ * Participants must durably deduplicate decisions by txn_id. The pending
+ * decision is in memory only and is not recovered after manager process loss. */
 int qihse_txn_abort_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
 /* ── Registry queries ───────────────────────────────────────────────────── */
