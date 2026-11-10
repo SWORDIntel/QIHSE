@@ -127,12 +127,33 @@ int main(void) {
         error, sizeof(error)));
     assert(!unresolved);
 
-    /* An unrelated active fence must never be cleared by the old abort. */
+    /* A later unfinished transaction may already own the active fence when
+     * replay reaches the older ABORTED entry. The old entry must defer to the
+     * final journal state, and the later fence must remain active. */
     assert(qihse_kv_ct_fence_range(store, operator, "different-active-transfer",
         600u, 610u, token, &source_cut));
+    qihse_cluster_ownership_txn_t later = prepared;
+    later.phase = QIHSE_OWNERSHIP_PREPARED;
+    later.start = 600u; later.end = 610u; later.source_lsn = source_cut;
+    snprintf(later.transfer_id, sizeof(later.transfer_id), "%s", "different-active-transfer");
+    assert(qihse_cluster_ownership_journal_append_txn(data_dir, &later) == 0);
+    assert(qihse_cluster_ownership_replay_control(&ownership, &unresolved,
+        error, sizeof(error)));
+    assert(unresolved);
+    qihse_kv_ct_transfer_status_t status = {0};
+    assert(qihse_kv_ct_transfer_status(store, operator, &status));
+    assert(status.fence_state == 1u &&
+        !strcmp(status.transfer_id, "different-active-transfer"));
+
+    /* A fence that does not match the journal's final pending transaction
+     * remains a hard failure; the deferred historical abort cannot bless it. */
+    assert(qihse_kv_ct_fence_finish(store, operator,
+        "different-active-transfer", false, token));
+    assert(qihse_kv_ct_fence_range(store, operator, "unrelated-active-transfer",
+        700u, 710u, token, &source_cut));
     assert(!qihse_cluster_ownership_replay_control(&ownership, &unresolved,
         error, sizeof(error)));
-    assert(strstr(error, "durable source abort fence recovery failed"));
+    assert(strstr(error, "active CT source fence does not match"));
 
     OPENSSL_cleanse(token, sizeof(token));
     qihse_cluster_topology_destroy(topology);

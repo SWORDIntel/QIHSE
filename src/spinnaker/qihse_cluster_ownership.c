@@ -1555,8 +1555,13 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
         qihse_kv_ct_transfer_status_t status;
         memset(&status, 0, sizeof(status));
         bool ok = qihse_kv_ct_transfer_status(c->store, c->principal, &status);
-        if (ok && status.fence_state == 1u &&
-            !strcmp(status.transfer_id, txn->transfer_id)) {
+        bool same_fence = ok && status.fence_state == 1u &&
+            !strcmp(status.transfer_id, txn->transfer_id) &&
+            status.first_slot == txn->start && status.last_slot == txn->end &&
+            status.cut_position == txn->source_lsn &&
+            !strcmp(status.source_id, txn->source_qkp_id) &&
+            !strcmp(status.generation, txn->generation);
+        if (same_fence) {
             unsigned char token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
             ok = qihse_kv_ct_owner_token_get(c->store, c->principal, token) &&
                 qihse_kv_ct_fence_finish(c->store, c->principal,
@@ -1565,10 +1570,13 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
             memset(&status, 0, sizeof(status));
             ok = ok && qihse_kv_ct_transfer_status(c->store, c->principal, &status);
         }
-        /* ABORTED is durable before the source fence is released. Recovery
-         * must finish that crash window, and a later restart must also accept
-         * the already released state. Never clear a different active fence. */
-        ok = ok && status.fence_state == 0u && status.transfer_id[0] == '\0';
+        /* ABORTED is durable before its source fence is released. Finish that
+         * crash window only when every durable fence field identifies this
+         * exact transaction. Older ABORTED entries can precede a later active
+         * transfer in the journal; leave that fence for final replay
+         * validation rather than mistaking it for this transaction. */
+        ok = ok && (status.fence_state != 1u ||
+            (status.transfer_id[0] && strcmp(status.transfer_id, txn->transfer_id)));
         OPENSSL_cleanse(&status, sizeof(status));
         if (!ok) {
             set_error(r->err, r->err_cap, "durable source abort fence recovery failed");
@@ -1971,6 +1979,33 @@ static bool ownership_replay_impl(
         if (!err || !err_cap || !err[0]) set_error(err, err_cap, "ownership journal is corrupt or recovery failed");
         return false;
     }
+    /* The replay callback visits historical terminal records before it knows
+     * which transaction is last. Validate any remaining live fence against
+     * that final journal state so a deferred historical ABORTED record cannot
+     * hide an unrelated transfer. */
+    qihse_kv_ct_transfer_status_t fence_status;
+    memset(&fence_status, 0, sizeof(fence_status));
+    if (!qihse_kv_ct_transfer_status(c->store, c->principal, &fence_status)) {
+        set_error(err, err_cap, "durable CT transfer status unavailable during journal recovery");
+        return false;
+    }
+    if (fence_status.fence_state == 1u) {
+        const qihse_cluster_ownership_txn_t* pending =
+            (*out_unresolved && ctx.has_prepared) ? &ctx.prepared : NULL;
+        bool matches_pending = pending &&
+            !strcmp(fence_status.transfer_id, pending->transfer_id) &&
+            fence_status.first_slot == pending->start &&
+            fence_status.last_slot == pending->end &&
+            fence_status.cut_position == pending->source_lsn &&
+            !strcmp(fence_status.source_id, pending->source_qkp_id) &&
+            !strcmp(fence_status.generation, pending->generation);
+        if (!matches_pending) {
+            OPENSSL_cleanse(&fence_status, sizeof(fence_status));
+            set_error(err, err_cap, "active CT source fence does not match the final unfinished ownership transaction");
+            return false;
+        }
+    }
+    OPENSSL_cleanse(&fence_status, sizeof(fence_status));
     if (*out_unresolved && ctx.has_prepared && ctx.prepared.next_generation[0]) {
         if (!resume_prepared_ct1(c, &ctx.prepared, err, err_cap)) return false;
         *out_unresolved = false;
