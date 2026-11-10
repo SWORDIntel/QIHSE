@@ -206,6 +206,35 @@ static void set_error(char* err, size_t cap, const char* message) {
     if (err && cap) snprintf(err, cap, "%s", message ? message : "ownership transfer failed");
 }
 
+static bool range_authority_hooks_valid(
+    const qihse_cluster_ownership_context_t* c) {
+    if (!c) return false;
+    unsigned configured = (c->range_reserve != NULL) +
+        (c->range_check_reserved != NULL) + (c->range_finalize != NULL) +
+        (c->range_check_finalized != NULL) + (c->range_abort != NULL);
+    return configured == 0 || configured == 5;
+}
+
+static bool range_check_reserved(qihse_cluster_ownership_context_t* c,
+    const qihse_cluster_ownership_txn_t* txn, char* err, size_t err_cap) {
+    if (!range_authority_hooks_valid(c)) {
+        set_error(err, err_cap, "range authority hooks are incomplete");
+        return false;
+    }
+    return !c->range_check_reserved || c->range_check_reserved(
+        c->range_authority_context, c->principal, txn, err, err_cap);
+}
+
+static bool range_check_finalized(qihse_cluster_ownership_context_t* c,
+    const qihse_cluster_ownership_txn_t* txn, char* err, size_t err_cap) {
+    if (!range_authority_hooks_valid(c)) {
+        set_error(err, err_cap, "range authority hooks are incomplete");
+        return false;
+    }
+    return !c->range_check_finalized || c->range_check_finalized(
+        c->range_authority_context, c->principal, txn, err, err_cap);
+}
+
 static bool ownership_system_operator_active(const qihse_user_t* user) {
     return user && qihse_auth_user_is_active(user) &&
         qihse_user_get_role(user) == QIHSE_ROLE_OPERATOR &&
@@ -293,6 +322,10 @@ bool qihse_cluster_ownership_transfer_prepare_ex(
         set_error(err, err_cap, "source cut and fence state outputs are required");
         return false;
     }
+    if (!range_authority_hooks_valid(c)) {
+        set_error(err, err_cap, "range authority hooks are incomplete");
+        return false;
+    }
     bool unresolved = false;
     if (!qihse_cluster_ownership_replay_control(c, &unresolved, err, err_cap)) {
         *out_recovery_may_be_needed = true;
@@ -303,6 +336,10 @@ bool qihse_cluster_ownership_transfer_prepare_ex(
         qihse_cluster_ownership_txn_t recovered;
         if (qihse_cluster_ownership_transfer_get_prepared(c, transfer_id,
                 &recovered, NULL, 0)) {
+            if (!range_check_reserved(c, &recovered, err, err_cap)) {
+                OPENSSL_cleanse(&recovered, sizeof(recovered));
+                return false;
+            }
             *out_source_lsn = recovered.source_lsn;
             *out_recovery_may_be_needed = true;
             OPENSSL_cleanse(&recovered, sizeof(recovered));
@@ -345,7 +382,16 @@ bool qihse_cluster_ownership_transfer_prepare_ex(
     snprintf(txn.target_qkp_id, sizeof(txn.target_qkp_id), "%s", target_qkp);
     snprintf(txn.generation, sizeof(txn.generation), "%s", status.generation);
     snprintf(txn.owner_id, sizeof(txn.owner_id), "%s", source.id);
-    txn.config_epoch = qihse_cluster_topology_epoch(c->topology) + 1u;
+    txn.config_epoch = 0;
+    if (c->range_reserve) {
+        if (!c->range_reserve(c->range_authority_context, c->principal,
+                &txn, err, err_cap)) {
+            OPENSSL_cleanse(owner_token, sizeof(owner_token));
+            return false;
+        }
+    } else {
+        txn.config_epoch = qihse_cluster_topology_epoch(c->topology) + 1u;
+    }
     if (txn.config_epoch == 0) {
         OPENSSL_cleanse(owner_token, sizeof(owner_token));
         set_error(err, err_cap, "topology config epoch exhausted"); return false;
@@ -510,6 +556,31 @@ bool qihse_cluster_ownership_transfer_get_finalized(
     return true;
 }
 
+bool qihse_cluster_ownership_transfer_get_aborted(
+    qihse_cluster_ownership_context_t* c, const char* transfer_id,
+    qihse_cluster_ownership_txn_t* out, char* err, size_t err_cap) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!c || !c->store || !ownership_system_operator_active(c->principal) ||
+        !transfer_id || !*transfer_id ||
+        strlen(transfer_id) > QIHSE_OWNERSHIP_ID_MAX || !out) {
+        set_error(err, err_cap, "active system Operator and valid transfer ID are required");
+        return false;
+    }
+    const char* data_dir = qihse_kv_store_data_directory(c->store);
+    find_txn_t found = {.transfer_id = transfer_id};
+    bool unresolved = false;
+    int count = data_dir ? qihse_cluster_ownership_journal_replay_txn(
+        data_dir, find_txn_cb, &found, &unresolved) : -1;
+    if (count < 0 || !found.found || found.txn.phase != QIHSE_OWNERSHIP_ABORTED ||
+        found.txn.next_generation[0] || found.txn.target_lsn != 0) {
+        set_error(err, err_cap, "matching aborted CT2 transfer is unavailable");
+        return false;
+    }
+    *out = found.txn;
+    set_error(err, err_cap, "");
+    return true;
+}
+
 bool qihse_cluster_ownership_transfer_finish_finalized(
     qihse_cluster_ownership_context_t* c, const char* transfer_id,
     char* err, size_t err_cap) {
@@ -531,6 +602,10 @@ bool qihse_cluster_ownership_transfer_finish_finalized(
     }
 
     qihse_cluster_ownership_txn_t txn = found.txn;
+    if (!range_check_finalized(c, &txn, err, err_cap)) {
+        OPENSSL_cleanse(&txn, sizeof(txn));
+        return false;
+    }
     uint16_t source_index, target_index;
     qihse_cluster_node_t source, target;
     char source_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
@@ -793,9 +868,17 @@ bool qihse_cluster_ownership_activate_target(
         return false;
     }
     if (txn.phase == QIHSE_OWNERSHIP_FINALIZED) {
+        if (!range_check_finalized(c, &txn, err, err_cap)) {
+            OPENSSL_cleanse(checksum, sizeof(checksum));
+            return false;
+        }
         OPENSSL_cleanse(checksum, sizeof(checksum));
         set_error(err, err_cap, "");
         return true;
+    }
+    if (!range_check_reserved(c, &txn, err, err_cap)) {
+        OPENSSL_cleanse(checksum, sizeof(checksum));
+        return false;
     }
     qihse_kv_ct_proof_t* seal = qihse_kv_ct_target_seal_create(c->store,
         c->principal, request_data_principal, txn.transfer_id, txn.source_qkp_id, txn.target_qkp_id,
@@ -857,6 +940,13 @@ bool qihse_cluster_ownership_activate_target(
     if (!activated) {
         set_error(err, err_cap, "target COMMITTED record is durable but proof-consuming activation needs recovery");
         return false;
+    }
+    if (c->range_finalize) {
+        /* ACTIVATE makes the target's data durable and query-ready for the
+         * exact receipt. The source then commits quorum FINALIZE; routing
+         * ownership is adopted only from that proof-bearing CT update. */
+        set_error(err, err_cap, "");
+        return true;
     }
     txn.phase = QIHSE_OWNERSHIP_FINALIZED;
     if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
@@ -990,7 +1080,7 @@ bool qihse_cluster_ownership_prepare_target_handler(
             image_sha256, &total_bytes) || !transfer_id || !topology_source_id ||
         !topology_target_id || !source_qkp_id || !target_qkp_id || !generation ||
         !source_lsn || !config_epoch || !total_bytes || first_slot > last_slot ||
-        last_slot >= QIHSE_CLUSTER_SLOT_COUNT || total_bytes > (64u << 20)) {
+        last_slot >= QIHSE_CLUSTER_SLOT_COUNT || total_bytes > INT64_MAX) {
         set_error(err, err_cap, "authenticated CT2 BEGIN request is malformed");
         goto done;
     }
@@ -1060,6 +1150,11 @@ bool qihse_cluster_ownership_prepare_target_handler(
         qihse_resp_ct_peer_receipt_free(receipt);
         OPENSSL_cleanse(&claim, sizeof(claim));
         set_error(err, err_cap, "a different target ownership transaction blocks this CT2 BEGIN");
+        goto done;
+    }
+    if (!range_check_reserved(c, &txn, err, err_cap)) {
+        qihse_resp_ct_peer_receipt_free(receipt);
+        OPENSSL_cleanse(&claim, sizeof(claim));
         goto done;
     }
     bool intent_written = false;
@@ -1213,6 +1308,10 @@ bool qihse_cluster_ownership_transfer_abort(
         set_error(err, err_cap, "authenticated context and transfer ID are required for abort");
         return false;
     }
+    if (!range_authority_hooks_valid(c)) {
+        set_error(err, err_cap, "range authority hooks are incomplete");
+        return false;
+    }
     if (qihse_cluster_topology_local_node(c->topology) != source_index) {
         set_error(err, err_cap, "only the local source may abort a prepared range transfer");
         return false;
@@ -1229,6 +1328,53 @@ bool qihse_cluster_ownership_transfer_abort(
     pending_state_t pending = {0}; bool unresolved = false;
     int n = data_dir ? qihse_cluster_ownership_journal_replay_txn(
         data_dir, pending_state_cb, &pending, &unresolved) : -1;
+    if (n >= 0 && !unresolved) {
+        qihse_cluster_ownership_txn_t aborted;
+        memset(&aborted, 0, sizeof(aborted));
+        if (!qihse_cluster_ownership_transfer_get_aborted(c, transfer_id,
+                &aborted, err, err_cap) ||
+            strcmp(aborted.source_id, source.id) ||
+            strcmp(aborted.target_id, target.id) ||
+            strcmp(aborted.source_qkp_id, source_qkp) ||
+            strcmp(aborted.target_qkp_id, target_qkp)) {
+            OPENSSL_cleanse(&aborted, sizeof(aborted));
+            set_error(err, err_cap, "matching durable CT2 ABORTED record is unavailable");
+            return false;
+        }
+        if (c->range_abort && !c->range_abort(c->range_authority_context,
+                c->principal, &aborted, err, err_cap)) {
+            OPENSSL_cleanse(&aborted, sizeof(aborted));
+            if (!err || !err_cap || !err[0])
+                set_error(err, err_cap, "quorum ABORT is not durable; source fence remains active");
+            return false;
+        }
+        qihse_kv_ct_transfer_status_t status;
+        memset(&status, 0, sizeof(status));
+        bool status_ok = qihse_kv_ct_transfer_status(c->store, c->principal, &status);
+        bool same_fence = status_ok && status.fence_state == 1u &&
+            !strcmp(status.transfer_id, aborted.transfer_id) &&
+            status.first_slot == aborted.start && status.last_slot == aborted.end &&
+            status.cut_position == aborted.source_lsn &&
+            !strcmp(status.source_id, aborted.source_qkp_id) &&
+            !strcmp(status.generation, aborted.generation);
+        bool fence_same_id = status_ok && status.fence_state == 1u &&
+            !strcmp(status.transfer_id, aborted.transfer_id);
+        unsigned char token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
+        bool released = !fence_same_id;
+        if (fence_same_id && same_fence)
+            released = qihse_kv_ct_owner_token_get(c->store, c->principal, token) &&
+                qihse_kv_ct_fence_finish(c->store, c->principal,
+                    transfer_id, false, token);
+        OPENSSL_cleanse(token, sizeof(token));
+        OPENSSL_cleanse(&status, sizeof(status));
+        OPENSSL_cleanse(&aborted, sizeof(aborted));
+        if (!status_ok || !released) {
+            set_error(err, err_cap, "quorum abort is durable but source fence release needs recovery");
+            return false;
+        }
+        set_error(err, err_cap, "");
+        return true;
+    }
     if (n < 0 || !unresolved || !pending.pending ||
         strcmp(pending.txn.transfer_id, transfer_id) ||
         strcmp(pending.txn.source_id, source.id) || strcmp(pending.txn.target_id, target.id) ||
@@ -1251,9 +1397,18 @@ bool qihse_cluster_ownership_transfer_abort(
         set_error(err, err_cap, "abort record could not be persisted; source fence remains active");
         return false;
     }
+    if (c->range_abort && !c->range_abort(c->range_authority_context,
+            c->principal, &aborted, err, err_cap)) {
+        OPENSSL_cleanse(owner_token, sizeof(owner_token));
+        OPENSSL_cleanse(&aborted, sizeof(aborted));
+        if (!err || !err_cap || !err[0])
+            set_error(err, err_cap, "quorum abort failed; source fence remains active");
+        return false;
+    }
     bool ok = qihse_kv_ct_fence_finish(c->store, c->principal,
         transfer_id, false, owner_token);
     OPENSSL_cleanse(owner_token, sizeof(owner_token));
+    OPENSSL_cleanse(&aborted, sizeof(aborted));
     if (!ok) {
         set_error(err, err_cap, "abort is durable but source fence release requires recovery");
         return false;
@@ -1442,6 +1597,10 @@ bool qihse_cluster_ownership_transfer_publish(
         set_error(err, err_cap, "target is not durably activated for this exact committed transfer");
         return false;
     }
+    if (!range_authority_hooks_valid(c)) {
+        set_error(err, err_cap, "range authority hooks are incomplete");
+        return false;
+    }
     bool needs_apply = false;
     for (uint32_t slot = txn.start; slot <= txn.end; ++slot) {
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
@@ -1463,6 +1622,10 @@ bool qihse_cluster_ownership_transfer_publish(
         needs_apply = true;
     }
     if (txn.phase == QIHSE_OWNERSHIP_COMMITTED) {
+        if (c->range_finalize && !c->range_finalize(
+                c->range_authority_context, c->principal, &txn, activation,
+                err, err_cap))
+            return false;
         qihse_cluster_ownership_txn_t finalized = txn;
         finalized.phase = QIHSE_OWNERSHIP_FINALIZED;
         if (qihse_cluster_ownership_journal_append_txn(data_dir, &finalized) != 0) {
@@ -1471,6 +1634,7 @@ bool qihse_cluster_ownership_transfer_publish(
         }
         txn = finalized;
     }
+    if (!range_check_finalized(c, &txn, err, err_cap)) return false;
     if (needs_apply) {
         if (!adopt_txn_ranges(c->topology, NULL, &txn, target_index)) {
             set_error(err, err_cap, "target activation is durable; source topology publish needs replay");
@@ -1535,6 +1699,19 @@ bool qihse_cluster_ownership_receive_ct_update(
         set_error(err, err_cap, "target activation receipt does not match the proof-bearing bus update");
         return false;
     }
+    qihse_cluster_ownership_txn_t authority_txn;
+    target_txn_from_tuple(&authority_txn, u->transfer_id, u->source_id,
+        u->target_id, u->source_qkp_id, u->target_qkp_id, u->generation,
+        u->start, u->end, u->source_lsn, u->config_epoch);
+    authority_txn.target_lsn = u->target_lsn;
+    memcpy(authority_txn.proof_digest, u->checksum, sizeof(authority_txn.proof_digest));
+    authority_txn.phase = QIHSE_OWNERSHIP_FINALIZED;
+    snprintf(authority_txn.owner_id, sizeof(authority_txn.owner_id), "%s", u->target_id);
+    if (!range_check_finalized(c, &authority_txn, err, err_cap)) {
+        OPENSSL_cleanse(&authority_txn, sizeof(authority_txn));
+        return false;
+    }
+    OPENSSL_cleanse(&authority_txn, sizeof(authority_txn));
     uint16_t local_index = qihse_cluster_topology_local_node(c->topology);
     bool already_target = true;
     bool can_advance = true;
@@ -1563,6 +1740,46 @@ bool qihse_cluster_ownership_receive_ct_update(
     if (already_target) {
         set_error(err, err_cap, "");
         return true; /* replayed/duplicate activation; receipt was rechecked */
+    }
+    if (local_index == target_index && c->range_finalize) {
+        const char* data_dir = qihse_kv_store_data_directory(c->store);
+        pending_state_t pending = {0}; bool unresolved = false;
+        int replayed = data_dir ? qihse_cluster_ownership_journal_replay_txn(
+            data_dir, pending_state_cb, &pending, &unresolved) : -1;
+        if (replayed < 0 || !unresolved || !pending.pending ||
+            pending.txn.phase != QIHSE_OWNERSHIP_COMMITTED ||
+            strcmp(pending.txn.transfer_id, u->transfer_id) ||
+            pending.txn.start != u->start || pending.txn.end != u->end ||
+            strcmp(pending.txn.source_id, u->source_id) ||
+            strcmp(pending.txn.target_id, u->target_id) ||
+            strcmp(pending.txn.source_qkp_id, u->source_qkp_id) ||
+            strcmp(pending.txn.target_qkp_id, u->target_qkp_id) ||
+            strcmp(pending.txn.generation, u->generation) ||
+            pending.txn.source_lsn != u->source_lsn ||
+            pending.txn.config_epoch != u->config_epoch ||
+            pending.txn.target_lsn != u->target_lsn ||
+            CRYPTO_memcmp(pending.txn.proof_digest, u->checksum, 32u) != 0) {
+            set_error(err, err_cap, "target activation journal does not match the finalized quorum update");
+            return false;
+        }
+        qihse_cluster_ownership_txn_t finalized = pending.txn;
+        finalized.phase = QIHSE_OWNERSHIP_FINALIZED;
+        if (!data_dir || qihse_cluster_ownership_journal_append_txn(
+                data_dir, &finalized) != 0 ||
+            !adopt_txn_ranges(c->topology, NULL, &finalized, target_index)) {
+            OPENSSL_cleanse(&finalized, sizeof(finalized));
+            set_error(err, err_cap, "quorum-finalized target ownership needs local recovery");
+            return false;
+        }
+        if (target.config_epoch < u->config_epoch) target.config_epoch = u->config_epoch;
+        bool node_ok = qihse_cluster_topology_upsert_node(c->topology, &target, NULL);
+        OPENSSL_cleanse(&finalized, sizeof(finalized));
+        if (!node_ok) {
+            set_error(err, err_cap, "quorum-finalized target node epoch needs local recovery");
+            return false;
+        }
+        set_error(err, err_cap, "");
+        return true;
     }
     if (local_index == target_index && target_already_owns_eligible && can_advance) {
         if (!adopt_txn_ranges(c->topology, NULL, &(qihse_cluster_ownership_txn_t){
@@ -1842,6 +2059,13 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
             status.cut_position == txn->source_lsn &&
             !strcmp(status.source_id, txn->source_qkp_id) &&
             !strcmp(status.generation, txn->generation);
+        if (ok && c->range_abort &&
+            !c->range_abort(c->range_authority_context, c->principal,
+                txn, r->err, r->err_cap)) {
+            OPENSSL_cleanse(&status, sizeof(status));
+            set_error(r->err, r->err_cap, "quorum ABORT is not durable; source fence remains active");
+            r->failed = true; return false;
+        }
         if (same_fence) {
             unsigned char token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
             ok = qihse_kv_ct_owner_token_get(c->store, c->principal, token) &&
@@ -1947,6 +2171,13 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
         }
     }
     bool update_target_node = !txn->next_generation[0] || promotion_roles_applied;
+    if (!txn->next_generation[0] && !range_check_finalized(c, txn,
+            r->err, r->err_cap)) {
+        if (!r->err || !r->err_cap || !r->err[0])
+            set_error(r->err, r->err_cap, "finalized CT2 quorum decision is unavailable during replay");
+        r->failed = true;
+        return false;
+    }
     if (update_target_node && target.config_epoch < txn->config_epoch)
         target.config_epoch = txn->config_epoch;
     if ((update_target_node && !qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) ||
@@ -2441,6 +2672,10 @@ static bool ownership_replay_impl(
     if (out_unresolved) *out_unresolved = false;
     if (!c || !c->topology || !c->store || !c->principal || !out_unresolved) {
         set_error(err, err_cap, "authenticated topology/store context is required for ownership recovery");
+        return false;
+    }
+    if (!range_authority_hooks_valid(c)) {
+        set_error(err, err_cap, "range authority hooks are incomplete");
         return false;
     }
     const char* data_dir = qihse_kv_store_data_directory(c->store);

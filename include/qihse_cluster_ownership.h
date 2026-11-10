@@ -28,6 +28,17 @@ typedef bool (*qihse_cluster_ownership_peer_id_fn)(
 typedef bool (*qihse_cluster_ownership_election_fn)(
     void* context, const char* topology_source_id, const char* topology_target_id,
     const char* generation, uint64_t durable_cursor);
+typedef bool (*qihse_cluster_ownership_range_reserve_fn)(
+    void* context, qihse_user_t* principal,
+    qihse_cluster_ownership_txn_t* draft, char* err, size_t err_cap);
+typedef bool (*qihse_cluster_ownership_range_check_fn)(
+    void* context, qihse_user_t* principal,
+    const qihse_cluster_ownership_txn_t* txn, char* err, size_t err_cap);
+typedef bool (*qihse_cluster_ownership_range_finalize_fn)(
+    void* context, qihse_user_t* principal,
+    const qihse_cluster_ownership_txn_t* txn,
+    const qihse_cluster_ct_activation_receipt_t* receipt,
+    char* err, size_t err_cap);
 
 typedef struct {
     qihse_cluster_topology_t* topology;
@@ -40,6 +51,14 @@ typedef struct {
     void* peer_id_context;
     qihse_cluster_ownership_election_fn promotion_authorized;
     void* promotion_context;
+    /* Optional quorum-backed range authority. Configure all four hooks for a
+     * group-authoritative context; leave all NULL for legacy/manual mode. */
+    qihse_cluster_ownership_range_reserve_fn range_reserve;
+    qihse_cluster_ownership_range_check_fn range_check_reserved;
+    qihse_cluster_ownership_range_finalize_fn range_finalize;
+    qihse_cluster_ownership_range_check_fn range_check_finalized;
+    qihse_cluster_ownership_range_check_fn range_abort;
+    void* range_authority_context;
 } qihse_cluster_ownership_context_t;
 
 /* Persist the source range fence and a PREPARED journal phase before the
@@ -71,6 +90,12 @@ bool qihse_cluster_ownership_transfer_get_committed(
  * supports idempotent client retries after later transfers or writes without
  * depending on current slot ownership or mutable peer seals. */
 bool qihse_cluster_ownership_transfer_get_finalized(
+    qihse_cluster_ownership_context_t* context, const char* transfer_id,
+    qihse_cluster_ownership_txn_t* out_txn, char* err, size_t err_cap);
+/* Read an exact durable CT2 ABORTED result for quorum-backed cancellation.
+ * The callback must use this getter after local ABORTED persistence and before
+ * the source fence is released. */
+bool qihse_cluster_ownership_transfer_get_aborted(
     qihse_cluster_ownership_context_t* context, const char* transfer_id,
     qihse_cluster_ownership_txn_t* out_txn, char* err, size_t err_cap);
 /* Finish local routing after a durable CT2 FINALIZED record. This is safe to

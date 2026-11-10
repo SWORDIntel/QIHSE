@@ -215,8 +215,10 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
     /* The bus handler has verified the target signature; ownership validation
      * persists ADOPTED, updates the still-lagging outer runs, and skips only
      * the newer B->C middle slots. */
-    assert(qihse_cluster_ownership_receive_ct1_promotion(&ownership,
-        &event, err, sizeof(err)));
+    bool adopted = qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &event, err, sizeof(err));
+    if (!adopted) fprintf(stderr, "CT1 promotion adoption failed: %s\n", err);
+    assert(adopted);
     for (uint16_t slot = 100; slot <= 110; ++slot) {
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
         uint64_t epoch = 0;
@@ -344,6 +346,129 @@ static void* append_terminal_race(void* opaque) {
     terminal_race_t* r = opaque;
     r->result = qihse_cluster_ownership_journal_append_txn(r->dir, &r->txn);
     return NULL;
+}
+
+typedef struct {
+    const char* data_dir;
+    qihse_user_t* expected_principal;
+    unsigned reserve_calls;
+    uint64_t epoch;
+    bool reject_reservation;
+} range_authority_test_t;
+
+static bool range_authority_test_reserve(void* opaque, qihse_user_t* principal,
+    qihse_cluster_ownership_txn_t* draft, char* err, size_t err_cap) {
+    range_authority_test_t* state = opaque;
+    assert(state && principal == state->expected_principal && draft);
+    assert(draft->phase == QIHSE_OWNERSHIP_INTENT && draft->config_epoch == 0 &&
+        draft->source_lsn == 0 && draft->start == 3 && draft->end == 5);
+    bool unresolved = false;
+    assert(qihse_cluster_ownership_journal_replay_txn(state->data_dir,
+        NULL, NULL, &unresolved) == 0 && !unresolved);
+    state->reserve_calls++;
+    draft->config_epoch = state->epoch;
+    if (err && err_cap) err[0] = '\0';
+    return !state->reject_reservation;
+}
+
+static bool range_authority_test_check(void* opaque, qihse_user_t* principal,
+    const qihse_cluster_ownership_txn_t* txn, char* err, size_t err_cap) {
+    range_authority_test_t* state = opaque;
+    assert(state && principal == state->expected_principal && txn);
+    if (err && err_cap) err[0] = '\0';
+    return txn->config_epoch == state->epoch;
+}
+
+static bool capture_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) {
+    qihse_cluster_ownership_txn_t* out = opaque;
+    *out = *txn;
+    return true;
+}
+
+static bool range_authority_test_finalize(void* opaque, qihse_user_t* principal,
+    const qihse_cluster_ownership_txn_t* txn,
+    const qihse_cluster_ct_activation_receipt_t* receipt,
+    char* err, size_t err_cap) {
+    (void)receipt;
+    return range_authority_test_check(opaque, principal, txn, err, err_cap);
+}
+
+static void test_range_authority_reserve_precedes_intent(qihse_user_t* op) {
+    char data_dir_buf[] = "./tests/.qihse_range_authority_XXXXXX";
+    assert(mkdtemp(data_dir_buf));
+    const char* old_env = getenv("QIHSE_DATA_DIR");
+    char* old_data_dir = old_env ? strdup(old_env) : NULL;
+    assert(!old_env || old_data_dir);
+    assert(setenv("QIHSE_DATA_DIR", data_dir_buf, 1) == 0);
+    qihse_kv_store_t* store = qihse_kv_store_create();
+    qihse_cluster_topology_t* topology = qihse_cluster_topology_create();
+    assert(store && topology);
+    const char* data_dir = qihse_kv_store_data_directory(store);
+    assert(data_dir && *data_dir);
+    qihse_cluster_node_t nodes[2];
+    uint16_t indices[2];
+    const char* seeds[] = {"range-auth-source", "range-auth-target"};
+    const char* pins[] = {"range-auth-qkp-source", "range-auth-qkp-target"};
+    for (size_t i = 0; i < 2; ++i) {
+        memset(&nodes[i], 0, sizeof(nodes[i]));
+        qihse_cluster_node_id_from_seed(seeds[i], strlen(seeds[i]), nodes[i].id);
+        snprintf(nodes[i].host, sizeof(nodes[i].host), "127.0.0.1");
+        nodes[i].port = (uint16_t)(7500u + i);
+        nodes[i].bus_port = (uint16_t)(17500u + i);
+        nodes[i].role = QIHSE_CLUSTER_NODE_PRIMARY;
+        nodes[i].healthy = true;
+        assert(qihse_cluster_topology_upsert_node(topology, &nodes[i], &indices[i]));
+    }
+    assert(qihse_cluster_topology_set_local_node(topology, indices[0]));
+    assert(qihse_cluster_topology_adopt_range(topology, 3, 5, indices[0], 2));
+    assert(qihse_kv_ct_source_enable(store, op, pins[0], "range-auth-replica",
+        "range-auth-generation", NULL, 128u * 1024u * 1024u));
+
+    promotion_pin_map_t pin_map;
+    memset(&pin_map, 0, sizeof(pin_map));
+    for (size_t i = 0; i < 2; ++i) {
+        snprintf(pin_map.node[i], sizeof(pin_map.node[i]), "%s", nodes[i].id);
+        snprintf(pin_map.pin[i], sizeof(pin_map.pin[i]), "%s", pins[i]);
+    }
+    range_authority_test_t state = {.data_dir = data_dir,
+        .expected_principal = op, .epoch = 42, .reject_reservation = true};
+    qihse_cluster_ownership_context_t context = {
+        .topology = topology, .store = store, .principal = op,
+        .data_principal = op, .peer_id = promotion_peer_id,
+        .peer_id_context = &pin_map, .range_reserve = range_authority_test_reserve,
+        .range_check_reserved = range_authority_test_check,
+        .range_finalize = range_authority_test_finalize,
+        .range_check_finalized = range_authority_test_check,
+        .range_abort = range_authority_test_check,
+        .range_authority_context = &state
+    };
+    uint64_t source_cut = 0;
+    bool recovery = false;
+    char err[192] = {0};
+    qihse_cluster_ownership_context_t incomplete = context;
+    incomplete.range_abort = NULL;
+    assert(!qihse_cluster_ownership_transfer_prepare_ex(&incomplete,
+        "range-auth-incomplete", indices[0], indices[1], 3, 5,
+        &source_cut, &recovery, err, sizeof(err)));
+    assert(state.reserve_calls == 0 && !recovery && source_cut == 0);
+    bool prepared_ok = qihse_cluster_ownership_transfer_prepare_ex(&context,
+        "range-auth-transfer", indices[0], indices[1], 3, 5,
+        &source_cut, &recovery, err, sizeof(err));
+    assert(!prepared_ok && state.reserve_calls == 1 && !recovery && source_cut == 0);
+    qihse_cluster_ownership_txn_t intent;
+    memset(&intent, 0, sizeof(intent));
+    bool unresolved = false;
+    assert(qihse_cluster_ownership_journal_replay_txn(data_dir,
+        capture_txn, &intent, &unresolved) == 0 && !unresolved);
+    OPENSSL_cleanse(&intent, sizeof(intent));
+    qihse_cluster_topology_destroy(topology);
+    qihse_kv_store_destroy(store);
+    if (old_data_dir) {
+        assert(setenv("QIHSE_DATA_DIR", old_data_dir, 1) == 0);
+        free(old_data_dir);
+    } else {
+        assert(unsetenv("QIHSE_DATA_DIR") == 0);
+    }
 }
 
 int main(void) {
@@ -660,6 +785,7 @@ int main(void) {
     assert(store);
     const char* store_dir = qihse_kv_store_data_directory(store);
     assert(store_dir && *store_dir);
+    test_range_authority_reserve_precedes_intent(op);
     test_signed_ct1_promotion_supersession(store, op);
     qihse_cluster_ownership_context_t ownership = {.store = store, .principal = op};
 
@@ -821,6 +947,23 @@ int main(void) {
     assert(!qihse_cluster_ownership_transfer_finish_finalized(&finish_ownership,
         "wrong-finalized-id", NULL, 0));
     qihse_cluster_topology_destroy(finish_topology);
+
+    qihse_cluster_ownership_txn_t getter_abort_prepare = txn(QIHSE_OWNERSHIP_PREPARED);
+    snprintf(getter_abort_prepare.transfer_id, sizeof(getter_abort_prepare.transfer_id),
+             "operator-aborted-getter");
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &getter_abort_prepare) == 0);
+    qihse_cluster_ownership_txn_t getter_abort_final = getter_abort_prepare;
+    getter_abort_final.phase = QIHSE_OWNERSHIP_ABORTED;
+    getter_abort_final.target_lsn = 0;
+    memset(getter_abort_final.proof_digest, 0, sizeof(getter_abort_final.proof_digest));
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &getter_abort_final) == 0);
+    memset(&got, 0xa5, sizeof(got));
+    assert(qihse_cluster_ownership_transfer_get_aborted(&ownership,
+        "operator-aborted-getter", &got, NULL, 0));
+    assert(got.phase == QIHSE_OWNERSHIP_ABORTED &&
+        !strcmp(got.transfer_id, getter_abort_final.transfer_id));
+    OPENSSL_cleanse(&getter_abort_prepare, sizeof(getter_abort_prepare));
+    OPENSSL_cleanse(&getter_abort_final, sizeof(getter_abort_final));
 
     assert(qihse_auth_destroy_user(op, 991u));
     memset(&got, 0xa5, sizeof(got));
