@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,38 @@ static uint16_t test_first = 10, test_last = 12;
 static uint16_t test_current_owner = 1;
 static bool test_topology_advanced;
 static bool fail_finalized_local_replay;
+
+static void test_group_claim_codec_preserves_empty_cursors(void) {
+    qihse_kv_ct_lane_authority_claim_t claim, decoded;
+    memset(&claim, 0, sizeof(claim));
+    claim.operation = QIHSE_KV_CT_LANE_AUTH_TRANSFER;
+    strcpy(claim.transfer_id, "empty-range-transfer");
+    memset(claim.source_group_id, 'a', 64u); claim.source_group_id[64] = '\0';
+    memset(claim.target_group_id, 'b', 64u); claim.target_group_id[64] = '\0';
+    memset(claim.source_qkp_id, 'c', 64u); claim.source_qkp_id[64] = '\0';
+    memset(claim.target_qkp_id, 'd', 64u); claim.target_qkp_id[64] = '\0';
+    memset(claim.source_generation, 'e', 32u); claim.source_generation[32] = '\0';
+    memset(claim.target_generation, 'f', 32u); claim.target_generation[32] = '\0';
+    memset(claim.successor_qkp_id, '1', 64u); claim.successor_qkp_id[64] = '\0';
+    claim.slots[123u / 8u] = (uint8_t)(1u << (123u % 8u));
+    claim.grant_epoch = 1u;
+    claim.reserve_index = 1u;
+    /* A sealed empty lane has a valid zero source cut and target cursor. */
+    claim.source_cut = 0u;
+    claim.target_cursor = 0u;
+    unsigned char wire[QIHSE_CT_GROUP_CLAIM_WIRE_BYTES];
+    assert(qihse_cluster_transfer_claim_encode(&claim, wire));
+    assert(qihse_cluster_transfer_claim_decode(wire, sizeof(wire), &decoded));
+    assert(decoded.source_cut == 0u && decoded.target_cursor == 0u);
+    assert(strcmp(decoded.transfer_id, claim.transfer_id) == 0);
+    assert(CRYPTO_memcmp(decoded.slots, claim.slots, sizeof(claim.slots)) == 0);
+    wire[sizeof(wire) - 1u] ^= 1u;
+    assert(qihse_cluster_transfer_claim_decode(wire, sizeof(wire), &decoded));
+    assert(decoded.promotion_event_digest[31] == 1u);
+    OPENSSL_cleanse(wire, sizeof(wire));
+    OPENSSL_cleanse(&decoded, sizeof(decoded));
+    OPENSSL_cleanse(&claim, sizeof(claim));
+}
 
 struct qihse_cluster_topology { int marker; };
 
@@ -712,6 +745,7 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
 }
 
 int main(void) {
+    test_group_claim_codec_preserves_empty_cursors();
     test_low_authorization_refused_before_export_or_qkp();
     test_pre_wire_failures_abort_only_new_prepare();
     test_prepare_failure_after_fence_is_pending();
