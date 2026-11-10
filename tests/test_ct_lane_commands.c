@@ -224,11 +224,19 @@ int main(void) {
     check_reply(server, op, 5u, cross_mset, "-", "CROSSSLOT");
     assert_value(store, op, a, NULL);
     assert_value(store, op, b, NULL);
+    const char *cross_msetnx[] = {"MSETNX", a, "new-a", b, "new-b"};
+    check_reply(server, op, 5u, cross_msetnx, "-", "CROSSSLOT");
+    assert_value(store, op, a, NULL);
+    assert_value(store, op, b, NULL);
 
     const char *set_a[] = {"SET", a, "old-a"};
     const char *set_b[] = {"SET", b, "old-b"};
     check_reply(server, op, 3u, set_a, "+", NULL);
     check_reply(server, op, 3u, set_b, "+", NULL);
+    assert_value(store, op, a, "old-a");
+    assert_value(store, op, b, "old-b");
+    const char *cross_rename[] = {"RENAME", a, b};
+    check_reply(server, op, 3u, cross_rename, "-", "CROSSSLOT");
     assert_value(store, op, a, "old-a");
     assert_value(store, op, b, "old-b");
     const char *cross_del[] = {"DEL", a, b};
