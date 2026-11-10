@@ -2697,6 +2697,19 @@ size_t qihse_ai_memory_recall_scoped(qihse_resp_server_t* server,
     uint16_t query_clearance = qihse_user_get_classification(user);
     uint16_t query_sci = qihse_user_get_sci(user);
     uint64_t query_deadline = want_vector ? aimem_mono_ns() + AIMEM_QUERY_NS : 0u;
+    /* Projection startup is asynchronous by design; wait only on semantic
+     * requests, bounded by the same request deadline. Lexical/BM25 remains
+     * immediately available while the index is built. */
+    if (want_vector) {
+        uint64_t now = aimem_mono_ns();
+        uint64_t remaining_ms = now < query_deadline ?
+            (query_deadline - now) / 1000000u : 0u;
+        uint32_t wait_ms = remaining_ms > 750u ? 750u : (uint32_t)remaining_ms;
+        if (!wait_ms || !qihse_ai_memory_projection_wait_ready(server, user, wait_ms)) {
+            errno = wait_ms ? EAGAIN : ETIMEDOUT;
+            return 0u;
+        }
+    }
     if (want_vector && (!qihse_ai_memory_embedder_fingerprint(query_model) ||
         !qihse_kv_projection_marker(store, &query_seq, &query_epoch) ||
         !aimem_projection_rank(server, user, query, kind, scope,

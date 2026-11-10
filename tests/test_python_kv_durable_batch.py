@@ -17,6 +17,8 @@ records = [
 ]
 
 with KVStore(user=user) as store:
+    assert store.set("t:7/aimem:0123456789abcdef", "operator raw access", user=user)
+    assert store.get("t:7/aimem:0123456789abcdef", user=user) == "operator raw access"
     try:
         store.set_batch_durable(records)
         raise AssertionError("batch accepted without explicit user")
@@ -27,6 +29,11 @@ with KVStore(user=user) as store:
 with KVStore(user=user) as reopened:
     assert reopened.get("scan:archive:1", user=user) == "complete"
     assert reopened.get("scan:archive:2", user=user) == "pending"
+    try:
+        reopened.set("overflow-label", "must reject", classification=65536, user=user)
+        raise AssertionError("classification wrapped through uint16")
+    except ValueError:
+        pass
     try:
         reopened.set_batch_durable(
             [{"key": "bad\x00key", "value": "x"}], user=user)

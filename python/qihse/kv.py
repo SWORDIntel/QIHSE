@@ -101,6 +101,10 @@ _lib.qihse_kv_save_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p
 _lib.qihse_kv_save_user.restype = ctypes.c_int
 _lib.qihse_kv_load_user.argtypes = [_KVStore_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qihse_kv_load_user.restype = ctypes.c_int
+_lib.qihse_user_get_tenant_id.argtypes = [ctypes.c_void_p]
+_lib.qihse_user_get_tenant_id.restype = ctypes.c_uint32
+_lib.qihse_user_get_role.argtypes = [ctypes.c_void_p]
+_lib.qihse_user_get_role.restype = ctypes.c_uint16
 _lib.qihse_kv_bulk_load_begin.argtypes = [_KVStore_p]
 _lib.qihse_kv_bulk_load_begin.restype = None
 _lib.qihse_kv_bulk_load_end.argtypes = [_KVStore_p]
@@ -109,6 +113,44 @@ _lib.qihse_kv_bulk_load_end.restype = None
 _libc = ctypes.CDLL(None)
 _libc.free.argtypes = [ctypes.c_void_p]
 _libc.free.restype = None
+
+_QIHSE_ROLE_OPERATOR = 0
+_QIHSE_TENANT_SYSTEM = 0
+
+
+def _aimem_internal_key(key: str) -> bool:
+    scoped = key
+    if key.startswith("t:"):
+        slash = key.find("/")
+        if slash < 3 or not key[2:slash].isdigit():
+            return False
+        scoped = key[slash + 1:]
+    return scoped.startswith(("aimem:", "aimemv:", "aimem-"))
+
+
+def _validate_key_scope(key: str, user, *, operation: str) -> None:
+    if not isinstance(key, str):
+        raise TypeError("KV keys must be strings")
+    if not key or "\0" in key:
+        raise ValueError("KV keys must be nonempty and cannot contain NUL")
+    operator = bool(user) and _lib.qihse_user_get_role(user) == _QIHSE_ROLE_OPERATOR and \
+        _lib.qihse_user_get_tenant_id(user) == _QIHSE_TENANT_SYSTEM
+    if operator:
+        return
+    if _aimem_internal_key(key):
+        raise PermissionError("AIMEM records require the typed AIMEM interface")
+    if bool(user):
+        tenant = int(_lib.qihse_user_get_tenant_id(user))
+        if tenant != _QIHSE_TENANT_SYSTEM and not (
+                key.startswith(f"t:{tenant}/") or key.startswith("commons/")):
+            raise PermissionError(f"KV key outside tenant namespace for {operation}")
+    elif key.startswith("t:"):
+        raise PermissionError("tenant-scoped KV access requires an authenticated principal")
+
+
+def _is_system_operator(user) -> bool:
+    return bool(user) and _lib.qihse_user_get_role(user) == _QIHSE_ROLE_OPERATOR and \
+        _lib.qihse_user_get_tenant_id(user) == _QIHSE_TENANT_SYSTEM
 
 
 class KVStore:
@@ -157,6 +199,7 @@ class KVStore:
                 raise TypeError("durable KV keys and values must be strings")
             if not key or "\0" in key or "\0" in value:
                 raise ValueError("durable KV keys must be nonempty and keys/values cannot contain NUL")
+            _validate_key_scope(key, user, operation="durable batch")
             remaining = _KV_BATCH_MAX_BYTES - total_bytes
             if remaining < 40 or len(key) + len(value) > remaining - 40:
                 raise ValueError("durable KV batch exceeds native byte bound")
@@ -189,18 +232,26 @@ class KVStore:
         sci_compartment: int = 0,
         user=None,
     ) -> bool:
+        _validate_key_scope(key, user, operation="set")
+        if not isinstance(value, str) or "\0" in value:
+            raise ValueError("KV values must be strings and cannot contain NUL")
+        classification = int(classification)
+        sci_compartment = int(sci_compartment)
+        if not 0 <= classification < (1 << 16) or not 0 <= sci_compartment < (1 << 16):
+            raise ValueError("classification and sci_compartment must fit uint16")
         return bool(
             _lib.qihse_kv_set_user(
                 self._ptr,
                 key.encode("utf-8"),
                 value.encode("utf-8"),
-                int(classification),
-                int(sci_compartment),
+                classification,
+                sci_compartment,
                 user,
             )
         )
 
     def get(self, key: str, user=None) -> Optional[str]:
+        _validate_key_scope(key, user, operation="get")
         ptr = _lib.qihse_kv_get_user(self._ptr, key.encode("utf-8"), user)
         if not ptr:
             return None
@@ -214,6 +265,7 @@ class KVStore:
         """Read class/SCI for a live row under an explicit principal."""
         if user is None:
             raise ValueError("QIHSE metadata read requires a principal")
+        _validate_key_scope(key, user, operation="metadata read")
         record = _KVRecordMeta()
         if not _lib.qihse_kv_meta_user(
                 self._ptr, key.encode("utf-8"), user,
@@ -222,12 +274,15 @@ class KVStore:
         return int(record.classification), int(record.sci_compartment)
 
     def delete(self, key: str, user=None) -> bool:
+        _validate_key_scope(key, user, operation="delete")
         return bool(_lib.qihse_kv_del_user(self._ptr, key.encode("utf-8"), user))
 
     def exists(self, key: str, user=None) -> bool:
+        _validate_key_scope(key, user, operation="exists")
         return bool(_lib.qihse_kv_exists_user(self._ptr, key.encode("utf-8"), user))
 
     def expire(self, key: str, ttl_ms: int, user=None) -> bool:
+        _validate_key_scope(key, user, operation="expire")
         return bool(_lib.qihse_kv_expire(self._ptr, key.encode("utf-8"), int(ttl_ms), user))
 
     def foreach(self, callback: Callable[[str, str], bool], user=None) -> int:
@@ -254,8 +309,13 @@ class KVStore:
             value_raw = ctypes.cast(value_ptr, ctypes.c_char_p).value
             if key_raw is None or value_raw is None:
                 return True
+            key_text = key_raw.decode("utf-8")
+            try:
+                _validate_key_scope(key_text, user, operation="enumeration")
+            except PermissionError:
+                return True
             count[0] += 1
-            return bool(callback(key_raw.decode("utf-8"), value_raw.decode("utf-8")))
+            return bool(callback(key_text, value_raw.decode("utf-8")))
 
         c_cb = _KV_ITER_CB(_cb)
         if prefix is None:
@@ -356,15 +416,24 @@ class KVStore:
         t.join(timeout=5)
 
     def size(self, user=None) -> int:
-        return int(_lib.qihse_kv_count_user(self._ptr, user))
+        count = [0]
+        self._foreach(lambda _key, _value: count.__setitem__(0, count[0] + 1) or True,
+                      user=user, prefix=None)
+        return count[0]
 
     def clear(self, user=None) -> int:
+        if not _is_system_operator(user):
+            raise PermissionError("KV clear requires the system Operator")
         return int(_lib.qihse_kv_clear_user(self._ptr, user))
 
     def save(self, filepath: str, user=None) -> bool:
+        if not _is_system_operator(user):
+            raise PermissionError("KV export requires the system Operator")
         return _lib.qihse_kv_save_user(self._ptr, filepath.encode("utf-8"), user) == 0
 
     def load(self, filepath: str, user=None) -> bool:
+        if not _is_system_operator(user):
+            raise PermissionError("KV import requires the system Operator")
         return _lib.qihse_kv_load_user(self._ptr, filepath.encode("utf-8"), user) == 0
 
     def get_shard(self, shard_id: str, user=None) -> Optional[str]:
