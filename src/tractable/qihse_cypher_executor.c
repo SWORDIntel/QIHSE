@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <errno.h>
+#include <stdint.h>
 
 /* ---- CSV line parser (for LOAD CSV) ---- */
 
@@ -1250,7 +1251,10 @@ static int compare_order_values(const cypher_res_t* a, const cypher_res_t* b) {
     if (a->type == CRES_NULL || b->type == CRES_NULL)
         return (a->type == CRES_NULL) - (b->type == CRES_NULL);
     if (a->type == CRES_STRING && b->type == CRES_STRING)
-        return strcmp(a->val.s ? a->val.s : "", b->val.s ? b->val.s : "");
+    {
+        int cmp = strcmp(a->val.s ? a->val.s : "", b->val.s ? b->val.s : "");
+        return (cmp > 0) - (cmp < 0);
+    }
     bool a_integer = a->type == CRES_INT64 || a->type == CRES_BOOL;
     bool b_integer = b->type == CRES_INT64 || b->type == CRES_BOOL;
     bool a_number = a_integer || a->type == CRES_DOUBLE;
@@ -1296,11 +1300,35 @@ static int compare_result_rows(const cypher_result_set_t* rs, size_t a, size_t b
     return (a > b) - (a < b); /* stable deterministic tie-break */
 }
 
+typedef struct {
+    const cypher_result_set_t* rs;
+    const qihse_cypher_clause_t* order;
+    const size_t* order_cols;
+} order_sort_context_t;
+
+static int compare_result_row_indices(const void* lhs, const void* rhs,
+                                      void* opaque) {
+    const order_sort_context_t* context = opaque;
+    size_t a = *(const size_t*)lhs;
+    size_t b = *(const size_t*)rhs;
+    return compare_result_rows(context->rs, a, b, context->order,
+                               context->order_cols);
+}
+
 static bool apply_order_skip_limit(cypher_result_set_t* rs,
                                    const qihse_cypher_clause_t* order,
                                    const qihse_cypher_clause_t* projection,
                                    int64_t skip, int64_t limit) {
     if (!rs || skip < -1 || limit < -1) return false;
+    if (rs->num_cols && rs->num_rows > SIZE_MAX / rs->num_cols) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    size_t cells = rs->num_rows * rs->num_cols;
+    if (cells > SIZE_MAX / sizeof(*rs->values)) {
+        errno = EOVERFLOW;
+        return false;
+    }
     size_t* order_cols = NULL;
     size_t* indices = NULL;
     cypher_res_t* sorted = NULL;
@@ -1329,20 +1357,17 @@ static bool apply_order_skip_limit(cypher_result_set_t* rs,
             }
             order_cols[i] = col;
         }
+        if (rs->num_rows > SIZE_MAX / sizeof(*indices)) {
+            free(order_cols);
+            errno = EOVERFLOW;
+            return false;
+        }
         indices = malloc((rs->num_rows ? rs->num_rows : 1) * sizeof(*indices));
         if (!indices) { free(order_cols); return false; }
         for (size_t i = 0; i < rs->num_rows; ++i) indices[i] = i;
-        /* Stable insertion sort; result sets are bounded and this avoids global qsort state. */
-        for (size_t i = 1; i < rs->num_rows; ++i) {
-            size_t value = indices[i], j = i;
-            while (j && compare_result_rows(rs, value, indices[j - 1], order,
-                                             order_cols) < 0) {
-                indices[j] = indices[j - 1];
-                --j;
-            }
-            indices[j] = value;
-        }
-        size_t cells = rs->num_rows * rs->num_cols;
+        order_sort_context_t context = {rs, order, order_cols};
+        qsort_r(indices, rs->num_rows, sizeof(*indices),
+                compare_result_row_indices, &context);
         sorted = malloc((cells ? cells : 1) * sizeof(*sorted));
         if (!sorted) { free(indices); free(order_cols); return false; }
         for (size_t row = 0; row < rs->num_rows; ++row)
