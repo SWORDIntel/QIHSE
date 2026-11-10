@@ -381,14 +381,50 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
 typedef struct {
     qihse_cluster_ownership_context_t* ownership;
     promotion_pin_map_t pins;
+    char allowed_transfer_id[2][QIHSE_OWNERSHIP_ID_MAX + 1u];
+    uint8_t allowed_slots[2][QIHSE_OWNERSHIP_SLOT_BITMAP_BYTES];
+    uint16_t final_owner[QIHSE_CLUSTER_SLOT_COUNT];
+    uint64_t final_epoch[QIHSE_CLUSTER_SLOT_COUNT];
 } promotion_chain_authority_t;
 
 static bool chain_range_check(void* opaque, qihse_user_t* principal,
     const qihse_cluster_ownership_txn_t* transaction, char* err, size_t err_cap) {
-    (void)opaque; (void)transaction;
+    promotion_chain_authority_t* state = opaque;
     if (err && err_cap) err[0] = '\0';
-    return qihse_auth_user_is_active(principal) &&
+    bool ok = qihse_auth_user_is_active(principal) &&
         qihse_user_get_role(principal) == QIHSE_ROLE_OPERATOR;
+    if (ok && state && transaction && transaction->lane_id[0]) {
+        ok = false;
+        for (size_t i = 0; i < 2u; ++i)
+            if (!strcmp(transaction->transfer_id, state->allowed_transfer_id[i]) &&
+                CRYPTO_memcmp(transaction->slot_bitmap, state->allowed_slots[i],
+                    sizeof(transaction->slot_bitmap)) == 0) {
+                ok = true;
+                break;
+            }
+    }
+    return ok;
+}
+
+static bool chain_range_refresh(void* opaque, qihse_user_t* principal,
+    const uint8_t slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES], char* err, size_t err_cap) {
+    promotion_chain_authority_t* state = opaque;
+    if (!state || !state->ownership || !slots ||
+        !qihse_auth_user_is_active(principal) ||
+        qihse_user_get_role(principal) != QIHSE_ROLE_OPERATOR) return false;
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(slots[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        uint16_t owner = state->final_owner[slot];
+        uint64_t epoch = state->final_epoch[slot];
+        if (owner == QIHSE_CLUSTER_NODE_NONE || !epoch ||
+            !qihse_cluster_topology_adopt_range(state->ownership->topology,
+                (uint16_t)slot, (uint16_t)slot, owner, epoch)) {
+            if (err && err_cap) snprintf(err, err_cap,
+                "test common ownership map has no committed owner for slot %u", slot);
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool chain_range_reserve(void* opaque, qihse_user_t* principal,
@@ -483,8 +519,19 @@ static size_t sign_ct1_certificate(uint8_t* out, size_t cap,
 
 static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
     qihse_user_t* op, qihse_user_t* guest) {
-    qihse_kv_store_t* chain_store = store;
+    (void)store;
+    char chain_data_dir[] = "./tests/.qihse_ct1_chain_store_XXXXXX";
+    assert(mkdtemp(chain_data_dir));
+    const char* old_data_dir = getenv("QIHSE_DATA_DIR");
+    char* saved_data_dir = old_data_dir ? strdup(old_data_dir) : NULL;
+    assert(!old_data_dir || saved_data_dir);
+    assert(setenv("QIHSE_DATA_DIR", chain_data_dir, 1) == 0);
+    qihse_kv_store_t* chain_store = qihse_kv_store_create_user(op);
     assert(chain_store);
+    if (saved_data_dir) {
+        assert(setenv("QIHSE_DATA_DIR", saved_data_dir, 1) == 0);
+        free(saved_data_dir);
+    } else assert(unsetenv("QIHSE_DATA_DIR") == 0);
     qihse_cluster_topology_t* topology = qihse_cluster_topology_create();
     assert(topology);
     qihse_federation_node_identity_t identities[2];
@@ -515,16 +562,16 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
         snprintf(identities[i].boot_id, sizeof(identities[i].boot_id), "ct1-chain-boot-%zu", i);
         identities[i].identity_kind = QIHSE_IDENTITY_HOST_AGENT;
         assert(qihse_federation_node_keygen_alg(
-            qihse_kv_store_data_directory(chain_store), QIHSE_SIG_ML_DSA_87, &identities[i]));
+            qihse_kv_store_data_directory(store), QIHSE_SIG_ML_DSA_87, &identities[i]));
         qihse_federation_node_identity_t existing_identity;
-        bool identity_preexisting = qihse_federation_node_identity_read(chain_store,
+        bool identity_preexisting = qihse_federation_node_identity_read(store,
             op, &identities[i].node_id, &existing_identity);
         if (identity_preexisting) {
             fprintf(stderr, "unexpected preexisting chain identity %s\n",
                 identities[i].key_handle);
             abort();
         }
-        if (!qihse_federation_node_enroll_request(chain_store, op, &identities[i])) {
+        if (!qihse_federation_node_enroll_request(store, op, &identities[i])) {
             fprintf(stderr, "chain enroll request failed: keylen=%u alg=%u key=%s errno=%d\n",
                 identities[i].public_key_len, (unsigned)identities[i].sig_alg,
                 identities[i].key_handle, errno);
@@ -533,7 +580,7 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
                 qihse_kv_store_data_directory(chain_store));
             abort();
         }
-        assert(qihse_federation_node_enroll_approve(chain_store, op, &identities[i].node_id, 1u));
+        assert(qihse_federation_node_enroll_approve(store, op, &identities[i].node_id, 1u));
         private_keys[i] = qihse_federation_node_key_load(identities[i].key_handle);
         assert(private_keys[i]);
     }
@@ -545,7 +592,7 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
     memset(&bus_config, 0, sizeof(bus_config));
     bus_config.topology = topology; bus_config.local_node_index = indices[3];
     bus_config.bus_port = 0u; bus_config.bind_address = "127.0.0.1";
-    bus_config.federation_store = chain_store; bus_config.federation_user = op;
+    bus_config.federation_store = store; bus_config.federation_user = op;
     qihse_cluster_bus_t* bus = qihse_cluster_bus_create(&bus_config);
     assert(bus);
     promotion_pin_map_t* map = &authority.pins;
@@ -561,8 +608,13 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
     ownership.range_abort = chain_range_check;
     ownership.range_finalize_promotion = chain_promotion_finalize;
     ownership.lane_claim = chain_lane_claim; ownership.lane_verify_claim = chain_lane_verify;
+    ownership.range_refresh = chain_range_refresh;
     ownership.range_authority_context = &authority;
     authority.ownership = &ownership;
+    for (size_t i = 0; i < QIHSE_CLUSTER_SLOT_COUNT; ++i)
+        authority.final_owner[i] = QIHSE_CLUSTER_NODE_NONE;
+    authority.final_owner[100] = indices[2]; authority.final_epoch[100] = 6u;
+    authority.final_owner[101] = indices[3]; authority.final_epoch[101] = 7u;
 
     qihse_cluster_bus_ct1_promotion_update_v2_t updates[2];
     memset(updates, 0, sizeof(updates));
@@ -575,7 +627,8 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
     for (size_t i = 0; i < 2; ++i) {
         qihse_cluster_bus_ct1_promotion_update_t* base = &updates[i].base;
         base->magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC;
-        base->start = 100u; base->end = 101u; base->config_epoch = (uint64_t)(5u + i);
+        base->start = 100u; base->end = (uint16_t)(i ? 100u : 101u);
+        base->config_epoch = (uint64_t)(5u + i);
         base->durable_cursor = 50u + i;
         snprintf(base->transfer_id, sizeof(base->transfer_id), "ct1-chain-%zu", i);
         snprintf(base->source_id, sizeof(base->source_id), "%s", nodes[sources[i]].id);
@@ -587,13 +640,17 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
         snprintf(base->generation, sizeof(base->generation), "%s", generations[i]);
         snprintf(base->next_generation, sizeof(base->next_generation), "%s", next_generations[i]);
         base->slot_bitmap[100u / 8u] |= (uint8_t)(1u << (100u % 8u));
-        base->slot_bitmap[101u / 8u] |= (uint8_t)(1u << (101u % 8u));
+        if (!i) base->slot_bitmap[101u / 8u] |= (uint8_t)(1u << (101u % 8u));
         promotion_seal_fields(base);
         updates[i].magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC;
         updates[i].target_cursor = 80u + i;
         snprintf(updates[i].lane_id, sizeof(updates[i].lane_id),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         assert(qihse_cluster_bus_ct1_promotion_v2_seal(&updates[i]));
+        snprintf(authority.allowed_transfer_id[i],
+            sizeof(authority.allowed_transfer_id[i]), "%s", base->transfer_id);
+        memcpy(authority.allowed_slots[i], base->slot_bitmap,
+            sizeof(base->slot_bitmap));
         lengths[i] = sign_ct1_certificate(envelopes[i], 8192u, &updates[i],
             (uint32_t)indices[targets[i]], private_keys[i], &identities[i]);
     }
@@ -637,13 +694,49 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE; uint64_t epoch = 0;
         assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
         assert(qihse_cluster_topology_get_slot_epoch(topology, slot, &epoch));
-        assert(owner == indices[2] && epoch == 6u);
+        assert(owner == authority.final_owner[slot] && epoch == authority.final_epoch[slot]);
     }
+    qihse_cluster_topology_t* replay_topology = qihse_cluster_topology_create();
+    assert(replay_topology);
+    uint16_t replay_indices[4];
+    for (size_t i = 0; i < 4; ++i)
+        assert(qihse_cluster_topology_upsert_node(replay_topology, &nodes[i],
+            &replay_indices[i]));
+    assert(qihse_cluster_topology_set_local_node(replay_topology, replay_indices[3]));
+    assert(qihse_cluster_topology_adopt_range(replay_topology, 100u, 101u,
+        replay_indices[0], 4u));
+    qihse_cluster_ownership_context_t replay_ownership = ownership;
+    replay_ownership.topology = replay_topology;
+    replay_ownership.bus = NULL;
+    authority.ownership = &replay_ownership;
+    bool replay_unresolved = false;
+    bool replay_ok = qihse_cluster_ownership_replay_control(&replay_ownership,
+        &replay_unresolved, err, sizeof(err));
+    if (!replay_ok || replay_unresolved)
+        fprintf(stderr, "CT1 chain replay failed: unresolved=%d %s\n",
+            replay_unresolved, err);
+    assert(replay_ok && !replay_unresolved);
+    for (uint16_t slot = 100; slot <= 101; ++slot) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE; uint64_t epoch = 0;
+        assert(qihse_cluster_topology_get_slot(replay_topology, slot, &owner, NULL, NULL));
+        assert(qihse_cluster_topology_get_slot_epoch(replay_topology, slot, &epoch));
+        assert(owner == authority.final_owner[slot] && epoch == authority.final_epoch[slot]);
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        qihse_cluster_node_t replay_node;
+        assert(qihse_cluster_topology_get_node(replay_topology, replay_indices[i],
+            &replay_node));
+        assert(replay_node.role == QIHSE_CLUSTER_NODE_PRIMARY);
+        assert(replay_node.config_epoch >= 4u);
+    }
+    qihse_cluster_topology_destroy(replay_topology);
+    authority.ownership = &ownership;
     const uint8_t* reversed[] = {envelopes[1], envelopes[0]};
     assert(!qihse_cluster_ownership_receive_ct1_promotion_chain(&ownership,
         reversed, lengths, 2u, err, sizeof(err)));
     qihse_cluster_bus_ct1_promotion_update_v2_t forged = updates[1];
-    forged.base.slot_bitmap[101u / 8u] = 0;
+    forged.base.end = 102u;
+    forged.base.slot_bitmap[102u / 8u] |= (uint8_t)(1u << (102u % 8u));
     assert(qihse_cluster_bus_ct1_promotion_seal(&forged.base));
     assert(qihse_cluster_bus_ct1_promotion_v2_seal(&forged));
     uint8_t* forged_envelope = calloc(1, 8192u);
@@ -669,7 +762,9 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
     assert(snprintf(chain_journal, sizeof(chain_journal), "%s/slot-ownership.journal",
         qihse_kv_store_data_directory(chain_store)) > 0);
     assert(unlink(chain_journal) == 0);
-    puts("[PASS] signed CT1 A->B->C chain repairs a missed predecessor and rejects reordered/conflicting certificates");
+    qihse_kv_store_destroy(chain_store);
+    remove_fixture(chain_data_dir);
+    puts("[PASS] signed CT1 A->B->C chain repairs a missed predecessor, replays only slot ownership, and rejects reordered/conflicting certificates");
 }
 
 typedef struct {
@@ -875,6 +970,8 @@ int main(void) {
     assert(r.last_start == 1 && strcmp(r.last_owner, "legacy") == 0);
     qihse_cluster_ownership_txn_t ct1_prepare = txn(QIHSE_OWNERSHIP_PREPARED);
     strcpy(ct1_prepare.transfer_id, "ct1-test-1");
+    strcpy(ct1_prepare.lane_id,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     strcpy(ct1_prepare.next_generation, "next-generation-4");
     ct1_prepare.slot_bitmap[10 / 8u] |= (uint8_t)(1u << (10 % 8u));
     ct1_prepare.slot_bitmap[11 / 8u] |= (uint8_t)(1u << (11 % 8u));
@@ -886,7 +983,9 @@ int main(void) {
     assert(qihse_cluster_ownership_journal_append_txn(dir3, &ct1_prepare) == 0);
     qihse_cluster_ownership_txn_t ct1_commit = ct1_prepare;
     ct1_commit.phase = QIHSE_OWNERSHIP_COMMITTED;
-    ct1_commit.target_lsn = ct1_commit.source_lsn;
+    /* CT1 target cursor is a sealed baseline row sequence, independent of the
+     * source replication cursor. */
+    ct1_commit.target_lsn = 1u;
     memset(ct1_commit.proof_digest, 0x35, sizeof(ct1_commit.proof_digest));
     assert(qihse_cluster_ownership_journal_append_txn(dir3, &ct1_commit) == 0);
     qihse_cluster_ownership_txn_t ct1_finalized = ct1_commit;

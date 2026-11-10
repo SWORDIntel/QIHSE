@@ -341,8 +341,60 @@ static void test_real_sender_wire_and_max_payload(void) {
     cfg.require_signed_ops = true;
     cfg.local_node_uuid = &f.peer.node_id;
     cfg.federation_sign_key = f.peer_pkey;
+    /* A target-signed promotion certificate is persisted/replicated before
+     * ownership FINAL, so exercise the no-send QBS builder here as well as
+     * the ordinary datagram sender below. */
+    qihse_cluster_node_t local_node;
+    assert(qihse_cluster_topology_get_node(f.topology, 0, &local_node));
+    local_node.has_uuid = true;
+    memcpy(local_node.node_uuid, f.peer.node_id.bytes,
+           sizeof(local_node.node_uuid));
+    assert(qihse_cluster_topology_upsert_node(f.topology, &local_node, NULL));
     f.bus = qihse_cluster_bus_create(&cfg);
     assert(f.bus && qihse_cluster_bus_start(f.bus));
+
+    qihse_cluster_bus_ct1_promotion_update_v2_t promotion;
+    memset(&promotion, 0, sizeof(promotion));
+    promotion.magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC;
+    promotion.base.magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC;
+    promotion.base.start = promotion.base.end = 7;
+    promotion.base.config_epoch = 1;
+    promotion.base.durable_cursor = 9;
+    snprintf(promotion.base.transfer_id, sizeof(promotion.base.transfer_id), "cert-test-1");
+    qihse_cluster_node_t source_node, successor_node;
+    assert(qihse_cluster_topology_get_node(f.topology, 1, &source_node));
+    assert(qihse_cluster_topology_get_node(f.topology, 2, &successor_node));
+    snprintf(promotion.base.source_id, sizeof(promotion.base.source_id), "%s", source_node.id);
+    snprintf(promotion.base.target_id, sizeof(promotion.base.target_id), "%s", local_node.id);
+    snprintf(promotion.base.successor_id, sizeof(promotion.base.successor_id), "%s", successor_node.id);
+    snprintf(promotion.base.source_qkp_id, sizeof(promotion.base.source_qkp_id), "qkp-source");
+    snprintf(promotion.base.target_qkp_id, sizeof(promotion.base.target_qkp_id), "qkp-target");
+    snprintf(promotion.base.successor_qkp_id, sizeof(promotion.base.successor_qkp_id), "qkp-successor");
+    snprintf(promotion.base.generation, sizeof(promotion.base.generation), "old-generation");
+    snprintf(promotion.base.next_generation, sizeof(promotion.base.next_generation), "new-generation");
+    promotion.base.slot_bitmap[7u / 8u] |= (uint8_t)(1u << (7u % 8u));
+    memset(promotion.base.promotion_digest, 0x5a,
+           sizeof(promotion.base.promotion_digest));
+    snprintf(promotion.lane_id, sizeof(promotion.lane_id),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    promotion.target_cursor = 9;
+    assert(qihse_cluster_bus_ct1_promotion_v2_seal(&promotion));
+    uint8_t* certificate = NULL;
+    size_t certificate_len = 0;
+    assert(qihse_cluster_bus_ct1_promotion_certificate_create(f.bus,
+        &promotion, &certificate, &certificate_len));
+    assert(certificate && certificate_len <= QIHSE_CLUSTER_BUS_CT1_CERTIFICATE_MAX);
+    qihse_cluster_bus_ct1_promotion_update_v2_t verified_promotion;
+    qihse_uuid_t verified_signer;
+    memset(&verified_promotion, 0, sizeof(verified_promotion));
+    memset(&verified_signer, 0, sizeof(verified_signer));
+    assert(qihse_cluster_bus_ct1_certificate_verify(f.bus, certificate,
+        certificate_len, &verified_promotion, &verified_signer));
+    assert(memcmp(verified_promotion.event_digest, promotion.event_digest,
+        sizeof(promotion.event_digest)) == 0);
+    assert(memcmp(verified_signer.bytes, f.peer.node_id.bytes,
+        sizeof(verified_signer.bytes)) == 0);
+    qihse_cluster_bus_ct1_certificate_free(certificate, certificate_len);
 
     uint8_t payload[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];
     memset(payload, 0x5a, sizeof(payload));
@@ -386,7 +438,7 @@ static void test_real_sender_wire_and_max_payload(void) {
     assert(st.signed_ops_accepted == 1u);
     assert(st.unsigned_ops_refused == 0u);
     fixture_down(&f);
-    printf("PASS (s5) production sender emits pinned signature trailer at max payload; unsigned PONG remains live\n");
+    printf("PASS (s5) exact QCP2 certificate is signed/verified and production sender emits max-payload signatures; unsigned PONG remains live\n");
 }
 
 int main(void) {

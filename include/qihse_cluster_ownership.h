@@ -53,8 +53,16 @@ typedef bool (*qihse_cluster_ownership_lane_verify_claim_fn)(
     void* context, qihse_user_t* principal,
     const qihse_kv_ct_lane_authority_claim_t* claim,
     bool require_final_decision);
+typedef bool (*qihse_cluster_ownership_range_refresh_fn)(
+    void* context, qihse_user_t* principal,
+    const uint8_t slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    char* err, size_t err_cap);
+typedef bool (*qihse_cluster_ownership_promotion_successor_prepare_fn)(
+    void* context, uint16_t successor_index,
+    const qihse_kv_ct_lane_authority_claim_t* reserved_claim,
+    char* err, size_t err_cap);
 
-typedef struct {
+typedef struct qihse_cluster_ownership_context {
     qihse_cluster_topology_t* topology;
     qihse_cluster_bus_t* bus;
     qihse_kv_store_t* store;
@@ -75,6 +83,14 @@ typedef struct {
     qihse_cluster_ownership_promotion_finalize_fn range_finalize_promotion;
     qihse_cluster_ownership_lane_claim_fn lane_claim;
     qihse_cluster_ownership_lane_verify_claim_fn lane_verify_claim;
+    /* Refresh routing from committed common ownership after a lane proof is
+     * verified. The adapter derives owner IDs/epochs itself; no caller map is
+     * accepted. */
+    qihse_cluster_ownership_range_refresh_fn range_refresh;
+    /* QKP-authenticated setup for the successor receiver lane. The daemon's
+     * normal lane worker then installs the baseline and certificate chain. */
+    qihse_cluster_ownership_promotion_successor_prepare_fn promotion_successor_prepare;
+    void* promotion_successor_context;
     void* range_authority_context;
 } qihse_cluster_ownership_context_t;
 

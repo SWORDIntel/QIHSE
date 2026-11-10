@@ -141,7 +141,8 @@ static bool txn_shape_valid(const qihse_cluster_ownership_txn_t* t) {
         t->phase == QIHSE_OWNERSHIP_ADOPTED)
         return (t->next_generation[0] || !strcmp(t->owner_id, t->target_id)) &&
                digest_nonzero(t->proof_digest) &&
-               (!t->next_generation[0] || t->target_lsn >= t->source_lsn);
+               (!t->next_generation[0] || t->lane_id[0] ||
+                t->target_lsn >= t->source_lsn);
     if (t->phase == QIHSE_OWNERSHIP_INTENT ||
         t->phase == QIHSE_OWNERSHIP_PREPARED ||
         t->phase == QIHSE_OWNERSHIP_ABORTED) {
