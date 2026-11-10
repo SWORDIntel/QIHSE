@@ -826,7 +826,11 @@ int qihse_txn_commit_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
 
     if (txn->state == QIHSE_TXN_PREPARED) {
         active->commit_seq = mgr->commit_seq + 1;
-        if (summary_needed_locked(mgr, txn)) {
+        /* Keep the write summary with the irrevocable decision even when no
+         * SERIALIZABLE transaction exists yet. A transaction may BEGIN while
+         * participant commit callbacks are in doubt; it snapshots the old
+         * commit_seq and must see this write once the decision completes. */
+        if (txn->write_count > 0) {
             active->commit_summary = committed_summary_create(txn, active->commit_seq);
             if (!active->commit_summary) {
                 uint32_t participants = active->participant_count == 0 ? 0 :

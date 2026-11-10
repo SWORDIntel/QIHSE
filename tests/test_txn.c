@@ -773,7 +773,8 @@ static void test_two_phase_commit(void) {
     assert(qihse_txn_register_participant(mgr, e2) == 0);
 
     qihse_txn_t* t = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
-    assert(t);
+    assert(t && qihse_txn_record_write(t, QIHSE_MVCC_ENGINE_KV,
+                                      "in-doubt-write", 14) == 0);
     assert(qihse_txn_prepare(mgr, t) == 0);
     assert(t->state == QIHSE_TXN_PREPARED);
     assert(p1.prepares == 1 && p2.prepares == 1);
@@ -791,6 +792,14 @@ static void test_two_phase_commit(void) {
     assert(p1.commits == 1 && p1.commit_successes == 1);
     assert(p2.commits == 1 && p2.commit_successes == 0);
     assert(late.commits == 0); /* participant set was frozen at PREPARE */
+    /* A SERIALIZABLE txn may begin after the irrevocable decision but before
+     * all participant ACKs. It must retain the old snapshot and conflict with
+     * the prepared transaction's write after the retry completes. */
+    qihse_txn_t* serial_during_retry =
+        qihse_txn_begin(mgr, QIHSE_ISO_SERIALIZABLE);
+    assert(serial_during_retry &&
+           qihse_txn_record_read(serial_during_retry, QIHSE_MVCC_ENGINE_KV,
+                                 "in-doubt-write", 14) == 0);
     qihse_txn_t* blocked = qihse_txn_begin(mgr, QIHSE_ISO_READ_COMMITTED);
     assert(blocked);
     assert(qihse_txn_commit(mgr, blocked) == -1);
@@ -801,6 +810,9 @@ static void test_two_phase_commit(void) {
     assert(p2.commits == 2 && p2.commit_successes == 1);
     assert(late.commits == 0);
     assert(qihse_txn_is_committed(mgr, t->id));
+    assert(qihse_txn_validate_occ(mgr, serial_during_retry) == -1);
+    assert(qihse_txn_commit(mgr, serial_during_retry) == -1);
+    assert(serial_during_retry->state == QIHSE_TXN_ABORTED);
     assert(qihse_txn_commit(mgr, blocked) == 0);
 
     /* A participant that refuses to prepare aborts the transaction. */
