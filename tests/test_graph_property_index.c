@@ -56,6 +56,12 @@ static void boundaries(void) {
     uint64_t long_b_id = add(g, "long", "payload", long_b);
     lookup(g, "long", "payload", long_a, long_a_id);
     lookup(g, "long", "payload", long_b, long_b_id);
+    const char *unlabeled_key = "plain";
+    graph_prop_t unlabeled_value = graph_prop_make_string("value");
+    uint64_t unlabeled_id = qihse_graph_vertex_create(g, NULL, 0, &unlabeled_key,
+                                                       &unlabeled_value, 1);
+    graph_prop_free(&unlabeled_value);
+    lookup(g, "", "plain", "value", unlabeled_id);
     assert(qihse_graph_vertex_remove_property(g, long_id, "n"));
     lookup(g, "f", "n", "a_much_longer_value_than_the_first_allocation_113", 0);
     assert(qihse_graph_vertex_delete(g, short_id));

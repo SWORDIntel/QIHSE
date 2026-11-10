@@ -213,8 +213,11 @@ static void pmap_add(prop_map_t* m, const char* label, const char* prop,
     } else {
         free(ck);
     }
-    for (size_t i = 0; i < b->count; ++i)
-        if (b->ids[i] == id) return;
+    /* IDs are inserted as a batch per vertex while the graph write lock is
+     * held. Repeated labels/properties for that same vertex are therefore
+     * adjacent in this bucket; checking only the tail avoids quadratic work
+     * for the common case of many vertices sharing one indexed value. */
+    if (b->count && b->ids[b->count - 1] == id) return;
     if (b->count == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 8;
         b->ids = realloc(b->ids, b->cap * sizeof(uint64_t));
@@ -906,7 +909,7 @@ size_t qihse_graph_get_vertices_by_property(qihse_graph_t* g, const char* label,
             graph_vertex_t **slot = vslot(g, b->ids[i]);
             graph_vertex_t *vertex = slot ? *slot : NULL;
             if (!vertex) continue;
-            if (label) {
+            if (label && *label) {
                 bool found_label = false;
                 for (size_t l = 0; l < vertex->num_labels; ++l)
                     if (strcmp(vertex->labels[l], label) == 0) { found_label = true; break; }
