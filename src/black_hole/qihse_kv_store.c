@@ -5579,7 +5579,7 @@ bool qihse_kv_ct_transfer_status(qihse_kv_store_t* store,
     if (out) memset(out, 0, sizeof(*out));
     if (!store || !out || !ct_admin(control_principal)) return false;
     kv_store_rdlock(store);
-    bool ok = store->ct_enabled && !store->recovery_pending &&
+    bool ok = !store->recovery_pending &&
         ct_admin(control_principal);
     if (ok) ct_transfer_status_fill_locked(store, out);
     kv_store_unlock(store);
@@ -5592,7 +5592,7 @@ bool qihse_kv_ct_transfer_status_detail(qihse_kv_store_t* store,
     if (out) memset(out, 0, sizeof(*out));
     if (!store || !out || !ct_admin(control_principal)) return false;
     kv_store_rdlock(store);
-    bool ok = store->ct_enabled && !store->recovery_pending &&
+    bool ok = !store->recovery_pending &&
         ct_admin(control_principal);
     if (ok) {
         ct_transfer_status_fill_locked(store, &out->base);

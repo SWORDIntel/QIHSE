@@ -150,6 +150,11 @@ int main(int argc, char** argv) {
     assert(service);
     qihse_kv_store_t* s = qihse_kv_store_create_user(op);
     assert(s);
+    qihse_kv_ct_transfer_status_detail_t initial_fence = {0};
+    assert(qihse_kv_ct_transfer_status_detail(s, op, &initial_fence));
+    assert(initial_fence.base.mode == 0u && initial_fence.base.fence_state == 0u);
+    assert(!qihse_kv_ct_transfer_status_detail(s, low, &initial_fence));
+    assert(!qihse_kv_ct_transfer_status_detail(s, NULL, &initial_fence));
     qihse_kv_store_set_replication_principal_id(s, 8302u);
     assert(qihse_kv_set_user(s, "commons/preexisting", "secret", 4u, 2u, op));
     assert(qihse_kv_get_user(s, "commons/preexisting", low) == NULL);

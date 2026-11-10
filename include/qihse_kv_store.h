@@ -329,7 +329,9 @@ bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
     uint64_t* out_cut_position);
 /* Read-only durable fence identity for journal recovery. An ABORTED journal
- * record may answer only after the matching source fence is absent/released. */
+ * record may answer only after the matching source fence is absent/released.
+ * A healthy unconfigured store succeeds with mode zero; absence of CT is not
+ * an I/O or recovery failure and must not prevent first group initialization. */
 typedef struct {
     uint32_t mode, fence_state, transfer_phase;
     uint16_t first_slot, last_slot;
