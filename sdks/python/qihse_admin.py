@@ -24,9 +24,11 @@ Typical use:
 """
 
 import ctypes
+import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from typing import List, Optional
 
 
@@ -37,6 +39,64 @@ class QihseAdminError(Exception):
         super().__init__(message)
         self.exit_code = exit_code
         self.stderr = stderr
+
+
+_OWNER_SNAPSHOT_MAX_READ = 512 * 1024
+
+
+def _owner_snapshot_bulk(reply: bytes) -> bytes:
+    """Decode one complete RESP2 bulk reply without interpreting its payload."""
+    if not isinstance(reply, bytes) or not reply.startswith(b"$"):
+        raise QihseAdminError("owner snapshot returned a non-bulk reply")
+    line_end = reply.find(b"\r\n", 1)
+    if line_end < 0:
+        raise QihseAdminError("owner snapshot returned a malformed bulk header")
+    length_text = reply[1:line_end]
+    if not length_text or any(c < 48 or c > 57 for c in length_text):
+        raise QihseAdminError("owner snapshot returned a malformed bulk length")
+    length = int(length_text)
+    payload_start = line_end + 2
+    payload_end = payload_start + length
+    if payload_end + 2 != len(reply) or reply[payload_end:payload_end + 2] != b"\r\n":
+        raise QihseAdminError("owner snapshot returned a truncated or oversized bulk reply")
+    return reply[payload_start:payload_end]
+
+
+def _owner_snapshot_manifest(reply: bytes) -> tuple[int, int]:
+    """Decode the fixed `[byte_length, source_change_seq]` RESP2 manifest."""
+    if not isinstance(reply, bytes) or not reply.startswith(b"*2\r\n"):
+        # Do not attach an arbitrary reply to the exception: it might contain
+        # server data if a future protocol regression returns the wrong frame.
+        raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+    body = reply[4:]
+    fields = []
+    for _ in range(2):
+        if not body.startswith(b"$"):
+            raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+        line_end = body.find(b"\r\n", 1)
+        if line_end < 0:
+            raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+        size_text = body[1:line_end]
+        if not size_text or any(c < 48 or c > 57 for c in size_text):
+            raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+        size = int(size_text)
+        start = line_end + 2
+        end = start + size
+        if end + 2 > len(body) or body[end:end + 2] != b"\r\n":
+            raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+        fields.append(body[start:end])
+        body = body[end + 2:]
+    if body:
+        raise QihseAdminError("owner snapshot BEGIN returned an oversized manifest")
+    numbers = []
+    for field in fields:
+        if not field or any(c < 48 or c > 57 for c in field):
+            raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+        value = int(field)
+        if value > (1 << 64) - 1:
+            raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
+        numbers.append(value)
+    return numbers[0], numbers[1]
 
 
 def _load_native_qkp_lib(lib_path: Optional[str] = None) -> Optional[ctypes.CDLL]:
@@ -925,6 +985,120 @@ class QKPAdminSession:
             return ctypes.string_at(reply, size.value)
         finally:
             self._lib.qihse_qkp_admin_free(reply)
+
+    def _stream_owner_snapshot(self, output_path, *, mode, chunk_size):
+        """Stream one immutable OWNER.SNAPSHOT to a mode-0600 file atomically.
+
+        ``inventory`` is the default live-data inventory and is not a restore
+        backup. ``backup`` requests the self-describing BACKUP_OWNER_DATA
+        container; restoring that container is a separate operation against a
+        fresh CT-disabled store. The session must already be authenticated as
+        an authorized system Operator and remains pinned for the whole stream.
+
+        The method retains at most one bounded RESP chunk in memory. On any
+        failure it removes the temporary file and attempts SNAPSHOT.END; the
+        destination is replaced only after the announced byte count, fsync,
+        and END all succeed. Returns size, source change sequence, and SHA-256
+        metadata without retaining or logging the payload.
+        """
+        if not self._client.value:
+            raise QihseAdminError("session is closed")
+        if mode not in ("inventory", "backup"):
+            raise ValueError("mode must be 'inventory' or 'backup'")
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or not 1 <= chunk_size <= _OWNER_SNAPSHOT_MAX_READ:
+            raise ValueError("chunk_size must be in 1..524288")
+        path_value = os.fspath(output_path)
+        if not isinstance(path_value, str):
+            raise TypeError("output_path must be a string or PathLike[str]")
+        path = os.path.abspath(path_value)
+        if not os.path.basename(path):
+            raise ValueError("output_path must name a file")
+        parent = os.path.dirname(path)
+        mode_arg = ("BACKUP",) if mode == "backup" else ()
+
+        fd = None
+        temporary = None
+        begun = False
+        try:
+            begin_reply = self.execute_resp("OWNER.SNAPSHOT.BEGIN", *mode_arg)
+            # The server may have created the snapshot even if its response is
+            # malformed or truncated, so try END for every returned BEGIN.
+            begun = not begin_reply.startswith(b"-")
+            byte_length, source_change_seq = _owner_snapshot_manifest(begin_reply)
+
+            # Create the private staging file next to the destination so
+            # os.replace is atomic on the target filesystem.
+            fd, temporary = tempfile.mkstemp(
+                prefix="." + os.path.basename(path) + ".",
+                suffix=".partial", dir=parent)
+            digest = hashlib.sha256()
+            offset = 0
+            with os.fdopen(fd, "wb", closefd=True) as stream:
+                fd = None
+                while offset < byte_length:
+                    wanted = min(chunk_size, byte_length - offset)
+                    chunk_reply = self.execute_resp(
+                        "OWNER.SNAPSHOT.READ", str(offset), str(wanted))
+                    chunk = _owner_snapshot_bulk(chunk_reply)
+                    if len(chunk) != wanted:
+                        raise QihseAdminError("owner snapshot returned a short chunk")
+                    stream.write(chunk)
+                    digest.update(chunk)
+                    offset += len(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            end_reply = self.execute_resp("OWNER.SNAPSHOT.END")
+            if end_reply != b"+OK\r\n":
+                raise QihseAdminError("owner snapshot END failed")
+            begun = False
+            os.replace(temporary, path)
+            temporary = None
+            dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return {
+                "path": path,
+                "mode": mode,
+                "size": byte_length,
+                "source_change_seq": source_change_seq,
+                "sha256": digest.hexdigest(),
+            }
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+            if begun:
+                try:
+                    end_reply = self.execute_resp("OWNER.SNAPSHOT.END")
+                    if end_reply != b"+OK\r\n":
+                        self.close()
+                except BaseException:
+                    # Preserve the original stream/write failure. The server
+                    # drops its handle when this authenticated session closes.
+                    # A failed END leaves no safe way to reuse this connection.
+                    self.close()
+
+    def owner_inventory(self, output_path, *, chunk_size=_OWNER_SNAPSHOT_MAX_READ):
+        """Write a live owner data inventory (not a restore backup) to a file."""
+        return self._stream_owner_snapshot(
+            output_path, mode="inventory", chunk_size=chunk_size)
+
+    def backup_owner_data(self, output_path, *, chunk_size=_OWNER_SNAPSHOT_MAX_READ):
+        """Write an online BACKUP_OWNER_DATA container to a private file.
+
+        Requires server support for ``OWNER.SNAPSHOT.BEGIN BACKUP``. Restore
+        only through the existing backup restore tooling into a fresh,
+        CT-disabled store; this does not resume CT journals or cursors.
+        """
+        return self._stream_owner_snapshot(
+            output_path, mode="backup", chunk_size=chunk_size)
 
     def execute(self, *command):
         """Return bytes/int/None/list, raising on errors even inside arrays."""
