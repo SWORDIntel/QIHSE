@@ -10,7 +10,6 @@
  */
 
 #include "qihse.h"
-#include "../orchestration/include/qihse_hetero.h"
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>

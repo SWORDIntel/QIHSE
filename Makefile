@@ -566,7 +566,7 @@ test-ct-slot-transfer: cluster-daemon keygen
 
 test-serial: test-ct-transport-protocol test-ct-transport-daemon test-ct-slot-transfer
 
-.PHONY: test-backup-merge test-backup-owner-data test-brain-ct-pending
+.PHONY: test-backup-merge test-backup-owner-data test-kv-wal-replay-apply-failure test-brain-ct-pending
 test-backup-merge: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_backup_merge tests/test_backup_merge.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_backup_merge
@@ -575,11 +575,15 @@ test-backup-owner-data: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_backup_owner_data tests/test_backup_owner_data.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_backup_owner_data
 
+test-kv-wal-replay-apply-failure: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_kv_wal_replay_apply_failure tests/test_kv_wal_replay_apply_failure.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_wal_replay_apply_failure
+
 test-brain-ct-pending: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_brain_ct_pending tests/test_brain_ct_pending.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_brain_ct_pending
 
-test-serial: test-backup-merge test-backup-owner-data test-brain-ct-pending
+test-serial: test-backup-merge test-backup-owner-data test-kv-wal-replay-apply-failure test-brain-ct-pending
 
 .PHONY: test-ct-brain-balance
 test-ct-brain-balance: cluster-daemon keygen
