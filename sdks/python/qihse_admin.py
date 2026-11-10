@@ -52,7 +52,8 @@ def _owner_snapshot_bulk(reply: bytes) -> bytes:
     if line_end < 0:
         raise QihseAdminError("owner snapshot returned a malformed bulk header")
     length_text = reply[1:line_end]
-    if not length_text or any(c < 48 or c > 57 for c in length_text):
+    if (not length_text or len(length_text) > 20 or
+            any(c < 48 or c > 57 for c in length_text)):
         raise QihseAdminError("owner snapshot returned a malformed bulk length")
     length = int(length_text)
     payload_start = line_end + 2
@@ -77,7 +78,8 @@ def _owner_snapshot_manifest(reply: bytes) -> tuple[int, int]:
         if line_end < 0:
             raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
         size_text = body[1:line_end]
-        if not size_text or any(c < 48 or c > 57 for c in size_text):
+        if (not size_text or len(size_text) > 20 or
+                any(c < 48 or c > 57 for c in size_text)):
             raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
         size = int(size_text)
         start = line_end + 2
@@ -90,7 +92,8 @@ def _owner_snapshot_manifest(reply: bytes) -> tuple[int, int]:
         raise QihseAdminError("owner snapshot BEGIN returned an oversized manifest")
     numbers = []
     for field in fields:
-        if not field or any(c < 48 or c > 57 for c in field):
+        if (not field or len(field) > 20 or
+                any(c < 48 or c > 57 for c in field)):
             raise QihseAdminError("owner snapshot BEGIN returned an invalid manifest")
         value = int(field)
         if value > (1 << 64) - 1:
@@ -1020,7 +1023,14 @@ class QKPAdminSession:
         temporary = None
         begun = False
         try:
-            begin_reply = self.execute_resp("OWNER.SNAPSHOT.BEGIN", *mode_arg)
+            try:
+                begin_reply = self.execute_resp("OWNER.SNAPSHOT.BEGIN", *mode_arg)
+            except BaseException:
+                # The server may have created its session-pinned snapshot
+                # before transport/protocol failure obscured the reply. Drop
+                # this connection so server-side session cleanup releases it.
+                self.close()
+                raise
             # The server may have created the snapshot even if its response is
             # malformed or truncated, so try END for every returned BEGIN.
             begun = not begin_reply.startswith(b"-")

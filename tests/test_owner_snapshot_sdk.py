@@ -25,17 +25,22 @@ def manifest(length: int, seq: int) -> bytes:
 
 class FakeSession:
     def __init__(self, payload: bytes, *, short_at=None, begin_reply=None,
-                 end_reply=b"+OK\r\n"):
+                 end_reply=b"+OK\r\n", begin_exception=None):
         self.payload = payload
         self.short_at = short_at
         self.begin_reply = begin_reply or manifest(len(payload), 9127)
         self.end_reply = end_reply
+        self.begin_exception = begin_exception
         self.commands = []
         self.closed = False
+        self.snapshot_active = False
 
     def execute_resp(self, *args):
         self.commands.append(args)
         if args[0] == "OWNER.SNAPSHOT.BEGIN":
+            self.snapshot_active = True
+            if self.begin_exception:
+                raise self.begin_exception
             return self.begin_reply
         if args[0] == "OWNER.SNAPSHOT.READ":
             offset, length = int(args[1]), int(args[2])
@@ -49,6 +54,7 @@ class FakeSession:
 
     def close(self):
         self.closed = True
+        self.snapshot_active = False
 
 
 def sdk_session(fake: FakeSession) -> QKPAdminSession:
@@ -104,7 +110,10 @@ class OwnerSnapshotSdkTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).glob(".*.partial")), [])
 
     def test_malformed_or_denied_begin_never_creates_output(self):
-        for reply in (b"*2\r\n$5\r\n12\r\n", b"-NOPERM operator required\r\n"):
+        oversized_manifest = (b"*2\r\n$21\r\n" + b"9" * 21 +
+                              b"\r\n$1\r\n0\r\n")
+        for reply in (b"*2\r\n$5\r\n12\r\n", oversized_manifest,
+                      b"-NOPERM operator required\r\n"):
             fake = FakeSession(b"HIGH_SECRET", begin_reply=reply)
             with tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / "inventory.raw"
@@ -127,6 +136,38 @@ class OwnerSnapshotSdkTests(unittest.TestCase):
                 session.backup_owner_data(target)
             self.assertEqual(target.read_bytes(), b"previous-complete-file")
             self.assertTrue(fake.closed)
+            self.assertEqual(list(Path(directory).glob(".*.partial")), [])
+
+    def test_begin_transport_exception_closes_unknown_snapshot_session(self):
+        fake = FakeSession(b"private-data", begin_exception=OSError("transport failed"))
+        session = sdk_session(fake)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "inventory.raw"
+            with self.assertRaisesRegex(OSError, "transport failed"):
+                session.owner_inventory(target)
+            self.assertTrue(fake.closed)
+            self.assertFalse(fake.snapshot_active)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(Path(directory).glob(".*.partial")), [])
+
+    def test_oversized_decimal_headers_raise_sdk_error(self):
+        payload = b"data"
+        fake = FakeSession(payload)
+        original = fake.execute_resp
+
+        def oversized_chunk(*args):
+            if args[0] == "OWNER.SNAPSHOT.READ":
+                fake.commands.append(args)
+                return b"$" + b"9" * 21 + b"\r\n"
+            return original(*args)
+
+        fake.execute_resp = oversized_chunk
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "inventory.raw"
+            with self.assertRaisesRegex(QihseAdminError, "malformed bulk length"):
+                sdk_session(fake).owner_inventory(target)
+            self.assertEqual(fake.commands[-1], ("OWNER.SNAPSHOT.END",))
+            self.assertFalse(target.exists())
             self.assertEqual(list(Path(directory).glob(".*.partial")), [])
 
     def test_bad_chunk_frame_cleans_temp_and_ends_snapshot(self):
