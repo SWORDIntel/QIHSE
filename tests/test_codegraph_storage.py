@@ -467,11 +467,15 @@ def main() -> None:
         manifest_path.write_text(json.dumps(invalid_roots))
         failed_gc = invoke("gc", expect=1)
         assert failed_gc["status"] == "collection_failed", failed_gc
+        assert failed_gc["removed_shared_blocks"] is None, failed_gc
+        assert failed_gc["removed_shared_block_bytes"] is None, failed_gc
+        assert failed_gc["shared_block_counts_complete"] is False, failed_gc
         assert orphan.is_file(), "GC deleted blocks despite an invalid retained root"
         manifest_path.write_text(json.dumps(current_generation))
 
         collected = invoke("gc")
         assert collected["status"] == "collected", collected
+        assert collected["shared_block_counts_complete"] is True, collected
         assert collected["removed_shared_blocks"] == 1, collected
         assert collected["removed_shared_block_bytes"] == len(orphan_data), collected
         assert not orphan.exists(), "explicit GC left a valid orphan generation block"

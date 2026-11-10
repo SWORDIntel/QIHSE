@@ -1954,6 +1954,7 @@ static int collect_snapshots(cg_state *st) {
     int rc = 1;
     size_t removed = 0, runtimes = 0, shared_removed = 0;
     uint64_t shared_bytes = 0;
+    bool shared_counts_complete = true;
     /* Authenticate and validate the retained current graph before removing anything. */
     if (!load_snapshot_unlocked(st, true)) goto done;
     if (!prune_snapshots_unlocked(st, st->manifest, &removed)) goto done;
@@ -1962,7 +1963,13 @@ static int collect_snapshots(cg_state *st) {
      * rollback roots retained above. Validation failure is fail-closed: the
      * shared-block collector does not remove anything unless both roots pass. */
     if (!generation_cleanup_unlocked(st, st->manifest, &shared_removed,
-                                     &shared_bytes)) goto done;
+                                     &shared_bytes)) {
+        /* The block collector can fail after partially unlinking candidates;
+         * its failure API does not return partial counters. Do not report
+         * misleading zero counts in that case. */
+        shared_counts_complete = false;
+        goto done;
+    }
     rc = 0;
 done:
     storage_lock(st, LOCK_UN);
@@ -1970,8 +1977,14 @@ done:
     json_text(report, "status", rc ? "collection_failed" : "collected");
     json_int(report, "removed_snapshots", (int64_t)removed);
     json_int(report, "removed_runtimes", (int64_t)runtimes);
-    json_int(report, "removed_shared_blocks", (int64_t)shared_removed);
-    json_int(report, "removed_shared_block_bytes", (int64_t)shared_bytes);
+    if (shared_counts_complete) {
+        json_int(report, "removed_shared_blocks", (int64_t)shared_removed);
+        json_int(report, "removed_shared_block_bytes", (int64_t)shared_bytes);
+    } else {
+        json_object_object_add(report, "removed_shared_blocks", json_object_new_null());
+        json_object_object_add(report, "removed_shared_block_bytes", json_object_new_null());
+    }
+    json_boolean(report, "shared_block_counts_complete", shared_counts_complete);
     print_json(report);
     json_object_put(report);
     return rc;
