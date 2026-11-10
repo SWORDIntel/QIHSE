@@ -75,9 +75,10 @@ bool qihse_consensus_mesh_range_lookup_user(qihse_consensus_mesh_t* mesh,
     *request = saved; *out_phase = phase;
     grant->reserve_index = 17; grant->grant_epoch = 101;
     memset(grant->reserve_digest, 3, 32);
-    if (phase == QIHSE_RANGE_PHASE_FINALIZED) {
-        decision->decision_index = 18; decision->grant_epoch = 101;
-        memset(decision->decision_digest, 18, 32);
+    if (phase == QIHSE_RANGE_PHASE_FINALIZED || phase == QIHSE_RANGE_PHASE_ABORTED) {
+        unsigned terminal = phase == QIHSE_RANGE_PHASE_FINALIZED ? 18u : 19u;
+        decision->decision_index = terminal; decision->grant_epoch = 101;
+        memset(decision->decision_digest, terminal, 32);
         memcpy(decision->evidence_digest, evidence, 32);
     }
     return true;
@@ -103,6 +104,7 @@ bool qihse_consensus_mesh_range_abort_user(qihse_consensus_mesh_t* mesh,
     abort_calls++; phase = QIHSE_RANGE_PHASE_ABORTED;
     memcpy(evidence, digest, 32);
     decision->decision_index = 19; decision->grant_epoch = 101;
+    memset(decision->decision_digest, 19, 32);
     memcpy(decision->evidence_digest, digest, 32); return true;
 }
 
@@ -315,6 +317,21 @@ int main(void) {
     local_node_index = 1;
     assert(qihse_cluster_range_authority_abort(&a, op, &transaction, NULL, 0));
     assert(abort_calls == 1 && phase == QIHSE_RANGE_PHASE_ABORTED);
+    assert(qihse_cluster_range_authority_claim(&a, op, &transaction, &claim));
+    assert(!qihse_cluster_range_authority_verify_claim(&verifier, &claim, false));
+    assert(qihse_cluster_range_authority_verify_aborted_claim(&verifier, &claim, true));
+    verifier.principal = low;
+    assert(!qihse_cluster_range_authority_verify_aborted_claim(&verifier, &claim, false));
+    verifier.principal = op;
+    claim.source_cut++;
+    assert(!qihse_cluster_range_authority_verify_aborted_claim(&verifier, &claim, true));
+    claim.source_cut--;
+    claim.final_decision_digest[0]++;
+    assert(!qihse_cluster_range_authority_verify_aborted_claim(&verifier, &claim, true));
+    claim.final_decision_digest[0]--;
+    phase = QIHSE_RANGE_PHASE_FINALIZED;
+    assert(!qihse_cluster_range_authority_verify_aborted_claim(&verifier, &claim, true));
+    phase = QIHSE_RANGE_PHASE_ABORTED;
     assert(!qihse_cluster_range_authority_reserve(&a, op, &transaction, NULL, 0));
     /* A receiver can reserve promotion while the old source/resolver is down.
      * The sparse bitmap and old stream cursor remain exact authority inputs. */

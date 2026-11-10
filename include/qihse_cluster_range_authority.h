@@ -83,7 +83,9 @@ bool qihse_cluster_range_authority_check_finalized(
 
 /* Copy the committed immutable reservation into a store-bound proof claim.
  * Copy/image cuts may be filled as staging proceeds; final verification binds
- * those values to the operation-specific committed evidence. */
+ * those values to the operation-specific committed evidence. An ABORTED
+ * transaction exports its terminal decision for the separate abort verifier;
+ * ordinary reservation/final verification continues to reject it. */
 bool qihse_cluster_range_authority_claim(
     void* authority, qihse_user_t* principal,
     const qihse_cluster_ownership_txn_t* transaction,
@@ -95,6 +97,14 @@ bool qihse_cluster_range_authority_verify_claim_user(
 bool qihse_cluster_range_authority_verify_claim(
     void* verifier, const qihse_kv_ct_lane_authority_claim_t* claim,
     bool require_final_decision);
+/* Separate abort verifier: ordinary reservation/final verification never
+ * authorizes releasing an aborted operation's durable local fence. */
+bool qihse_cluster_range_authority_verify_aborted_claim_user(
+    void* authority, qihse_user_t* principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim);
+bool qihse_cluster_range_authority_verify_aborted_claim(
+    void* verifier, const qihse_kv_ct_lane_authority_claim_t* claim,
+    bool require_terminal_decision);
 bool qihse_cluster_range_authority_finalize_promotion(
     void* authority, qihse_user_t* principal,
     const qihse_cluster_ownership_txn_t* transaction,

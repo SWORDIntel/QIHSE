@@ -378,7 +378,8 @@ bool qihse_cluster_range_authority_claim(void* opaque,
     qihse_consensus_range_decision_t decision = {0};
     qihse_consensus_range_phase_t phase = QIHSE_RANGE_PHASE_NONE;
     if (!c || !lookup(opaque, principal, t, &r, &grant, &decision, &phase) ||
-        (phase != QIHSE_RANGE_PHASE_RESERVED && phase != QIHSE_RANGE_PHASE_FINALIZED))
+        (phase != QIHSE_RANGE_PHASE_RESERVED && phase != QIHSE_RANGE_PHASE_FINALIZED &&
+         !(phase == QIHSE_RANGE_PHASE_ABORTED && t->phase == QIHSE_OWNERSHIP_ABORTED)))
         return false;
     c->operation = r.op == QIHSE_RANGE_OP_PROMOTION ?
         QIHSE_KV_CT_LANE_AUTH_PROMOTION : QIHSE_KV_CT_LANE_AUTH_TRANSFER;
@@ -394,7 +395,7 @@ bool qihse_cluster_range_authority_claim(void* opaque,
     c->grant_epoch = grant.grant_epoch; c->reserve_index = grant.reserve_index;
     memcpy(c->reserve_digest, grant.reserve_digest, 32);
     c->source_cut = t->source_lsn; c->target_cursor = t->target_lsn;
-    if (phase == QIHSE_RANGE_PHASE_FINALIZED) {
+    if (phase == QIHSE_RANGE_PHASE_FINALIZED || phase == QIHSE_RANGE_PHASE_ABORTED) {
         c->final_decision_index = decision.decision_index;
         memcpy(c->final_decision_digest, decision.decision_digest, 32);
         if (r.op == QIHSE_RANGE_OP_PROMOTION)
@@ -482,6 +483,65 @@ bool qihse_cluster_range_authority_verify_claim(void* opaque,
     qihse_cluster_range_verifier_t* verifier = opaque;
     return verifier && qihse_cluster_range_authority_verify_claim_user(
         verifier->authority, verifier->principal, c, require_final);
+}
+
+bool qihse_cluster_range_authority_verify_aborted_claim_user(void* opaque,
+    qihse_user_t* principal, const qihse_kv_ct_lane_authority_claim_t* c) {
+    qihse_cluster_range_authority_t* a = opaque;
+    if (!a || !a->mesh || !operator_active(principal) || !c ||
+        c->operation != QIHSE_KV_CT_LANE_AUTH_TRANSFER ||
+        !text_valid(c->transfer_id, sizeof(c->transfer_id)) ||
+        !hex_valid(c->source_group_id, 64) || !hex_valid(c->target_group_id, 64) ||
+        !text_valid(c->source_qkp_id, sizeof(c->source_qkp_id)) ||
+        !text_valid(c->target_qkp_id, sizeof(c->target_qkp_id)) ||
+        !text_valid(c->successor_qkp_id, sizeof(c->successor_qkp_id)) ||
+        !hex_valid(c->source_generation, 32) || !hex_valid(c->target_generation, 32) ||
+        !c->final_decision_index || !digest_present(c->final_decision_digest) ||
+        c->target_cursor != 0)
+        return false;
+    qihse_consensus_range_request_t r = {0};
+    qihse_consensus_range_grant_t grant = {0};
+    qihse_consensus_range_decision_t decision = {0};
+    qihse_consensus_range_phase_t phase = QIHSE_RANGE_PHASE_NONE;
+    if (!qihse_consensus_mesh_range_lookup_user(a->mesh, principal, c->transfer_id,
+            &r, &grant, &decision, &phase) || phase != QIHSE_RANGE_PHASE_ABORTED ||
+        !claim_request_matches(c, &r) || c->grant_epoch != grant.grant_epoch ||
+        c->reserve_index != grant.reserve_index ||
+        CRYPTO_memcmp(c->reserve_digest, grant.reserve_digest, 32) ||
+        c->final_decision_index != decision.decision_index ||
+        c->grant_epoch != decision.grant_epoch ||
+        CRYPTO_memcmp(c->final_decision_digest, decision.decision_digest, 32))
+        return false;
+    qihse_cluster_ownership_txn_t t = {0};
+    snprintf(t.transfer_id, sizeof(t.transfer_id), "%s", r.transfer_id);
+    snprintf(t.source_id, sizeof(t.source_id), "%s", r.source_topology_id);
+    snprintf(t.target_id, sizeof(t.target_id), "%s", r.target_topology_id);
+    snprintf(t.source_qkp_id, sizeof(t.source_qkp_id), "%s", r.source_qkp_id);
+    snprintf(t.target_qkp_id, sizeof(t.target_qkp_id), "%s", r.target_qkp_id);
+    snprintf(t.generation, sizeof(t.generation), "%s", r.source_generation);
+    t.config_epoch = c->grant_epoch; t.source_lsn = c->source_cut;
+    /* ABORTED journal transitions zero their target cursor and activation
+     * digest. Binding those values to the mesh prevents an activation receipt
+     * or a caller's assertion from becoming permission to un-fence a source. */
+    bool seen = false, ended = false;
+    for (uint32_t s = 0; s < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++s) {
+        if (r.slots[s / 8u] & (1u << (s % 8u))) {
+            if (ended) return false;
+            if (!seen) t.start = (uint16_t)s;
+            seen = true; t.end = (uint16_t)s;
+        } else if (seen) ended = true;
+    }
+    uint8_t digest[32] = {0};
+    return seen && transition_digest(&t, "QIHSE-RANGE-ABORTED-1", digest) &&
+        CRYPTO_memcmp(digest, decision.evidence_digest, 32) == 0;
+}
+
+bool qihse_cluster_range_authority_verify_aborted_claim(void* opaque,
+    const qihse_kv_ct_lane_authority_claim_t* c, bool require_terminal) {
+    (void)require_terminal; /* This verifier always requires committed ABORT. */
+    qihse_cluster_range_verifier_t* verifier = opaque;
+    return verifier && qihse_cluster_range_authority_verify_aborted_claim_user(
+        verifier->authority, verifier->principal, c);
 }
 
 bool qihse_cluster_range_authority_finalize_promotion(void* opaque,
