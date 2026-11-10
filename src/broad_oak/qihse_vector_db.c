@@ -322,6 +322,8 @@ struct qihse_vector_db_s {
     bool explicit_edges_dirty;
     pthread_mutex_t explicit_edge_mutex;
     bool explicit_edge_mutex_initialized;
+    pthread_mutex_t adapter_mutex;
+    bool adapter_mutex_initialized;
 };
 
 /* Forward declarations for cold-spill functions (Phase 4) */
@@ -1279,52 +1281,56 @@ static bool qihse_vdb_int8_load(qihse_vector_db_t vdb) {
 }
 
 static bool qihse_vdb_reserve_rows(qihse_vector_db_t vdb, size_t needed) {
-    qihse_index_row_t* next;
-    size_t cap;
+    size_t cap = vdb->rows_capacity ? vdb->rows_capacity : 8u;
+    uint64_t* counts = NULL;
+    uint64_t* last = NULL;
+    qihse_memory_tier_t* tiers = NULL;
 
-    if (needed <= vdb->rows_capacity) {
+    if (needed <= vdb->rows_capacity && needed <= vdb->row_tracking_capacity)
         return true;
-    }
-    cap = vdb->rows_capacity ? vdb->rows_capacity : 8u;
     while (cap < needed) {
-        if (cap > SIZE_MAX / 2u) {
-            errno = EOVERFLOW;
-            return false;
-        }
+        if (cap > SIZE_MAX / 2u) { errno = EOVERFLOW; return false; }
         cap *= 2u;
     }
-    next = (qihse_index_row_t*)realloc(vdb->rows, cap * sizeof(*next));
-    if (!next) {
-        errno = ENOMEM;
+    if (cap > SIZE_MAX / sizeof(*vdb->rows) ||
+        cap > SIZE_MAX / sizeof(*counts) || cap > SIZE_MAX / sizeof(*tiers)) {
+        errno = EOVERFLOW;
         return false;
     }
-    vdb->rows = next;
+    /* Reserve tracking arrays as a group. Independent reallocs can move one
+     * old buffer before another fails, leaving dangling pointers in vdb. */
+    if (cap > vdb->row_tracking_capacity) {
+        counts = malloc(cap * sizeof(*counts));
+        last = malloc(cap * sizeof(*last));
+        tiers = malloc(cap * sizeof(*tiers));
+        if (!counts || !last || !tiers) goto fail;
+        for (size_t i = 0u; i < cap; i++) {
+            bool old = i < vdb->row_tracking_capacity;
+            counts[i] = old ? vdb->row_access_counts[i] : 0u;
+            last[i] = old ? vdb->row_last_access_ns[i] : 0u;
+            tiers[i] = old ? vdb->row_tier[i] : QIHSE_MEM_DRAM;
+        }
+    }
+    qihse_index_row_t* rows = realloc(vdb->rows, cap * sizeof(*rows));
+    if (!rows) goto fail;
+    vdb->rows = rows;
     vdb->rows_capacity = cap;
-
-    /* Resize hierarchical storage tracking arrays */
-    if (vdb->row_tracking_capacity < cap) {
-        uint64_t* new_counts = (uint64_t*)realloc(
-            vdb->row_access_counts, cap * sizeof(*new_counts));
-        uint64_t* new_last = (uint64_t*)realloc(
-            vdb->row_last_access_ns, cap * sizeof(*new_last));
-        qihse_memory_tier_t* new_tier = (qihse_memory_tier_t*)realloc(
-            vdb->row_tier, cap * sizeof(*new_tier));
-        if (!new_counts || !new_last || !new_tier) {
-            errno = ENOMEM;
-            return false;
-        }
-        /* Zero-initialize new slots */
-        for (size_t i = vdb->row_tracking_capacity; i < cap; ++i) {
-            new_counts[i] = 0;
-            new_last[i] = 0;
-            new_tier[i] = QIHSE_MEM_DRAM;
-        }
-        vdb->row_access_counts = new_counts;
-        vdb->row_last_access_ns = new_last;
-        vdb->row_tier = new_tier;
+    if (counts) {
+        free(vdb->row_access_counts);
+        free(vdb->row_last_access_ns);
+        free(vdb->row_tier);
+        vdb->row_access_counts = counts;
+        vdb->row_last_access_ns = last;
+        vdb->row_tier = tiers;
         vdb->row_tracking_capacity = cap;
     }
     return true;
+fail:
+    free(counts);
+    free(last);
+    free(tiers);
+    errno = ENOMEM;
+    return false;
 }
 
 static bool qihse_vdb_reserve_bytes(uint8_t** ptr, size_t* cap, size_t needed) {
@@ -4411,59 +4417,83 @@ static bool qihse_vdb_append_row(qihse_vector_db_t vdb,
     return true;
 }
 
-static bool qihse_vdb_apply_add(qihse_vector_db_t vdb,
-                                const qihse_vdb_wal_add_t* add,
-                                bool reject_duplicates) {
-    uint64_t auto_base;
-    size_t i;
-
+/* Validate and reserve the complete batch before WAL publication or any row
+ * becomes visible. Replay uses the same preflight, without writing another WAL. */
+static bool qihse_vdb_prepare_add(qihse_vector_db_t vdb,
+                                  const qihse_vdb_wal_add_t* add,
+                                  bool reject_duplicates) {
+    size_t vector_bytes, metadata_bytes = 0u;
     if (!vdb || !add || !add->vectors || add->count == 0u || add->dims == 0u ||
-        add->dims > (uint64_t)SIZE_MAX) {
+        add->count > (uint64_t)SIZE_MAX || add->dims > (uint64_t)SIZE_MAX ||
+        (vdb->vector_dims != 0u && vdb->vector_dims != (size_t)add->dims)) {
         errno = EINVAL;
         return false;
     }
-    if (add->ids && qihse_vdb_has_duplicate_ids(add->ids,
-                                                (size_t)add->count)) {
+    if (add->generation == UINT64_MAX ||
+        (!add->ids && add->count > UINT64_MAX - vdb->next_auto_id)) {
+        errno = EOVERFLOW;
         return false;
     }
-    if (vdb->vector_dims != 0u && vdb->vector_dims != (size_t)add->dims) {
-        errno = EINVAL;
+    if (!qihse_checked_mul_size((size_t)add->count, (size_t)add->dims, &vector_bytes) ||
+        !qihse_checked_mul_size(vector_bytes, sizeof(float), &vector_bytes)) return false;
+    if (add->ids && qihse_vdb_has_duplicate_ids(add->ids, (size_t)add->count))
         return false;
-    }
-    if (vdb->vector_dims == 0u) {
-        vdb->vector_dims = (size_t)add->dims;
-    }
-    auto_base = vdb->next_auto_id;
-    for (i = 0u; i < (size_t)add->count; i++) {
-        uint64_t id = add->ids ? add->ids[i] : auto_base + (uint64_t)i;
+    for (size_t i = 0u; i < (size_t)add->count; i++) {
+        uint64_t id = add->ids ? add->ids[i] : vdb->next_auto_id + (uint64_t)i;
+        size_t size = add->metadata_sizes ? add->metadata_sizes[i] : 0u;
+        if (size && (!add->metadata || !add->metadata[i])) {
+            errno = EINVAL;
+            return false;
+        }
+        if (!qihse_checked_add_size(metadata_bytes, size, &metadata_bytes)) return false;
         if (reject_duplicates && qihse_vdb_id_exists(vdb, id)) {
             errno = EEXIST;
             return false;
         }
     }
-    for (i = 0u; i < (size_t)add->count; i++) {
+    size_t old_dims = vdb->vector_dims;
+    vdb->vector_dims = (size_t)add->dims;
+    if (!qihse_vdb_reserve_appends(vdb, (size_t)add->count, metadata_bytes)) {
+        vdb->vector_dims = old_dims;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_vdb_apply_prepared_add(qihse_vector_db_t vdb,
+                                         const qihse_vdb_wal_add_t* add) {
+    uint64_t auto_base = vdb->next_auto_id;
+    for (size_t i = 0u; i < (size_t)add->count; i++) {
         const void* meta = add->metadata ? add->metadata[i] : NULL;
         size_t meta_size = add->metadata_sizes ? add->metadata_sizes[i] : 0u;
         uint64_t id = add->ids ? add->ids[i] : auto_base + (uint64_t)i;
-
-        if (meta_size != 0u && !meta) {
-            errno = EINVAL;
-            return false;
-        }
+        /* Preflight already reserved all row/vector/metadata storage. */
         if (!qihse_vdb_append_row(vdb, id, add->vectors + (i * vdb->vector_dims),
                                   meta, meta_size, add->generation,
-                                  QIHSE_CLASS_UNCLASSIFIED, QIHSE_SCI_NONE)) {
-            return false;
-        }
+                                  QIHSE_CLASS_UNCLASSIFIED, QIHSE_SCI_NONE)) return false;
     }
-    if (!add->ids) {
-        vdb->next_auto_id = auto_base + add->count;
-    }
-    if (add->generation >= vdb->next_generation) {
+    if (!add->ids) vdb->next_auto_id = auto_base + add->count;
+    if (add->generation >= vdb->next_generation)
         vdb->next_generation = add->generation + 1u;
-    }
     vdb->dirty = true;
     return true;
+}
+
+static bool qihse_vdb_apply_add(qihse_vector_db_t vdb,
+                                const qihse_vdb_wal_add_t* add,
+                                bool reject_duplicates) {
+    return qihse_vdb_prepare_add(vdb, add, reject_duplicates) &&
+           qihse_vdb_apply_prepared_add(vdb, add);
+}
+
+static bool qihse_vdb_wal_layout(qihse_vector_db_t vdb, size_t payload_size,
+                                  size_t* total_size, uint64_t* commit_offset,
+                                  uint64_t* end_offset) {
+    size_t mutation_bytes;
+    return qihse_checked_add_size(QIHSE_VDB_WAL_HEADER_SIZE, payload_size, &mutation_bytes) &&
+           qihse_checked_add_size(mutation_bytes, QIHSE_VDB_WAL_HEADER_SIZE + 16u, total_size) &&
+           qihse_checked_add_u64(vdb->wal_bytes_pending, (uint64_t)mutation_bytes, commit_offset) &&
+           qihse_checked_add_u64(vdb->wal_bytes_pending, (uint64_t)*total_size, end_offset);
 }
 
 static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
@@ -4476,7 +4506,8 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
     size_t ids_bytes;
     size_t sizes_bytes;
     size_t metadata_bytes = 0u;
-    size_t payload_size;
+    size_t payload_size, total_size;
+    uint64_t cmt_off, wal_end;
     size_t offset = 0u;
     size_t i;
     bool ok = false;
@@ -4514,6 +4545,7 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
         return false;
     }
 
+    if (!qihse_vdb_wal_layout(vdb, payload_size, &total_size, &cmt_off, &wal_end)) return false;
     payload = (uint8_t*)malloc(payload_size ? payload_size : 1u);
     if (!payload) {
         errno = ENOMEM;
@@ -4559,8 +4591,6 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
         uint64_t mut_crc;
         uint64_t cmt_crc;
         uint64_t mut_off;
-        uint64_t cmt_off;
-        size_t total_size;
         uint8_t* wal_buf;
         size_t off = 0u;
         qihse_container_t ctr;
@@ -4577,7 +4607,6 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
 
         /* mutation record starts at current WAL length */
         mut_off = vdb->wal_bytes_pending;
-        cmt_off = mut_off + QIHSE_VDB_WAL_HEADER_SIZE + (uint64_t)payload_size;
 
         qihse_le_write_u64(commit_payload + 0u, mut_off);
         qihse_le_write_u64(commit_payload + 8u, mut_crc);
@@ -4591,7 +4620,6 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
         qihse_le_write_u64(cmt_hdr + 32u, cmt_crc);
         qihse_le_write_u64(cmt_hdr + 40u, mut_off);
 
-        total_size = (2u * QIHSE_VDB_WAL_HEADER_SIZE) + payload_size + sizeof(commit_payload);
         wal_buf = (uint8_t*)malloc(total_size);
         if (!wal_buf) {
             free(payload);
@@ -4611,7 +4639,7 @@ static bool qihse_vdb_write_wal_vectors(qihse_vector_db_t vdb,
         }
         free(wal_buf);
         if (ok) {
-            vdb->wal_bytes_pending += (uint64_t)total_size;
+            vdb->wal_bytes_pending = wal_end;
             vdb->wal_last_record_offset = cmt_off;
         }
         return ok;
@@ -4637,7 +4665,7 @@ static bool qihse_vdb_write_edge_wal(qihse_vector_db_t vdb,
     uint64_t mut_crc;
     uint64_t cmt_crc;
     uint64_t mut_off;
-    uint64_t cmt_off;
+    uint64_t cmt_off, wal_end;
     size_t total_size;
     uint8_t* wal_buf = NULL;
     qihse_container_t ctr;
@@ -4659,6 +4687,7 @@ static bool qihse_vdb_write_edge_wal(qihse_vector_db_t vdb,
             !qihse_checked_add_size(payload_size, edges[i].metadata_size, &payload_size))
             return false;
     }
+    if (!qihse_vdb_wal_layout(vdb, payload_size, &total_size, &cmt_off, &wal_end)) return false;
     payload = (uint8_t*)malloc(payload_size);
     if (!payload) { errno = ENOMEM; return false; }
     qihse_le_write_u64(payload, (uint64_t)edge_count);
@@ -4687,7 +4716,6 @@ static bool qihse_vdb_write_edge_wal(qihse_vector_db_t vdb,
     qihse_le_write_u64(mut_hdr + 32u, mut_crc);
     qihse_le_write_u64(mut_hdr + 40u, vdb->wal_last_record_offset);
     mut_off = vdb->wal_bytes_pending;
-    cmt_off = mut_off + QIHSE_VDB_WAL_HEADER_SIZE + (uint64_t)payload_size;
     qihse_le_write_u64(commit_payload + 0u, mut_off);
     qihse_le_write_u64(commit_payload + 8u, mut_crc);
     cmt_crc = qihse_fnv1a64(commit_payload, sizeof(commit_payload));
@@ -4699,12 +4727,6 @@ static bool qihse_vdb_write_edge_wal(qihse_vector_db_t vdb,
     qihse_le_write_u64(cmt_hdr + 24u, sizeof(commit_payload));
     qihse_le_write_u64(cmt_hdr + 32u, cmt_crc);
     qihse_le_write_u64(cmt_hdr + 40u, mut_off);
-    if (!qihse_checked_add_size(2u * QIHSE_VDB_WAL_HEADER_SIZE, payload_size,
-                                &total_size) ||
-        !qihse_checked_add_size(total_size, sizeof(commit_payload), &total_size)) {
-        free(payload);
-        return false;
-    }
     wal_buf = (uint8_t*)malloc(total_size);
     if (!wal_buf) { free(payload); errno = ENOMEM; return false; }
     offset = 0u;
@@ -4720,7 +4742,7 @@ static bool qihse_vdb_write_edge_wal(qihse_vector_db_t vdb,
     }
     free(wal_buf);
     if (ok) {
-        vdb->wal_bytes_pending += (uint64_t)total_size;
+        vdb->wal_bytes_pending = wal_end;
         vdb->wal_last_record_offset = cmt_off;
     }
     return ok;
@@ -5127,7 +5149,6 @@ done:
 }
 
 static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
-    uint64_t pending = 0u;
     uint64_t valid_end = 0u;
     uint64_t last_record_offset = QIHSE_VDB_WAL_NO_PREV;
     uint64_t valid_last_record_offset = QIHSE_VDB_WAL_NO_PREV;
@@ -5151,10 +5172,16 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
         if (!qihse_ctr_open_read(vdb->db_path, &ctr)) {
             return errno == ENOENT;
         }
-        if (qihse_ctr_section_length(&ctr, QIHSE_CTR_SEC_WAL) > 0u) {
+        uint64_t declared_size = qihse_ctr_section_length(&ctr, QIHSE_CTR_SEC_WAL);
+        bool read_ok = declared_size == 0u ||
             qihse_ctr_read_section_alloc(&ctr, QIHSE_CTR_SEC_WAL, &wal_data, &wal_size);
-        }
+        int read_errno = errno;
         qihse_ctr_close(&ctr);
+        if (!read_ok || declared_size != (uint64_t)wal_size) {
+            free(wal_data);
+            errno = read_ok || !read_errno ? EIO : read_errno;
+            return false;
+        }
 
         if (!wal_data || wal_size == 0u) {
             free(wal_data);
@@ -5199,7 +5226,7 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
                  prev_offset_val != 0u)) {
                 break;
             }
-            if (pos + QIHSE_VDB_WAL_HEADER_SIZE + payload_size64 > (uint64_t)wal_size) {
+            if (payload_size64 > (uint64_t)wal_size - pos - QIHSE_VDB_WAL_HEADER_SIZE) {
                 break;
             }
             payload = wal_data + pos + QIHSE_VDB_WAL_HEADER_SIZE;
@@ -5256,18 +5283,25 @@ static bool qihse_vdb_replay_wal(qihse_vector_db_t vdb) {
                 valid_last_record_offset = record_start;
             }
             last_record_offset = record_start;
-            pending = record_end;
             pos = record_end;
         }
         free(pending_payload);
         pending_payload = NULL;
 
         /* Truncate torn tail from the WAL section if needed */
-        if (pending != valid_end && !vdb->read_only) {
+        if (valid_end != (uint64_t)wal_size && !vdb->read_only) {
             qihse_container_t ctr2;
-            if (qihse_ctr_open_write(vdb->db_path, false, &ctr2)) {
-                qihse_ctr_wal_truncate(&ctr2, valid_end);
-                qihse_ctr_close(&ctr2);
+            if (!qihse_ctr_open_write(vdb->db_path, false, &ctr2)) {
+                free(wal_data);
+                return false;
+            }
+            bool repaired = qihse_ctr_wal_truncate(&ctr2, valid_end);
+            int repair_errno = errno;
+            qihse_ctr_close(&ctr2);
+            if (!repaired) {
+                free(wal_data);
+                errno = repair_errno ? repair_errno : EIO;
+                return false;
             }
         }
         free(wal_data);
@@ -5547,6 +5581,14 @@ qihse_vector_db_t qihse_vector_db_open(
         return NULL;
     }
     vdb->explicit_edge_mutex_initialized = true;
+    int adapter_rc = pthread_mutex_init(&vdb->adapter_mutex, NULL);
+    if (adapter_rc != 0) {
+        pthread_mutex_destroy(&vdb->explicit_edge_mutex);
+        free(vdb);
+        errno = adapter_rc;
+        return NULL;
+    }
+    vdb->adapter_mutex_initialized = true;
 
     /* Hierarchical storage defaults */
     vdb->memory_hot_threshold = 100.0;     /* 100 accesses per evaluation window = hot */
@@ -5690,27 +5732,11 @@ bool qihse_vector_db_add_vectors(
 ) {
     qihse_vdb_wal_add_t add;
     uint64_t generation;
-    size_t i;
     if (!vdb || !vectors || num_vectors == 0u || vector_dims == 0u) {
         errno = EINVAL;
         return false;
     }
-    if (vdb->read_only || vdb->mapped_vectors) {
-        errno = EROFS;
-        return false;
-    }
-    if ((uint64_t)num_vectors > UINT64_MAX || (uint64_t)vector_dims > UINT64_MAX) {
-        errno = EOVERFLOW;
-        return false;
-    }
-    if (ids && qihse_vdb_has_duplicate_ids(ids, num_vectors)) return false;
-    for (i = 0u; i < num_vectors; i++) {
-        if (metadata_sizes && metadata_sizes[i] != 0u && (!metadata || !metadata[i])) {
-            errno = EINVAL;
-            return false;
-        }
-        /* Vector and metadata shape validation is completed before WAL write. */
-    }
+    if (!qihse_vdb_ensure_writable(vdb)) return false;
     generation = vdb->next_generation;
     memset(&add, 0, sizeof(add));
     add.generation = generation;
@@ -5721,10 +5747,13 @@ bool qihse_vector_db_add_vectors(
     add.metadata = metadata;
     add.metadata_sizes = metadata_sizes;
 
+    size_t old_dims = vdb->vector_dims;
+    if (!qihse_vdb_prepare_add(vdb, &add, true)) return false;
     if (vdb->file_backed && !qihse_vdb_write_wal_add(vdb, &add)) {
+        vdb->vector_dims = old_dims;
         return false;
     }
-    return qihse_vdb_apply_add(vdb, &add, true);
+    return qihse_vdb_apply_prepared_add(vdb, &add);
 }
 
 bool qihse_vector_db_add_model_weights(
@@ -6107,6 +6136,7 @@ static bool qihse_vdb_reserve_appends(qihse_vector_db_t vdb,
     size_t vector_bytes;
     size_t new_vector_used;
     size_t new_metadata_used;
+    size_t new_rows;
 
     if (append_count == 0u) {
         return true;
@@ -6115,7 +6145,8 @@ static bool qihse_vdb_reserve_appends(qihse_vector_db_t vdb,
         !qihse_checked_mul_size(append_count, one_vector_bytes, &vector_bytes) ||
         !qihse_checked_add_size(vdb->vector_bytes_used, vector_bytes, &new_vector_used) ||
         !qihse_checked_add_size(vdb->metadata_bytes_used, metadata_bytes, &new_metadata_used) ||
-        !qihse_vdb_reserve_rows(vdb, vdb->total_vectors + append_count) ||
+        !qihse_checked_add_size(vdb->total_vectors, append_count, &new_rows) ||
+        !qihse_vdb_reserve_rows(vdb, new_rows) ||
         !qihse_vdb_reserve_bytes(&vdb->vectors, &vdb->vector_bytes_capacity, new_vector_used) ||
         !qihse_vdb_reserve_bytes(&vdb->metadata, &vdb->metadata_bytes_capacity, new_metadata_used)) {
         return false;
@@ -8511,6 +8542,18 @@ bool qihse_vector_db_build_int4(qihse_vector_db_t vdb) {
     return true;
 }
 
+bool qihse_vector_db_adapter_lock(qihse_vector_db_t vdb) {
+    if (!vdb || !vdb->adapter_mutex_initialized) { errno = EINVAL; return false; }
+    int rc = pthread_mutex_lock(&vdb->adapter_mutex);
+    if (rc != 0) { errno = rc; return false; }
+    return true;
+}
+
+void qihse_vector_db_adapter_unlock(qihse_vector_db_t vdb) {
+    if (vdb && vdb->adapter_mutex_initialized)
+        pthread_mutex_unlock(&vdb->adapter_mutex);
+}
+
 void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     if (!vdb) {
         return;
@@ -8551,6 +8594,9 @@ void qihse_vector_db_destroy(qihse_vector_db_t vdb) {
     qihse_vdb_edge_array_free(vdb->explicit_edges, vdb->explicit_edge_count);
     if (vdb->explicit_edge_mutex_initialized) {
         pthread_mutex_destroy(&vdb->explicit_edge_mutex);
+    }
+    if (vdb->adapter_mutex_initialized) {
+        pthread_mutex_destroy(&vdb->adapter_mutex);
     }
     free(vdb);
 }

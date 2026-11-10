@@ -362,6 +362,14 @@ typedef struct qihse_vector_db_s* qihse_vector_db_t;
  * one external lock across each complete operation and any coupled lookup /
  * mutation sequence. The primary RESP server uses its vdb_lock for this. */
 
+/* Shared external guard for adapters that borrow the same handle. Different
+ * handles have independent guards. Native operations do not acquire this
+ * non-recursive guard themselves: callers must cover the complete operation
+ * or coupled lookup/mutation sequence, and stop all users before destruction.
+ * If an adapter also owns another lock, acquire that lock before this one. */
+bool qihse_vector_db_adapter_lock(qihse_vector_db_t vdb);
+void qihse_vector_db_adapter_unlock(qihse_vector_db_t vdb);
+
 /* ============================================================================
  * VECTOR DATABASE LIFECYCLE
  * ============================================================================ */
