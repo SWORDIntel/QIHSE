@@ -87,6 +87,7 @@ int main(void) {
     bitmap_set(slots_b, slot_b);
     assert(!bitmap_has(slots_a, slot_b) && !bitmap_has(slots_b, slot_a));
     char *key_a = key_for_slot("commons/lane-a-", slot_a);
+    char *key_a2 = key_for_slot("commons/lane-a-batch-", slot_a);
     char *key_b = key_for_slot("t:73/lane-b-", slot_b);
 
     qihse_kv_store_t *store = qihse_kv_store_create_user(op);
@@ -106,6 +107,11 @@ int main(void) {
     assert(qihse_kv_ct_lane_receiver_bind(store, op, LANE_B, slots_b,
         "peer-b", "node-a", GEN_B, QIHSE_KV_CT_TENANT_SYSTEM_ALL,
         0u, 0u, token_b));
+    unsigned char rejected_token[QIHSE_KV_CT_TOKEN_BYTES];
+    assert(!qihse_kv_ct_lane_receiver_bind(store, op,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        slots_b, "peer-c", "node-a", GEN_C, QIHSE_KV_CT_TENANT_EXACT,
+        73u, 0u, rejected_token));
     assert(qihse_kv_ct_lane_owner_token_get(store, op, LANE_A, token_a));
     assert(qihse_kv_ct_lane_owner_token_get(store, op, LANE_B, token_b));
 
@@ -198,7 +204,29 @@ int main(void) {
     assert(!qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_A, token_b, &scope));
     assert(!qihse_kv_set_user(store, key_a, "scope-required", 4u, 1u, op));
     assert(qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_A, token_a, &scope));
-    assert(qihse_kv_set_user(store, key_a, "lane-a-v1", 4u, 1u, op));
+    /* The local metadata namespace has its own authenticated native-WAL
+     * scope; a slot-lane token must not authorize it, and vice versa. */
+    const char *local_key = "t:73/aimem:test-lane-local";
+    assert(!qihse_kv_set_user(store, local_key, "wrong-scope", 4u, 1u, op));
+    assert(!qihse_kv_set_batch_durable_user(store,
+        (qihse_kv_batch_set_record_t[]){{key_a, "cross-lane", 0u, 4u, 1u},
+                                       {key_b, "cross-lane", 0u, 4u, 1u}},
+        2u, op));
+    qihse_kv_ct_writer_scope_leave(scope);
+    scope = NULL;
+    assert(qihse_kv_ct_node_local_scope_enter(store, op, &scope));
+    assert(qihse_kv_set_user(store, local_key, "local-wal", 4u, 1u, op));
+    assert(!qihse_kv_set_user(store, key_a, "wrong-local-scope", 4u, 1u, op));
+    assert_value(store, op, local_key, "local-wal");
+    qihse_kv_ct_writer_scope_leave(scope);
+    scope = NULL;
+    assert(qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_A, token_a, &scope));
+    qihse_kv_batch_set_record_t batch_a[] = {
+        {key_a, "lane-a-v1", 0u, 4u, 1u},
+        {key_a2, "lane-a-v1-batch", 0u, 4u, 1u}
+    };
+    assert(qihse_kv_set_batch_durable_user(store, batch_a,
+        sizeof(batch_a) / sizeof(batch_a[0]), op));
     assert(qihse_kv_get_user(store, key_a, op) == NULL);
     assert(!qihse_kv_set_user(store, key_b, "wrong-lane-write", 4u, 1u, op));
     assert_value(store, op, key_a, NULL); /* durable ACK gates primary reads */
@@ -210,12 +238,14 @@ int main(void) {
         0u, 8u, 65536u, &groups, &group_count, &resume));
     assert(qihse_kv_ct_lane_source_read(store, peer, LANE_A, GEN_A,
         0u, 8u, 65536u, &groups, &group_count, &resume));
-    assert(group_count == 1u && resume == 1u && groups[0].count == 1u);
+    assert(group_count == 1u && resume == 1u && groups[0].count == 2u);
     assert(strcmp(groups[0].records[0].key, key_a) == 0 &&
            strcmp(groups[0].records[0].value, "lane-a-v1") == 0 &&
            groups[0].records[0].classification == 4u &&
            groups[0].records[0].sci_compartment == 1u &&
            groups[0].records[0].resource_tenant_id == 0u);
+    assert(strcmp(groups[0].records[1].key, key_a2) == 0 &&
+           strcmp(groups[0].records[1].value, "lane-a-v1-batch") == 0);
     assert(qihse_kv_ct_lane_source_ack(store, peer, LANE_A,
         "peer-a", GEN_A, resume));
     assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
@@ -385,6 +415,7 @@ int main(void) {
     qihse_auth_release_principal_scoped(low);
     qihse_auth_release_principal_scoped(peer);
     free(key_a);
+    free(key_a2);
     free(key_b);
     aimem_fixture_cleanup(data_dir);
     return 0;
