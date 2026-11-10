@@ -632,6 +632,15 @@ test-ct-transfer-large: lib
 
 test-serial: test-ct-transfer-large
 
+.PHONY: test-ct2-image-bounds
+test-ct2-image-bounds: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_ct2_image_bounds tests/test_ct2_image_bounds.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct2_image_bounds
+
+test-serial: test-ct2-image-bounds
+
 .PHONY: test-ct-target
 test-ct-target:
 	$(CC) $(CFLAGS) -std=c11 -UNDEBUG -o tests/test_ct_target tests/test_ct_target.c src/spinnaker/qihse_ct_target.c $(LDFLAGS)
