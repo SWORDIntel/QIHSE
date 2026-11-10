@@ -13161,6 +13161,75 @@ static bool qihse_resp_ct_group_for_key(qihse_resp_server_t* server,
     return found;
 }
 
+static bool qihse_resp_ct_group_expected_identity(qihse_resp_session_t* s,
+        const char* lane_id, qihse_kv_ct_lane_mode_t mode,
+        const char* authenticated_peer,
+        char owner_out[QIHSE_QKP_NODE_ID_LEN + 1u],
+        char successor_out[QIHSE_QKP_NODE_ID_LEN + 1u],
+        char generation_out[33]) {
+    if (!s || !s->server || !lane_id || !authenticated_peer ||
+        !s->server->pqc.node_id || !s->server->ct_control_principal ||
+        !s->server->ct_ownership_context || !owner_out || !successor_out ||
+        !generation_out ||
+        !qihse_auth_user_is_active(s->server->ct_control_principal)) return false;
+    owner_out[0] = successor_out[0] = generation_out[0] = '\0';
+    qihse_resp_ct_group_t* group = qihse_resp_ct_group_find(s->server, lane_id);
+    qihse_cluster_range_authority_t* authority =
+        s->server->ct_ownership_context->range_authority_context;
+    if (!group || !authority || !authority->mesh) return false;
+
+    char owner_qkp[QIHSE_QKP_NODE_ID_LEN + 1u] = {0};
+    char successor_qkp[QIHSE_QKP_NODE_ID_LEN + 1u] = {0};
+    char generation[33] = {0};
+    snprintf(owner_qkp, sizeof(owner_qkp), "%s", group->configured_owner_qkp_id);
+    snprintf(successor_qkp, sizeof(successor_qkp), "%s",
+             group->configured_successor_qkp_id);
+    snprintf(generation, sizeof(generation), "%s", group->config.generation);
+
+    qihse_consensus_range_request_t transition;
+    qihse_consensus_range_decision_t decision;
+    bool found = false;
+    memset(&transition, 0, sizeof(transition));
+    memset(&decision, 0, sizeof(decision));
+    bool ok = qihse_consensus_mesh_range_group_transition_user(authority->mesh,
+        s->server->ct_control_principal, lane_id, &transition, &decision, &found);
+    if (ok && found) {
+        ok = transition.op == QIHSE_RANGE_OP_PROMOTION &&
+            strcmp(transition.source_group_id, lane_id) == 0 &&
+            strcmp(transition.target_group_id, lane_id) == 0 &&
+            transition.target_qkp_id[0] && transition.successor_qkp_id[0] &&
+            transition.target_generation[0] && decision.decision_index != 0u;
+        if (ok) {
+            snprintf(owner_qkp, sizeof(owner_qkp), "%s", transition.target_qkp_id);
+            snprintf(successor_qkp, sizeof(successor_qkp), "%s",
+                     transition.successor_qkp_id);
+            snprintf(generation, sizeof(generation), "%s",
+                     transition.target_generation);
+        }
+    }
+    if (ok) {
+        const char* expected_local = mode == QIHSE_KV_CT_LANE_SOURCE
+            ? owner_qkp : successor_qkp;
+        const char* expected_peer = mode == QIHSE_KV_CT_LANE_SOURCE
+            ? successor_qkp : owner_qkp;
+        ok = (mode == QIHSE_KV_CT_LANE_SOURCE ||
+              mode == QIHSE_KV_CT_LANE_RECEIVER) &&
+            strcmp(s->server->pqc.node_id, expected_local) == 0 &&
+            strcmp(authenticated_peer, expected_peer) == 0;
+    }
+    if (ok) {
+        snprintf(owner_out, QIHSE_QKP_NODE_ID_LEN + 1u, "%s", owner_qkp);
+        snprintf(successor_out, QIHSE_QKP_NODE_ID_LEN + 1u, "%s", successor_qkp);
+        snprintf(generation_out, 33u, "%s", generation);
+    }
+    OPENSSL_cleanse(owner_qkp, sizeof(owner_qkp));
+    OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+    OPENSSL_cleanse(generation, sizeof(generation));
+    OPENSSL_cleanse(&transition, sizeof(transition));
+    OPENSSL_cleanse(&decision, sizeof(decision));
+    return ok;
+}
+
 static const qihse_resp_dispatch_ent_t* qihse_resp_dispatch_find(
     const qihse_resp_arg_t* name);
 
@@ -13216,7 +13285,15 @@ static bool qihse_resp_ct_group_status(qihse_resp_session_t* s,
     if (!s || !s->server || !out || !qihse_resp_repl_data_plane_allowed(s) ||
         !qihse_resp_ct_group_find(s->server, lane_id)) return false;
     const char* authenticated_peer = qihse_resp_replication_peer_id(s->server, s->qkp);
-    if (!authenticated_peer) return false;
+    /* Check the current quorum-authoritative group identities before the KV
+     * status call. This metadata read is harmless, but the ordering keeps an
+     * unrelated pinned peer from causing lane state to be materialized. */
+    char expected_owner[QIHSE_QKP_NODE_ID_LEN + 1u] = {0};
+    char expected_successor[QIHSE_QKP_NODE_ID_LEN + 1u] = {0};
+    char expected_generation[33] = {0};
+    if (!authenticated_peer || !qihse_resp_ct_group_expected_identity(
+            s, lane_id, mode, authenticated_peer, expected_owner,
+            expected_successor, expected_generation)) return false;
     pthread_rwlock_rdlock(&s->server->kv_lock);
     /* KV admits this metadata-only status read to the configured CT service
      * principal on either lane mode. Keep the authenticated peer identity at
@@ -13224,14 +13301,20 @@ static bool qihse_resp_ct_group_status(qihse_resp_session_t* s,
      * substitute a local Operator for the remote service identity. */
     bool ok = qihse_kv_ct_lane_status(s->server->store, s->user, lane_id, out);
     pthread_rwlock_unlock(&s->server->kv_lock);
-    if (!ok || out->mode != mode) return false;
-    if (mode == QIHSE_KV_CT_LANE_SOURCE)
-        return s->server->pqc.node_id &&
-            strcmp(out->source_id, s->server->pqc.node_id) == 0 &&
-            strcmp(out->peer_id, authenticated_peer) == 0;
-    return s->server->pqc.node_id &&
-        strcmp(out->peer_id, s->server->pqc.node_id) == 0 &&
-        strcmp(out->source_id, authenticated_peer) == 0;
+    bool tuple_ok = ok && out->mode == mode &&
+        strcmp(out->generation, expected_generation) == 0 &&
+        strcmp(out->source_id, expected_owner) == 0 &&
+        strcmp(out->peer_id, expected_successor) == 0 &&
+        s->server->pqc.node_id &&
+        (mode == QIHSE_KV_CT_LANE_SOURCE
+            ? strcmp(out->source_id, s->server->pqc.node_id) == 0 &&
+              strcmp(out->peer_id, authenticated_peer) == 0
+            : strcmp(out->peer_id, s->server->pqc.node_id) == 0 &&
+              strcmp(out->source_id, authenticated_peer) == 0);
+    OPENSSL_cleanse(expected_owner, sizeof(expected_owner));
+    OPENSSL_cleanse(expected_successor, sizeof(expected_successor));
+    OPENSSL_cleanse(expected_generation, sizeof(expected_generation));
+    return tuple_ok;
 }
 
 static bool qihse_resp_ct_group_status_reply(qihse_resp_session_t* s,
@@ -13348,7 +13431,6 @@ static bool qihse_resp_handle_ct1_group(qihse_resp_session_t* s,
                 ? s->server->ct_ownership_context->range_authority_context : NULL;
         bool valid = s && s->server && s->server->ct_group_count &&
             qihse_resp_repl_data_plane_allowed(s) &&
-            qihse_auth_can_access(s->user, UINT16_MAX, UINT16_MAX) &&
             qihse_resp_ct_group_claim_parse(&r->argv[2], &claim) &&
             claim.operation == QIHSE_KV_CT_LANE_AUTH_PROMOTION &&
             claim.source_group_id[0] &&
@@ -13731,8 +13813,7 @@ static bool qihse_resp_ct_group_stage_file(qihse_resp_server_t* server,
 static bool qihse_resp_ct_group_claim_peer(qihse_resp_session_t* s,
         const qihse_kv_ct_lane_authority_claim_t* claim, bool require_successor) {
     if (!s || !claim || !s->server->ct_group_count ||
-        !qihse_resp_repl_data_plane_allowed(s) ||
-        !qihse_auth_can_access(s->user, UINT16_MAX, UINT16_MAX)) return false;
+        !qihse_resp_repl_data_plane_allowed(s)) return false;
     const char* peer = qihse_resp_replication_peer_id(s->server, s->qkp);
     const char* expected = require_successor ? claim->target_qkp_id
                                              : claim->source_qkp_id;
