@@ -20,6 +20,8 @@
 #ifdef QIHSE_TABLE_STORE_TESTING
 /* Defined only in the test-instrumented table-store build. */
 extern void qihse_table_txn_test_set_generation(qihse_table_txn_t*, uint64_t);
+extern void qihse_table_test_set_generation(qihse_table_t*, uint64_t);
+extern void qihse_table_txn_test_set_base_generation(qihse_table_txn_t*, uint64_t);
 #endif
 
 /* Test-only fsync fault: fail exactly once after rename, on the directory. */
@@ -1625,6 +1627,60 @@ static void test_read_only_group_validation(void) {
     qihse_table_store_destroy(store);
 }
 
+#ifdef QIHSE_TABLE_STORE_TESTING
+static int generation_guard_matches(const qihse_col_value_t* values,
+                                    size_t count, void* opaque) {
+    assert(count == 1);
+    return values[0].v.i32 == *(const int*)opaque;
+}
+
+static bool generation_guard_row(const qihse_col_value_t* values,
+                                size_t count, void* opaque) {
+    assert(count == 1);
+    assert(values[0].v.i32 != 2 && values[0].v.i32 != 3);
+    if (values[0].v.i32 == 1) *(bool*)opaque = true;
+    return true;
+}
+
+static void test_generation_exhaustion_is_atomic(void) {
+    qihse_col_def_t defs[] = {{.name = "id", .type = QIHSE_TS_INT32}};
+    qihse_table_store_t* store = qihse_table_store_create();
+    assert(store);
+    qihse_table_t* table = qihse_table_store_create_table(
+        store, "generation_guard", defs, 1);
+    assert(table);
+    qihse_col_value_t first = {.type = QIHSE_TS_INT32, .v.i32 = 1};
+    qihse_col_value_t second = {.type = QIHSE_TS_INT32, .v.i32 = 2};
+    assert(qihse_table_insert(table, &first, 1) == 0);
+
+    qihse_table_test_set_generation(table, UINT64_MAX);
+    assert(qihse_table_insert(table, &second, 1) == -1);
+    int id = 1, col = 0;
+    qihse_col_value_t replacement = {.type = QIHSE_TS_INT32, .v.i32 = 3};
+    assert(qihse_table_update(table, generation_guard_matches, &id, &col,
+                              &replacement, 1) == -1);
+    errno = 0;
+    assert(!qihse_table_delete(table, generation_guard_matches, &id));
+    assert(errno == EOVERFLOW);
+    assert(qihse_table_row_count(table) == 1);
+    bool saw_original = false;
+    qihse_table_scan(table, generation_guard_row, &saw_original);
+    assert(saw_original);
+    qihse_table_store_destroy(store);
+
+    store = qihse_table_store_create();
+    assert(store);
+    table = qihse_table_store_create_table(store, "generation_commit", defs, 1);
+    assert(table && qihse_table_insert(table, &first, 1) == 0);
+    qihse_table_txn_t* txn = qihse_table_txn_begin(table);
+    assert(txn && qihse_table_txn_insert(txn, &second, 1) >= 0);
+    qihse_table_txn_test_set_base_generation(txn, UINT64_MAX);
+    assert(!qihse_table_txn_commit(txn));
+    assert(qihse_table_row_count(table) == 1);
+    qihse_table_store_destroy(store);
+}
+#endif
+
 int main(void) {
     assert(mkdir("./build", 0700) == 0 || errno == EEXIST);
     test_atomic_multi_table_schema();
@@ -1632,6 +1688,9 @@ int main(void) {
     test_typed_nullable_snapshot();
     test_reject_nonfinite_snapshot();
     test_read_only_group_validation();
+#ifdef QIHSE_TABLE_STORE_TESTING
+    test_generation_exhaustion_is_atomic();
+#endif
     qihse_col_def_t defs[3] = {
         { .name = "id", .type = QIHSE_TS_INT32 },
         { .name = "name", .type = QIHSE_TS_STRING },

@@ -1374,6 +1374,11 @@ int qihse_table_insert(qihse_table_t* table,
     if (!row) return -1;
 
     pthread_rwlock_wrlock(&table->lock);
+    if (table->generation == UINT64_MAX) {
+        pthread_rwlock_unlock(&table->lock);
+        ts_free_row(row, table->num_cols);
+        return -1;
+    }
 
     /* Find a free slot (reuse a tombstone if available). */
     size_t slot = table->num_rows;
@@ -1423,6 +1428,10 @@ int qihse_table_update(qihse_table_t* table,
     }
 
     pthread_rwlock_wrlock(&table->lock);
+    if (table->generation == UINT64_MAX) {
+        pthread_rwlock_unlock(&table->lock);
+        return -1;
+    }
     qihse_col_value_t** candidate =
         ts_dup_rows(table->rows, table->num_rows, table->num_cols);
     if (table->num_rows > 0 && !candidate) {
@@ -1466,6 +1475,11 @@ bool qihse_table_delete(qihse_table_t* table,
     }
 
     pthread_rwlock_wrlock(&table->lock);
+    if (table->generation == UINT64_MAX) {
+        pthread_rwlock_unlock(&table->lock);
+        errno = EOVERFLOW;
+        return false;
+    }
     bool any = false;
     for (size_t i = 0; i < table->num_rows; i++) {
         if (!table->rows[i]) continue;  /* already tombstoned */
@@ -1910,6 +1924,23 @@ void qihse_table_txn_test_set_generation(qihse_table_txn_t* txn,
     if (txn) txn->shadow.generation = generation;
 }
 
+void qihse_table_test_set_generation(qihse_table_t* table,
+                                     uint64_t generation) {
+    if (!table) return;
+    pthread_rwlock_wrlock(&table->lock);
+    table->generation = generation;
+    pthread_rwlock_unlock(&table->lock);
+}
+
+void qihse_table_txn_test_set_base_generation(qihse_table_txn_t* txn,
+                                             uint64_t generation) {
+    if (!txn) return;
+    pthread_rwlock_wrlock(&txn->table->lock);
+    txn->table->generation = generation;
+    txn->base_generation = generation;
+    pthread_rwlock_unlock(&txn->table->lock);
+}
+
 void qihse_table_test_force_next_txn_generation(const char* table_name,
                                                uint64_t generation) {
     ts_test_next_txn_table = table_name;
@@ -2088,6 +2119,19 @@ static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
         ts_group_destroy_unique(txns, count);
         free(items);
         return ready ? QIHSE_TS_RETRY_COMMITTED : QIHSE_TS_RETRY_ERROR;
+    }
+    /* A successful write publication advances each live generation once.
+     * Refuse before persistence/receipt creation instead of wrapping a
+     * snapshot fence back to zero. */
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i].table->generation == UINT64_MAX) {
+            for (size_t j = count; j > 0; --j)
+                pthread_rwlock_unlock(&items[j - 1].table->lock);
+            if (durable) pthread_mutex_unlock(&store->mutex);
+            ts_group_destroy_unique(txns, count);
+            free(items);
+            return QIHSE_TS_RETRY_ERROR;
+        }
     }
     ts_retry_entry_t entry = {0};
     if (id) {
