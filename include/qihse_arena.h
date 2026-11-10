@@ -26,6 +26,8 @@ void qihse_arena_destroy(qihse_arena_t* arena);
 /**
  * @brief Allocates contiguous memory from the arena.
  * This is an O(1) operation that bumps a pointer, preventing fragmentation.
+ * Returned pointers are aligned to 16 bytes on 64-bit systems and 8 bytes on
+ * 32-bit systems. Zero, overflowed, or unavailable allocations return NULL.
  * @param arena The arena.
  * @param size The number of bytes to allocate.
  * @return Pointer to the allocated memory, or NULL if out of memory.

@@ -7,7 +7,7 @@ typedef struct qihse_arena_block {
     struct qihse_arena_block* next;
     size_t used;
     size_t capacity;
-    uint8_t data[];
+    uint8_t* data;
 } qihse_arena_block_t;
 
 struct qihse_arena {
@@ -16,12 +16,23 @@ struct qihse_arena {
     qihse_arena_block_t* current_block;
 };
 
+static size_t arena_alignment(void) {
+    return sizeof(void*) == 8 ? 16 : 8;
+}
+
 static qihse_arena_block_t* alloc_block(size_t capacity) {
-    qihse_arena_block_t* block = (qihse_arena_block_t*)malloc(sizeof(qihse_arena_block_t) + capacity);
+    const size_t alignment = arena_alignment();
+    if (capacity > SIZE_MAX - sizeof(qihse_arena_block_t) - (alignment - 1))
+        return NULL;
+    qihse_arena_block_t* block = (qihse_arena_block_t*)malloc(
+        sizeof(qihse_arena_block_t) + (alignment - 1) + capacity);
     if (!block) return NULL;
     block->next = NULL;
     block->used = 0;
     block->capacity = capacity;
+    uintptr_t raw = (uintptr_t)(block + 1);
+    if (raw > UINTPTR_MAX - (alignment - 1)) { free(block); return NULL; }
+    block->data = (uint8_t*)((raw + alignment - 1) & ~(uintptr_t)(alignment - 1));
     return block;
 }
 
@@ -53,7 +64,8 @@ void qihse_arena_destroy(qihse_arena_t* arena) {
 void* qihse_arena_alloc(qihse_arena_t* arena, size_t size) {
     if (!arena || size == 0) return NULL;
 
-    size_t align = sizeof(void*) == 8 ? 16 : 8;
+    size_t align = arena_alignment();
+    if (size > SIZE_MAX - (align - 1)) return NULL;
     size = (size + align - 1) & ~(align - 1);
 
     if (arena->current_block->capacity - arena->current_block->used >= size) {
