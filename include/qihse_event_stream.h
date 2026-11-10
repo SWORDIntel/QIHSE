@@ -62,7 +62,9 @@ bool qihse_event_stream_flush(qihse_event_stream_t* stream);
 
 /* Append a record with schema version and event ID.
  * The event_id must be QIHSE_ES_EVENT_ID_SIZE bytes (SHA-384).
- * Returns the stream offset of the committed record, or 0 on failure.
+ * Returns the physical stream offset plus one on success, or 0 on failure.
+ * Subtract one from a nonzero return to obtain the committed record's offset;
+ * this encoding preserves the legacy ABI while allowing offset zero to succeed.
  * Rejects duplicate event IDs already present in the topic. */
 uint64_t qihse_event_stream_append_record(
     qihse_event_stream_t* stream,

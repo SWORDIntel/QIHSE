@@ -88,6 +88,9 @@ class Durability(IntEnum):
 
 # Constants
 EVENT_ID_SIZE = 48
+MAX_PAYLOAD_SIZE = 16 * 1024 * 1024
+MAX_BATCH_RECORDS = 1024
+MAX_BATCH_BYTES = 64 * 1024 * 1024
 RECORD_HEADER_SIZE = 88
 F_COMMITTED = 0x01
 F_CORRUPT = 0x02
@@ -181,6 +184,33 @@ class EventScope(NamedTuple):
     topic: str
     classification: int
     sci: int
+
+
+def _native_scope(scope: EventScope) -> _Scope:
+    """Validate scope values before ctypes narrows them to the C ABI."""
+    if not isinstance(scope.topic, str):
+        raise TypeError("event scope topic must be a string")
+    labels = (scope.classification, scope.sci)
+    if any(isinstance(value, bool) or not isinstance(value, int) or
+           not 0 <= value <= 0xFFFF for value in labels):
+        raise ValueError("event scope classification and sci must fit uint16")
+    return _Scope(scope.topic.encode("utf-8"), scope.classification, scope.sci)
+
+
+def _payload_size(value) -> int:
+    """Return bytes-like payload size without materializing a copy."""
+    if isinstance(value, memoryview):
+        return value.nbytes
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    raise TypeError("event payload must be bytes-like")
+
+
+def _payload_bytes(value) -> bytes:
+    # Keep the long-standing bytes-like API, while refusing bytes(int), which
+    # allocates an attacker/caller-controlled number of zero bytes.
+    _payload_size(value)
+    return bytes(value)
 
 
 class EventRecord:
@@ -292,17 +322,48 @@ class EventStream:
             raise ValueError("scoped event batches require an authenticated user")
         if not isinstance(scope, EventScope):
             scope = EventScope(*scope)
-        c_scope = _Scope(scope.topic.encode("utf-8"), int(scope.classification), int(scope.sci))
-        native_records = (_BatchRecord * len(records))()
-        native_results = (_BatchResult * len(records))()
-        keepalive = []
-        for i, item in enumerate(records):
-            payload = bytes(item["payload"])
+        c_scope = _native_scope(scope)
+        try:
+            count = len(records)
+        except TypeError as exc:
+            raise TypeError("event batch records must be a sized sequence") from exc
+        if not 1 <= count <= MAX_BATCH_RECORDS:
+            raise ValueError(f"event batch record count must be 1..{MAX_BATCH_RECORDS}")
+
+        # Preflight all record sizes before allocating native arrays or copying
+        # any payload. In particular, bytes(integer) is rejected by _payload_size.
+        prepared = []
+        total_bytes = 0
+        for item in records:
+            if len(prepared) >= count:
+                raise ValueError("event batch changed size during validation")
+            payload_value = item["payload"]
+            payload_size = _payload_size(payload_value)
+            if payload_size > MAX_PAYLOAD_SIZE:
+                raise ValueError("event payload exceeds native per-record bound")
+            total_bytes += payload_size
+            if total_bytes > MAX_BATCH_BYTES:
+                raise ValueError("event batch exceeds native aggregate byte bound")
+            schema_id = item["schema_id"]
+            if (isinstance(schema_id, bool) or not isinstance(schema_id, int) or
+                    not 0 <= schema_id <= 0xFFFFFFFF):
+                raise ValueError("schema_id must fit uint32")
             event_id = item.get("event_id")
             if event_id is not None:
-                event_id = bytes(event_id)
-                if len(event_id) != EVENT_ID_SIZE:
+                event_id_size = _payload_size(event_id)
+                if event_id_size != EVENT_ID_SIZE:
                     raise ValueError(f"event_id must be {EVENT_ID_SIZE} bytes")
+            prepared.append((payload_value, schema_id, event_id))
+        if len(prepared) != count:
+            raise ValueError("event batch changed size during validation")
+
+        native_records = (_BatchRecord * count)()
+        native_results = (_BatchResult * count)()
+        keepalive = []
+        for i, (payload_value, schema_id, event_id) in enumerate(prepared):
+            payload = _payload_bytes(payload_value)
+            if event_id is not None:
+                event_id = _payload_bytes(event_id)
                 id_buf = (ctypes.c_uint8 * EVENT_ID_SIZE).from_buffer_copy(event_id)
                 keepalive.append(id_buf)
                 id_ptr = ctypes.cast(id_buf, ctypes.POINTER(ctypes.c_uint8))
@@ -314,11 +375,11 @@ class EventStream:
                 payload_ptr = ctypes.cast(payload_buf, ctypes.POINTER(ctypes.c_uint8))
             else:
                 payload_ptr = ctypes.POINTER(ctypes.c_uint8)()
-            native_records[i] = _BatchRecord(int(item["schema_id"]), id_ptr,
+            native_records[i] = _BatchRecord(schema_id, id_ptr,
                                              payload_ptr, len(payload))
         if not _lib.qihse_event_stream_append_batch(
                 self._ptr, user, ctypes.byref(c_scope), native_records,
-                len(records), native_results):
+                count, native_results):
             raise RuntimeError("authenticated event batch rejected or durability failed")
         return [(int(r.stream_offset), bool(r.duplicate)) for r in native_results]
 
@@ -329,9 +390,16 @@ class EventStream:
             raise ValueError("scoped event reads require an authenticated user")
         if not isinstance(scope, EventScope):
             scope = EventScope(*scope)
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        c_scope = _Scope(scope.topic.encode("utf-8"), int(scope.classification), int(scope.sci))
+        if (isinstance(capacity, bool) or not isinstance(capacity, int) or
+                not 1 <= capacity <= MAX_BATCH_RECORDS):
+            raise ValueError(f"capacity must be 1..{MAX_BATCH_RECORDS}")
+        if (isinstance(max_payload_bytes, bool) or not isinstance(max_payload_bytes, int) or
+                not 0 <= max_payload_bytes <= MAX_BATCH_BYTES):
+            raise ValueError("max_payload_bytes is outside the native batch bound")
+        if (isinstance(cursor, bool) or not isinstance(cursor, int) or
+                not 0 <= cursor < 1 << 64):
+            raise ValueError("cursor must fit uint64")
+        c_scope = _native_scope(scope)
         native = (_ReadRecord * capacity)()
         c_cursor = ctypes.c_uint64(cursor)
         count = ctypes.c_size_t()

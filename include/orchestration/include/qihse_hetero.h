@@ -9,8 +9,8 @@
  * License: MIT
  */
 
-#ifndef QIHSE_HETERO_H
-#define QIHSE_HETERO_H
+#ifndef QIHSE_ORCHESTRATION_HETERO_H
+#define QIHSE_ORCHESTRATION_HETERO_H
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -249,4 +249,4 @@ bool qihse_device_type_supports_cap(qihse_device_type_t type, qihse_device_caps_
 } /* extern "C" */
 #endif
 
-#endif /* QIHSE_HETERO_H */
+#endif /* QIHSE_ORCHESTRATION_HETERO_H */

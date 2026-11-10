@@ -56,6 +56,7 @@ class PublicAPIInstall(unittest.TestCase):
             self.assertTrue((sdk / "bin/qihse-admin-cli").is_file())
             # Do not let omitted API roots silently skip their compile checks.
             required = {"qihse.h", "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
+                        "qihse_backup.h", "qihse_operations.h",
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
@@ -70,6 +71,23 @@ class PublicAPIInstall(unittest.TestCase):
                 source.write_text(f"#include <qihse/{name}>\n")
                 self.run_command(self.cc + ["-std=c11", "-D_GNU_SOURCE", "-Werror",
                                  "-fsyntax-only", f"-I{headers}", str(source)], cwd=work)
+            # The legacy compute API and orchestration API intentionally use
+            # distinct device typedefs; their headers must compose in either order.
+            for order, includes in (
+                ("compute-first", ('#include <qihse/qihse_hetero.h>\n'
+                                    '#include <qihse/orchestration/include/qihse_hetero.h>\n')),
+                ("orchestration-first", ('#include <qihse/orchestration/include/qihse_hetero.h>\n'
+                                          '#include <qihse/qihse_hetero.h>\n')),
+            ):
+                source = work / f"hetero-{order}.c"
+                source.write_text(includes +
+                    'int main(void) {\n'
+                    '  qihse_compute_device_type_t compute = QIHSE_DEV_CPU_AMX;\n'
+                    '  qihse_device_type_t orchestration = QIHSE_DEVICE_CPU_AMX;\n'
+                    '  return (int)compute + (int)orchestration;\n'
+                    '}\n')
+                self.run_command(self.cc + ["-std=c11", "-D_GNU_SOURCE", "-Werror",
+                    "-fsyntax-only", f"-I{headers}", str(source)], cwd=work)
             source = work / "consumer.c"
             shutil.copyfile(ROOT / "tests/public_api_install_smoke.c", source)
             consumer = work / "consumer"

@@ -40,6 +40,9 @@ extern "C" {
  * DEVICE TYPE ENUMERATION
  * ============================================================================ */
 
+/* This legacy compute API uses its own enum namespace. The orchestration API
+ * separately exposes qihse_device_type_t; keeping these names distinct lets
+ * consumers include both public headers in one translation unit. */
 typedef enum {
     QIHSE_DEV_CPU_AMX = 0,      /* CPU cores with AMX tile matrix multiply */
     QIHSE_DEV_CPU_VNNI = 1,     /* CPU cores with AVX512-VNNI INT8 */
@@ -48,14 +51,14 @@ typedef enum {
     QIHSE_DEV_NPU = 4,          /* Intel NPU via OpenVINO */
     QIHSE_DEV_INTEL_GPU = 5,    /* Intel Arc GPU via oneAPI/SYCL */
     QIHSE_DEV_NVIDIA_GPU = 6,   /* NVIDIA GPU via CUDA */
-} qihse_device_type_t;
+} qihse_compute_device_type_t;
 
 /* ============================================================================
  * COMPUTE DEVICE ABSTRACTION
  * ============================================================================ */
 
 typedef struct {
-    qihse_device_type_t type;
+    qihse_compute_device_type_t type;
     bool available;              /* Device is present and functional */
     double measured_tops;        /* Calibrated throughput in TOPS */
     double theoretical_tops;     /* Theoretical maximum TOPS */
@@ -120,7 +123,7 @@ const char* qihse_device_capability_string(const qihse_compute_device_t* device)
  * ============================================================================ */
 
 typedef struct {
-    qihse_device_type_t device;   /* Which device processes this partition */
+    qihse_compute_device_type_t device;   /* Which device processes this partition */
     size_t start_idx;            /* Start index in candidate array */
     size_t count;                /* Number of candidates for this device */
     void* input_buffer;          /* Device-specific input buffer */
@@ -185,7 +188,7 @@ typedef struct {
     void* device_ptr;            /* Device-accessible pointer (may be same) */
     size_t size;                 /* Buffer size in bytes */
     bool is_unified;             /* True if zero-copy capable */
-    qihse_device_type_t owner;   /* Which device owns this memory */
+    qihse_compute_device_type_t owner;   /* Which device owns this memory */
     bool pinned;                 /* True if host memory is pinned for DMA */
 } qihse_unified_buffer_t;
 
@@ -203,7 +206,7 @@ typedef struct {
  */
 qihse_unified_buffer_t* qihse_alloc_unified(
     size_t size,
-    qihse_device_type_t primary_device,
+    qihse_compute_device_type_t primary_device,
     bool allow_peer_access
 );
 
@@ -238,7 +241,7 @@ typedef struct {
     double latency_us;           /* Startup latency (microseconds) */
     size_t optimal_batch_size;   /* Measured optimal batch size */
     double utilization_percent;  /* Measured compute utilization */
-} qihse_device_metrics_t;
+} qihse_compute_device_metrics_t;
 
 /**
  * @brief Calibrate single device performance
@@ -251,7 +254,7 @@ typedef struct {
  */
 int qihse_calibrate_device(
     qihse_compute_device_t* device,
-    qihse_device_metrics_t* metrics
+    qihse_compute_device_metrics_t* metrics
 );
 
 /**

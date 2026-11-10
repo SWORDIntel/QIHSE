@@ -402,7 +402,7 @@ int qihse_compute_pool_calibrate(qihse_compute_pool_t* pool) {
         qihse_compute_device_t* dev = &pool->devices[i];
         if (!dev->available) continue;
 
-        qihse_device_metrics_t metrics = {0};
+        qihse_compute_device_metrics_t metrics = {0};
 
         /* Run appropriate benchmark based on device type */
         switch (dev->type) {
@@ -576,7 +576,7 @@ void qihse_rebalance_schedule(
 
 qihse_unified_buffer_t* qihse_alloc_unified(
     size_t size,
-    qihse_device_type_t primary_device,
+    qihse_compute_device_type_t primary_device,
     bool allow_peer_access __attribute__((unused))
 ) {
     qihse_unified_buffer_t* buffer = calloc(1, sizeof(qihse_unified_buffer_t));
@@ -622,12 +622,12 @@ int qihse_sync_unified(qihse_unified_buffer_t* buffer) {
 
 int qihse_calibrate_device(
     qihse_compute_device_t* device,
-    qihse_device_metrics_t* metrics
+    qihse_compute_device_metrics_t* metrics
 ) {
     if (!device || !metrics) return -1;
 
     /* Reset metrics */
-    memset(metrics, 0, sizeof(qihse_device_metrics_t));
+    memset(metrics, 0, sizeof(qihse_compute_device_metrics_t));
 
     /* Run appropriate benchmark */
     switch (device->type) {

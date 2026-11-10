@@ -6,6 +6,7 @@
 #include <qihse/qihse_pg_wire.h>
 #include <qihse/qihse_kv_store.h>
 #include <qihse/qihse_auth_maintenance.h>
+#include <qihse/qihse_backup.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,11 @@ int main(int argc, char **argv)
         qihse_auth_maintenance_capabilities;
     if (!capabilities || capabilities(NULL, NULL) == QIHSE_AUTH_MAINT_OK)
         return 9;
+    int (*volatile incremental_backup)(qihse_kv_store_t *, qihse_user_t *,
+        const char *, uint64_t, qihse_backup_info_t *) = qihse_backup_incremental_user;
+    int (*volatile restore_user)(qihse_kv_store_t *, qihse_user_t *,
+        const char *) = qihse_restore_user;
+    if (!incremental_backup || !restore_user) return 10;
     char *vector = NULL;
     bool ok = qihse_sql_to_tsvector_english("running", &vector);
     if (argc == 2 && strcmp(argv[1], "missing-stemmer") == 0) {

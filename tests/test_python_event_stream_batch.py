@@ -2,11 +2,17 @@ import ctypes
 import os
 from pathlib import Path
 
-from qihse import EventScope, EventStream
+from qihse import (DocumentSourceRef, DurableReceipt, EventScope, EventStream,
+                   ExtendedKnowledgeVersion, KnowledgeProvenance,
+                   KnowledgeRelation, RecallMode)
 from qihse.core import _lib
 
 
 def main():
+    # The package-root lazy exports must cover the public AIMEM model types.
+    assert all(value is not None for value in (
+        DocumentSourceRef, DurableReceipt, ExtendedKnowledgeVersion,
+        KnowledgeProvenance, KnowledgeRelation, RecallMode))
     password = b"PythonEventStreamOperator1!"
     _lib.qihse_auth_init.argtypes = []
     _lib.qihse_auth_init.restype = ctypes.c_bool
@@ -23,10 +29,35 @@ def main():
     root = Path(os.environ["QIHSE_EVENT_STREAM_TEST_DIR"])
     stream = EventStream(str(root / "events"))
     scope = EventScope("python-firmware", 0, 0)
+
+    # Reject narrowing and oversize batches before entering the native ABI.
+    for bad_scope in (EventScope("python-firmware", 65536, 0),
+                      EventScope("python-firmware", 0, -1),
+                      EventScope("python-firmware", True, 0)):
+        try:
+            stream.append_batch(bad_scope, [{"schema_id": 1, "payload": b"x"}], user=user)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range EventScope labels were accepted")
+    for bad_records in ([{"schema_id": 1, "payload": 100_000_000}],
+                        [{"schema_id": 1, "payload": b""}] * 1025):
+        try:
+            stream.append_batch(scope, bad_records, user=user)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError("invalid/oversized event batch was accepted")
+    try:
+        stream.read_batch(scope, user=user, capacity=1025)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("oversized read capacity was accepted")
     event_id = bytes(range(48))
     appended = stream.append_batch(scope, [
         {"schema_id": 3, "event_id": event_id, "payload": b"archive"},
-        {"schema_id": 3, "payload": b"member"},
+        {"schema_id": 3, "payload": memoryview(b"member")},
     ], user=user)
     assert appended[0] == (0, False)
     assert appended[1][1] is False
