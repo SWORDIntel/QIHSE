@@ -1,10 +1,16 @@
 # Three-host cluster recovery and native upgrade
 
-Date: 2026-11-09
-Status: source-level range balancing is validated. All nine services are stopped;
-all nine authenticated full backups verify, the three main-store deltas are
-preserved, and the merged union backup verifies. Fresh-generation restore and
-the new topology deployment remain pending.
+Date: 2026-11-09 (updated 2026-11-10)
+Status: all nine original stores were backed up and reconciled into one
+authenticated union. That union was restored into a fresh generation and
+independently compared as 271,434 identical records with zero additions or
+conflicts. CT2 then distributed ownership across T420, 730xd and T320. Six
+recovery services are enabled and active. T420 and T320 serve data; 730xd is
+still data-fenced because restart replay retries an already completed abort.
+The focused replay fix and regression test pass locally; complete-suite
+validation now passes (204 targets, zero failures); native deployment is in
+progress. Keep all original backups and the union intact until all three
+owners pass data-plane and replication checks.
 
 Step 1 checkpoint: the demonstrated 730xd-to-T320 alias ARP failure was
 repaired at the user's request using a persistent verified neighbour mapping.
@@ -30,13 +36,9 @@ completion roadmap.
 
 ## Findings established during the study
 
-- All three cluster services still run the older versioned release. The new
-  CT1/CT2 source has passed the complete 203-target suite with zero failures,
-  but has not been deployed to these services.
-- The three live ownership maps disagree. T320 reports 730xd failed or
-  disconnected. Shared Operator credentials match; a credential-derived bus
-  key mismatch was not observed. The exact cause of failed-peer reports is
-  still unproved. Reachable client ports do not establish healthy bus traffic.
+- The original live ownership maps disagreed. A verified neighbor mapping
+  repaired 730xd-to-T320 discovery; the new topology now reports the same map
+  and six connected peers from all three owners.
 - The legacy `qihse_cluster_handoff_range()` / `MOVESLOTS` path is still
   fenced off. Manual `CLUSTER CT2 TRANSFER` and populated-owner brain R5 use
   the durable `qihse_cluster_transfer_range()` engine instead.
@@ -215,14 +217,14 @@ The nine full backups were reconciled into
 and zero conflicting live keys. T420's main backup was empty. The final union
 is 1,764,599,446 bytes and passed authenticated verification. All source full
 backups and three main-store deltas remain preserved; intermediate union files
-also remain available. No store has been restored yet.
+also remain available. Rechecking the union on 2026-11-10 produced SHA-256
+`bf400593bb9157329626f8bedb0932904fc5f9c599c19a7c25be61c7fc20ea3e`.
 
-Next restore the verified union into a fresh generation with an Operator auth
-context, then partition and transfer ranges using the tested CT2 path. Preserve
-the old stores and source backups until the accepted new cluster proves the
-recovered union. The restore target needs a usable Operator auth context before
-the restore command runs; bootstrap it through the configured Operator
-credential rather than assuming restore creates identity state.
+The union was restored through the authenticated backup API into fresh 730xd
+owner and T420 successor directories. An authenticated fresh backup from the
+restored 730xd owner compared against the union as 271,434 identical records,
+zero additions and zero conflicts. This verified the complete merged dataset
+before CT2 partitioning. All source backups and the union remain preserved.
 
 Verify the recovered union using canonical record comparisons, including
 labels and expiry, not counts alone. Expired records must be accounted for
@@ -231,34 +233,37 @@ contradictory ownership maps.
 
 ### 5. Start the replicated cluster and redistribute
 
-Configure one coherent topology with three data owners and three separate
-successor processes, each successor on another physical host. Verify capacity
-for both owned data and replicas before selecting the placement.
+The fresh generation is running as one topology with three data owners and
+three separate successor processes, each successor on another physical host.
+The original services remain stopped. Use the tested Operator CT2 path for any
+remaining data movement, retain transfer IDs for interrupted retries, and
+never bypass the transfer's 4,096-row / 64 MiB bounds. The isolated slot that
+exceeded the bound stays intact on 730xd.
 
-Bring up the fresh generation with startup maintenance and failover holds
-until topology and replication prerequisites are satisfied. Use the tested
-Operator CT2 transfer path for initial distribution, retaining transfer IDs
-for interrupted retries. Keep automatic R5 rebalancing disabled during this
-uneven-capacity rollout: its current target is equal slot counts, which can
-undo the capacity-weighted placement. Each transfer is bounded to 4,096 rows
-and 64 MiB; subdivide ranges accordingly. An oversized individual slot
-requires explicit handling, never truncation.
-Set `--brain-rebalance-min-slots 0` on each brain process for this deployment;
-zero disables R5. Manual Operator CT2 transfers remain available.
+Automatic R5 rebalancing remains disabled on the recovery units because its
+current target is equal slot counts and is not capacity-aware. Manual Operator
+CT2 transfers remain available. Do not enable R5 until a capacity-aware policy
+has been implemented and tested.
 
-All three machines must own data after distribution. Choose allocation using
-actual stored bytes and available capacity rather than assuming equal slot
-counts produce equal storage. 730xd's temporary seed role ends after recovery
-and distribution. Enable the repaired automatic balancing policy afterward.
+All three machines now own data. The ownership map queried independently from
+T420, 730xd and T320 is:
 
-The separate upgraded HAX memory service remains available during cluster
-preparation. Its memories do not become cluster-distributed merely because
-cluster slots moved; preserve its endpoint and validate its reads separately.
-After the new owner/replica ring is healthy, reattach the six namespace caches
-only if their consumers still require those endpoints; point them at the
-appropriate new owner and verify their filters. Otherwise leave them stopped
-with their verified backups retained, after confirming no configured consumer
-depends on them.
+| Owner | Slots | Count |
+| --- | --- | ---: |
+| T420 A | `0–5039`, `5041–5460` | 5,460 |
+| T320 C | `5461–10921` | 5,461 |
+| 730xd B | `5040`, `10922–16383` | 5,463 |
+
+All six peers report connected. Slot 5040 remains on B because the CT2 row/byte
+bound rejected that isolated slot before mutation; the one-slot skew is
+intentional. Each owner has an off-host successor. Slot-count automatic
+rebalancing remains disabled because it is not capacity-aware. The 730xd owner
+must be unfenced before the cluster is ready for ordinary use.
+
+The separate HAX memory service remains outside this slot merge. The six
+namespace cache services are stopped with their authenticated backups
+preserved. Reattach a cache only if a consumer still needs it, point it at the
+appropriate new owner, and verify its filters. Otherwise keep it stopped.
 
 ### 6. Verify the finish line
 
@@ -298,29 +303,41 @@ provide a recovery point. After new writes are accepted, simply restarting old
 stores would lose those writes; use forward recovery or an explicitly reconciled
 new backup instead. Do not promise an automatic rollback after cutover.
 
-## Checkpoint
+## Current execution checkpoint (2026-11-10)
 
-At plan creation, no live cluster stop, restart, backup, restore, transfer,
-promotion or configuration change had been performed during the study. Source
-transport validation is complete; see the execution checkpoint below for live
-recovery progress and remaining automation work.
-
-## Current execution checkpoint (2026-11-09)
-
-- The T420-to-T320 persistent neighbour repair is in place. The coordinated
-  outage stopped all three main services and six namespace replicas; old
-  stores and ownership journals remain intact.
-- Candidate source `fc4fe6cb00205dda55dcbef4327548fd755cedb5` is published and
-  natively built on all three hosts. Inactive package directories are named
-  with `fc4fe6c`; all three checksum manifests validate 104 files. No systemd
-  unit has been changed.
-- The source now includes the 3 GiB bounded backup-merge ceiling required by
-  the 1.76 GB source image. Focused merge tests pass; the full required suite
-  passed 203 targets with zero failures.
-- Nine authenticated full backups verify. Main-store delta evidence is
-  preserved separately. The merged full container verifies and accounts for
-  296 new records, 830 exact duplicate cache records and zero conflicts.
-- No restore, range transfer, new service activation or live ownership change
-  has been performed. The next phase is fresh-generation restore and topology
-  staging; capacity-weighted initial placement still requires a measured
-  per-range byte inventory.
+- Nine authenticated original full backups, three main-store delta exports,
+  and the authenticated merged union remain preserved under
+  `/var/backups/qihse-recovery-20261109`. The union was re-hashed today as
+  `bf400593bb9157329626f8bedb0932904fc5f9c599c19a7c25be61c7fc20ea3e`.
+- The union contains 271,434 reconciled records. The fresh 730xd restored
+  owner was independently backed up and compared to it: 271,434 identical,
+  zero additions and zero conflicts. The six cache inputs contributed 830
+  exact duplicates; the merge recorded zero conflicting live keys.
+- Native recovery packages were built for each host from source revision
+  `8d79780b4556c9e2170e1d012d0f7f8203535946`. Six persistent enabled recovery
+  services are active: owners A/B/C on T420/730xd/T320 and off-host successors
+  on T320/T420/730xd respectively. The old services and old data directories
+  remain stopped and untouched.
+- All three owners independently return the same six-peer cluster map, with
+  all peers connected. Slot ownership is T420 `0–5039, 5041–5460` (5,460),
+  T320 `5461–10921` (5,461), and 730xd `5040, 10922–16383` (5,463). Slot 5040
+  safely stayed on 730xd after CT2 refused its isolated transfer under the
+  current bound; no rows were truncated.
+- Data-plane status is not yet uniform. T420 and T320 answer data commands;
+  730xd returns `TRYAGAIN ownership recovery is in progress`. Its log identifies
+  the cause as `durable source abort fence recovery failed`.
+- The cause is that startup replay attempts to release an already released
+  ABORTED CT2 fence. The source fix now releases only the exact matching active
+  fence, accepts a verified clear fence on later restarts, and refuses to clear
+  a different active transfer. `make test-ownership-abort-replay` passes and
+  covers the original recovery, repeat replay and different-fence refusal.
+  `make test TEST_JOBS=32` passed 204 targets with zero failures. Native 730xd
+  deployment and post-restart data-plane verification remain pending.
+- CT1 had drained to durable=acknowledged on all owners before the persistent
+  restart. Recheck all three cursors after clearing the 730xd fence.
+- AIMEM remains node-local by current CT2 design: 309 records on B, none on A
+  or C. The memories are present in the verified union but are not distributed
+  evenly by slot movement. Treat this separately from cluster slot readiness.
+- Automatic capacity-aware balancing, automatic failover promotion, and
+  dynamic successor reassignment remain open roadmap items. Keep the current
+  slot-count R5 automatic rebalancer disabled for this heterogeneous layout.

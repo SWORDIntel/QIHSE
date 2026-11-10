@@ -510,6 +510,11 @@ test-ownership-journal: lib
 	$(CC) $(CFLAGS) -o tests/test_ownership_journal tests/test_ownership_journal.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_journal
 
+.PHONY: test-ownership-abort-replay
+test-ownership-abort-replay: lib
+	$(CC) $(CFLAGS) -o tests/test_ownership_abort_replay tests/test_ownership_abort_replay.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ownership_abort_replay
+
 # Exact-history transport serialization, real registry authorization, and
 # durable mutation/cursor recovery. Keep the fault-injected KV implementation
 # local to its test executable; production library fault hooks stay disabled.
@@ -1496,7 +1501,7 @@ test-serial: test-cluster-failover-unproven
 
 .PHONY: test-cluster-maintenance test-cluster-maintenance-resp
 test-serial: test-cluster-maintenance test-cluster-maintenance-resp
-test-serial: test-slot-migration-auth test-ownership-journal
+test-serial: test-slot-migration-auth test-ownership-journal test-ownership-abort-replay
 test-serial: test-document-store-user
 
 .PHONY: test-document-store-user

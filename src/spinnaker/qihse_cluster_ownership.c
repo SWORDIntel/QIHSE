@@ -1552,10 +1552,24 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
             set_error(r->err, r->err_cap, "aborted transfer journal is not on its source");
             r->failed = true; return false;
         }
-        unsigned char token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
-        bool ok = qihse_kv_ct_owner_token_get(c->store, c->principal, token) &&
-            qihse_kv_ct_fence_finish(c->store, c->principal, txn->transfer_id, false, token);
-        OPENSSL_cleanse(token, sizeof(token));
+        qihse_kv_ct_transfer_status_t status;
+        memset(&status, 0, sizeof(status));
+        bool ok = qihse_kv_ct_transfer_status(c->store, c->principal, &status);
+        if (ok && status.fence_state == 1u &&
+            !strcmp(status.transfer_id, txn->transfer_id)) {
+            unsigned char token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
+            ok = qihse_kv_ct_owner_token_get(c->store, c->principal, token) &&
+                qihse_kv_ct_fence_finish(c->store, c->principal,
+                    txn->transfer_id, false, token);
+            OPENSSL_cleanse(token, sizeof(token));
+            memset(&status, 0, sizeof(status));
+            ok = ok && qihse_kv_ct_transfer_status(c->store, c->principal, &status);
+        }
+        /* ABORTED is durable before the source fence is released. Recovery
+         * must finish that crash window, and a later restart must also accept
+         * the already released state. Never clear a different active fence. */
+        ok = ok && status.fence_state == 0u && status.transfer_id[0] == '\0';
+        OPENSSL_cleanse(&status, sizeof(status));
         if (!ok) {
             set_error(r->err, r->err_cap, "durable source abort fence recovery failed");
             r->failed = true; return false;
