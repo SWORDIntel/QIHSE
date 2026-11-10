@@ -72,6 +72,13 @@
 #define SSL void
 #endif
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#if defined(_WIN32) && !defined(SHUT_RDWR)
+#define SHUT_RDWR SD_BOTH
+#endif
+
 static SSL_CTX* global_pqc_ssl_ctx __attribute__((unused)) = NULL;
 static __thread SSL* current_ssl = NULL;
 static __thread bool pg_batch_suppress_ready;
@@ -127,6 +134,10 @@ struct qihse_pg_wire_listener {
 
 /* Write exactly n bytes, retrying on EINTR / short writes. */
 static int pg_write_all(int fd, const void* buf, size_t n) {
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
     const uint8_t* p = (const uint8_t*)buf;
     while (n > 0) {
         ssize_t w;
@@ -137,9 +148,11 @@ static int pg_write_all(int fd, const void* buf, size_t n) {
         } else
 #endif
         {
-            w = write(fd, p, n);
-            if (w < 0) {
-                if (errno == EINTR) continue;
+            w = send(fd, p, n, MSG_NOSIGNAL);
+            if (w <= 0) {
+                if (w < 0 && errno == EINTR) continue;
+                if (!w) errno = EIO;
+                shutdown(fd, SHUT_RDWR);
                 return -1;
             }
         }
@@ -176,12 +189,14 @@ typedef struct {
     uint8_t* data;
     size_t   len;
     size_t   cap;
+    bool     failed;
 } pg_buf_t;
 
 static void pg_buf_init(pg_buf_t* b) {
     b->cap  = 256;
     b->len  = 0;
     b->data = (uint8_t*)malloc(b->cap);
+    b->failed = b->data == NULL;
 }
 
 static void pg_buf_free(pg_buf_t* b) {
@@ -189,13 +204,22 @@ static void pg_buf_free(pg_buf_t* b) {
     b->data = NULL;
     b->len  = 0;
     b->cap  = 0;
+    b->failed = true;
 }
 
 static int pg_buf_ensure(pg_buf_t* b, size_t extra) {
-    if (b->len + extra > b->cap) {
-        size_t new_cap = (b->cap * 2 >= b->len + extra) ? b->cap * 2 : b->len + extra + 256;
+    if (b->failed) return -1;
+    if (extra > SIZE_MAX - b->len) {
+        b->failed = true;
+        errno = EOVERFLOW;
+        return -1;
+    }
+    size_t want = b->len + extra;
+    if (want > b->cap) {
+        size_t new_cap = b->cap > SIZE_MAX / 2 ? want : b->cap * 2;
+        if (new_cap < want) new_cap = want;
         uint8_t* p = (uint8_t*)realloc(b->data, new_cap);
-        if (!p) return -1;
+        if (!p) { b->failed = true; return -1; }
         b->data = p;
         b->cap  = new_cap;
     }
@@ -225,8 +249,9 @@ static int pg_buf_append_int32(pg_buf_t* b, int32_t v) {
 }
 
 static int pg_buf_append(pg_buf_t* b, const void* src, size_t n) {
+    if (!src && n) { b->failed = true; errno = EINVAL; return -1; }
     if (pg_buf_ensure(b, n) < 0) return -1;
-    memcpy(b->data + b->len, src, n);
+    if (n) memcpy(b->data + b->len, src, n);
     b->len += n;
     return 0;
 }
@@ -236,11 +261,16 @@ static int pg_buf_append_str(pg_buf_t* b, const char* s) {
 }
 
 static int pg_buf_flush(pg_buf_t* b, int fd) {
+    if (b->failed) return -1;
     if (b->len == 0) return 0;
     return pg_write_all(fd, b->data, b->len);
 }
 
 static int pg_send_msg(int fd, uint8_t tag, const uint8_t* body, size_t body_len) {
+    if (body_len > INT32_MAX - 4u || (!body && body_len)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     pg_buf_t b;
     pg_buf_init(&b);
     if (pg_buf_append_byte(&b, tag) < 0) goto err;
@@ -264,17 +294,26 @@ static int pg_send_parameter_status(int fd, const char* name, const char* value)
     pg_buf_init(&b);
     pg_buf_append_str(&b, name);
     pg_buf_append_str(&b, value);
-    int rc = pg_send_msg(fd, 'S', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'S', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 }
+
+#ifdef QIHSE_PROTOCOL_IO_TESTING
+int qihse_test_pg_write_all(int fd, const void* buf, size_t len) {
+    return pg_write_all(fd, buf, len);
+}
+int qihse_test_pg_parameter_status(int fd, const char* name, const char* value) {
+    return pg_send_parameter_status(fd, name, value);
+}
+#endif
 
 static int pg_send_backend_key_data(int fd, int32_t pid, int32_t secret) {
     pg_buf_t b;
     pg_buf_init(&b);
     pg_buf_append_int32(&b, pid);
     pg_buf_append_int32(&b, secret);
-    int rc = pg_send_msg(fd, 'K', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'K', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 }
@@ -303,7 +342,7 @@ static int pg_send_row_description(int fd, const char** field_names, const int32
         pg_buf_append_int32(&b, -1);
         pg_buf_append_int16(&b, 0);
     }
-    int rc = pg_send_msg(fd, 'T', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'T', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 }
@@ -347,7 +386,7 @@ static int pg_send_data_row(int fd, const char** values, int16_t ncols) {
             pg_buf_append(&b, values[i], (size_t)len);
         }
     }
-    int rc = pg_send_msg(fd, 'D', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'D', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 }
@@ -594,7 +633,7 @@ static int pg_send_command_complete(int fd, const char* tag) {
     pg_buf_t b;
     pg_buf_init(&b);
     pg_buf_append_str(&b, tag);
-    int rc = pg_send_msg(fd, 'C', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'C', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 }
@@ -612,7 +651,7 @@ static int pg_send_error(int fd, const char* severity, const char* sqlstate, con
     pg_buf_append_byte(&b, 'M');
     pg_buf_append_str(&b, message);
     pg_buf_append_byte(&b, '\0');
-    int rc = pg_send_msg(fd, 'E', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'E', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 }
@@ -1873,7 +1912,7 @@ static int pg_extended_row_description(int fd,
             pg_buf_append_int32(&b, -1) < 0 ||
             pg_buf_append_int16(&b, format) < 0) goto fail;
     }
-    int rc = pg_send_msg(fd, 'T', b.data, b.len);
+    int rc = (b.failed ? -1 : pg_send_msg(fd, 'T', b.data, b.len));
     pg_buf_free(&b);
     return rc;
 fail:
@@ -1922,7 +1961,7 @@ static const char* pg_extended_describe(int fd, pg_extended_t* ext,
             if (pg_buf_append_int32(&b, (int32_t)meta.param_oids[i]) < 0) {
                 pg_buf_free(&b); *write_status = -1; return NULL;
             }
-        *write_status = pg_send_msg(fd, 't', b.data, b.len);
+        *write_status = (b.failed ? -1 : pg_send_msg(fd, 't', b.data, b.len));
         pg_buf_free(&b);
         if (*write_status < 0) return NULL;
     }
@@ -2339,10 +2378,11 @@ static qihse_user_t* pg_send_auth_and_startup(int fd) {
         return NULL;
     }
     password[pwd_body_len] = '\0';
-    /* The password string is null-terminated within the message body;
-     * trim at the first null. */
     size_t pwd_len = strnlen(password, pwd_body_len);
-    password[pwd_len] = '\0';
+    if (pwd_len + 1u != pwd_body_len) {
+        free(password);
+        return NULL;
+    }
 
     /* Authenticate against the QIHSE auth subsystem.  This is the same
      * pattern used by qihse_bolt.c: qihse_auth_authenticate_from() takes
@@ -2364,17 +2404,21 @@ static qihse_user_t* pg_send_auth_and_startup(int fd) {
         return NULL;
     }
 
-    pg_send_parameter_status(fd, "server_version",    "14.0 (QIHSE)");
-    pg_send_parameter_status(fd, "client_encoding",   "UTF8");
-    pg_send_parameter_status(fd, "server_encoding",   "UTF8");
-    pg_send_parameter_status(fd, "DateStyle",         "ISO, MDY");
-    pg_send_parameter_status(fd, "TimeZone",          "UTC");
-    pg_send_parameter_status(fd, "integer_datetimes", "on");
-    pg_send_parameter_status(fd, "standard_conforming_strings", "on");
-    pg_send_parameter_status(fd, "IntervalStyle",     "postgres");
-
-    pg_send_backend_key_data(fd, 1, 0);
-    pg_send_ready_for_query(fd);
+    static const char* const parameters[][2] = {
+        {"server_version", "14.0 (QIHSE)"},
+        {"client_encoding", "UTF8"},
+        {"server_encoding", "UTF8"},
+        {"DateStyle", "ISO, MDY"},
+        {"TimeZone", "UTC"},
+        {"integer_datetimes", "on"},
+        {"standard_conforming_strings", "on"},
+        {"IntervalStyle", "postgres"}
+    };
+    for (size_t i = 0; i < sizeof(parameters) / sizeof(parameters[0]); ++i)
+        if (pg_send_parameter_status(fd, parameters[i][0], parameters[i][1]) < 0)
+            return NULL;
+    if (pg_send_backend_key_data(fd, 1, 0) < 0 ||
+        pg_send_ready_for_query(fd) < 0) return NULL;
 
     return user;
 }

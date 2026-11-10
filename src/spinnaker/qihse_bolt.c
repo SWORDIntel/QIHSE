@@ -24,6 +24,9 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#if defined(_WIN32) && !defined(SHUT_RDWR)
+#define SHUT_RDWR SD_BOTH
+#endif
 
 /* ============================================================
  * Connection helpers
@@ -54,9 +57,11 @@ static uint32_t bolt_get_source_ip(int fd) {
  * ============================================================ */
 
 void qihse_bolt_buf_init(qihse_bolt_buf_t* b, size_t initial_cap) {
+    if (!b) return;
     b->cap = initial_cap ? initial_cap : 64;
     b->buf = (uint8_t*)malloc(b->cap);
     b->len = 0;
+    if (!b->buf) b->cap = 0;
 }
 
 void qihse_bolt_buf_free(qihse_bolt_buf_t* b) {
@@ -66,15 +71,33 @@ void qihse_bolt_buf_free(qihse_bolt_buf_t* b) {
 }
 
 void qihse_bolt_buf_reserve(qihse_bolt_buf_t* b, size_t extra) {
-    if (b->len + extra <= b->cap) return;
-    size_t ncap = b->cap ? b->cap : 64;
-    while (ncap < b->len + extra) ncap *= 2;
-    b->buf = (uint8_t*)realloc(b->buf, ncap);
+    if (!b || !b->cap) return;
+    if (extra > SIZE_MAX - b->len) {
+        errno = EOVERFLOW;
+        b->cap = b->len = 0;
+        return;
+    }
+    size_t want = b->len + extra;
+    if (want <= b->cap) return;
+    size_t ncap = b->cap;
+    while (ncap < want) {
+        if (ncap > SIZE_MAX / 2) { ncap = want; break; }
+        ncap *= 2;
+    }
+    uint8_t* next = (uint8_t*)realloc(b->buf, ncap);
+    if (!next) { b->cap = b->len = 0; return; }
+    b->buf = next;
     b->cap = ncap;
 }
 
 void qihse_bolt_buf_append(qihse_bolt_buf_t* b, const void* data, size_t n) {
+    if (b && n && !data) {
+        errno = EINVAL;
+        b->cap = b->len = 0;
+        return;
+    }
     qihse_bolt_buf_reserve(b, n);
+    if (!b || !b->cap || !n) return;
     memcpy(b->buf + b->len, data, n);
     b->len += n;
 }
@@ -231,7 +254,7 @@ void qihse_bolt_decoder_init(qihse_bolt_decoder_t* d, const uint8_t* data, size_
 }
 
 static int bolt_have(qihse_bolt_decoder_t* d, size_t n) {
-    return d->pos + n <= d->len;
+    return d && d->data && d->pos <= d->len && n <= d->len - d->pos;
 }
 
 static uint16_t bolt_get_u16be(qihse_bolt_decoder_t* d) {
@@ -270,20 +293,20 @@ void qihse_bolt_value_free(qihse_bolt_value_t* v) {
             free(v->v.s.data);
             break;
         case QIHSE_BOLT_LIST:
-            for (size_t i = 0; i < v->v.list.count; i++)
+            for (size_t i = 0; v->v.list.items && i < v->v.list.count; i++)
                 qihse_bolt_value_free(v->v.list.items[i]);
             free(v->v.list.items);
             break;
         case QIHSE_BOLT_MAP:
             for (size_t i = 0; i < v->v.map.count; i++) {
-                qihse_bolt_value_free(v->v.map.keys[i]);
-                qihse_bolt_value_free(v->v.map.vals[i]);
+                if (v->v.map.keys) qihse_bolt_value_free(v->v.map.keys[i]);
+                if (v->v.map.vals) qihse_bolt_value_free(v->v.map.vals[i]);
             }
             free(v->v.map.keys);
             free(v->v.map.vals);
             break;
         case QIHSE_BOLT_STRUCT:
-            for (size_t i = 0; i < v->v.strct.nfields; i++)
+            for (size_t i = 0; v->v.strct.fields && i < v->v.strct.nfields; i++)
                 qihse_bolt_value_free(v->v.strct.fields[i]);
             free(v->v.strct.fields);
             break;
@@ -306,7 +329,9 @@ static qihse_bolt_value_t* bolt_decode_string_payload(qihse_bolt_decoder_t* d, s
     return v;
 }
 
-static qihse_bolt_value_t* bolt_decode_list_entries(qihse_bolt_decoder_t* d, size_t count) {
+static qihse_bolt_value_t* bolt_decode_value(qihse_bolt_decoder_t* d, unsigned depth);
+
+static qihse_bolt_value_t* bolt_decode_list_entries(qihse_bolt_decoder_t* d, size_t count, unsigned depth) {
     if (count > 65536u) return NULL;
     qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_LIST);
     if (!v) return NULL;
@@ -314,13 +339,13 @@ static qihse_bolt_value_t* bolt_decode_list_entries(qihse_bolt_decoder_t* d, siz
     v->v.list.items = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
     if (!v->v.list.items) { free(v); return NULL; }
     for (size_t i = 0; i < count; i++) {
-        v->v.list.items[i] = qihse_bolt_decode(d);
+        v->v.list.items[i] = bolt_decode_value(d, depth + 1);
         if (!v->v.list.items[i]) { qihse_bolt_value_free(v); return NULL; }
     }
     return v;
 }
 
-static qihse_bolt_value_t* bolt_decode_map_entries(qihse_bolt_decoder_t* d, size_t count) {
+static qihse_bolt_value_t* bolt_decode_map_entries(qihse_bolt_decoder_t* d, size_t count, unsigned depth) {
     if (count > 65536u) return NULL;
     qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_MAP);
     if (!v) return NULL;
@@ -329,14 +354,15 @@ static qihse_bolt_value_t* bolt_decode_map_entries(qihse_bolt_decoder_t* d, size
     v->v.map.vals = (qihse_bolt_value_t**)calloc(count ? count : 1, sizeof(qihse_bolt_value_t*));
     if (!v->v.map.keys || !v->v.map.vals) { qihse_bolt_value_free(v); return NULL; }
     for (size_t i = 0; i < count; i++) {
-        v->v.map.keys[i] = qihse_bolt_decode(d);
-        v->v.map.vals[i] = qihse_bolt_decode(d);
+        v->v.map.keys[i] = bolt_decode_value(d, depth + 1);
+        v->v.map.vals[i] = bolt_decode_value(d, depth + 1);
         if (!v->v.map.keys[i] || !v->v.map.vals[i]) { qihse_bolt_value_free(v); return NULL; }
     }
     return v;
 }
 
-qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
+static qihse_bolt_value_t* bolt_decode_value(qihse_bolt_decoder_t* d, unsigned depth) {
+    if (depth > 64) { errno = EOVERFLOW; return NULL; }
     if (!bolt_have(d, 1)) return NULL;
     uint8_t marker = d->data[d->pos++];
 
@@ -361,12 +387,12 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
 
     /* Tiny lists: 0x90..0x9F (length 0..15) */
     if (marker >= 0x90 && marker <= 0x9F) {
-        return bolt_decode_list_entries(d, marker & 0x0F);
+        return bolt_decode_list_entries(d, marker & 0x0F, depth);
     }
 
     /* Tiny maps: 0xA0..0xAF (size 0..15) */
     if (marker >= 0xA0 && marker <= 0xAF) {
-        return bolt_decode_map_entries(d, marker & 0x0F);
+        return bolt_decode_map_entries(d, marker & 0x0F, depth);
     }
 
     switch (marker) {
@@ -425,33 +451,33 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     /* Lists: List 8 (0xD4), List 16 (0xD5), List 32 (0xD6) */
     if (marker == 0xD4) {
         if (!bolt_have(d, 1)) return NULL;
-        return bolt_decode_list_entries(d, d->data[d->pos++]);
+        return bolt_decode_list_entries(d, d->data[d->pos++], depth);
     }
     if (marker == 0xD5) {
         if (!bolt_have(d, 2)) return NULL;
-        return bolt_decode_list_entries(d, bolt_get_u16be(d));
+        return bolt_decode_list_entries(d, bolt_get_u16be(d), depth);
     }
     if (marker == 0xD6) {
         if (!bolt_have(d, 4)) return NULL;
         uint32_t count = bolt_get_u32be(d);
         if (count > 65536u) return NULL;
-        return bolt_decode_list_entries(d, count);
+        return bolt_decode_list_entries(d, count, depth);
     }
 
     /* Maps: Map 8 (0xD8), Map 16 (0xD9), Map 32 (0xDA) */
     if (marker == 0xD8) {
         if (!bolt_have(d, 1)) return NULL;
-        return bolt_decode_map_entries(d, d->data[d->pos++]);
+        return bolt_decode_map_entries(d, d->data[d->pos++], depth);
     }
     if (marker == 0xD9) {
         if (!bolt_have(d, 2)) return NULL;
-        return bolt_decode_map_entries(d, bolt_get_u16be(d));
+        return bolt_decode_map_entries(d, bolt_get_u16be(d), depth);
     }
     if (marker == 0xDA) {
         if (!bolt_have(d, 4)) return NULL;
         uint32_t count = bolt_get_u32be(d);
         if (count > 65536u) return NULL;
-        return bolt_decode_map_entries(d, count);
+        return bolt_decode_map_entries(d, count, depth);
     }
 
     /* Structs */
@@ -460,40 +486,13 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
         if (!bolt_have(d, 1)) return NULL;
         uint8_t sig = d->data[d->pos++];
         qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRUCT);
+        if (!v) return NULL;
         v->v.strct.signature = sig;
         v->v.strct.nfields = nfields;
         v->v.strct.fields = (qihse_bolt_value_t**)calloc(nfields ? nfields : 1, sizeof(qihse_bolt_value_t*));
+        if (!v->v.strct.fields) { free(v); return NULL; }
         for (size_t i = 0; i < nfields; i++) {
-            v->v.strct.fields[i] = qihse_bolt_decode(d);
-            if (!v->v.strct.fields[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
-    }
-    if (marker == 0xB1) {
-        if (!bolt_have(d, 3)) return NULL;
-        uint16_t nfields = bolt_get_u16be(d);
-        uint8_t sig = d->data[d->pos++];
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRUCT);
-        v->v.strct.signature = sig;
-        v->v.strct.nfields = nfields;
-        v->v.strct.fields = (qihse_bolt_value_t**)calloc(nfields ? nfields : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < nfields; i++) {
-            v->v.strct.fields[i] = qihse_bolt_decode(d);
-            if (!v->v.strct.fields[i]) { qihse_bolt_value_free(v); return NULL; }
-        }
-        return v;
-    }
-    if (marker == 0xB2) {
-        if (!bolt_have(d, 5)) return NULL;
-        uint32_t nfields = bolt_get_u32be(d);
-        if (nfields > 65536u) return NULL;
-        uint8_t sig = d->data[d->pos++];
-        qihse_bolt_value_t* v = bolt_new_value(QIHSE_BOLT_STRUCT);
-        v->v.strct.signature = sig;
-        v->v.strct.nfields = nfields;
-        v->v.strct.fields = (qihse_bolt_value_t**)calloc(nfields ? nfields : 1, sizeof(qihse_bolt_value_t*));
-        for (size_t i = 0; i < nfields; i++) {
-            v->v.strct.fields[i] = qihse_bolt_decode(d);
+            v->v.strct.fields[i] = bolt_decode_value(d, depth + 1);
             if (!v->v.strct.fields[i]) { qihse_bolt_value_free(v); return NULL; }
         }
         return v;
@@ -502,19 +501,35 @@ qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
     return NULL;
 }
 
+qihse_bolt_value_t* qihse_bolt_decode(qihse_bolt_decoder_t* d) {
+    return bolt_decode_value(d, 0);
+}
+
 /* ============================================================
  * Message framing (chunking)
  * ============================================================ */
 
 void qihse_bolt_encode_message(qihse_bolt_buf_t* b, uint8_t signature,
                                const uint8_t* payload, size_t payload_len) {
-    /* Single chunk: 2-byte big-endian length (signature + payload), then body,
-     * then 0x0000 end-of-message marker. */
-    uint16_t chunk_len = (uint16_t)(payload_len + 1);
-    bolt_put_u16be(b, chunk_len);
+    if (payload_len && !payload) {
+        if (b) b->cap = b->len = 0;
+        errno = EINVAL;
+        return;
+    }
+    /* Each wire chunk has a 16-bit length. Only the first carries the
+     * signature; large messages continue in subsequent chunks. */
+    size_t first = payload_len < UINT16_MAX - 1u ? payload_len : UINT16_MAX - 1u;
+    bolt_put_u16be(b, (uint16_t)(first + 1u));
     qihse_bolt_buf_append(b, &signature, 1);
-    if (payload_len) qihse_bolt_buf_append(b, payload, payload_len);
-    /* end-of-message marker */
+    qihse_bolt_buf_append(b, payload, first);
+    size_t off = first;
+    while (off < payload_len && b && b->cap) {
+        size_t chunk = payload_len - off;
+        if (chunk > UINT16_MAX) chunk = UINT16_MAX;
+        bolt_put_u16be(b, (uint16_t)chunk);
+        qihse_bolt_buf_append(b, payload + off, chunk);
+        off += chunk;
+    }
     bolt_put_u16be(b, 0x0000);
 }
 
@@ -522,8 +537,13 @@ int qihse_bolt_decode_message(const uint8_t* data, size_t len,
                               uint8_t* out_sig, uint8_t** out_payload, size_t* out_payload_len,
                               size_t* out_consumed) {
     size_t pos = 0;
+    if (out_payload) *out_payload = NULL;
+    if (out_payload_len) *out_payload_len = 0;
+    if (out_consumed) *out_consumed = 0;
+    if (!data && len) { errno = EINVAL; return -1; }
     qihse_bolt_buf_t acc;
     qihse_bolt_buf_init(&acc, 64);
+    if (!acc.cap) return -1;
     int got_sig = 0;
     uint8_t sig = 0;
 
@@ -534,13 +554,12 @@ int qihse_bolt_decode_message(const uint8_t* data, size_t len,
             /* end of message */
             if (!got_sig) { qihse_bolt_buf_free(&acc); return -1; }
             if (out_sig) *out_sig = sig;
+            if (out_payload_len) *out_payload_len = acc.len;
             if (out_payload) {
                 *out_payload = acc.buf;
                 acc.buf = NULL;
-            } else {
-                qihse_bolt_buf_free(&acc);
             }
-            if (out_payload_len) *out_payload_len = acc.len;
+            qihse_bolt_buf_free(&acc);
             if (out_consumed) *out_consumed = pos;
             return 0;
         }
@@ -557,6 +576,7 @@ int qihse_bolt_decode_message(const uint8_t* data, size_t len,
         } else {
             qihse_bolt_buf_append(&acc, data + pos, chunk_len);
         }
+        if (!acc.cap) { qihse_bolt_buf_free(&acc); return -1; }
         pos += chunk_len;
     }
     qihse_bolt_buf_free(&acc);
@@ -568,18 +588,31 @@ int qihse_bolt_decode_message(const uint8_t* data, size_t len,
  * Socket helpers
  * ============================================================ */
 
-static void bolt_write_all(int fd, const uint8_t* buf, size_t len) {
-    if (fd < 0) return;
+static bool bolt_write_all(int fd, const uint8_t* buf, size_t len) {
+    if (fd < 0 || (!buf && len)) return false;
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
     size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, buf + off, len - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            break;
+        ssize_t w = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            if (w == 0) errno = EIO;
+            shutdown(fd, SHUT_RDWR);
+            return false;
         }
         off += (size_t)w;
     }
+    return true;
 }
+
+#ifdef QIHSE_PROTOCOL_IO_TESTING
+bool qihse_test_bolt_write_all(int fd, const uint8_t* buf, size_t len) {
+    return bolt_write_all(fd, buf, len);
+}
+#endif
 
 static ssize_t bolt_read_all(int fd, uint8_t* buf, size_t len) {
     size_t off = 0;
@@ -619,7 +652,7 @@ bool qihse_bolt_handshake(int fd, uint32_t* out_version) {
         (uint8_t)(chosen >> 24), (uint8_t)(chosen >> 16),
         (uint8_t)(chosen >> 8), (uint8_t)(chosen & 0xFF)
     };
-    bolt_write_all(fd, resp, 4);
+    if (!bolt_write_all(fd, resp, 4)) return false;
     if (out_version) *out_version = chosen;
     return chosen != 0;
 }
@@ -640,7 +673,8 @@ static void bolt_send_success(int fd, const char* key, const char* val) {
     qihse_bolt_buf_t msg;
     qihse_bolt_buf_init(&msg, body.len + 4);
     qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_SUCCESS, body.buf, body.len);
-    bolt_write_all(fd, msg.buf, msg.len);
+    if (body.cap && msg.cap) bolt_write_all(fd, msg.buf, msg.len);
+    else shutdown(fd, SHUT_RDWR);
     qihse_bolt_buf_free(&body);
     qihse_bolt_buf_free(&msg);
 }
@@ -656,7 +690,8 @@ static void bolt_send_failure(int fd, const char* code, const char* message) {
     qihse_bolt_buf_t msg;
     qihse_bolt_buf_init(&msg, body.len + 4);
     qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_FAILURE, body.buf, body.len);
-    bolt_write_all(fd, msg.buf, msg.len);
+    if (body.cap && msg.cap) bolt_write_all(fd, msg.buf, msg.len);
+    else shutdown(fd, SHUT_RDWR);
     qihse_bolt_buf_free(&body);
     qihse_bolt_buf_free(&msg);
 }
@@ -665,7 +700,8 @@ static void bolt_send_ignored(int fd) {
     qihse_bolt_buf_t msg;
     qihse_bolt_buf_init(&msg, 8);
     qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_IGNORED, NULL, 0);
-    bolt_write_all(fd, msg.buf, msg.len);
+    if (msg.cap) bolt_write_all(fd, msg.buf, msg.len);
+    else shutdown(fd, SHUT_RDWR);
     qihse_bolt_buf_free(&msg);
 }
 
@@ -689,7 +725,8 @@ static void bolt_send_record(int fd, const qihse_bolt_value_t* const* fields, si
     qihse_bolt_buf_t msg;
     qihse_bolt_buf_init(&msg, body.len + 4);
     qihse_bolt_encode_message(&msg, QIHSE_BOLT_MSG_RECORD, body.buf, body.len);
-    bolt_write_all(fd, msg.buf, msg.len);
+    if (body.cap && msg.cap) bolt_write_all(fd, msg.buf, msg.len);
+    else shutdown(fd, SHUT_RDWR);
     qihse_bolt_buf_free(&body);
     qihse_bolt_buf_free(&msg);
 }
@@ -704,7 +741,7 @@ static ssize_t bolt_capture_write(void* write_ctx, const void* data,
                                   size_t len) {
     qihse_bolt_buf_t* b = (qihse_bolt_buf_t*)write_ctx;
     qihse_bolt_buf_append(b, data, len);
-    return (ssize_t)len;
+    return b->cap ? (ssize_t)len : -1;
 }
 
 void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
@@ -732,11 +769,14 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
     qihse_bolt_buf_t captured;
     qihse_bolt_buf_init(&captured, 1024);
     bool has_captured = false;
+    if (!accum.cap || !captured.cap) goto done;
 
     for (;;) {
         ssize_t r = read(client_fd, rbuf, sizeof(rbuf));
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
         qihse_bolt_buf_append(&accum, rbuf, (size_t)r);
+        if (!accum.cap) goto done;
 
         /* Process all complete messages */
         for (;;) {
@@ -747,7 +787,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
             int rc = qihse_bolt_decode_message(accum.buf, accum.len,
                                                &sig, &payload, &payload_len, &consumed);
             if (rc == 1) break; /* need more data */
-            if (rc < 0) { qihse_bolt_buf_free(&accum); close(client_fd); return; }
+            if (rc < 0) goto done;
 
             /* shift accumulator */
             if (consumed > 0 && consumed < accum.len) {
@@ -932,7 +972,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                                 const qihse_bolt_value_t* fields[1] = { &row };
                                 bolt_send_record(client_fd, fields, 1u);
                                 free(row.v.s.data);
-                            }
+                            } else { free(payload); goto done; }
                             i = j;
                         }
                     }
@@ -959,7 +999,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx &&
+                    if (!ctx ||
                         !qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                             uwp_pkt + sizeof(qihse_uwp_header_t),
                                             uwp_len - sizeof(qihse_uwp_header_t),
@@ -985,7 +1025,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx &&
+                    if (!ctx ||
                         !qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                             uwp_pkt + sizeof(qihse_uwp_header_t),
                                             uwp_len - sizeof(qihse_uwp_header_t),
@@ -1011,7 +1051,7 @@ void qihse_bolt_handle_client(int client_fd, qihse_uwp_context_t* ctx) {
                     }
                     uint8_t resp[256];
                     size_t resp_len = 0;
-                    if (ctx &&
+                    if (!ctx ||
                         !qihse_uwp_dispatch(ctx, bolt_user, (const qihse_uwp_header_t*)uwp_pkt,
                                             uwp_pkt + sizeof(qihse_uwp_header_t),
                                             uwp_len - sizeof(qihse_uwp_header_t),

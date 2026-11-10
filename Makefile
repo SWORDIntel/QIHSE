@@ -1512,6 +1512,17 @@ test-ownership-journal-write-status: lib
 
 test-serial: test-ownership-journal-write-status
 
+.PHONY: test-protocol-io-failures
+test-protocol-io-failures: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_PROTOCOL_IO_TESTING -Wl,--export-dynamic \
+	    -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=send \
+	    -o tests/test_protocol_io_failures tests/test_protocol_io_failures.c \
+	    src/spinnaker/qihse_bolt.c src/spinnaker/qihse_pg_wire.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_protocol_io_failures
+
+test-serial: test-protocol-io-failures
+
 test-backup-merge-concurrent: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_BACKUP_TEST -Wl,--export-dynamic \
 	    -o tests/test_backup_merge_concurrent tests/test_backup_merge_concurrent.c \

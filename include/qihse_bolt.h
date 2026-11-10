@@ -78,6 +78,8 @@ struct qihse_bolt_value {
 typedef struct {
     uint8_t* buf;
     size_t len;
+    /* Zero after initialization/append failure; len is reset to zero and
+     * further writes are ignored until freed and reinitialized. Free owns buf. */
     size_t cap;
 } qihse_bolt_buf_t;
 
@@ -111,14 +113,15 @@ void qihse_bolt_value_free(qihse_bolt_value_t* v);
 /* ---- Message framing (chunking) ---- */
 
 /* Encode a complete message (signature + payload) into chunked wire format.
- * Writes a single chunk (big-endian length, signature, payload, 0x00 terminator)
+ * Splits the signature and payload into chunks of at most 65535 bytes,
  * followed by a 0x0000 end-of-message marker. */
 void qihse_bolt_encode_message(qihse_bolt_buf_t* b, uint8_t signature,
                                const uint8_t* payload, size_t payload_len);
 
 /* Decode one message from a chunked stream. Returns the message signature and
  * sets out_payload/out_len to the reassembled message body (caller frees
- * out_payload). Returns -1 on error, 0 if not enough data yet. */
+ * out_payload). Returns -1 on error, 0 on success, 1 if not enough data yet.
+ * Output lengths/pointer are cleared before decoding. */
 int qihse_bolt_decode_message(const uint8_t* data, size_t len,
                               uint8_t* out_sig, uint8_t** out_payload, size_t* out_payload_len,
                               size_t* out_consumed);
