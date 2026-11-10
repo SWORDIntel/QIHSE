@@ -19,7 +19,7 @@ import time
 import uuid
 
 from ct_transport_drill import (
-    IsolatedCluster, OPERATOR_PASSWORD, ROOT, ct1_receiver_status, ct1_source_status,
+    IsolatedCluster, OPERATOR_PASSWORD, ROOT,
     _free_udp_port, new_generation, parse_resp_frame, topology_id_for,
 )
 
@@ -84,16 +84,48 @@ def wait_value(session, key, expected, timeout=45):
     raise AssertionError(f"value did not converge for {key}")
 
 
-def wait_drained(source_to_receiver, receiver_to_source, label):
+def group_source_status(peer, lane_id):
+    reply = command(peer, "REPL.CT1", "STATUS", lane_id)
+    if not isinstance(reply, list) or len(reply) != 13 or reply[0] != lane_id.encode():
+        raise AssertionError(f"unexpected CT1 source lane status: {reply!r}")
+    return {
+        "source_id": reply[1].decode(), "generation": reply[2].decode(),
+        "peer_id": reply[3].decode(), "durable_position": int(reply[4]),
+        "acknowledged_position": int(reply[5]), "baseline_row_seq": int(reply[8]),
+        "baseline_stream_cut": int(reply[9]), "baseline_digest": reply[10].decode(),
+        "certificate_head": reply[11].decode(), "certificate_ack": reply[12].decode(),
+    }
+
+
+def group_receiver_status(peer, lane_id):
+    reply = command(peer, "REPL.CT1", "TARGET", lane_id, "STATUS")
+    if not isinstance(reply, list) or len(reply) != 8 or reply[0] != lane_id.encode():
+        raise AssertionError(f"unexpected CT1 receiver lane status: {reply!r}")
+    return {
+        "source_id": reply[1].decode(), "generation": reply[2].decode(),
+        "peer_id": reply[3].decode(), "durable_position": int(reply[4]),
+        "baseline_sealed": int(reply[5]) == 1,
+        "baseline_stream_cut": int(reply[6]), "baseline_digest": reply[7].decode(),
+    }
+
+
+def wait_drained(source_to_receiver, receiver_to_source, lane_id, label):
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
-        source = ct1_source_status(receiver_to_source)
-        receiver = ct1_receiver_status(source_to_receiver)
-        if (source["acknowledged_lsn"] >= source["durable_lsn"] and
-                receiver["durable_cursor"] >= source["durable_lsn"]):
+        source = group_source_status(receiver_to_source, lane_id)
+        receiver = group_receiver_status(source_to_receiver, lane_id)
+        if (source["source_id"] == receiver["source_id"] and
+                source["peer_id"] == receiver["peer_id"] and
+                source["generation"] == receiver["generation"] and
+                source["baseline_digest"] == receiver["baseline_digest"] and
+                source["baseline_stream_cut"] == receiver["baseline_stream_cut"] and
+                source["certificate_head"] == source["certificate_ack"] and
+                receiver["baseline_sealed"] and
+                source["acknowledged_position"] >= source["durable_position"] and
+                receiver["durable_position"] >= source["durable_position"]):
             return
         time.sleep(0.1)
-    raise AssertionError(f"CT1 lane {label} did not drain")
+    raise AssertionError(f"CT1 lane {label} did not drain with matching baseline/certificate metadata")
 
 
 def pending_tuple(path):
@@ -266,13 +298,10 @@ def main():
             expect_ok(command(admins[name], "SET", keys[name], values[name]),
                       f"write {name} owned group")
         for group, (outbound, inbound) in lane_clients.items():
-            wait_drained(outbound, inbound, group)
-        # Verify each data owner and its configured receiver can read the write.
-        for name in NODES:
-            wait_value(admins[name], keys[name], values[name])
-        for group in ("group-a", "group-b", "group-c"):
-            owner, successor = OWNER[group], SUCCESSOR[group]
-            wait_value(admins[successor], keys[owner], values[owner])
+            wait_drained(outbound, inbound, group_ids[group], group)
+        # Public GET remains fenced on receiver-owned slots, including for the
+        # Operator. Verify owner reads below and receiver progress via the
+        # authenticated CT1 durable cursor/status contract above.
         initial = owner_map(admins["lead"])
         if initial is None or any(sum(owner == topology[name] for owner in initial.values()) == 0
                                   for name in NODES):
@@ -291,13 +320,13 @@ def main():
         lane_clients = open_lane_clients()
         for name in NODES:
             wait_value(admins[name], keys[name], values[name])
-        wait_value(admins["successor"], keys["joiner"], values["joiner"])
-
-        # Verify the generic slot-owned classified/SCI row seeded through the
-        # authenticated qihse_kv_set_user API reached A's existing C receiver.
+        # Validate restarted B's own live owner state. Its receiver-owned C
+        # rows remain fenced from public GET until a durable ownership change.
+        wait_value(admins["successor"], keys["successor"], values["successor"])
+        # Validate A can read the protected slot while it owns it. Receiver
+        # presence is established by CT1 durable-cursor progress, not GET.
         if command(admins["lead"], "GET", protected_key) != protected_value.encode():
             raise AssertionError("generic classified source row is missing on A")
-        wait_value(admins["joiner"], protected_key, protected_value.encode())
         # Reopen C with low clearance and SCI so CT2 target authorization must
         # refuse the protected group and preserve A's durable pending tuple.
         admins["joiner"].close()
@@ -363,8 +392,9 @@ def main():
         expect_ok(command(admins["joiner"], "SET", post_transfer_key,
                           "C remains a live owner"), "write C-owned group after CT2")
         for group, (outbound, inbound) in lane_clients.items():
-            wait_drained(outbound, inbound, group)
-        wait_value(admins["successor"], post_transfer_key, b"C remains a live owner")
+            wait_drained(outbound, inbound, group_ids[group], group)
+        # B is C's replica for group C, so its ordinary GET is intentionally
+        # fenced. wait_drained() above checks the authenticated CT1 cursor.
         if any(sum(owner == topology[name] for owner in final["joiner"].values()) == 0
                for name in NODES) or \
                 sum(owner == topology["lead"] for owner in final["lead"].values()) >= 8192 or \
