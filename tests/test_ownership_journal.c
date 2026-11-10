@@ -254,14 +254,15 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
     }
     qihse_cluster_topology_destroy(disjoint_topo);
 
-    /* A still older signed event must not demote a target that has since
-     * become a replica at a newer node epoch. The local source's old slot is
-     * left for the newer primary's proof to reconcile. */
+    /* A signed A->B event can arrive after B's node epoch advanced for other
+     * ranges. Even when B remains a primary, the old proof cannot establish
+     * that A's lagging slots still belong to B; they must wait for the newer
+     * promotion chain. */
     nodes[0].role = QIHSE_CLUSTER_NODE_PRIMARY;
     nodes[0].primary_index = QIHSE_CLUSTER_NODE_NONE;
     nodes[0].config_epoch = 20;
-    nodes[1].role = QIHSE_CLUSTER_NODE_REPLICA;
-    nodes[1].primary_index = ix[3];
+    nodes[1].role = QIHSE_CLUSTER_NODE_PRIMARY;
+    nodes[1].primary_index = QIHSE_CLUSTER_NODE_NONE;
     nodes[1].config_epoch = 20;
     nodes[2].config_epoch = 20;
     nodes[3].config_epoch = 20;
@@ -279,7 +280,8 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
         &event, err, sizeof(err)));
     qihse_cluster_node_t check;
     assert(qihse_cluster_topology_get_node(stale_topo, ix[1], &check));
-    assert(check.role == QIHSE_CLUSTER_NODE_REPLICA && check.primary_index == ix[3]);
+    assert(check.role == QIHSE_CLUSTER_NODE_PRIMARY &&
+           check.primary_index == QIHSE_CLUSTER_NODE_NONE && check.config_epoch == 20);
     uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
     assert(qihse_cluster_topology_get_slot(stale_topo, 100, &owner, NULL, NULL));
     assert(owner == ix[0]);

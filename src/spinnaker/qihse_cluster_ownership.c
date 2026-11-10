@@ -2014,10 +2014,12 @@ bool qihse_cluster_ownership_receive_ct1_promotion(
     bool apply_roles = promotion_roles_can_apply(c->topology,
         txn.config_epoch, source_index, target_index, successor_index,
         &source, &target, &successor);
-    if (!apply_roles && target.role != QIHSE_CLUSTER_NODE_PRIMARY) {
-        /* This signed event is historical and the promoted node has since
-         * become a replica. Do not route stale slots to a non-primary; a
-         * newer promotion proof is responsible for those ownership changes. */
+    if (!apply_roles && target.config_epoch > txn.config_epoch) {
+        /* This signed event is historical: the target's node-wide CT
+         * relationship has advanced since the promotion. Even if the target
+         * is still a primary for other ranges, this event cannot prove that
+         * the bitmap's unresolved slots still belong to it. Keep those slots
+         * at their current owners until the newer promotion chain is known. */
         set_error(err, err_cap, "");
         return true;
     }
