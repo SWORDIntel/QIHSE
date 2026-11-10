@@ -582,21 +582,6 @@ static qihse_brain_transfer_result_t daemon_brain_group_transfer(void* opaque,
             "group transfer requires configured topology and principals");
         return QIHSE_BRAIN_TRANSFER_REJECTED;
     }
-    uint8_t selected_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
-    for (uint32_t slot = first; slot <= last; ++slot)
-        selected_slots[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
-    qihse_kv_ct_lane_status_t selected_lane;
-    memset(&selected_lane, 0, sizeof(selected_lane));
-    bool generation_ok = qihse_kv_ct_lane_source_for_slots(ownership->store,
-        control, selected_slots, &selected_lane) &&
-        !strcmp(selected_lane.generation, expected_generation);
-    OPENSSL_cleanse(selected_slots, sizeof(selected_slots));
-    OPENSSL_cleanse(&selected_lane, sizeof(selected_lane));
-    if (!generation_ok) {
-        if (error && error_cap) snprintf(error, error_cap,
-            "selected group generation changed before transfer");
-        return QIHSE_BRAIN_TRANSFER_REJECTED;
-    }
     qihse_cluster_ownership_context_t request = *ownership;
     request.principal = control;
     request.data_principal = data;
@@ -606,7 +591,7 @@ static qihse_brain_transfer_result_t daemon_brain_group_transfer(void* opaque,
     qihse_cluster_transfer_result_t result = qihse_cluster_transfer_range_group(
         &transfer, transfer_id,
         qihse_cluster_topology_local_node(ownership->topology), target,
-        first, last, error, error_cap);
+        first, last, expected_generation, error, error_cap);
     switch (result) {
         case QIHSE_CLUSTER_TRANSFER_COMMITTED: return QIHSE_BRAIN_TRANSFER_COMMITTED;
         case QIHSE_CLUSTER_TRANSFER_PENDING: return QIHSE_BRAIN_TRANSFER_PENDING;
@@ -2828,11 +2813,12 @@ static bool ct_group_failover_successor(const qihse_cluster_topology_t* topology
 static void ct_group_failover_tick(qihse_kv_store_t* store,
         qihse_cluster_ownership_context_t* ownership,
         qihse_cluster_topology_t* topology,
+        qihse_consensus_mesh_t* mesh,
         const ct_identity_map_set_t* maps,
         const qihse_qkp_replication_peer_t* allowed_peers, size_t allowed_count,
         const qihse_ct_group_config_t* groups, size_t group_count,
         uint16_t local_index, const char* local_qkp_id) {
-    if (!store || !ownership || !topology || !maps || !groups || !group_count ||
+    if (!store || !ownership || !topology || !mesh || !maps || !groups || !group_count ||
         !local_qkp_id || !*local_qkp_id) return;
     for (size_t i = 0; i < group_count; ++i) {
         qihse_kv_ct_lane_status_t lane;
@@ -2852,10 +2838,12 @@ static void ct_group_failover_tick(qihse_kv_store_t* store,
             qihse_cluster_node_t owner;
             should_promote = ct_group_current_map(
                     &(ct_group_authority_context_t){.operator_user = ownership->principal,
-                        .identity_maps = maps, .mesh = NULL},
+                        .identity_maps = maps, .mesh = mesh},
                     &groups[i], owner_topology, owner_qkp, generation,
                     successor_topology, successor_qkp) &&
                 strcmp(lane.source_id, owner_qkp) == 0 &&
+                strcmp(lane.generation, generation) == 0 &&
+                strcmp(lane.peer_id, successor_qkp) == 0 &&
                 qihse_cluster_topology_find_node(topology, owner_topology,
                     &failed_index) &&
                 qihse_cluster_topology_get_node(topology, failed_index, &owner) &&
@@ -4885,6 +4873,7 @@ int main(int argc, char** argv) {
                     OPENSSL_cleanse(all_slots, sizeof(all_slots));
                 }
                 ct_group_failover_tick(store, &ct_ownership, topology,
+                    consensus_mesh,
                     &ct_identity_maps, replication_allowed_peers,
                     replication_allowed_peer_count, ct_groups,
                     ct_group_count, indexes[self_index], pqc_node_id);

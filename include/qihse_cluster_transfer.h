@@ -55,6 +55,7 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     qihse_cluster_transfer_context_t *context, const char *transfer_id,
     uint16_t source_index, uint16_t target_index,
     uint16_t first_slot, uint16_t last_slot,
+    const char *expected_source_generation,
     char *err, size_t err_cap);
 
 /* Canonical binary claim payload for the binary-safe REPL.CT2 GROUP-* wire

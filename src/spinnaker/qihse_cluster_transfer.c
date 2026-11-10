@@ -1001,12 +1001,14 @@ static bool group_successor(qihse_cluster_ownership_context_t* ownership,
 qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     qihse_cluster_transfer_context_t* c, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first_slot,
-    uint16_t last_slot, char* err, size_t err_cap) {
+    uint16_t last_slot, const char* expected_source_generation,
+    char* err, size_t err_cap) {
     if (err && err_cap) err[0] = '\0';
     qihse_cluster_ownership_context_t* ownership = c ? c->ownership : NULL;
     if (!c || !ownership || !ownership->store || !ownership->principal ||
         !ownership->data_principal || !ownership->resp_server || !transfer_id ||
         !*transfer_id || strlen(transfer_id) > QIHSE_OWNERSHIP_ID_MAX ||
+        !expected_source_generation || strlen(expected_source_generation) != 32u ||
         first_slot > last_slot || last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
         source_index == target_index || !ownership->range_authority_context ||
         !ownership->lane_claim || !ownership->lane_verify_claim) {
@@ -1045,7 +1047,8 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
             &txn, NULL, 0)) {
         bool exact = txn.phase == QIHSE_OWNERSHIP_FINALIZED &&
             !strcmp(txn.transfer_id, transfer_id) &&
-            txn.start == first_slot && txn.end == last_slot && txn.lane_id[0];
+            txn.start == first_slot && txn.end == last_slot && txn.lane_id[0] &&
+            !strcmp(txn.generation, expected_source_generation);
         bool done = exact && qihse_cluster_ownership_transfer_finish_finalized(
             ownership, transfer_id, err, err_cap);
         OPENSSL_cleanse(&txn, sizeof(txn));
@@ -1056,6 +1059,7 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     if (qihse_cluster_ownership_transfer_get_committed(ownership, transfer_id,
             &txn, NULL, 0)) {
         bool ok = txn.start == first_slot && txn.end == last_slot &&
+            !strcmp(txn.generation, expected_source_generation) &&
             trusted_topology_mapping_matches(c, &txn, source_index, target_index) &&
             activate_and_publish(c, target_index, &txn, err, err_cap);
         OPENSSL_cleanse(&txn, sizeof(txn));
@@ -1067,6 +1071,22 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     bool recovery_may_be_needed = false;
     if (!qihse_cluster_ownership_transfer_get_prepared(ownership,
             transfer_id, &txn, NULL, 0)) {
+        uint8_t selected_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+        for (uint32_t slot = first_slot; slot <= last_slot; ++slot)
+            selected_slots[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+        qihse_kv_ct_lane_status_t current_lane;
+        memset(&current_lane, 0, sizeof(current_lane));
+        bool generation_current = qihse_kv_ct_lane_source_for_slots(
+            ownership->store, ownership->principal, selected_slots,
+            &current_lane) &&
+            strcmp(current_lane.generation, expected_source_generation) == 0;
+        OPENSSL_cleanse(selected_slots, sizeof(selected_slots));
+        OPENSSL_cleanse(&current_lane, sizeof(current_lane));
+        if (!generation_current) {
+            set_error(err, err_cap,
+                "selected source generation changed before a new transfer");
+            return QIHSE_CLUSTER_TRANSFER_REJECTED;
+        }
         if (!qihse_cluster_ownership_transfer_prepare_ex(ownership, transfer_id,
                 source_index, target_index, first_slot, last_slot,
                 &source_cut, &recovery_may_be_needed, err, err_cap))
@@ -1080,6 +1100,7 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     if (txn.phase != QIHSE_OWNERSHIP_PREPARED ||
         strcmp(txn.transfer_id, transfer_id) || txn.start != first_slot ||
         txn.end != last_slot || txn.source_lsn != source_cut ||
+        strcmp(txn.generation, expected_source_generation) != 0 ||
         !txn.lane_id[0] || !txn.generation[0] || !txn.source_qkp_id[0] ||
         !txn.target_qkp_id[0] ||
         !topology_matches(c, &txn, source_index, target_index,
