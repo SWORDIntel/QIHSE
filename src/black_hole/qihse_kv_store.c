@@ -395,6 +395,7 @@ struct qihse_kv_replica_snapshot {
     uint64_t size;
     uint64_t source_change_seq;
     qihse_user_t* principal;
+    bool owns_principal;
     uint32_t principal_id;
     uint32_t tenant_id;
     uint16_t classification;
@@ -2381,11 +2382,10 @@ typedef bool (*kv_sst_record_cb)(const char* key, const kv_disk_record_t* r, voi
  * O(keys) only for the temporary membership set used while the metadata index
  * is degraded.
  *
- * `include_tombstones` is the delta exporter's mode: a newest TOMBSTONE is
- * a deletion a delta must be able to carry, so it is emitted instead of
- * skipped (expired-but-live records are still skipped, matching the full
- * export's liveness semantics).  Every existing caller passes false and
- * keeps the live-only behavior.
+ * `include_tombstones` and `include_expired` are used by the owner recovery
+ * snapshot: those dead states are needed to avoid turning a retained delete
+ * into an apparent absence. Existing callers keep the default live-only or
+ * tombstone-only behavior.
  *
  * Returns 1 when the scan completed, 0 when the callback asked to stop,
  * -1 on error.
@@ -2397,7 +2397,7 @@ typedef bool (*kv_sst_record_cb)(const char* key, const kv_disk_record_t* r, voi
  * compaction still runs and can rebuild a healthy index afterwards.  A
  * degraded index must never block the merge that repairs it. */
 static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
-                              kv_sst_record_cb cb, void* ud) {
+                              bool include_expired, kv_sst_record_cb cb, void* ud) {
     if (!store || !store->trie || !cb) return -1;
     const bool index_usable = store->sst_meta && !store->sst_meta->degraded;
     sst_meta_index_t* seen = NULL;
@@ -2450,7 +2450,7 @@ static int sst_foreach_newest(qihse_kv_store_t* store, bool include_tombstones,
             bool expired = (!tombstone && r.expire_time_ms != 0u && r.expire_time_ms <= now);
             size_t z = 0u;
             bool shadowed = qihse_trinary_trie_search(store->trie, r.key, &z) != NULL;
-            bool emit = newest && !shadowed && !expired &&
+            bool emit = newest && !shadowed && (include_expired || !expired) &&
                         (include_tombstones || !tombstone);
             if (emit) {
                 if (!cb(r.key, &r, ud)) stopped = 1;
@@ -2511,7 +2511,7 @@ static bool compact_sstables_stream(qihse_kv_store_t* store) {
     char tmp[8192]; FILE* out = NULL;
     if (!atomic_file_begin(new_path, tmp, sizeof(tmp), &out)) return false;
     compact_emit_ctx_t wctx = { .f = out, .ok = true, .written = 0u, .store = store };
-    int rc = sst_foreach_newest(store, true, compact_emit_cb, &wctx);
+    int rc = sst_foreach_newest(store, true, false, compact_emit_cb, &wctx);
     if (rc < 0 || !wctx.ok || ferror(out)) { fclose(out); unlink(tmp); return false; }
     if (wctx.written == 0u) {
         /* Nothing live left in SSTables — drop all old files, no new one. */
@@ -5580,7 +5580,7 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
     if (store->sstable_counter > 0) {
         rc = prefix && *prefix
            ? sst_foreach_prefix_indexed(store, &ctx)
-           : sst_foreach_newest(store, false, foreach_sst_emit_cb, &ctx);
+           : sst_foreach_newest(store, false, false, foreach_sst_emit_cb, &ctx);
     }
     kv_store_unlock(store);
     return rc >= 0;
@@ -5879,6 +5879,7 @@ typedef struct {
     qihse_user_t* user;
     const char* glob;
     uint64_t now;
+    bool include_dead;
     bool ok;
     bool authorized;
 } replica_snapshot_write_ctx_t;
@@ -5889,7 +5890,8 @@ static bool replica_snapshot_write_mem_cb(const char* key, void* value,
     replica_snapshot_write_ctx_t* ctx = (replica_snapshot_write_ctx_t*)ud;
     kv_payload_t* p = (kv_payload_t*)value;
     if (!ctx || !ctx->ok || !ctx->authorized || !key || !p) return false;
-    if (fnmatch(ctx->glob, key, 0) != 0 || payload_is_dead(p, ctx->now) ||
+    if (fnmatch(ctx->glob, key, 0) != 0 ||
+        (!ctx->include_dead && payload_is_dead(p, ctx->now)) ||
         !ct_key_owned_for_read(ctx->store, key)) return true;
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
         ctx->authorized = false;
@@ -5921,19 +5923,22 @@ static bool replica_snapshot_write_sst_cb(const char* key,
 static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
                                                const char* filepath,
                                                qihse_user_t* user,
-                                               const char* glob) {
+                                               const char* glob,
+                                               bool include_dead) {
     if (!store || !store->trie || !filepath || !glob || !*glob) return -1;
-    bool fast = store->sst_meta && !store->sst_meta->degraded;
-    if (!fast && !compact_sstables_into_memtable(store)) return -1;
+    /* The newest-first SST iterator has a bounded metadata-only fallback for
+     * degraded indexes. Do not compact here: compaction intentionally drops
+     * expired rows, which an owner recovery image must preserve. */
     char tmp[8192]; FILE* f = NULL;
     if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
     replica_snapshot_write_ctx_t ctx = {
         .f = f, .store = store, .user = user, .glob = glob, .now = current_time_ms(),
-        .ok = true, .authorized = true
+        .include_dead = include_dead, .ok = true, .authorized = true
     };
     qihse_trinary_trie_foreach(store->trie, replica_snapshot_write_mem_cb, &ctx);
-    if (ctx.ok && ctx.authorized && fast) {
-        int rc = sst_foreach_newest(store, false, replica_snapshot_write_sst_cb, &ctx);
+    if (ctx.ok && ctx.authorized && store->sstable_counter > 0) {
+        int rc = sst_foreach_newest(store, include_dead, include_dead,
+                                    replica_snapshot_write_sst_cb, &ctx);
         if (rc < 0) ctx.ok = false;
     }
     if (!ctx.authorized) { fclose(f); unlink(tmp); errno = EACCES; return -2; }
@@ -5976,7 +5981,7 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
     export_write_ctx_t wr = { .f = f, .now = now, .ok = true };
     qihse_trinary_trie_foreach(store->trie, export_write_cb, &wr);
     if (wr.ok && fast) {
-        int rc = sst_foreach_newest(store, false, export_sst_write_cb, &wr);
+        int rc = sst_foreach_newest(store, false, false, export_sst_write_cb, &wr);
         if (rc < 0) wr.ok = false;
     }
     if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); kv_store_unlock(store); return -1; }
@@ -6005,7 +6010,7 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
      * authorized snapshot. The name is never sent over the replication wire. */
     kv_store_wrlock(store);
     int save_rc = store->recovery_pending ? -1 :
-        qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob);
+        qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob, false);
     /* The data file and this watermark must describe the same locked store
      * view. Callers can safely resume delta replication after this value. */
     uint64_t source_change_seq = save_rc == 0 ? store->change_seq : 0u;
@@ -6036,6 +6041,82 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
     snapshot->tenant_id = qihse_user_get_tenant_id(user);
     snapshot->classification = qihse_user_get_classification(user);
     snapshot->sci = qihse_user_get_sci(user);
+    *out_snapshot = snapshot;
+    return 0;
+}
+
+int qihse_kv_ct_owner_data_snapshot_create(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal,
+    qihse_kv_replica_snapshot_t** out_snapshot) {
+    if (out_snapshot) *out_snapshot = NULL;
+    if (!store || store->memory_snapshot || !out_snapshot ||
+        !ct_admin(operator_principal) ||
+        !qihse_auth_can_access(operator_principal, UINT16_MAX, UINT16_MAX)) {
+        errno = EACCES;
+        return -2;
+    }
+    qihse_user_t* principal = operator_principal;
+    if (!qihse_auth_user_is_active(principal) ||
+        !qihse_auth_can_access(principal, UINT16_MAX, UINT16_MAX)) {
+        errno = EACCES;
+        return -2;
+    }
+    const char* dir = get_qihse_data_dir();
+    if (!dir) return -1;
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%sqihse-owner-backup-XXXXXX", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    int seed_fd = mkstemp(path);
+    if (seed_fd < 0) return -1;
+    (void)fchmod(seed_fd, 0600);
+    close(seed_fd);
+
+    kv_store_wrlock(store);
+    bool owner_ready = store->ct_enabled && store->ct_mode == 1u &&
+        store->ct_admitted && !store->recovery_pending &&
+        store->ct_fence_state == 0u && store->ct_transfer_phase == 0u &&
+        store->ct_transfer_source_id[0] == '\0';
+    if (!owner_ready) errno = EBUSY;
+    int save_rc = owner_ready
+        ? qihse_kv_save_replica_snapshot_file(store, path, principal, "*", true)
+        : -1;
+    uint64_t source_change_seq = save_rc == 0 ? store->change_seq : 0u;
+    kv_store_unlock(store);
+    if (!qihse_auth_user_is_active(principal) ||
+        !qihse_auth_can_access(principal, UINT16_MAX, UINT16_MAX)) {
+        save_rc = -2; errno = EACCES;
+    }
+    if (save_rc != 0) {
+        int saved_errno = errno;
+        (void)unlink(path);
+        errno = saved_errno;
+        return saved_errno == EACCES ? -2 : -1;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int saved_errno = errno;
+    (void)unlink(path);
+    if (fd < 0) { errno = saved_errno; return -1; }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(fd);
+        return -1;
+    }
+    qihse_kv_replica_snapshot_t* snapshot = calloc(1u, sizeof(*snapshot));
+    if (!snapshot) {
+        close(fd);
+        return -1;
+    }
+    snapshot->fd = fd;
+    snapshot->size = (uint64_t)st.st_size;
+    snapshot->source_change_seq = source_change_seq;
+    snapshot->principal = principal;
+    snapshot->owns_principal = false; /* Caller owns this explicit principal. */
+    snapshot->principal_id = qihse_user_get_id(principal);
+    snapshot->tenant_id = qihse_user_get_tenant_id(principal);
+    snapshot->classification = qihse_user_get_classification(principal);
+    snapshot->sci = qihse_user_get_sci(principal);
     *out_snapshot = snapshot;
     return 0;
 }
@@ -6101,6 +6182,8 @@ bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
 void qihse_kv_replica_snapshot_destroy(qihse_kv_replica_snapshot_t* snapshot) {
     if (!snapshot) return;
     if (snapshot->fd >= 0) close(snapshot->fd);
+    if (snapshot->owns_principal)
+        qihse_auth_release_principal_scoped(snapshot->principal);
     free(snapshot);
 }
 
@@ -6207,6 +6290,137 @@ qihse_kv_store_t* qihse_kv_open_snapshot_user(FILE* stream, qihse_user_t* user,
     if (!qihse_auth_user_is_active(user)) failure = EACCES;
     if (failure) { qihse_kv_store_destroy(store); errno = failure; return NULL; }
     return store;
+}
+
+typedef struct {
+    qihse_kv_store_t* store;
+    qihse_user_t* user;
+    qihse_kv_snapshot_record_cb callback;
+    void* user_data;
+    bool authorized;
+    bool callback_ok;
+} snapshot_iter_ctx_t;
+
+static bool snapshot_iter_record_cb(const char* key, void* value,
+    size_t value_size, void* opaque) {
+    (void)value_size;
+    snapshot_iter_ctx_t* ctx = opaque;
+    kv_payload_t* p = value;
+    if (!ctx || !ctx->authorized || !ctx->callback_ok || !key || !p) return false;
+    if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) {
+        ctx->authorized = false;
+        return false;
+    }
+    qihse_kv_record_meta_t metadata = {
+        .classification = p->classification,
+        .sci_compartment = p->sci_compartment,
+        .expire_time_ms = p->expire_time_ms,
+        .change_seq = p->change_seq,
+        .flags = p->flags
+    };
+    if (!ctx->callback(key, p->val, &metadata, ctx->user_data)) {
+        ctx->callback_ok = false;
+        return false;
+    }
+    return true;
+}
+
+bool qihse_kv_snapshot_foreach_record_user(qihse_kv_store_t* snapshot,
+    qihse_user_t* user, qihse_kv_snapshot_record_cb callback, void* user_data) {
+    if (!snapshot || !snapshot->memory_snapshot || !snapshot->trie ||
+        !user || !qihse_auth_user_is_active(user) || !callback) {
+        errno = EACCES;
+        return false;
+    }
+    kv_store_rdlock(snapshot);
+    snapshot_iter_ctx_t ctx = {
+        .store = snapshot, .user = user, .callback = callback,
+        .user_data = user_data, .authorized = true, .callback_ok = true
+    };
+    qihse_trinary_trie_foreach(snapshot->trie, snapshot_iter_record_cb, &ctx);
+    bool ok = ctx.authorized && ctx.callback_ok && qihse_auth_user_is_active(user);
+    kv_store_unlock(snapshot);
+    if (!ok) errno = ctx.authorized ? EIO : EACCES;
+    return ok;
+}
+
+bool qihse_kv_snapshot_get_record_user(qihse_kv_store_t* snapshot,
+    const char* key, qihse_user_t* user, char** out_value,
+    qihse_kv_record_meta_t* out_metadata) {
+    if (out_value) *out_value = NULL;
+    if (out_metadata) memset(out_metadata, 0, sizeof(*out_metadata));
+    if (!snapshot || !snapshot->memory_snapshot || !snapshot->trie || !key ||
+        !user || !qihse_auth_user_is_active(user) || !out_value || !out_metadata) {
+        errno = EACCES;
+        return false;
+    }
+    kv_store_rdlock(snapshot);
+    size_t value_size = 0u;
+    kv_payload_t* p = qihse_trinary_trie_search(snapshot->trie, key, &value_size);
+    bool ok = p && qihse_auth_can_access(user, p->classification, p->sci_compartment);
+    char* copy = ok ? strdup(p->val) : NULL;
+    if (ok && !copy) ok = false;
+    if (ok) {
+        *out_metadata = (qihse_kv_record_meta_t){
+            .classification = p->classification,
+            .sci_compartment = p->sci_compartment,
+            .expire_time_ms = p->expire_time_ms,
+            .change_seq = p->change_seq,
+            .flags = p->flags
+        };
+        *out_value = copy;
+    }
+    kv_store_unlock(snapshot);
+    if (!ok) errno = p ? EACCES : ENOENT;
+    return ok;
+}
+
+typedef struct { FILE* file; bool ok; } snapshot_save_ctx_t;
+static bool snapshot_save_record_cb(const char* key, const char* value,
+    const qihse_kv_record_meta_t* metadata, void* opaque) {
+    snapshot_save_ctx_t* ctx = opaque;
+    if (!ctx || !ctx->ok || !metadata) return false;
+    ctx->ok = disk_record_write_fields(ctx->file, key, value,
+        metadata->expire_time_ms, metadata->classification,
+        metadata->sci_compartment, metadata->flags, metadata->change_seq);
+    return ctx->ok;
+}
+
+int qihse_kv_snapshot_save_user(qihse_kv_store_t* snapshot,
+    const char* filepath, qihse_user_t* user) {
+    if (!snapshot || !snapshot->memory_snapshot || !filepath || !*filepath || !user) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (!principal || !generation ||
+        !qihse_auth_validate_handle_generation(principal, generation)) {
+        if (principal) qihse_auth_release_principal_scoped(principal);
+        errno = EACCES;
+        return -2;
+    }
+    char tmp[8192];
+    FILE* file = NULL;
+    if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &file)) {
+        qihse_auth_release_principal_scoped(principal);
+        return -1;
+    }
+    snapshot_save_ctx_t ctx = {.file = file, .ok = true};
+    bool iter_ok = qihse_kv_snapshot_foreach_record_user(
+        snapshot, principal, snapshot_save_record_cb, &ctx);
+    if (!iter_ok || !ctx.ok || ferror(file) ||
+        !qihse_auth_validate_handle_generation(principal, generation)) {
+        fclose(file);
+        unlink(tmp);
+        qihse_auth_release_principal_scoped(principal);
+        errno = iter_ok && ctx.ok ? EACCES : EIO;
+        return iter_ok && ctx.ok ? -2 : -1;
+    }
+    bool committed = atomic_file_commit(file, tmp, filepath);
+    qihse_auth_release_principal_scoped(principal);
+    return committed ? 0 : -1;
 }
 
 static bool replica_snapshot_file_valid(const char* filepath, qihse_user_t* principal,
@@ -6729,7 +6943,7 @@ static int kv_export_incremental_common(qihse_kv_store_t* store, qihse_user_t* u
     if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return -1; }
     qihse_trinary_trie_foreach(store->trie, delta_trie_cb, &ctx);
     if (ctx.ok && fast) {
-        int rc = sst_foreach_newest(store, true, delta_sst_cb, &ctx);
+        int rc = sst_foreach_newest(store, true, false, delta_sst_cb, &ctx);
         if (rc < 0) ctx.ok = false;
     }
     if (!ctx.ok) {

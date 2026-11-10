@@ -396,6 +396,13 @@ void qihse_kv_store_set_replication_principal_id(qihse_kv_store_t* store,
 int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user,
                                      const char* namespace_glob,
                                      qihse_kv_replica_snapshot_t** out_snapshot);
+/* Authenticated, CT1-owner-only data backup. Unlike the replication baseline
+ * snapshot, this captures tombstones and expired rows as well as live rows,
+ * and it does not advance or persist a replication cursor. The snapshot is
+ * data-only: it is not a continuation point for the CT journal. */
+int qihse_kv_ct_owner_data_snapshot_create(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal,
+    qihse_kv_replica_snapshot_t** out_snapshot);
 bool qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot,
     qihse_user_t* principal, uint64_t* out_size);
 /* Change-sequence watermark captured while the immutable snapshot bytes were
@@ -461,6 +468,22 @@ typedef struct {
     uint64_t change_seq;       /* immutable local mutation LSN */
     uint8_t  flags;            /* WAL record flags (tombstone bit etc.) */
 } qihse_kv_record_meta_t;
+
+typedef bool (*qihse_kv_snapshot_record_cb)(const char* key, const char* value,
+    const qihse_kv_record_meta_t* metadata, void* user_data);
+/* These helpers are restricted to detached snapshots opened by
+ * qihse_kv_open_snapshot_user(). They enumerate/read retained dead records
+ * too, with full per-record authorization. Callback strings are borrowed for
+ * the callback duration; a callback false stops enumeration. */
+bool qihse_kv_snapshot_foreach_record_user(qihse_kv_store_t* snapshot,
+    qihse_user_t* user, qihse_kv_snapshot_record_cb callback, void* user_data);
+bool qihse_kv_snapshot_get_record_user(qihse_kv_store_t* snapshot,
+    const char* key, qihse_user_t* user, char** out_value,
+    qihse_kv_record_meta_t* out_metadata);
+/* Serialize every row of a detached snapshot, including tombstones and
+ * expired values, to a private atomic QFS image. */
+int qihse_kv_snapshot_save_user(qihse_kv_store_t* snapshot,
+    const char* filepath, qihse_user_t* user);
 
 bool qihse_kv_meta_user(qihse_kv_store_t* store, const char* key,
                         qihse_user_t* user, qihse_kv_record_meta_t* out);

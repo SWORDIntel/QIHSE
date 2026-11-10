@@ -152,7 +152,7 @@ static bool backup_decode_header(const uint8_t in[BACKUP_HEADER_BYTES],
     if (version != BACKUP_VERSION) return false;
     backup_get_bytes(in, BACKUP_OFF_TYPE, &type, 4u);
     if (type != (uint32_t)BACKUP_FULL && type != (uint32_t)BACKUP_INCREMENTAL &&
-        type != (uint32_t)BACKUP_WAL) {
+        type != (uint32_t)BACKUP_WAL && type != (uint32_t)BACKUP_OWNER_DATA) {
         return false;
     }
     memset(out, 0, sizeof(*out));
@@ -264,6 +264,33 @@ static bool backup_finish_file(FILE* f) {
     return ok;
 }
 
+/* The temp file is already fsynced before rename. Persist the new directory
+ * entry too; after a successful return, the requested backup name survives a
+ * power loss. A failure after rename is ambiguous: keep the published file
+ * and return an error rather than deleting a candidate or implying rollback. */
+static bool backup_fsync_parent(const char* path) {
+    if (!path || !*path) return false;
+    char parent[BACKUP_PATH_MAX];
+    size_t length = strnlen(path, sizeof(parent));
+    if (length == 0u || length >= sizeof(parent)) return false;
+    memcpy(parent, path, length + 1u);
+    char* slash = strrchr(parent, '/');
+    if (!slash) {
+        memcpy(parent, ".", 2u);
+    } else if (slash == parent) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    int fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return ok;
+}
+
 /* Stream `len` bytes out of `src`, optionally into `dst` and always through
  * the running hash.  A short read is reported rather than padded, so a
  * truncated container cannot be verified as if it were whole.  `buf` is the
@@ -330,6 +357,8 @@ static void backup_info_commit(qihse_backup_info_t* info, const backup_header_t*
 static int backup_seal_container(const char* output_path, backup_type_t type,
                                  uint64_t start_lsn, uint64_t end_lsn,
                                  const char* data_path, const qihse_user_t* user,
+                                 uint64_t principal_generation,
+                                 bool* out_published,
                                  qihse_backup_info_t* info) {
     int result = QIHSE_BACKUP_EXPORT_ERR;
     FILE* data_f = NULL;
@@ -338,6 +367,7 @@ static int backup_seal_container(const char* output_path, backup_type_t type,
     char tmp_path[BACKUP_PATH_MAX];
     bool tmp_pending = false;
     uint64_t data_bytes = 0u, moved = 0u, checksum = 0u;
+    if (out_published) *out_published = false;
 
     data_f = backup_open_read(data_path);
     if (!data_f) goto done;
@@ -391,11 +421,16 @@ static int backup_seal_container(const char* output_path, backup_type_t type,
      * damages the previous backup that was there. */
     if (!backup_finish_file(out_f)) { out_f = NULL; goto done; }
     out_f = NULL;
-    if (!qihse_auth_user_is_active(user)) {
+    if (!qihse_auth_validate_handle_generation(user, principal_generation)) {
         result = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
     }
     if (rename(tmp_path, output_path) != 0) goto done;
     tmp_pending = false;
+    if (out_published) *out_published = true;
+    if (!backup_fsync_parent(output_path)) goto done;
+    if (!qihse_auth_validate_handle_generation(user, principal_generation)) {
+        result = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
+    }
 
     backup_info_commit(info, &h);
     result = QIHSE_BACKUP_EXPORT_OK;
@@ -422,28 +457,57 @@ static int backup_write_container(qihse_kv_store_t* kv, qihse_user_t* user,
                                   uint64_t since_seq, qihse_backup_info_t* info,
                                   int (*produce)(qihse_kv_store_t*, const char*,
                                                  qihse_user_t*, uint64_t, uint64_t*)) {
+    int gate = backup_principal_gate(user);
+    if (gate != QIHSE_BACKUP_EXPORT_OK) {
+        qihse_backup_info_free(info);
+        if (info) memset(info, 0, sizeof(*info));
+        return gate;
+    }
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (!principal || !generation ||
+        qihse_user_get_id(principal) != qihse_user_get_id(user) ||
+        !qihse_auth_validate_handle_generation(principal, generation)) {
+        if (principal) qihse_auth_release_principal_scoped(principal);
+        qihse_backup_info_free(info);
+        if (info) memset(info, 0, sizeof(*info));
+        return QIHSE_BACKUP_EXPORT_DENIED;
+    }
     char data_path[BACKUP_PATH_MAX];
     if (!backup_sibling_path(output_path, ".data", data_path, sizeof(data_path))) {
+        qihse_auth_release_principal_scoped(principal);
         qihse_backup_info_free(info);
         if (info) memset(info, 0, sizeof(*info));
         return QIHSE_BACKUP_EXPORT_ERR;
     }
     uint64_t resume_seq = 0u;
-    int save_rc = produce(kv, data_path, user, since_seq, &resume_seq);
+    int save_rc = produce(kv, data_path, principal, since_seq, &resume_seq);
     /* The KV layer only ever leaves a file at data_path when it returns 0,
      * so a truncated or unbuilt scratch path is never unlinked. */
     if (save_rc == -2) {
+        qihse_auth_release_principal_scoped(principal);
         qihse_backup_info_free(info);
         if (info) memset(info, 0, sizeof(*info));
         return QIHSE_BACKUP_EXPORT_DENIED;
     }
     if (save_rc != 0) {
+        qihse_auth_release_principal_scoped(principal);
         qihse_backup_info_free(info);
         if (info) memset(info, 0, sizeof(*info));
         return QIHSE_BACKUP_EXPORT_ERR;
     }
-    return backup_seal_container(output_path, type, since_seq, resume_seq,
-                                 data_path, user, info);
+    if (!qihse_auth_validate_handle_generation(principal, generation)) {
+        unlink(data_path);
+        qihse_auth_release_principal_scoped(principal);
+        qihse_backup_info_free(info);
+        if (info) memset(info, 0, sizeof(*info));
+        return QIHSE_BACKUP_EXPORT_DENIED;
+    }
+    int result = backup_seal_container(output_path, type, since_seq, resume_seq,
+                                       data_path, principal, generation, NULL, info);
+    qihse_auth_release_principal_scoped(principal);
+    return result;
 }
 
 /* The full writer's data-section producer: the KV layer's authorization-
@@ -471,6 +535,261 @@ int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
     if (!backup_info_reserve(info, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
     return backup_write_container(kv, user, output_path, BACKUP_FULL, 0u, info,
                                   backup_full_produce);
+}
+
+struct qihse_backup_owner_snapshot {
+    int fd;
+    uint64_t size;
+    qihse_user_t* principal;
+    uint64_t principal_generation;
+    uint32_t principal_id;
+    uint32_t tenant_id;
+    uint16_t classification;
+    uint16_t sci;
+};
+
+static bool owner_snapshot_authorized(
+    const qihse_backup_owner_snapshot_t* snapshot, qihse_user_t* user) {
+    return snapshot && snapshot->fd >= 0 && user &&
+        qihse_user_get_id(user) == snapshot->principal_id &&
+        qihse_user_get_tenant_id(user) == snapshot->tenant_id &&
+        qihse_auth_validate_handle_generation(user, snapshot->principal_generation) &&
+        qihse_auth_can_access(user, snapshot->classification, snapshot->sci);
+}
+
+int qihse_backup_owner_snapshot_create(qihse_kv_store_t* kv, qihse_user_t* user,
+    qihse_backup_owner_snapshot_t** out_snapshot, uint64_t* out_source_change_seq) {
+    if (out_snapshot) *out_snapshot = NULL;
+    if (out_source_change_seq) *out_source_change_seq = 0u;
+    if (!kv || !user || !out_snapshot || !out_source_change_seq)
+        return QIHSE_BACKUP_EXPORT_ERR;
+    int rc = backup_principal_gate(user);
+    if (rc != QIHSE_BACKUP_EXPORT_OK) return rc;
+
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (!principal || !generation || qihse_user_get_id(principal) != qihse_user_get_id(user) ||
+        !qihse_auth_validate_handle_generation(principal, generation) ||
+        !qihse_auth_can_access(principal, UINT16_MAX, UINT16_MAX)) {
+        if (principal) qihse_auth_release_principal_scoped(principal);
+        errno = EACCES;
+        return QIHSE_BACKUP_EXPORT_DENIED;
+    }
+
+    int result = QIHSE_BACKUP_EXPORT_ERR;
+    qihse_kv_replica_snapshot_t* raw_snapshot = NULL;
+    qihse_backup_owner_snapshot_t* snapshot = NULL;
+    uint8_t* chunk = NULL;
+    char raw_path[BACKUP_PATH_MAX] = {0};
+    char container_path[BACKUP_PATH_MAX] = {0};
+    char unique_path[BACKUP_PATH_MAX] = {0};
+    FILE* raw_out = NULL;
+    bool raw_pending = false, container_pending = false;
+    const char* dir = qihse_kv_store_data_directory(kv);
+    if (!dir) goto done;
+
+    int snap_rc = qihse_kv_ct_owner_data_snapshot_create(kv, principal, &raw_snapshot);
+    if (snap_rc == -2) { result = QIHSE_BACKUP_EXPORT_DENIED; goto done; }
+    if (snap_rc != 0) goto done;
+    uint64_t raw_size = 0u, source_seq = 0u;
+    if (!qihse_kv_replica_snapshot_size(raw_snapshot, principal, &raw_size) ||
+        !qihse_kv_replica_snapshot_change_seq(raw_snapshot, principal, &source_seq)) {
+        result = errno == EACCES ? QIHSE_BACKUP_EXPORT_DENIED : QIHSE_BACKUP_EXPORT_ERR;
+        goto done;
+    }
+
+    int n = snprintf(raw_path, sizeof(raw_path), "%sqihse-owner-data-%ld-XXXXXX",
+                     dir, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(raw_path)) goto done;
+    int raw_fd = mkstemp(raw_path);
+    if (raw_fd < 0) goto done;
+    raw_pending = true;
+    (void)fchmod(raw_fd, 0600);
+    raw_out = fdopen(raw_fd, "wb");
+    if (!raw_out) { close(raw_fd); goto done; }
+
+    chunk = malloc(BACKUP_COPY_CHUNK);
+    if (!chunk) goto done;
+    uint64_t offset = 0u;
+    while (offset < raw_size) {
+        size_t got = 0u;
+        size_t want = raw_size - offset < BACKUP_COPY_CHUNK
+            ? (size_t)(raw_size - offset) : BACKUP_COPY_CHUNK;
+        if (!qihse_kv_replica_snapshot_read(raw_snapshot, principal, offset,
+                chunk, want, &got) || got != want || fwrite(chunk, 1u, got, raw_out) != got) {
+            result = errno == EACCES ? QIHSE_BACKUP_EXPORT_DENIED : QIHSE_BACKUP_EXPORT_ERR;
+            goto done;
+        }
+        offset += got;
+    }
+    if (!backup_finish_file(raw_out)) { raw_out = NULL; goto done; }
+    raw_out = NULL;
+
+    if (!qihse_auth_validate_handle_generation(principal, generation)) {
+        result = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
+    }
+    n = snprintf(unique_path, sizeof(unique_path),
+                 "%sqihse-owner-container-%ld-XXXXXX", dir, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(unique_path)) goto done;
+    int seed_fd = mkstemp(unique_path);
+    if (seed_fd < 0) goto done;
+    (void)fchmod(seed_fd, 0600);
+    close(seed_fd);
+    container_pending = true;
+    memcpy(container_path, unique_path, strlen(unique_path) + 1u);
+    bool published = false;
+    int seal_rc = backup_seal_container(container_path, BACKUP_OWNER_DATA, 0u,
+            source_seq, raw_path, principal, generation, &published, NULL);
+    if (published) container_pending = false;
+    if (seal_rc != QIHSE_BACKUP_EXPORT_OK) {
+        raw_pending = false; /* sealer always consumes the data path */
+        goto done;
+    }
+    raw_pending = false;
+
+    int fd = open(container_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) goto done;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        !qihse_auth_validate_handle_generation(principal, generation)) {
+        int saved = errno ? errno : EACCES;
+        close(fd); errno = saved; goto done;
+    }
+    (void)unlink(container_path);
+    container_pending = false;
+    snapshot = calloc(1u, sizeof(*snapshot));
+    if (!snapshot) { close(fd); goto done; }
+    snapshot->fd = fd;
+    snapshot->size = (uint64_t)st.st_size;
+    snapshot->principal = principal;
+    snapshot->principal_generation = generation;
+    snapshot->principal_id = qihse_user_get_id(principal);
+    snapshot->tenant_id = qihse_user_get_tenant_id(principal);
+    snapshot->classification = qihse_user_get_classification(principal);
+    snapshot->sci = qihse_user_get_sci(principal);
+    *out_source_change_seq = source_seq;
+    *out_snapshot = snapshot;
+    principal = NULL; /* snapshot now owns the scoped principal reference */
+    result = QIHSE_BACKUP_EXPORT_OK;
+
+done:
+    if (raw_out) fclose(raw_out);
+    if (raw_pending) unlink(raw_path);
+    if (container_pending) unlink(unique_path);
+    if (raw_snapshot) qihse_kv_replica_snapshot_destroy(raw_snapshot);
+    free(chunk);
+    if (principal) qihse_auth_release_principal_scoped(principal);
+    if (result != QIHSE_BACKUP_EXPORT_OK && snapshot) {
+        if (snapshot->fd >= 0) close(snapshot->fd);
+        free(snapshot);
+    }
+    return result;
+}
+
+bool qihse_backup_owner_snapshot_size(const qihse_backup_owner_snapshot_t* snapshot,
+    qihse_user_t* user, uint64_t* out_size) {
+    if (out_size) *out_size = 0u;
+    if (!out_size || !owner_snapshot_authorized(snapshot, user)) {
+        errno = EACCES; return false;
+    }
+    *out_size = snapshot->size;
+    return true;
+}
+
+bool qihse_backup_owner_snapshot_read(qihse_backup_owner_snapshot_t* snapshot,
+    qihse_user_t* user, uint64_t offset, void* out, size_t capacity, size_t* out_read) {
+    if (out_read) *out_read = 0u;
+    if (!snapshot || !out_read || (capacity && !out) || offset > snapshot->size ||
+        !owner_snapshot_authorized(snapshot, user)) {
+        if (out && capacity) memset(out, 0, capacity);
+        errno = EACCES; return false;
+    }
+    size_t want = snapshot->size - offset < (uint64_t)capacity
+        ? (size_t)(snapshot->size - offset) : capacity;
+    size_t done = 0u;
+    while (done < want) {
+        ssize_t n = pread(snapshot->fd, (char*)out + done, want - done,
+                          (off_t)(offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    if (!owner_snapshot_authorized(snapshot, user)) {
+        if (done) memset(out, 0, done);
+        errno = EACCES; return false;
+    }
+    *out_read = done;
+    return true;
+}
+
+void qihse_backup_owner_snapshot_destroy(qihse_backup_owner_snapshot_t* snapshot) {
+    if (!snapshot) return;
+    if (snapshot->fd >= 0) close(snapshot->fd);
+    qihse_auth_release_principal_scoped(snapshot->principal);
+    free(snapshot);
+}
+
+int qihse_backup_owner_data_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                                 const char* output_path,
+                                 qihse_backup_info_t* info) {
+    if (info) memset(info, 0, sizeof(*info));
+    if (!kv || !user || !output_path || !*output_path)
+        return QIHSE_BACKUP_EXPORT_ERR;
+    if (!backup_info_reserve(info, output_path)) return QIHSE_BACKUP_EXPORT_ERR;
+    qihse_backup_owner_snapshot_t* snapshot = NULL;
+    uint64_t source_seq = 0u, size = 0u;
+    int rc = qihse_backup_owner_snapshot_create(kv, user, &snapshot, &source_seq);
+    if (rc != QIHSE_BACKUP_EXPORT_OK) goto done;
+    if (!qihse_backup_owner_snapshot_size(snapshot, snapshot->principal, &size)) {
+        rc = QIHSE_BACKUP_EXPORT_DENIED; goto done;
+    }
+    char tmp_path[BACKUP_PATH_MAX];
+    if (!backup_sibling_path(output_path, ".owner", tmp_path, sizeof(tmp_path))) {
+        rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
+    }
+    FILE* out = backup_create_exclusive(tmp_path);
+    if (!out) { rc = QIHSE_BACKUP_EXPORT_ERR; goto done; }
+    bool ok = true;
+    uint8_t* buf = malloc(BACKUP_COPY_CHUNK);
+    if (!buf) ok = false;
+    uint64_t off = 0u;
+    while (ok && off < size) {
+        size_t got = 0u;
+        size_t want = size - off < BACKUP_COPY_CHUNK ? (size_t)(size - off) : BACKUP_COPY_CHUNK;
+        if (!qihse_backup_owner_snapshot_read(snapshot, snapshot->principal, off,
+                buf, want, &got) || got != want || fwrite(buf, 1u, got, out) != got) ok = false;
+        off += got;
+    }
+    free(buf);
+    if (!ok || !backup_finish_file(out)) {
+        if (ok) out = NULL;
+        else fclose(out);
+        unlink(tmp_path); rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
+    }
+    if (!owner_snapshot_authorized(snapshot, snapshot->principal)) {
+        unlink(tmp_path); rc = QIHSE_BACKUP_EXPORT_DENIED; goto done;
+    }
+    if (rename(tmp_path, output_path) != 0 || !backup_fsync_parent(output_path)) {
+        unlink(tmp_path); rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
+    }
+    backup_header_t h;
+    FILE* verify = backup_open_read(output_path);
+    uint8_t header[BACKUP_HEADER_BYTES];
+    if (!verify || fread(header, 1u, sizeof(header), verify) != sizeof(header) ||
+        !backup_decode_header(header, &h) || h.type != BACKUP_OWNER_DATA) {
+        if (verify) fclose(verify);
+        rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
+    }
+    fclose(verify);
+    backup_info_commit(info, &h);
+    rc = QIHSE_BACKUP_EXPORT_OK;
+done:
+    if (snapshot) qihse_backup_owner_snapshot_destroy(snapshot);
+    if (rc != QIHSE_BACKUP_EXPORT_OK && info) {
+        qihse_backup_info_free(info); memset(info, 0, sizeof(*info));
+    }
+    return rc;
 }
 
 /* The incremental writer's data-section producer: the KV layer's delta
@@ -525,7 +844,9 @@ int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* bac
      * the whole store would silently drop every record the delta did not
      * carry.  A delta is applied by a delta-aware consumer against the base
      * it extends, not by whole-store restore. */
-    if (h.type != BACKUP_FULL) { result = QIHSE_BACKUP_EXPORT_UNSUPPORTED; goto done; }
+    if (h.type != BACKUP_FULL && h.type != BACKUP_OWNER_DATA) {
+        result = QIHSE_BACKUP_EXPORT_UNSUPPORTED; goto done;
+    }
 
     struct stat st;
     if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) goto done;
@@ -566,7 +887,9 @@ int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* bac
      * record's classification: it refuses the WHOLE load (EACCES) if any
      * record is outside this principal's clearance/SCI, and its load is
      * transactional, so a denial leaves the live dataset untouched rather
-     * than half-restored (AGENTS.md invariants 1 and 2). */
+     * than half-restored (AGENTS.md invariants 1 and 2). Owner-data images
+     * are data-only recovery images and the KV layer's CT guard prevents
+     * importing one into an active CT source; it never resumes CT cursors. */
     int load_rc = qihse_kv_load_user(kv, scratch_path, user);
     if (load_rc == -2) { result = QIHSE_BACKUP_EXPORT_DENIED; goto done; }
     if (load_rc != 0) goto done;
@@ -582,7 +905,7 @@ done:
 
 /* A verified detached view; never opens a configured storage directory. */
 static qihse_kv_store_t* backup_merge_open(qihse_user_t* user, const char* path,
-    size_t max_bytes, size_t max_records, int* result) {
+    size_t max_bytes, size_t max_records, backup_type_t* out_type, int* result) {
     FILE* in = backup_open_read(path);
     FILE* raw = NULL;
     uint8_t* chunk = NULL;
@@ -593,7 +916,8 @@ static qihse_kv_store_t* backup_merge_open(qihse_user_t* user, const char* path,
     *result = QIHSE_BACKUP_EXPORT_ERR;
     if (!in) goto done;
     if (fread(encoded, 1, sizeof(encoded), in) != sizeof(encoded) ||
-        !backup_decode_header(encoded, &h) || h.type != BACKUP_FULL ||
+        !backup_decode_header(encoded, &h) ||
+        (h.type != BACKUP_FULL && h.type != BACKUP_OWNER_DATA) ||
         h.data_length > max_bytes || fstat(fileno(in), &st) || st.st_size < 0 ||
         (uint64_t)st.st_size != BACKUP_HEADER_BYTES + h.data_length) goto done;
     *result = backup_container_gate(user, &h);
@@ -608,7 +932,7 @@ static qihse_kv_store_t* backup_merge_open(qihse_user_t* user, const char* path,
             BACKUP_COPY_CHUNK, &moved) || hash != h.checksum ||
         fflush(raw) || fseeko(raw, 0, SEEK_SET)) goto done;
     view = qihse_kv_open_snapshot_user(raw, user, max_bytes, max_records);
-    if (view) *result = QIHSE_BACKUP_EXPORT_OK;
+    if (view) { *out_type = h.type; *result = QIHSE_BACKUP_EXPORT_OK; }
     else if (errno == EACCES) *result = QIHSE_BACKUP_EXPORT_DENIED;
 done:
     if (in) fclose(in);
@@ -623,28 +947,55 @@ typedef struct {
     FILE* out;
     qihse_backup_merge_stats_t stats;
     size_t max_bytes;
+    size_t max_records;
+    size_t records;
+    uint64_t principal_generation;
+    bool owner_data;
+    bool denied;
     bool ok;
 } backup_merge_context;
 
-static bool backup_merge_row(const char* key, const char* value,
-    uint16_t classification, uint16_t sci, void* opaque) {
+static bool backup_merge_row_common(const char* key, const char* value,
+    const qihse_kv_record_meta_t* incoming_meta, uint16_t classification,
+    uint16_t sci, void* opaque) {
     backup_merge_context* c = opaque;
-    qihse_kv_record_meta_t m, old;
-    if (!qihse_kv_meta_user(c->incoming, key, c->user, &m)) {
-        /* Expiry may have elapsed since enumeration. Never resurrect it. */
-        return true;
+    if (!qihse_auth_validate_handle_generation(c->user,
+                                               c->principal_generation)) {
+        c->denied = true; c->ok = false; errno = EACCES; return false;
     }
-    char* existing = qihse_kv_get_user(c->base, key, c->user);
-    if (existing) {
-        bool same = qihse_kv_meta_user(c->base, key, c->user, &old) &&
-            !strcmp(existing, value) && old.classification == classification &&
-            old.sci_compartment == sci && old.expire_time_ms == m.expire_time_ms &&
-            old.flags == m.flags;
+    qihse_kv_record_meta_t m = incoming_meta ? *incoming_meta : (qihse_kv_record_meta_t){0};
+    qihse_kv_record_meta_t old = {0};
+    char* existing = NULL;
+    bool exists;
+    errno = 0;
+    if (c->owner_data) {
+        exists = qihse_kv_snapshot_get_record_user(c->base, key, c->user,
+                                                   &existing, &old);
+    } else {
+        existing = qihse_kv_get_user(c->base, key, c->user);
+        exists = existing && qihse_kv_meta_user(c->base, key, c->user, &old);
+    }
+    if (!qihse_auth_validate_handle_generation(c->user,
+                                                c->principal_generation) ||
+        (!exists && errno == EACCES)) {
+        free(existing); c->denied = true; c->ok = false;
+        errno = EACCES; return false;
+    }
+    if (exists) {
+        bool same = existing && !strcmp(existing, value) &&
+            old.classification == classification && old.sci_compartment == sci &&
+            old.expire_time_ms == m.expire_time_ms && old.flags == m.flags;
         free(existing);
         if (same) c->stats.identical++;
         else c->stats.conflicts++;
         return true;
     }
+    free(existing);
+    if (!qihse_auth_validate_handle_generation(c->user,
+                                                c->principal_generation)) {
+        c->denied = true; c->ok = false; errno = EACCES; return false;
+    }
+    if (++c->records > c->max_records) { c->ok = false; errno = E2BIG; return false; }
     c->stats.added++;
     if (fprintf(c->out, "%zu %zu %llu %u %u %u %llu\n", strlen(key), strlen(value),
             (unsigned long long)m.expire_time_ms, (unsigned)classification,
@@ -655,6 +1006,46 @@ static bool backup_merge_row(const char* key, const char* value,
     off_t bytes = ftello(c->out);
     if (bytes < 0 || (uint64_t)bytes > c->max_bytes) c->ok = false;
     return c->ok;
+}
+
+static bool backup_merge_row(const char* key, const char* value,
+    uint16_t classification, uint16_t sci, void* opaque) {
+    backup_merge_context* c = opaque;
+    qihse_kv_record_meta_t m;
+    errno = 0;
+    if (!qihse_kv_meta_user(c->incoming, key, c->user, &m)) {
+        if (errno == EACCES || !qihse_auth_validate_handle_generation(
+                c->user, c->principal_generation)) {
+            c->denied = true; c->ok = false; errno = EACCES; return false;
+        }
+        return true;
+    }
+    return backup_merge_row_common(key, value, &m, classification, sci, opaque);
+}
+
+static bool backup_merge_snapshot_row(const char* key, const char* value,
+    const qihse_kv_record_meta_t* metadata, void* opaque) {
+    if (!metadata) return false;
+    return backup_merge_row_common(key, value, metadata, metadata->classification,
+                                   metadata->sci_compartment, opaque);
+}
+
+static bool backup_merge_count_row(const char* key, const char* value,
+    const qihse_kv_record_meta_t* metadata, void* opaque) {
+    (void)key; (void)value; (void)metadata;
+    size_t* count = opaque;
+    if (*count == SIZE_MAX) return false;
+    ++*count;
+    return true;
+}
+
+static bool backup_merge_count_full_row(const char* key, const char* value,
+    uint16_t classification, uint16_t sci, void* opaque) {
+    (void)key; (void)value; (void)classification; (void)sci;
+    size_t* count = opaque;
+    if (*count == SIZE_MAX) return false;
+    ++*count;
+    return true;
 }
 
 int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
@@ -674,42 +1065,78 @@ int qihse_backup_merge_user(qihse_user_t* user, const char* base_path,
         ((a.st_dev == out.st_dev && a.st_ino == out.st_ino) ||
          (b.st_dev == out.st_dev && b.st_ino == out.st_ino) || S_ISLNK(out.st_mode)))
         return QIHSE_BACKUP_EXPORT_ERR;
-    qihse_kv_store_t *base = NULL, *incoming = NULL, *union_view = NULL;
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (!principal || !generation ||
+        !qihse_auth_validate_handle_generation(principal, generation)) {
+        if (principal) qihse_auth_release_principal_scoped(principal);
+        errno = EACCES; return QIHSE_BACKUP_EXPORT_DENIED;
+    }
+    qihse_kv_store_t *base = NULL, *incoming = NULL;
     FILE* merged = NULL;
     char path[BACKUP_PATH_MAX] = {0};
-    bool pending = false;
-    backup_merge_context c = {.user = user, .max_bytes = max_bytes, .ok = true};
-    base = backup_merge_open(user, base_path, max_bytes, max_records, &rc);
+    bool pending = false, owner_data = false;
+    backup_type_t base_type = BACKUP_FULL, incoming_type = BACKUP_FULL;
+    backup_merge_context c = {.user = principal, .max_bytes = max_bytes,
+        .max_records = max_records, .principal_generation = generation, .ok = true};
+    base = backup_merge_open(principal, base_path, max_bytes, max_records,
+                             &base_type, &rc);
     if (!base) goto done;
-    incoming = backup_merge_open(user, incoming_path, max_bytes, max_records, &rc);
+    incoming = backup_merge_open(principal, incoming_path, max_bytes, max_records,
+                                 &incoming_type, &rc);
     if (!incoming) goto done;
+    if (base_type != incoming_type) { rc = QIHSE_BACKUP_EXPORT_UNSUPPORTED; goto done; }
+    owner_data = base_type == BACKUP_OWNER_DATA;
+    c.owner_data = owner_data;
     rc = QIHSE_BACKUP_EXPORT_ERR;
-    if (!backup_sibling_path(output_path, ".merge", path, sizeof(path)) ||
-        qihse_kv_save_user(base, path, user)) goto done;
+    if (!backup_sibling_path(output_path, ".merge", path, sizeof(path))) goto done;
+    int save_rc = owner_data
+        ? qihse_kv_snapshot_save_user(base, path, principal)
+        : qihse_kv_save_user(base, path, principal);
+    if (save_rc != 0) {
+        if (save_rc == -2 || errno == EACCES) rc = QIHSE_BACKUP_EXPORT_DENIED;
+        goto done;
+    }
     pending = true;
+    size_t base_records = 0u;
+    bool count_ok = owner_data
+        ? qihse_kv_snapshot_foreach_record_user(base, principal,
+            backup_merge_count_row, &base_records)
+        : qihse_kv_foreach_meta_user(base, principal,
+            backup_merge_count_full_row, &base_records);
+    if (!count_ok || base_records > max_records) goto done;
+    c.records = base_records;
     merged = fopen(path, "a+");
     if (!merged) goto done;
     if (fseeko(merged, 0, SEEK_END) || ftello(merged) < 0 ||
         (uint64_t)ftello(merged) > max_bytes) goto done;
     c.base = base; c.incoming = incoming; c.out = merged;
-    if (!qihse_kv_foreach_meta_user(incoming, user, backup_merge_row, &c) || !c.ok)
+    bool iter_ok = owner_data
+        ? qihse_kv_snapshot_foreach_record_user(incoming, principal,
+            backup_merge_snapshot_row, &c)
+        : qihse_kv_foreach_meta_user(incoming, principal, backup_merge_row, &c);
+    if (!iter_ok || !c.ok) {
+        if (c.denied || errno == EACCES) rc = QIHSE_BACKUP_EXPORT_DENIED;
         goto done;
-    if (backup_principal_gate(user)) { rc = QIHSE_BACKUP_EXPORT_DENIED; goto done; }
+    }
+    if (!qihse_auth_validate_handle_generation(principal, generation)) {
+        rc = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
+    }
     if (c.stats.conflicts) { rc = QIHSE_BACKUP_EXPORT_CONFLICT; goto done; }
     if (fflush(merged) || fseeko(merged, 0, SEEK_SET)) goto done;
-    union_view = qihse_kv_open_snapshot_user(merged, user, max_bytes, max_records);
-    if (!union_view) goto done;
     fclose(merged); merged = NULL;
-    rc = backup_seal_container(output_path, BACKUP_FULL, 0, 0, path, user, NULL);
+    rc = backup_seal_container(output_path, base_type, 0, 0, path,
+                               principal, generation, NULL, NULL);
     pending = false;
 done:
     if (merged) fclose(merged);
     if (pending) unlink(path);
-    if (union_view) qihse_kv_store_destroy(union_view);
     if (incoming) qihse_kv_store_destroy(incoming);
     if (base) qihse_kv_store_destroy(base);
     if (stats && (rc == QIHSE_BACKUP_EXPORT_OK || rc == QIHSE_BACKUP_EXPORT_CONFLICT))
         *stats = c.stats;
+    qihse_auth_release_principal_scoped(principal);
     return rc;
 }
 

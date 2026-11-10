@@ -63,7 +63,10 @@ extern "C" {
 typedef enum {
     BACKUP_FULL = 0,
     BACKUP_INCREMENTAL = 1,
-    BACKUP_WAL = 2
+    BACKUP_WAL = 2,
+    /* CT source owner data only. Contains the owner's current rows, including
+     * retained tombstones/expiry metadata, but no CT journal or cursors. */
+    BACKUP_OWNER_DATA = 3
 } backup_type_t;
 
 typedef struct {
@@ -98,6 +101,31 @@ typedef struct {
  * qihse_backup_info_free() releases. */
 int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
                            const char* output_path, qihse_backup_info_t* info);
+
+/* Export an ONLINE, admitted CT1 source's locally owned data as a
+ * self-contained, authenticated
+ * data-only image. Retained tombstones and expiry metadata are included for
+ * conservative union/recovery; CT identity, owner token, cursors and journal
+ * are deliberately not included. A persisted-but-disarmed CT store is not
+ * exportable through this operation. Restore into a fresh CT-disabled store,
+ * then initialize a new CT source generation and successor baseline. */
+int qihse_backup_owner_data_user(qihse_kv_store_t* kv, qihse_user_t* user,
+                                 const char* output_path,
+                                 qihse_backup_info_t* info);
+
+/* Opaque online owner-data container for OWNER.SNAPSHOT.BEGIN BACKUP. The
+ * handle owns a scoped principal reference and immutable, private bytes.
+ * Every size/read operation requires that same principal. */
+typedef struct qihse_backup_owner_snapshot qihse_backup_owner_snapshot_t;
+int qihse_backup_owner_snapshot_create(qihse_kv_store_t* kv, qihse_user_t* user,
+    qihse_backup_owner_snapshot_t** out_snapshot, uint64_t* out_source_change_seq);
+bool qihse_backup_owner_snapshot_size(
+    const qihse_backup_owner_snapshot_t* snapshot, qihse_user_t* user,
+    uint64_t* out_size);
+bool qihse_backup_owner_snapshot_read(qihse_backup_owner_snapshot_t* snapshot,
+    qihse_user_t* user, uint64_t offset, void* out, size_t capacity,
+    size_t* out_read);
+void qihse_backup_owner_snapshot_destroy(qihse_backup_owner_snapshot_t* snapshot);
 
 /* Incremental export.  Writes the delta since the caller's change-sequence
  * cursor: the data section is the KV layer's delta stream (only records
@@ -151,18 +179,21 @@ int qihse_backup_incremental_user(qihse_kv_store_t* kv, qihse_user_t* user,
  * This is not principal/ACL/identity or full-cluster recovery. */
 int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* backup_path);
 
-/* Offline, bounded union of two FULL containers into a new FULL container.
- * Both source containers remain untouched. Authorization/checksum validation
- * precedes enumeration. Identical live records (including labels and absolute
- * expiry, excluding independent local change sequences) deduplicate. Any
- * conflicting key refuses the entire publication (-4): neither source version
- * is overwritten or silently selected, and an existing output is preserved.
+/* Offline, bounded union of two containers of the same type (FULL or
+ * OWNER_DATA) into a new container of that type. Both source containers remain
+ * untouched. Authorization/checksum validation precedes enumeration.
+ * Identical records (including labels and absolute expiry, excluding
+ * independent local change sequences) deduplicate. Any conflicting key
+ * refuses the entire publication (-4): neither source version is overwritten
+ * or silently selected, and an existing output is preserved.
  * Output must differ from both inputs. Counters are released only to an active
  * authorized caller; no key names or payloads are reported. Limits apply to
  * each input and to the resulting union (max 3 GiB / 2 million records).
  * The caller retains input paths as conflict provenance and must resolve
- * conflicts before restore. Full backups omit expired rows and tombstones;
- * this function is not a distributed tombstone reconciliation algorithm. */
+ * conflicts before restore. FULL containers omit expired rows and tombstones
+ * and cannot be mixed with OWNER_DATA. OWNER_DATA retains tombstones and
+ * expired rows; a live/dead disagreement is a conflict. This is a conservative
+ * recovery union, not a distributed CT journal or causal deletion protocol. */
 typedef struct {
     size_t added, identical, conflicts;
 } qihse_backup_merge_stats_t;
