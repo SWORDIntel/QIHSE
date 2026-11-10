@@ -70,6 +70,8 @@ def owner_map(session):
 
 
 def wait_value(session, key, expected, timeout=45):
+    if isinstance(expected, str):
+        expected = expected.encode()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         reply = command(session, "GET", key)
@@ -160,7 +162,9 @@ def main():
         mesh_ports = {name: _free_udp_port() for name in NODES}
         group_ids = {name: secrets.token_hex(32) for name in OWNER}
         generations = {name: new_generation() for name in OWNER}
-        protected_tag = tag_for(5692, 8191, "protected")
+        planned_first, planned_last = 5692, 8191
+        protected_tag = tag_for(planned_first, planned_last, "protected")
+        protected_slot = binascii.crc_hqx(protected_tag.encode(), 0) % 16384
         protected_key = f"{{{protected_tag}}}:slot-protected"
         protected_value = f"classified-sci-fixture-{secrets.token_hex(12)}"
         seed_classified_kv(cluster, "lead", protected_key, protected_value,
@@ -312,13 +316,13 @@ def main():
         # do not use an unavailable source read as evidence of data loss.
         time.sleep(8)
         denied_view = owner_map(admins["successor"])
-        if denied_view is None or denied_view.get(7000) != topology["lead"]:
+        if denied_view is None or denied_view.get(protected_slot) != topology["lead"]:
             raise AssertionError("clearance/SCI denial changed A ownership before authorization")
         durable_pending_path = cluster.root / "brain-a" / "ct2-pending"
         denied_pending = pending_tuple(durable_pending_path)
         if (denied_pending[0] != 1 or denied_pending[3] != topology["lead"] or
                 denied_pending[4] != topology["joiner"] or
-                not (denied_pending[1] <= 7000 <= denied_pending[2] <= 8191)):
+                not (denied_pending[1] <= protected_slot <= denied_pending[2] <= planned_last)):
             raise AssertionError(f"low-clearance target did not retain the exact A->C fenced tuple: {denied_pending!r}")
 
         # Raise C's data principal through the existing startup configuration.
@@ -336,7 +340,7 @@ def main():
             if all(mapping is not None for mapping in final.values()):
                 owner_id = topology["joiner"]
                 if (all(mapping == final["lead"] for mapping in final.values()) and
-                    all(mapping.get(7000) == owner_id for mapping in final.values()) and
+                    all(mapping.get(protected_slot) == owner_id for mapping in final.values()) and
                     all(sum(owner == topology["lead"] for owner in mapping.values()) < 8192
                         for mapping in final.values()) and
                     all(sum(owner == topology["joiner"] for owner in mapping.values()) > 3192
