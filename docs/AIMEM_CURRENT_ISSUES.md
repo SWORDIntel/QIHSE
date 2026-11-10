@@ -85,16 +85,16 @@ the existing APIs and identities.
 
 | Area | Confirmed defect | Current repair status |
 | --- | --- | --- |
-| CT ownership | Promotion announcements did not establish peer ownership; stale/partially superseded transfers and lost announcements could leave conflicting maps; fencing preceded recoverable intent. | Repair and focused interruption/convergence checks in progress. |
-| AIMEM adapters | Raw tenant KV access could read or change internal memory/grant/receipt records. | Central RESP/Python boundary repair integrated; readiness errors and snapshot dispatch follow-ups in progress. |
-| Owner backup | Inventory streams were not restorable backups; ordinary whole-store export was blocked on active CT owners. | Authenticated owner-data container and SDK streaming integrated; retained tombstones and fresh CT-disabled restore checked. Actual socket backup stream integration is in progress. |
+| CT ownership | Promotion announcements did not establish peer ownership; stale/partially superseded transfers and lost announcements could leave conflicting maps; fencing preceded recoverable intent. | Repairs integrated: durable intent, monotonic slot epochs, signed promotion adoption, retained original proof bounds and bounded periodic cache emissions. Focused interruption, overlap and UDP emission cases pass. Missing predecessor promotion chains remain open; see the CT runtime contract. |
+| AIMEM adapters | Raw tenant KV access could read or change internal memory/grant/receipt records. | Central RESP/Python boundary, precise readiness errors and snapshot cleanup/read dispatch repairs integrated. |
+| Owner backup | Inventory streams were not restorable backups; ordinary whole-store export was blocked on active CT owners. | Authenticated owner-data container, SDK streaming and QKP BACKUP mode integrated; retained tombstones, classified data and fresh CT-disabled restore checked. |
 | Export lifecycle | Export could outlive its principal generation; failed private owner backup preparation could leave an orphan; a failed partial read could leave copied bytes in the output. | Native export generation checks and owner-container cleanup/read scrubbing integrated. |
 | CodeGraph retention | Explicit GC omitted shared generation blocks; some failure receipts reported zero rather than unknown counts. | Shared cleanup and truthful incomplete-count receipts integrated. Chosen XXH3 snapshot formats are unchanged. |
 | SDK/build tools | Missing installed public headers, Python input bounds, overlapping header names, unsafe native object reuse and inaccurate rollout script discovery. | Focused fixes integrated. Rolling script refuses immutable release-package paths; activation of new versioned releases is still separate work. |
-| Generic graph engine | Property updates left stale index entries; external-ID maps were shared across graphs; analytics and fixed neighbor buffers returned wrong/truncated results. | Source repair and focused correctness cases in progress. The CodeGraph CLI uses its own CSR engine. |
-| Hybrid graph/vector | Expanded neighbors lacked per-vector authorization; query-sized buffers could receive database-sized vectors. | Source repair and focused visibility/dimension cases in progress. |
-| Transactions/query results | Participant commit failures were reported as success; Cypher accepted ordering/pagination clauses without applying them. | Focused repair in progress. Durable coordinator-decision recovery remains absent and must not be claimed. |
-| Persistence | Native KV replay could truncate valid frames after an apply failure. Generic MVCC redo ignored mutation failures; sparse cache truncation retained pages; VFS WAL accepted partial replay and unchecked offset arithmetic. | Source repair and focused fault cases in progress. Native KV replay is active. Generic recovery is exercised through its public API/tests; no daemon caller was found. VFS WAL has no current in-tree consumers. SQLite has conditional cache calls but never creates the cache; those VFS defects are latent. |
+| Generic graph engine | Property updates left stale index entries; external-ID maps were shared across graphs; analytics and fixed neighbor buffers returned wrong/truncated results. | Repairs integrated: typed full-value index checks, per-graph mappings, dynamic traversal, corrected analytics and strict ingest failures. The CodeGraph CLI uses its own CSR engine. |
+| Hybrid graph/vector | Expanded neighbors lacked per-vector authorization; query-sized buffers could receive database-sized vectors. | Repairs integrated: authenticated vector visibility for every admitted vertex, dimension checks before fetch, dynamic frontiers. Focused protected-neighbor and high-degree cases pass. |
+| Transactions/query results | Participant commit failures were reported as success; Cypher accepted ordering/pagination clauses without applying them. | Retryable COMMITTING/ABORTING outcomes, stable participant sets and retained OCC history integrated. Cypher applies final projected ordering/pagination; negative values and unsupported WITH modifiers are explicit errors. Durable coordinator-decision recovery remains absent. |
+| Persistence | Native KV replay could truncate valid frames after an apply failure. Generic MVCC redo ignored mutation failures; sparse cache truncation retained pages; VFS WAL accepted partial replay and unchecked offset arithmetic. | Repairs integrated with focused fault cases: apply/read failures preserve the WAL; required tail-repair failures stop startup; failed generic redo inhibits checkpointing; VFS replay distinguishes completion from a valid prefix. Generic recovery is exercised through its public API/tests; no daemon caller was found. VFS WAL has no current in-tree consumers. SQLite has conditional cache calls but never creates the cache; those VFS defects are latent. |
 
 Owner-data containers are data recovery images, not CT journal/cursor resume
 images. Restore uses a fresh CT-disabled destination and then the existing
@@ -102,6 +102,32 @@ cluster admission process. Merge still opens two bounded detached input views;
 it no longer builds a third full trie, but is not a fully streaming
 merge. Legacy full exports do not contain deletion causality and cannot be
 mixed with owner-data containers.
+
+The generic 2PC manager retains pending decisions only in memory. Participants
+must durably deduplicate commit/abort callbacks by transaction ID, including
+an effect whose acknowledgement was lost. Resolve pending decisions before
+destroying the manager; this repair does not supply crash recovery for them.
+The dormant VFS WAL implementation uses a dense replay image capped at 1 GiB.
+The dormant page cache still opens the process-global persistent KV namespace;
+it must not be enabled for multiple databases without isolating that storage.
+
+Focused graph and graph/vector ASan/UBSan runs instrumented the changed units
+and passed with leak detection disabled. The separate graph LeakSanitizer run
+reported existing test callers that omit freeing returned vertex/edge copies;
+it is not recorded as leak-clean. The KEYSTONE-enabled AIMEM source passed a
+syntax check, but the new readiness errno cases were not exercised in an
+enabled projection runtime during this batch.
+
+The combined local library and cluster daemon build successfully. Integrated
+focused checks pass for transactions, 23 graph cases, VFS replay/cache/CRC,
+and native WAL apply/read/tail-repair faults. The QKP backup protocol fixture
+also verifies a protected record round trip to a fresh CT-disabled restore
+and denial to its authenticated low-clearance peer. CT checks cover the
+ownership journal, abort/replay, failover, transfer and bus paths in the
+isolated repair tree; the final combined bus/journal check verifies the
+periodic overlap announcement regression as well. These are focused checks,
+not a full-suite result. No service was restarted or data migrated in this
+repair batch.
 
 ## Resolved: expiry sweep and SSTable compaction
 

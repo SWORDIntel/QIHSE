@@ -68,8 +68,8 @@ above):
 | `include/qihse_federation_transport.h` | 16 | 16 |
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
-| `include/qihse_backup.h` | 12 | 12 |
-| `include/qihse_kv_store.h` | 99 | 96 (3 `static inline`) |
+| `include/qihse_backup.h` | 17 | 17 |
+| `include/qihse_kv_store.h` | 104 | 101 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions

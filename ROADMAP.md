@@ -6,7 +6,7 @@
 
 Status marks: `[x]` implemented with repository evidence (source + build wiring + test) · `[~]` partially implemented · `[ ]` open (not started or completion not established) · `[>]` superseded/conditional
 
-**Current program status (reviewed 2026-11-10):** 169 implemented, 28 partial, 12 open and 3 superseded/conditional checklist entries. The live cluster has a functional published baseline. The recent-change review reopened CT.1/CT.2 for promotion dissemination, transfer ordering/convergence and fence/journal crash recovery; HAX.2 for raw tenant KV access to internal AIMEM records/grants. The raw adapter boundary and authenticated owner-data backup repairs are locally integrated; CT convergence and socket backup integration are still in progress. The wider review also found generic graph, hybrid-vector, transaction and persistence defects; [the repair record](docs/AIMEM_CURRENT_ISSUES.md#5-repair-batch-in-progress-2026-11-10) separates these from live status. CG.13 explicit CLI shared-block collection is repaired, with retained-root and orphan-cleanup regression coverage. The earlier required suite completed 203 targets with zero failures; the new full run was stopped at the user's request so review and fixes can finish first. Historical passing tests do not close the newly found cases.
+**Current program status (reviewed 2026-11-10):** 169 implemented, 28 partial, 12 open and 3 superseded/conditional checklist entries. The live cluster has a functional published baseline. The repair batch now locally integrates raw AIMEM adapter restrictions, restorable owner-data streaming backups, WAL failure preservation, graph/vector correctness, retryable 2PC outcomes, and CT intent/epoch/promotion/cache repairs. The combined library and daemon build; focused regressions and scoped sanitizer checks are recorded in [the repair record](docs/AIMEM_CURRENT_ISSUES.md#5-repair-batch-in-progress-2026-11-10). CT.1/CT.2 remain partial: recovering an observer that missed a predecessor promotion still needs an authenticated ownership chain, and existing transfer-size and placement limits remain. HAX.2 retains its broader integration/rollout gaps. CG.13 explicit shared-block collection is repaired. The full suite was stopped at the user's request and was not rerun for this batch. Historical passing tests do not establish coverage of every new case; these repairs have not been deployed.
 
 **Canonical tracking:** [CodeGraph](#codegraph) · [native HAX / KEYSTONE index](#native-hax) · [optional bridge](#bridge) · [design mappings / operational gaps](#consolidated-designs). W0–W12 and CT identifiers remain below.
 
@@ -597,11 +597,14 @@ Namespace-limited read-only replica pull is separate from the grouped CT1 succes
 <a id="ct--secure-cluster-transport-follow-ups-open"></a>
 ### CT — Secure cluster transport (repair in progress)
 
-The evidence below describes the implemented baseline. The Nov. 10 review
-reopened completion for signed promotion dissemination, eventual ownership
-convergence after lost announcements, per-slot ordering under partially
-superseded transfers, and durable intent before fencing. Focused repairs are
-in progress; prior passing drills do not cover those newly found cases.
+The evidence below describes the implemented baseline. The Nov. 10 local
+repair adds signed promotion dissemination, periodic proof reannouncement,
+per-slot ordering under partially superseded transfers, and durable intent
+before fencing. Focused receiver, cache-delivery and interruption regressions
+cover those cases. An observer that missed A-to-B promotion still cannot
+adopt a later B-to-C promotion without proof of the missing ownership chain;
+this remains open, as do the documented size/placement limits. The repair
+batch is not deployed and has not had a new full-suite run.
 
 - [~] **CT.1 — Replicate writes to a promotable successor:** implemented opt-in pinned QKP transport with an explicit topology/transport identity map, fsynced grouped mutation history, and atomic receiver apply/cursor recovery. Write success waits for successor durability; reopened sources stay disarmed until pinned reconciliation. Five real-daemon tests prove restart, lost-ACK recovery, log GC followed by another write, lead failure, Operator promotion with a fresh successor, and stale-lead rejection. Native protocol/storage/codec tests cover classified data, SCI, tenants, forged peers, replay and fault boundaries. Legacy cleartext replication remains disabled; automatic takeover still requires a genuine authority decision. [Verification](docs/validation/ct_transport_20261109.md).
 - [~] **CT.2 — Secure data-bearing slot transfer:** implemented Operator-triggered pinned transfer to an existing primary with its own CT1 successor. All-writer range fences, durable chunk offsets, image verification, canonical seals and successor ACKs protect the transfer. Target activation refreshes data admission before source publication; peers verify the actual target's durable receipt before adopting ownership. Completed retries and historical receipts use immutable FINALIZED evidence. The four-daemon drill proves low-clearance denial, concurrent-write refusal, interrupted recovery, authoritative in-range replacement, outside-range preservation, peer convergence, primary restart and reverse transfer with a 60-character ID. Storage tests include SCI/tenant denial, abort and transfer-back recovery. The 4096-row/64-MiB bound refuses oversized operations rather than truncating data; unfenced ownership paths remain closed. [Contract](docs/plans/ct_transport_runtime.md) · [Verification](docs/validation/ct_transport_20261109.md).
