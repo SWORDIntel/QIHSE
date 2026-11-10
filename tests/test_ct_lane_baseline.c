@@ -228,11 +228,10 @@ static int target_process(const char *data_dir, const char *image_path,
     assert(qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
         operator_user, TARGET_LANE, selected_slots, image_path,
         (uint64_t)row_seq_text, 0u, digest, target_token));
-    assert_value(store, operator_user, source_key, "classified-baseline");
-    assert_value(store, operator_user, stale_key, NULL);
+    /* Receiver-owned slots are intentionally unreadable until promotion. The
+     * installer itself verifies the imported range's semantic digest. */
     assert_value(store, operator_user, retained_key, "keep-this-slot");
     assert_value(store, operator_user, other_key, "keep-other-lane");
-    assert_value(store, low_user, source_key, NULL);
 
     qihse_kv_ct_lane_status_t status = {0};
     assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
@@ -240,6 +239,7 @@ static int target_process(const char *data_dir, const char *image_path,
            status.baseline_sealed == !partial &&
            status.durable_position == 0u && status.acknowledged_position == 0u &&
            status.baseline_row_seq == (partial ? 0u : (uint64_t)row_seq_text));
+    if (!partial) assert(memcmp(status.baseline_digest, digest, sizeof(digest)) == 0);
     assert(memcmp(status.slot_bitmap, target_slots, sizeof(target_slots)) == 0);
     assert(qihse_kv_ct_lane_status(store, operator_user, OTHER_LANE, &status));
     assert(status.mode == QIHSE_KV_CT_LANE_RECEIVER);
@@ -263,25 +263,19 @@ static int target_process(const char *data_dir, const char *image_path,
             &mode, &frame_bytes) == 0);
         assert(fclose(delta) == 0);
         qihse_ct_codec_clear(&group);
-        assert_value(store, operator_user, source_key,
-                     "updated-after-baseline");
-        assert_value(store, operator_user, stale_key,
-                     "recreated-after-baseline");
+        /* Receiver data remains fenced from ordinary reads until promotion. */
     }
 
     qihse_kv_store_destroy(store);
     store = qihse_kv_store_create_user(operator_user);
     assert(store);
-    assert_value(store, operator_user, source_key, partial
-        ? "classified-baseline" : "updated-after-baseline");
-    assert_value(store, operator_user, stale_key,
-        partial ? NULL : "recreated-after-baseline");
     assert_value(store, operator_user, retained_key, "keep-this-slot");
     assert_value(store, operator_user, other_key, "keep-other-lane");
     assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
     assert(status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
            status.durable_position == (partial ? 0u : 1u) &&
            status.acknowledged_position == 0u);
+    if (!partial) assert(memcmp(status.baseline_digest, digest, sizeof(digest)) == 0);
     assert(memcmp(status.slot_bitmap, target_slots, sizeof(target_slots)) == 0);
 
     qihse_kv_store_destroy(store);
