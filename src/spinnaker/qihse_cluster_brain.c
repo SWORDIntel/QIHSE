@@ -2026,7 +2026,7 @@ static void brain_check_rebalance(brain_t* brain, const brain_obs_t* obs) {
         snprintf(evidence, sizeof(evidence),
                  "{\"range\":\"%u-%u\",\"to\":\"%.12s\",\"my_slots\":%llu,\"joiner_slots\":%llu}",
                  first, pick_end, joiner->id, (unsigned long long)my_slots, (unsigned long long)owned);
-        /* The durable CT2 pending tuple is the authority for a balance move.
+        /* The durable CT2 adapter validates authority for a balance move.
          * Keep the observation as useful evidence, but do not make recovery
          * or a validated fenced transfer depend on federation-journal
          * availability. Legacy state actions remain behind brain_gate(). */

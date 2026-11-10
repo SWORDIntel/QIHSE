@@ -121,12 +121,11 @@ def main():
             if brain:
                 brain_dir = cluster.root / "lead-brain"
                 brain_dir.mkdir(mode=0o700, exist_ok=True)
+                # Act mode uses its default donor floor and the durable CT2
+                # adapter. Optional observation-signing keys are not transfer
+                # authority; QKP's separately provisioned peer pins still are.
                 extra.extend(["--brain", "--brain-act", "--brain-interval", "1",
-                              "--brain-cooldown", "1", "--brain-rebalance-min-slots", "1",
-                              "--brain-dir", str(brain_dir), "--brain-node-key",
-                              str(cluster.identity_file(name, "qihse_dsa_key.pem")),
-                              "--brain-dsa-key",
-                              str(cluster.identity_file(name, "qihse_dsa_key.pem"))])
+                              "--brain-cooldown", "1", "--brain-dir", str(brain_dir)])
             return cluster.start_ct1_node(
                 name, NAMES.index(name), role, peer, IDS[name], IDS[peer], generation,
                 extra_args=extra, topology_names=NAMES, slot_ranges=RANGES,

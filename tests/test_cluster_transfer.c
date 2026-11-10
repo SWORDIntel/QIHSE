@@ -50,6 +50,7 @@ static bool mock_data_access = true;
 static uint16_t test_first = 10, test_last = 12;
 static uint16_t test_current_owner = 1;
 static bool test_topology_advanced;
+static bool fail_finalized_local_replay;
 
 struct qihse_cluster_topology { int marker; };
 
@@ -377,6 +378,14 @@ bool qihse_cluster_ownership_transfer_publish(qihse_cluster_ownership_context_t 
     return true;
 }
 
+bool qihse_cluster_ownership_transfer_finish_finalized(
+    qihse_cluster_ownership_context_t *c, const char *id, char *err, size_t cap) {
+    (void)err; (void)cap;
+    assert(c && !strcmp(id, finalized.transfer_id));
+    event("finish-finalized");
+    return !fail_finalized_local_replay;
+}
+
 bool qihse_cluster_ownership_transfer_abort(qihse_cluster_ownership_context_t *c,
     const char *id, uint16_t src, uint16_t dst, char *err, size_t cap) {
     (void)c; (void)err; (void)cap;
@@ -653,34 +662,39 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
            !strcmp(events[events_before_committed_retry + 2], "publish") &&
            publish_calls == publishes_before_committed_retry + 1 &&
            test_current_owner == 2);
-    /* A finalized retry repairs a lost one-shot publication by repeating the
-     * idempotent pinned activation and refreshing proof-bearing publication. */
-    finalized = committed;
-    finalized.phase = QIHSE_OWNERSHIP_FINALIZED;
-    size_t events_before_retry = event_count;
-    int reads_before_retry = read_calls;
-    int publishes_before_retry = publish_calls;
-    assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
-        NULL, 0) == QIHSE_CLUSTER_TRANSFER_COMMITTED);
-    assert(event_count == events_before_retry + 3 &&
-           read_calls == reads_before_retry &&
-           publish_calls == publishes_before_retry + 1);
-    assert(!strcmp(events[events_before_retry], "activate") &&
-           !strcmp(events[events_before_retry + 1], "activation-receipt") &&
-           !strcmp(events[events_before_retry + 2], "publish"));
-    /* An invalid durable receipt cannot advance or republish ownership. */
+    /* A bad activation receipt still cannot finish an unfinalized operation. */
     forge_activation_receipt = true;
     int publishes_before_forged = publish_calls;
     assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
         NULL, 0) == QIHSE_CLUSTER_TRANSFER_PENDING);
     assert(publish_calls == publishes_before_forged);
     forge_activation_receipt = false;
+
+    /* Once FINALIZED is durable, a retry needs no fresh target response.
+     * Its local crash-window replay remains required before completion. */
+    finalized = committed;
+    finalized.phase = QIHSE_OWNERSHIP_FINALIZED;
+    durable_activated = false;
+    activated = 0;
+    size_t events_before_retry = event_count;
+    int reads_before_retry = read_calls;
+    int publishes_before_retry = publish_calls;
+    assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
+        NULL, 0) == QIHSE_CLUSTER_TRANSFER_COMMITTED);
+    assert(event_count == events_before_retry + 1 &&
+           read_calls == reads_before_retry &&
+           publish_calls == publishes_before_retry);
+    assert(!strcmp(events[events_before_retry], "finish-finalized"));
+    fail_finalized_local_replay = true;
+    assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
+        NULL, 0) == QIHSE_CLUSTER_TRANSFER_PENDING);
+    fail_finalized_local_replay = false;
     size_t events_before_immutable_reject = event_count;
     /* Reusing an immutable finalized ID with a different range is refused. */
     assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 11, 12,
         NULL, 0) == QIHSE_CLUSTER_TRANSFER_REJECTED);
     assert(event_count == events_before_immutable_reject && read_calls == reads_before_retry &&
-           publish_calls == publishes_before_retry + 1);
+           publish_calls == publishes_before_retry);
     qihse_cluster_ct_peer_receipt_t staged = {0};
     uint64_t target_lsn = 0;
     unsigned char checksum[32] = {0};

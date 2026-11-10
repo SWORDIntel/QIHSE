@@ -608,6 +608,37 @@ partition-arbitration limits. The fixed whole-transfer size cap is removed;
 import uses resumable bounded groups. The repair
 batch is not deployed and has not had a new full-suite run.
 
+**Active cluster implementation order (2026-11-10):**
+
+1. Repair the current path first: automatic CT2 balancing under `--brain-act`,
+   durable retry independent of the observation journal, and local completion
+   of an already FINALIZED transfer without requiring its old target online.
+   The donor is whichever eligible node currently owns the most slots; this
+   does not designate a permanent cluster-wide primary. Slot balancing alone
+   does not establish equal record counts or byte/load balancing.
+2. Replace store-wide replication state with explicit replication contexts:
+   stable group identity, exact slot bitmap, peer/generation, baseline and
+   independent durable/ACK positions. A physical node must own group A while
+   receiving group B, restart both, then promote B without resetting A.
+   Legacy configuration remains a default context; group operation must not
+   silently route rows through the old singleton stream.
+3. Preserve portable original signed promotion certificates in that durable
+   stream. An observer must recover A-to-B-to-C in order when it missed the
+   first event and B is unavailable. A relay's assertion is not predecessor
+   evidence. Verify restart, reordered delivery, bitmap/generation conflicts
+   and forged certificates before closing missed-chain recovery.
+4. Use the existing consensus mesh for a common initial slot/group map,
+   expected-owner/epoch reservation and evidence-bound terminal transitions.
+   Competing overlapping moves must have one quorum outcome, including an
+   inherited uncommitted log tail and a lost reply. CT1 promotion and CT2
+   transfer must use the same ownership history. Local fences and signed
+   gossip alone do not establish partition arbitration.
+5. Wire shared group configuration and range decisions into the daemon and
+   brain, then run a disposable multi-node drill with every physical node
+   owning and replicating ranges. Check writes, deletes, labels, interrupted
+   moves, successor loss and restart. No live upgrade is implied by source
+   implementation or a unit-only pass.
+
 - [~] **CT.1 — Replicate writes to a promotable successor:** implemented opt-in pinned QKP transport with an explicit topology/transport identity map, fsynced grouped mutation history, and atomic receiver apply/cursor recovery. Write success waits for successor durability; reopened sources stay disarmed until pinned reconciliation. Five real-daemon tests prove restart, lost-ACK recovery, log GC followed by another write, lead failure, Operator promotion with a fresh successor, and stale-lead rejection. Native protocol/storage/codec tests cover classified data, SCI, tenants, forged peers, replay and fault boundaries. Legacy cleartext replication remains disabled; automatic takeover still requires a genuine authority decision. [Verification](docs/validation/ct_transport_20261109.md).
 - [~] **CT.2 — Secure data-bearing slot transfer:** implemented Operator-triggered pinned transfer to an existing primary with its own CT1 successor. All-writer range fences, durable chunk offsets, image verification, canonical seals and successor ACKs protect the transfer. Target activation refreshes data admission before source publication; peers verify the actual target's durable receipt before adopting ownership. Completed retries and historical receipts use immutable FINALIZED evidence. The four-daemon drill proves low-clearance denial, concurrent-write refusal, interrupted recovery, authoritative in-range replacement, outside-range preservation, peer convergence, primary restart and reverse transfer with a 60-character ID. Storage tests include SCI/tenant denial, abort and transfer-back recovery. The fixed whole-transfer cap is removed: a 4097-row, 67,284,039-byte fixture crashes after its first durable group, resumes to exactly two groups, and hides incoming rows until activation. Per-frame limits and configured replication-log capacity remain. Target import memory still scales with the range. Unfenced ownership paths remain closed. [Contract](docs/plans/ct_transport_runtime.md) · [Verification](docs/validation/ct_transport_20261109.md).
 

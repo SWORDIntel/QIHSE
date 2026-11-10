@@ -429,13 +429,14 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
             return QIHSE_CLUSTER_TRANSFER_REJECTED;
         }
         progress(c, QIHSE_CLUSTER_TRANSFER_COMMITTING, 0, 0);
-        /* A lost one-shot bus datagram must be repairable by an exact retry.
-         * Re-ask the pinned target to activate idempotently, verify its typed
-         * receipt, then republish the historical proof. Per-slot epochs make
-         * peers reject it if a newer transfer has superseded this one. */
-        bool announced = activate_and_publish(c, target_index, &finalized, err, err_cap);
+        /* FINALIZED already records verified target activation. Repair the
+         * local publication crash window and reannounce from that evidence;
+         * a completed operation must not become pending because its former
+         * target is now offline or has advanced to another generation. */
+        bool finished = qihse_cluster_ownership_transfer_finish_finalized(
+            c->ownership, transfer_id, err, err_cap);
         OPENSSL_cleanse(&finalized, sizeof(finalized));
-        return announced ? QIHSE_CLUSTER_TRANSFER_COMMITTED : QIHSE_CLUSTER_TRANSFER_PENDING;
+        return finished ? QIHSE_CLUSTER_TRANSFER_COMMITTED : QIHSE_CLUSTER_TRANSFER_PENDING;
     }
     OPENSSL_cleanse(&finalized, sizeof(finalized));
 

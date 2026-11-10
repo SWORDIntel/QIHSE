@@ -9,8 +9,8 @@
  *
  * Observe + remember + decide always run. Configured CT2 rebalancing runs
  * only with explicit principals and the durable transfer adapter. Acting runs when `act` is
- * set: a brain that can act is a brain that can misact, so the journal earns
- * trust first. Failed-owner recovery belongs to CT1 promotion; a health-only
+ * set. Durable CT2 validates authority and owns recovery; optional observation
+ * signing/readback does not gate that path. Failed-owner recovery belongs to CT1 promotion; a health-only
  * rollback never rewrites ownership. Every observation/decision is appended to a durable
  * qihse_event_stream (topic "cluster.brain") and decisions are signed with
  * the node's ML-DSA-87 key when one is configured.
@@ -40,9 +40,8 @@
  *                SHA-384 of the recorded observation bytes), which is what
  *                makes it reproducible from recorded inputs.
  *
- * Decisions that commit cluster state (rehome, rebalance, rollback, prune and
- * the confirmation of a completed hand-off) are signed and are refused
- * outright when there is no journaled pre-condition to cite — see
+ * Legacy state actions (rehome, rollback and prune) are refused without a
+ * journaled pre-condition to cite — see
  * qihse_cluster_brain_precondition_ok().  Policy observations (asymmetry,
  * isolation, reconnection) and refusals are journaled with the same envelope
  * but unsigned, because they do not change cluster state and occur once per
@@ -53,8 +52,8 @@
  * The private key is NEVER journaled: records carry a key handle and the
  * SHA-384 fingerprint of the public key only.
  *
- * Nothing here is a prerequisite for local operation: a brain without a
- * federation journal still observes, journals locally, and refuses to act.
+ * A brain without a federation journal still observes and can balance using
+ * its durable CT2 adapter. Legacy state actions retain their journal gate.
  */
 
 #include <stdbool.h>
