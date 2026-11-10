@@ -47,14 +47,6 @@ static char *key_for_slot(const char *prefix, uint16_t wanted_slot) {
     return NULL;
 }
 
-static void assert_value(qihse_kv_store_t *store, qihse_user_t *user,
-                         const char *key, const char *expected) {
-    char *value = qihse_kv_get_user(store, key, user);
-    if (expected) assert(value && strcmp(value, expected) == 0);
-    else assert(value == NULL);
-    free(value);
-}
-
 static void copy_snapshot(qihse_kv_replica_snapshot_t *snapshot,
                           qihse_user_t *principal, const char *path) {
     uint64_t size = 0u;
