@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <ftw.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "qihse_auth.h"
@@ -24,12 +26,29 @@
 #include "qihse_qkp.h"
 #include "qihse_resp_engine.h"
 #include "qihse_resp_wire.h"
+#include "qihse_backup.h"
 
 #define OP_PASSWORD "CtWireOperator11!"
 #define HIGH_PASSWORD "CtWireHighUser11!"
 #define LOW_PASSWORD "CtWireLowUser11!"
 #define PROTECTED "CT-WIRE-CLASS5-SCI9-PROTECTED"
 #define GENERATION "0123456789abcdef0123456789abcdef"
+
+static void restore_owner_backup_child(const char* backup_path, const char* data_dir) {
+    assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
+    assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator(OP_PASSWORD));
+    qihse_user_t* op = qihse_auth_authenticate_id(0u, OP_PASSWORD);
+    assert(op);
+    qihse_kv_store_t* restored = qihse_kv_store_create_user(op);
+    assert(restored);
+    assert(qihse_restore_user(restored, op, backup_path) == QIHSE_BACKUP_EXPORT_OK);
+    char* value = qihse_kv_get_user(restored, "t:71/ct1/preexisting", op);
+    assert(value && strcmp(value, PROTECTED) == 0);
+    free(value);
+    qihse_kv_store_destroy(restored);
+}
 
 static int remove_entry(const char* path, const struct stat* st, int type,
                         struct FTW* walk) {
@@ -67,6 +86,52 @@ typedef struct {
     size_t have;
     size_t off;
 } peer_t;
+
+static void fd_write_exact(int fd, const void* input, size_t length) {
+    const uint8_t* p = input;
+    size_t sent = 0u;
+    while (sent < length) {
+        ssize_t n = write(fd, p + sent, length - sent);
+        assert(n > 0);
+        sent += (size_t)n;
+    }
+}
+
+static size_t parse_bulk_at(const uint8_t* frame, size_t frame_len,
+                            size_t* position, const uint8_t** payload) {
+    assert(*position < frame_len && frame[(*position)++] == '$');
+    size_t start = *position;
+    while (*position + 1u < frame_len &&
+           !(frame[*position] == '\r' && frame[*position + 1u] == '\n')) (*position)++;
+    assert(*position + 1u < frame_len);
+    char number[32]; size_t digits = *position - start;
+    assert(digits && digits < sizeof number);
+    memcpy(number, frame + start, digits); number[digits] = '\0';
+    size_t length = (size_t)strtoull(number, NULL, 10);
+    *position += 2u;
+    assert(length + 2u <= frame_len - *position);
+    *payload = frame + *position;
+    assert(frame[*position + length] == '\r' && frame[*position + length + 1u] == '\n');
+    *position += length + 2u;
+    return length;
+}
+
+static uint64_t parse_decimal_bulk(const uint8_t* frame, size_t frame_len) {
+    size_t pos = 0u; const uint8_t* payload = NULL;
+    size_t n = parse_bulk_at(frame, frame_len, &pos, &payload);
+    assert(pos == frame_len && n > 0u && n < 32u);
+    char text[32]; memcpy(text, payload, n); text[n] = '\0';
+    char* end = NULL; unsigned long long value = strtoull(text, &end, 10);
+    assert(end && *end == '\0');
+    return (uint64_t)value;
+}
+
+static uint64_t parse_decimal_payload(const uint8_t* payload, size_t length) {
+    assert(length > 0u && length < 32u);
+    char text[32]; memcpy(text, payload, length); text[length] = '\0';
+    char* end = NULL; unsigned long long value = strtoull(text, &end, 10);
+    assert(end && *end == '\0'); return (uint64_t)value;
+}
 
 static void* serve_one_peer(void* opaque) {
     peer_t* p = opaque;
@@ -152,6 +217,14 @@ static char* read_resp(peer_t* p, size_t* out_len) {
         } while (line[ln++] != '\n');
         line[ln] = '\0';
         long count = strtol((char*)line, NULL, 10);
+        if (marker == '$' && count >= 0) {
+            assert(count <= 16 * 1024 * 1024);
+            for (long j = 0; j < count + 2; ++j) {
+                unsigned char ch = next_plain(p);
+                if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); assert(out); }
+                out[len++] = (char)ch;
+            }
+        }
         size_t children = marker == '*' && count > 0 ? (size_t)count : 0;
         if (marker == '*' && (count < 0 || count > 8192)) assert(false);
         for (size_t i = 0; i < children; ++i) {
@@ -197,7 +270,11 @@ static char* command(peer_t* p, size_t argc, const char* const* argv,
     return read_resp(p, out_len);
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    if (argc == 4 && strcmp(argv[1], "restore-owner-backup") == 0) {
+        restore_owner_backup_child(argv[2], argv[3]);
+        return 0;
+    }
     char root[] = "build/ct-transport-protocol-XXXXXX";
     assert(mkdtemp(root));
     char source_dir[600];
@@ -270,12 +347,67 @@ int main(void) {
     cfg.pqc.trusted_count = 1;
     qihse_resp_server_t* server = qihse_resp_server_create(&cfg);
     assert(server);
+
+    /* A dedicated pinned QKP administrator exercises normal Operator scope;
+     * the existing replication peer remains data-plane-only. */
+    qihse_resp_server_config_t local_cfg = cfg;
+    local_cfg.pqc.admin_peer_node_id = "ct-backup-admin";
+    local_cfg.pqc.admin_peer_dsa_pub_path = target_id.pub;
+    qihse_resp_server_t* local_server = qihse_resp_server_create(&local_cfg);
+    assert(local_server);
+    peer_t* backup_peer = open_peer(local_server, &target_id, &source_id,
+                                    "ct-backup-admin", true);
+    size_t reply_len = 0u;
+    char* reply;
+    const char* begin_backup[] = {"OWNER.SNAPSHOT.BEGIN", "BACKUP"};
+    reply = command(backup_peer, 2, begin_backup, &reply_len);
+    assert(reply_len > 4u && reply[0] == '*');
+    size_t pos = 4u; const uint8_t *field = NULL;
+    size_t size_digits = parse_bulk_at((const uint8_t*)reply, reply_len, &pos, &field);
+    uint64_t backup_size = parse_decimal_payload(field, size_digits);
+    uint64_t backup_seq = parse_decimal_bulk((const uint8_t*)reply + pos, reply_len - pos);
+    free(reply);
+    assert(backup_size > 64u && backup_size < (64u * 1024u * 1024u));
+    assert(backup_seq >= baseline_seq);
+    uint8_t* backup_bytes = malloc((size_t)backup_size); assert(backup_bytes);
+    size_t backup_have = 0u;
+    while (backup_have < backup_size) {
+        size_t chunk = (size_t)(backup_size - backup_have);
+        if (chunk > 60000u) chunk = 60000u;
+        char offset_text[32], length_text[32];
+        snprintf(offset_text, sizeof offset_text, "%zu", backup_have);
+        snprintf(length_text, sizeof length_text, "%zu", chunk);
+        const char* read_cmd[] = {"OWNER.SNAPSHOT.READ", offset_text, length_text};
+        reply = command(backup_peer, 3, read_cmd, &reply_len);
+        pos = 0u; size_t got = parse_bulk_at((const uint8_t*)reply, reply_len, &pos, &field);
+        assert(pos == reply_len && got == chunk);
+        memcpy(backup_bytes + backup_have, field, got);
+        backup_have += got;
+        free(reply);
+    }
+    assert(backup_size >= 8u && memcmp(backup_bytes, "QIHSEBAK", 8u) == 0);
+    const char* end_backup[] = {"OWNER.SNAPSHOT.END"};
+    reply = command(backup_peer, 1, end_backup, &reply_len);
+    assert(reply_len >= 5u && memcmp(reply, "+OK\r\n", 5u) == 0); free(reply);
+    close_peer(backup_peer);
+    qihse_resp_server_destroy(local_server);
+
+    /* Existing secure replication tests continue on the original endpoint. */
     peer_t* successor = open_peer(server, &target_id, &source_id,
                                   "ct-successor", true);
     const char* status_cmd[] = {"REPL.CT1", "STATUS"};
-    size_t reply_len = 0;
-    char* reply = command(successor, 2, status_cmd, &reply_len);
+    reply = command(successor, 2, status_cmd, &reply_len);
     assert(reply[0] == '*' && memmem(reply, reply_len, GENERATION, 32));
+    free(reply);
+
+    /* The same protected owner data must not be exposed through the new
+     * backup mode to the authenticated low-clearance replication principal. */
+    reply = command(successor, 2, begin_backup, &reply_len);
+    assert(reply[0] == '-' && !memmem(reply, reply_len, PROTECTED, strlen(PROTECTED)));
+    free(reply);
+    const char* denied_backup_read[] = {"OWNER.SNAPSHOT.READ", "0", "1024"};
+    reply = command(successor, 3, denied_backup_read, &reply_len);
+    assert(reply[0] == '-' && !memmem(reply, reply_len, PROTECTED, strlen(PROTECTED)));
     free(reply);
 
     qihse_kv_ct_writer_scope_t* scope = NULL;
@@ -344,6 +476,23 @@ int main(void) {
     close_peer(forged);
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(source);
+    /* Restore in a child with a separate, CT-disabled storage directory so
+     * the process-global KV path never changes under the live owner. */
+    char backup_path[640], restore_dir[640];
+    assert(snprintf(backup_path, sizeof backup_path, "%s/owner-data.qbak", root) > 0);
+    assert(snprintf(restore_dir, sizeof restore_dir, "%s/restore", root) > 0);
+    assert(mkdir(restore_dir, 0700) == 0);
+    int backup_fd = open(backup_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(backup_fd >= 0); fd_write_exact(backup_fd, backup_bytes, (size_t)backup_size);
+    assert(close(backup_fd) == 0); free(backup_bytes);
+    pid_t child = fork(); assert(child >= 0);
+    if (child == 0) {
+        execl(argv[0], argv[0], "restore-owner-backup", backup_path,
+              restore_dir, (char*)NULL);
+        _exit(127);
+    }
+    int child_status = 0; assert(waitpid(child, &child_status, 0) == child);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
     /* The audit subsystem owns a process-wide lock under QIHSE_DATA_DIR and
      * has an atexit hook. Shut it down before removing this isolated tree. */
     qihse_audit_shutdown();

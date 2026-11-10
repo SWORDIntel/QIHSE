@@ -224,6 +224,17 @@ int main(void) {
     assert(strcmp(response, "+PONG\r\n") == 0);
     free(response);
 
+    const char* eval_args[] = {"EVAL", "return 1", "0"};
+    send_command(client.fd, 3u, eval_args);
+    response = read_response(&client);
+    assert(strcmp(response, "-ERR scripting is not supported by this server\r\n") == 0);
+    free(response);
+    const char* script_load_args[] = {"SCRIPT", "LOAD", "return 1"};
+    send_command(client.fd, 3u, script_load_args);
+    response = read_response(&client);
+    assert(strcmp(response, "-ERR scripting is not supported by this server\r\n") == 0);
+    free(response);
+
     static const char pipeline[] =
         "*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$5\r\nvalue\r\n"
         "*2\r\n$3\r\nGET\r\n$3\r\nbar\r\n"
@@ -591,6 +602,13 @@ int main(void) {
         assert(strstr(response, protected_key) == NULL &&
                strstr(response, "HIGH_CLUSTER_SECRET") == NULL);
         free(response);
+        qihse_resp_server_ct_control_only_set(auth_server, true);
+        const char* owner_snapshot_end[] = { "OWNER.SNAPSHOT.END" };
+        send_command(auth_client.fd, 1u, owner_snapshot_end);
+        response = read_response(&auth_client);
+        assert(strcmp(response, "+OK\r\n") == 0);
+        free(response);
+        qihse_resp_server_ct_control_only_set(auth_server, false);
         char slot_text[16];
         snprintf(slot_text, sizeof slot_text, "%u", (unsigned)protected_slot);
         const char* unsafe_node[] = { "CLUSTER", "SETSLOT", slot_text,
