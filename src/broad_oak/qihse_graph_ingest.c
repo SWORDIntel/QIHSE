@@ -18,6 +18,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
+#include <stdint.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -47,9 +49,36 @@ static void jskip_ws(jparser_t* j) {
 
 static jval_t* jparse_value(jparser_t* j);
 
+static bool json_hex4(const char *p, uint32_t *out) {
+    uint32_t value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        unsigned char c = (unsigned char)p[i];
+        unsigned digit = c >= '0' && c <= '9' ? c - '0' :
+                         c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                         c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+        if (digit > 15) return false;
+        value = (value << 4) | digit;
+    }
+    *out = value;
+    return true;
+}
+
+static size_t json_utf8(uint32_t cp, char *out) {
+    if (cp <= 0x7f) { out[0] = (char)cp; return 1; }
+    if (cp <= 0x7ff) {
+        out[0] = (char)(0xc0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3f)); return 2;
+    }
+    if (cp <= 0xffff) {
+        out[0] = (char)(0xe0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[2] = (char)(0x80 | (cp & 0x3f)); return 3;
+    }
+    out[0] = (char)(0xf0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3f)); out[3] = (char)(0x80 | (cp & 0x3f)); return 4;
+}
+
 static jval_t* jnew(jtype_t t) {
     jval_t* v = calloc(1, sizeof(jval_t));
-    v->type = t;
+    if (v) v->type = t;
     return v;
 }
 
@@ -84,6 +113,7 @@ static jval_t* jparse_string(jparser_t* j) {
     size_t len = j->p - start;
     /* unescape in-place */
     char* s = malloc(len + 1);
+    if (!s) { snprintf(j->err, sizeof(j->err), "out of memory parsing string"); return NULL; }
     size_t si = 0;
     for (size_t i = 0; i < len; i++) {
         if (start[i] == '\\' && i + 1 < len) {
@@ -95,7 +125,32 @@ static jval_t* jparse_string(jparser_t* j) {
                 case '"': s[si++] = '"'; break;
                 case '\\': s[si++] = '\\'; break;
                 case '/': s[si++] = '/'; break;
-                default: s[si++] = start[i]; break;
+                case 'b': s[si++] = '\b'; break;
+                case 'f': s[si++] = '\f'; break;
+                case 'u': {
+                    uint32_t cp;
+                    if (i + 4 >= len || !json_hex4(start + i + 1, &cp)) {
+                        free(s); snprintf(j->err, sizeof(j->err), "invalid Unicode escape"); return NULL;
+                    }
+                    i += 4;
+                    if (cp >= 0xd800 && cp <= 0xdbff) {
+                        uint32_t low;
+                        if (i + 6 >= len || start[i + 1] != '\\' || start[i + 2] != 'u' ||
+                            !json_hex4(start + i + 3, &low) || low < 0xdc00 || low > 0xdfff) {
+                            free(s); snprintf(j->err, sizeof(j->err), "invalid Unicode surrogate pair"); return NULL;
+                        }
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                        i += 6;
+                    } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                        free(s); snprintf(j->err, sizeof(j->err), "unpaired Unicode surrogate"); return NULL;
+                    }
+                    if (cp == 0) {
+                        free(s); snprintf(j->err, sizeof(j->err), "NUL is not supported in graph strings"); return NULL;
+                    }
+                    si += json_utf8(cp, s + si);
+                    break;
+                }
+                default: free(s); snprintf(j->err, sizeof(j->err), "invalid JSON escape"); return NULL;
             }
         } else {
             s[si++] = start[i];
@@ -104,6 +159,7 @@ static jval_t* jparse_string(jparser_t* j) {
     s[si] = '\0';
     j->p++; /* skip closing quote */
     jval_t* v = jnew(JT_STR);
+    if (!v) { free(s); snprintf(j->err, sizeof(j->err), "out of memory parsing string"); return NULL; }
     v->sval = s;
     return v;
 }
@@ -111,35 +167,66 @@ static jval_t* jparse_string(jparser_t* j) {
 static jval_t* jparse_number(jparser_t* j) {
     const char* start = j->p;
     bool is_dbl = false;
-    if (*j->p == '-' || *j->p == '+') j->p++;
-    while (j->p < j->end && (isdigit((unsigned char)*j->p) || *j->p == '.' || *j->p == 'e' || *j->p == 'E' || *j->p == '+' || *j->p == '-')) {
-        if (*j->p == '.' || *j->p == 'e' || *j->p == 'E') is_dbl = true;
+    if (*j->p == '-') j->p++;
+    if (j->p >= j->end || !isdigit((unsigned char)*j->p)) goto invalid;
+    if (*j->p == '0') {
         j->p++;
+        if (j->p < j->end && isdigit((unsigned char)*j->p)) goto invalid;
+    } else while (j->p < j->end && isdigit((unsigned char)*j->p)) j->p++;
+    if (j->p < j->end && *j->p == '.') {
+        is_dbl = true; j->p++;
+        if (j->p >= j->end || !isdigit((unsigned char)*j->p)) goto invalid;
+        while (j->p < j->end && isdigit((unsigned char)*j->p)) j->p++;
+    }
+    if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
+        is_dbl = true; j->p++;
+        if (j->p < j->end && (*j->p == '+' || *j->p == '-')) j->p++;
+        if (j->p >= j->end || !isdigit((unsigned char)*j->p)) goto invalid;
+        while (j->p < j->end && isdigit((unsigned char)*j->p)) j->p++;
     }
     size_t len = j->p - start;
     char buf[64];
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    if (len >= sizeof(buf)) goto invalid;
     memcpy(buf, start, len);
     buf[len] = '\0';
     jval_t* v = jnew(is_dbl ? JT_DBL : JT_INT);
-    if (is_dbl) v->dval = strtod(buf, NULL);
-    else v->ival = strtoll(buf, NULL, 10);
+    if (!v) { snprintf(j->err, sizeof(j->err), "out of memory parsing number"); return NULL; }
+    errno = 0;
+    char *end = NULL;
+    if (is_dbl) {
+        v->dval = strtod(buf, &end);
+        if (errno || !end || *end || !isfinite(v->dval)) { jfree(v); goto invalid; }
+    } else {
+        v->ival = strtoll(buf, &end, 10);
+        if (errno || !end || *end) { jfree(v); goto invalid; }
+    }
     return v;
+invalid:
+    snprintf(j->err, sizeof(j->err), "invalid or out-of-range number");
+    return NULL;
 }
 
 static jval_t* jparse_array(jparser_t* j) {
     j->p++; /* skip '[' */
     jskip_ws(j);
     jval_t* v = jnew(JT_ARR);
+    if (!v) { snprintf(j->err, sizeof(j->err), "out of memory parsing array"); return NULL; }
     size_t cap = 4;
     v->arr = malloc(cap * sizeof(jval_t*));
+    if (!v->arr) { jfree(v); snprintf(j->err, sizeof(j->err), "out of memory parsing array"); return NULL; }
     v->arr_len = 0;
     if (*j->p == ']') { j->p++; return v; }
     for (;;) {
         jskip_ws(j);
         jval_t* elem = jparse_value(j);
         if (!elem) { jfree(v); return NULL; }
-        if (v->arr_len == cap) { cap *= 2; v->arr = realloc(v->arr, cap * sizeof(jval_t*)); }
+        if (v->arr_len == cap) {
+            if (cap > SIZE_MAX / 2 / sizeof(jval_t*)) { jfree(elem); jfree(v); snprintf(j->err, sizeof(j->err), "array too large"); return NULL; }
+            size_t next_cap = cap * 2;
+            jval_t **next = realloc(v->arr, next_cap * sizeof(*next));
+            if (!next) { jfree(elem); jfree(v); snprintf(j->err, sizeof(j->err), "out of memory parsing array"); return NULL; }
+            v->arr = next; cap = next_cap;
+        }
         v->arr[v->arr_len++] = elem;
         jskip_ws(j);
         if (*j->p == ',') { j->p++; continue; }
@@ -155,9 +242,11 @@ static jval_t* jparse_object(jparser_t* j) {
     j->p++; /* skip '{' */
     jskip_ws(j);
     jval_t* v = jnew(JT_OBJ);
+    if (!v) { snprintf(j->err, sizeof(j->err), "out of memory parsing object"); return NULL; }
     size_t cap = 4;
     v->keys = malloc(cap * sizeof(char*));
     v->vals = malloc(cap * sizeof(jval_t*));
+    if (!v->keys || !v->vals) { jfree(v); snprintf(j->err, sizeof(j->err), "out of memory parsing object"); return NULL; }
     v->obj_len = 0;
     if (*j->p == '}') { j->p++; return v; }
     for (;;) {
@@ -170,7 +259,19 @@ static jval_t* jparse_object(jparser_t* j) {
         jskip_ws(j);
         jval_t* val = jparse_value(j);
         if (!val) { jfree(key); jfree(v); return NULL; }
-        if (v->obj_len == cap) { cap *= 2; v->keys = realloc(v->keys, cap * sizeof(char*)); v->vals = realloc(v->vals, cap * sizeof(jval_t*)); }
+        if (v->obj_len == cap) {
+            if (cap > SIZE_MAX / 2 / sizeof(jval_t*)) { jfree(key); jfree(val); jfree(v); snprintf(j->err, sizeof(j->err), "object too large"); return NULL; }
+            size_t next_cap = cap * 2;
+            char **next_keys = malloc(next_cap * sizeof(*next_keys));
+            jval_t **next_vals = malloc(next_cap * sizeof(*next_vals));
+            if (!next_keys || !next_vals) {
+                free(next_keys); free(next_vals); jfree(key); jfree(val); jfree(v);
+                snprintf(j->err, sizeof(j->err), "out of memory parsing object"); return NULL;
+            }
+            memcpy(next_keys, v->keys, cap * sizeof(*next_keys));
+            memcpy(next_vals, v->vals, cap * sizeof(*next_vals));
+            free(v->keys); free(v->vals); v->keys = next_keys; v->vals = next_vals; cap = next_cap;
+        }
         v->keys[v->obj_len] = key->sval; key->sval = NULL; jfree(key);
         v->vals[v->obj_len] = val;
         v->obj_len++;
@@ -191,10 +292,10 @@ static jval_t* jparse_value(jparser_t* j) {
     if (c == '"') return jparse_string(j);
     if (c == '{') return jparse_object(j);
     if (c == '[') return jparse_array(j);
-    if (c == '-' || c == '+' || isdigit((unsigned char)c)) return jparse_number(j);
-    if (strncmp(j->p, "true", 4) == 0) { j->p += 4; jval_t* v = jnew(JT_BOOL); v->bval = 1; return v; }
-    if (strncmp(j->p, "false", 5) == 0) { j->p += 5; jval_t* v = jnew(JT_BOOL); v->bval = 0; return v; }
-    if (strncmp(j->p, "null", 4) == 0) { j->p += 4; return jnew(JT_NULL); }
+    if (c == '-' || isdigit((unsigned char)c)) return jparse_number(j);
+    if (strncmp(j->p, "true", 4) == 0) { j->p += 4; jval_t* v = jnew(JT_BOOL); if (v) v->bval = 1; else snprintf(j->err, sizeof(j->err), "out of memory parsing boolean"); return v; }
+    if (strncmp(j->p, "false", 5) == 0) { j->p += 5; jval_t* v = jnew(JT_BOOL); if (v) v->bval = 0; else snprintf(j->err, sizeof(j->err), "out of memory parsing boolean"); return v; }
+    if (strncmp(j->p, "null", 4) == 0) { j->p += 4; jval_t *v = jnew(JT_NULL); if (!v) snprintf(j->err, sizeof(j->err), "out of memory parsing null"); return v; }
     snprintf(j->err, sizeof(j->err), "unexpected char '%c' at pos %ld", c, (long)(j->p - j->end));
     return NULL;
 }
@@ -202,45 +303,91 @@ static jval_t* jparse_value(jparser_t* j) {
 static jval_t* jparse_file(const char* filepath, bool jsonl, char* err, size_t err_len) {
     FILE* f = fopen(filepath, "rb");
     if (!f) { snprintf(err, err_len, "cannot open %s: %s", filepath, strerror(errno)); return NULL; }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        snprintf(err, err_len, "input is not seekable or size lookup failed: %s", strerror(errno));
+        fclose(f); return NULL;
+    }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* buf = malloc(sz + 1);
-    fread(buf, 1, sz, f);
+    if (sz < 0 || (uintmax_t)sz > SIZE_MAX - 1 || fseek(f, 0, SEEK_SET) != 0) {
+        snprintf(err, err_len, "invalid input size or rewind failed: %s", strerror(errno));
+        fclose(f); return NULL;
+    }
+    char* buf = malloc((size_t)sz + 1);
+    if (!buf) { snprintf(err, err_len, "out of memory reading input"); fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz || ferror(f)) {
+        snprintf(err, err_len, "input read failed: %s", strerror(errno));
+        free(buf); fclose(f); return NULL;
+    }
     buf[sz] = '\0';
     fclose(f);
 
     if (jsonl) {
         /* parse each line as a separate JSON object, return as JT_ARR */
         jval_t* arr = jnew(JT_ARR);
+        if (!arr) { snprintf(err, err_len, "out of memory parsing JSONL"); free(buf); return NULL; }
         size_t cap = 64;
         arr->arr = malloc(cap * sizeof(jval_t*));
+        if (!arr->arr) { snprintf(err, err_len, "out of memory parsing JSONL"); jfree(arr); free(buf); return NULL; }
         arr->arr_len = 0;
         char* line = buf;
         char* eol;
         while ((eol = memchr(line, '\n', buf + sz - line))) {
+            size_t line_len = (size_t)(eol - line);
+            if (memchr(line, '\0', line_len)) {
+                snprintf(err, err_len, "JSONL record contains embedded NUL");
+                jfree(arr); free(buf); return NULL;
+            }
             *eol = '\0';
             /* trim */
             char* s = line; while (isspace((unsigned char)*s)) s++;
             if (*s != '\0') {
-                jparser_t j = { .p = s, .end = s + strlen(s), .err = "" };
+                jparser_t j = { .p = s, .end = line + line_len, .err = "" };
                 jval_t* v = jparse_value(&j);
-                if (v) {
-                    if (arr->arr_len == cap) { cap *= 2; arr->arr = realloc(arr->arr, cap * sizeof(jval_t*)); }
-                    arr->arr[arr->arr_len++] = v;
+                if (!v) {
+                    snprintf(err, err_len, "JSONL parse error: %s", j.err);
+                    jfree(arr); free(buf); return NULL;
                 }
+                jskip_ws(&j);
+                if (j.p != j.end) {
+                    snprintf(err, err_len, "JSONL record has trailing data");
+                    jfree(v); jfree(arr); free(buf); return NULL;
+                }
+                if (arr->arr_len == cap) {
+                    if (cap > SIZE_MAX / 2 / sizeof(jval_t*)) { snprintf(err, err_len, "JSONL has too many records"); jfree(v); jfree(arr); free(buf); return NULL; }
+                    size_t next_cap = cap * 2; jval_t **next = realloc(arr->arr, next_cap * sizeof(*next));
+                    if (!next) { snprintf(err, err_len, "out of memory parsing JSONL"); jfree(v); jfree(arr); free(buf); return NULL; }
+                    arr->arr = next; cap = next_cap;
+                }
+                arr->arr[arr->arr_len++] = v;
             }
             line = eol + 1;
         }
         /* last line (no trailing newline) */
+        size_t line_len = (size_t)((buf + sz) - line);
+        if (memchr(line, '\0', line_len)) {
+            snprintf(err, err_len, "JSONL record contains embedded NUL");
+            jfree(arr); free(buf); return NULL;
+        }
         char* s = line; while (isspace((unsigned char)*s)) s++;
         if (*s != '\0') {
-            jparser_t j = { .p = s, .end = buf + sz, .err = "" };
+            jparser_t j = { .p = s, .end = line + line_len, .err = "" };
             jval_t* v = jparse_value(&j);
-            if (v) {
-                if (arr->arr_len == cap) { cap *= 2; arr->arr = realloc(arr->arr, cap * sizeof(jval_t*)); }
-                arr->arr[arr->arr_len++] = v;
+            if (!v) {
+                snprintf(err, err_len, "JSONL parse error: %s", j.err);
+                jfree(arr); free(buf); return NULL;
             }
+            jskip_ws(&j);
+            if (j.p != j.end) {
+                snprintf(err, err_len, "JSONL record has trailing data");
+                jfree(v); jfree(arr); free(buf); return NULL;
+            }
+            if (arr->arr_len == cap) {
+                if (cap > SIZE_MAX / 2 / sizeof(jval_t*)) { snprintf(err, err_len, "JSONL has too many records"); jfree(v); jfree(arr); free(buf); return NULL; }
+                size_t next_cap = cap * 2; jval_t **next = realloc(arr->arr, next_cap * sizeof(*next));
+                if (!next) { snprintf(err, err_len, "out of memory parsing JSONL"); jfree(v); jfree(arr); free(buf); return NULL; }
+                arr->arr = next; cap = next_cap;
+            }
+            arr->arr[arr->arr_len++] = v;
         }
         free(buf);
         return arr;
@@ -248,6 +395,14 @@ static jval_t* jparse_file(const char* filepath, bool jsonl, char* err, size_t e
 
     jparser_t j = { .p = buf, .end = buf + sz, .err = "" };
     jval_t* v = jparse_value(&j);
+    if (v) {
+        jskip_ws(&j);
+        if (j.p != j.end) {
+            snprintf(err, err_len, "JSON has trailing data");
+            jfree(v);
+            v = NULL;
+        }
+    }
     free(buf);
     if (!v) snprintf(err, err_len, "JSON parse error: %s", j.err);
     return v;
@@ -258,6 +413,16 @@ static jval_t* jobj_get(const jval_t* obj, const char* key) {
     for (size_t i = 0; i < obj->obj_len; i++)
         if (strcmp(obj->keys[i], key) == 0) return obj->vals[i];
     return NULL;
+}
+
+static bool json_props_supported(const jval_t *props) {
+    if (!props) return true;
+    if (props->type != JT_OBJ) return false;
+    for (size_t i = 0; i < props->obj_len; ++i) {
+        jtype_t type = props->vals[i]->type;
+        if (type == JT_NULL || type == JT_ARR || type == JT_OBJ) return false;
+    }
+    return true;
 }
 
 /* ---- CSV parser ---- */
@@ -372,87 +537,24 @@ static graph_prop_t prop_from_string(const char* s) {
 
 /* ---- ID remapping (external string ID → internal uint64_t) ---- */
 
-typedef struct {
-    char* key;
-    uint64_t id;
-} id_map_entry_t;
-
-typedef struct {
-    id_map_entry_t* entries;
-    size_t cap;
-    size_t count;
-} id_map_t;
-
-static id_map_t* get_id_map(qihse_graph_t* g) {
-    (void)g;
-    static id_map_t global_map = { .entries = NULL, .cap = 0, .count = 0 };
-    return &global_map;
-}
-
-// Simple FNV-1a hash
-static uint64_t hash_str(const char* str) {
-    uint64_t hash = 14695981039346656037ULL;
-    while (*str) {
-        hash ^= (unsigned char)*str++;
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-void qihse_graph_ingest_register_id(qihse_graph_t* g, const char* external_id, uint64_t internal_id) {
-    id_map_t* m = get_id_map(g);
-    if (m->count * 2 >= m->cap) {
-        size_t new_cap = m->cap ? m->cap * 2 : 1024;
-        id_map_entry_t* new_entries = calloc(new_cap, sizeof(id_map_entry_t));
-        for (size_t i = 0; i < m->cap; i++) {
-            if (m->entries[i].key) {
-                size_t idx = hash_str(m->entries[i].key) & (new_cap - 1);
-                while (new_entries[idx].key) idx = (idx + 1) & (new_cap - 1);
-                new_entries[idx] = m->entries[i];
-            }
-        }
-        free(m->entries);
-        m->entries = new_entries;
-        m->cap = new_cap;
-    }
-    size_t idx = hash_str(external_id) & (m->cap - 1);
-    while (m->entries[idx].key) {
-        if (strcmp(m->entries[idx].key, external_id) == 0) {
-            m->entries[idx].id = internal_id;
-            return;
-        }
-        idx = (idx + 1) & (m->cap - 1);
-    }
-    m->entries[idx].key = strdup(external_id);
-    m->entries[idx].id = internal_id;
-    m->count++;
+bool qihse_graph_ingest_register_id(qihse_graph_t* g, const char* external_id, uint64_t internal_id) {
+    return qihse_graph_external_id_register(g, external_id, internal_id);
 }
 
 uint64_t qihse_graph_ingest_lookup_id(qihse_graph_t* g, const char* external_id) {
-    id_map_t* m = get_id_map(g);
-    if (m->cap > 0) {
-        size_t idx = hash_str(external_id) & (m->cap - 1);
-        while (m->entries[idx].key) {
-            if (strcmp(m->entries[idx].key, external_id) == 0) return m->entries[idx].id;
-            idx = (idx + 1) & (m->cap - 1);
-        }
-    }
+    if (!g || !external_id) return 0;
+    uint64_t id = qihse_graph_external_id_lookup(g, external_id);
+    if (id) return id;
     /* try numeric */
+    errno = 0;
     char* endp;
     uint64_t num = strtoull(external_id, &endp, 10);
-    if (*endp == '\0') return num;
+    if (errno == 0 && endp != external_id && *endp == '\0') return num;
     return 0;
 }
 
 void qihse_graph_ingest_clear_ids(qihse_graph_t* g) {
-    id_map_t* m = get_id_map(g);
-    for (size_t i = 0; i < m->cap; i++) {
-        if (m->entries[i].key) free(m->entries[i].key);
-    }
-    free(m->entries);
-    m->entries = NULL;
-    m->count = 0;
-    m->cap = 0;
+    qihse_graph_external_id_clear(g);
 }
 
 /* ---- CSV vertex ingest ---- */
@@ -497,6 +599,10 @@ int64_t qihse_graph_ingest_vertices_csv(qihse_graph_t* g,
 
         csv_row_t row = csv_parse_line(line, delimiter);
         if (row.count == 0) { errors++; csv_row_free(&row); continue; }
+        size_t property_columns = row.count;
+        if (id_col_idx >= 0 && (size_t)id_col_idx < row.count) property_columns--;
+        if (label_col_idx >= 0 && (size_t)label_col_idx < row.count) property_columns--;
+        if (property_columns > 256) { errors++; csv_row_free(&row); continue; }
 
         /* determine labels */
         char* labels_buf[16];
@@ -558,11 +664,15 @@ int64_t qihse_graph_ingest_vertices_csv(qihse_graph_t* g,
             (const char* const*)prop_keys, prop_vals, num_props);
 
         /* register ID mapping if there's an ID column (both numeric and string) */
-        if (id_col_idx >= 0 && (size_t)id_col_idx < row.count && row.fields[id_col_idx][0]) {
-            qihse_graph_ingest_register_id(g, row.fields[id_col_idx], new_vid);
+        bool id_failed = false;
+        if (new_vid && id_col_idx >= 0 && (size_t)id_col_idx < row.count && row.fields[id_col_idx][0]) {
+            id_failed = !qihse_graph_ingest_register_id(g, row.fields[id_col_idx], new_vid);
         }
 
-        if (new_vid == 0) errors++;
+        if (new_vid == 0 || id_failed) {
+            if (new_vid) qihse_graph_vertex_delete(g, new_vid);
+            errors++;
+        }
         else count++;
 
         /* cleanup */
@@ -719,7 +829,9 @@ int64_t qihse_graph_ingest_vertices_json(qihse_graph_t* g,
     if (root->type == JT_OBJ) {
         /* single object — wrap in array */
         arr = jnew(JT_ARR);
+        if (!arr) { jfree(root); if (out_errors) *out_errors = 1; return -1; }
         arr->arr = malloc(sizeof(jval_t*));
+        if (!arr->arr) { jfree(arr); jfree(root); if (out_errors) *out_errors = 1; return -1; }
         arr->arr[0] = root;
         arr->arr_len = 1;
     }
@@ -734,7 +846,15 @@ int64_t qihse_graph_ingest_vertices_json(qihse_graph_t* g,
         char* labels[16];
         size_t num_labels = 0;
         jval_t* lbls = jobj_get(obj, "labels");
+        if (lbls && lbls->type != JT_ARR) { errors++; continue; }
+        jval_t* lbl = jobj_get(obj, "label");
+        if (lbl && lbl->type != JT_STR) { errors++; continue; }
         if (lbls && lbls->type == JT_ARR) {
+            if (lbls->arr_len > 16) { errors++; continue; }
+            bool valid_labels = true;
+            for (size_t j = 0; j < lbls->arr_len; ++j)
+                if (lbls->arr[j]->type != JT_STR) valid_labels = false;
+            if (!valid_labels) { errors++; continue; }
             for (size_t j = 0; j < lbls->arr_len && num_labels < 16; j++) {
                 if (lbls->arr[j]->type == JT_STR)
                     labels[num_labels++] = lbls->arr[j]->sval;
@@ -742,16 +862,19 @@ int64_t qihse_graph_ingest_vertices_json(qihse_graph_t* g,
         }
         /* also accept single "label" string */
         if (num_labels == 0) {
-            jval_t* lbl = jobj_get(obj, "label");
             if (lbl && lbl->type == JT_STR) { labels[0] = lbl->sval; num_labels = 1; }
         }
 
         /* properties */
         jval_t* props = jobj_get(obj, "properties");
+        if (!json_props_supported(props)) { errors++; continue; }
+        jval_t* idv = jobj_get(obj, "id");
+        if (idv && idv->type != JT_INT && idv->type != JT_STR) { errors++; continue; }
         char* prop_keys[256];
         graph_prop_t prop_vals[256];
         size_t num_props = 0;
         if (props && props->type == JT_OBJ) {
+            if (props->obj_len > 256) { errors++; continue; }
             for (size_t j = 0; j < props->obj_len && num_props < 256; j++) {
                 prop_keys[num_props] = strdup(props->keys[j]);
                 prop_vals[num_props] = prop_from_jval(props->vals[j]);
@@ -764,17 +887,20 @@ int64_t qihse_graph_ingest_vertices_json(qihse_graph_t* g,
             (const char* const*)prop_keys, prop_vals, num_props);
 
         /* register external ID if present */
-        jval_t* idv = jobj_get(obj, "id");
+        bool id_failed = false;
         if (idv) {
             if (idv->type == JT_INT) {
                 char idbuf[32]; snprintf(idbuf, sizeof(idbuf), "%lld", (long long)idv->ival);
-                qihse_graph_ingest_register_id(g, idbuf, vid);
+                id_failed = !qihse_graph_ingest_register_id(g, idbuf, vid);
             } else if (idv->type == JT_STR) {
-                qihse_graph_ingest_register_id(g, idv->sval, vid);
+                id_failed = !qihse_graph_ingest_register_id(g, idv->sval, vid);
             }
         }
 
-        if (vid == 0) errors++;
+        if (vid == 0 || id_failed) {
+            if (vid) qihse_graph_vertex_delete(g, vid);
+            errors++;
+        }
         else count++;
 
         for (size_t j = 0; j < num_props; j++) {
@@ -784,7 +910,7 @@ int64_t qihse_graph_ingest_vertices_json(qihse_graph_t* g,
     }
 
     if (arr != root) jfree(arr);
-    jfree(root);
+    else jfree(root);
     if (out_errors) *out_errors = errors;
     return count;
 }
@@ -804,7 +930,9 @@ int64_t qihse_graph_ingest_edges_json(qihse_graph_t* g,
     jval_t* arr = root;
     if (root->type == JT_OBJ) {
         arr = jnew(JT_ARR);
+        if (!arr) { jfree(root); if (out_errors) *out_errors = 1; return -1; }
         arr->arr = malloc(sizeof(jval_t*));
+        if (!arr->arr) { jfree(arr); jfree(root); if (out_errors) *out_errors = 1; return -1; }
         arr->arr[0] = root;
         arr->arr_len = 1;
     }
@@ -819,7 +947,8 @@ int64_t qihse_graph_ingest_edges_json(qihse_graph_t* g,
         const char* etype = "RELATED";
         jval_t* tv = jobj_get(obj, "type");
         if (!tv) tv = jobj_get(obj, "rel_type");
-        if (tv && tv->type == JT_STR) etype = tv->sval;
+        if (tv && tv->type != JT_STR) { errors++; continue; }
+        if (tv) etype = tv->sval;
 
         /* start / end */
         jval_t* sv = jobj_get(obj, "start");
@@ -843,10 +972,12 @@ int64_t qihse_graph_ingest_edges_json(qihse_graph_t* g,
 
         /* properties */
         jval_t* props = jobj_get(obj, "properties");
+        if (!json_props_supported(props)) { errors++; continue; }
         char* prop_keys[256];
         graph_prop_t prop_vals[256];
         size_t num_props = 0;
         if (props && props->type == JT_OBJ) {
+            if (props->obj_len > 256) { errors++; continue; }
             for (size_t j = 0; j < props->obj_len && num_props < 256; j++) {
                 prop_keys[num_props] = strdup(props->keys[j]);
                 prop_vals[num_props] = prop_from_jval(props->vals[j]);
@@ -867,7 +998,7 @@ int64_t qihse_graph_ingest_edges_json(qihse_graph_t* g,
     }
 
     if (arr != root) jfree(arr);
-    jfree(root);
+    else jfree(root);
     if (out_errors) *out_errors = errors;
     return count;
 }

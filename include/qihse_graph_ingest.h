@@ -112,9 +112,9 @@ uint64_t qihse_graph_ingest_lookup_id(qihse_graph_t* g, const char* external_id)
 
 /* Register an external ID → internal ID mapping (called automatically by
  * the CSV/JSON ingest functions). */
-void qihse_graph_ingest_register_id(qihse_graph_t* g,
-                                    const char* external_id,
-                                    uint64_t internal_id);
+bool qihse_graph_ingest_register_id(qihse_graph_t* g,
+                                   const char* external_id,
+                                   uint64_t internal_id);
 
 /* Clear all ID mappings (frees memory). */
 void qihse_graph_ingest_clear_ids(qihse_graph_t* g);

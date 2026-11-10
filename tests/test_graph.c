@@ -7,6 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
+#include <math.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -176,6 +181,7 @@ static void test_pagerank(void) {
     double total = 0;
     for (int i = 0; i < 4; i++) total += scores[i];
     ASSERT(total > 0, "PageRank scores should be positive");
+    ASSERT(fabs(total - 1.0) < 1e-6, "PageRank must redistribute dangling mass");
     
     qihse_graph_destroy(g);
     PASS();
@@ -489,6 +495,93 @@ static void test_ingest_edges_jsonl(void) {
     PASS();
 }
 
+static void test_ingest_rejects_bad_jsonl_and_limits(void) {
+    TEST("JSON ingest rejects malformed and over-limit records");
+    const char *path = "/tmp/test_ingest_rejects_graph.jsonl";
+    FILE *fp = fopen(path, "w"); ASSERT(fp, "create malformed fixture");
+    fputs("{\"id\":\"valid\"}\n{bad json}\n", fp); fclose(fp);
+    qihse_graph_t *g = qihse_graph_create(); ASSERT(g, "graph alloc");
+    int64_t errors = 0;
+    fp = fopen(path, "w"); ASSERT(fp, "create single-object JSON fixture");
+    fputs("{\"id\":\"single\",\"properties\":{\"name\":\"one\"}}", fp); fclose(fp);
+    qihse_graph_t *single = qihse_graph_create(); ASSERT(single, "single-object graph alloc");
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(single, path, false, &errors) == 1 && errors == 0,
+           "single-object JSON ingest failed");
+    qihse_graph_destroy(single);
+
+    fp = fopen(path, "w"); ASSERT(fp, "restore malformed JSONL fixture");
+    fputs("{\"id\":\"valid\"}\n{bad json}\n", fp); fclose(fp);
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, path, true, &errors) == -1,
+           "malformed JSONL was silently skipped");
+    ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
+           "malformed file partially modified graph");
+
+    fp = fopen(path, "wb"); ASSERT(fp, "create embedded-NUL fixture");
+    const char nul_record[] = "{\"id\":\"valid\"}\0{\"id\":\"hidden\"}\n";
+    ASSERT(fwrite(nul_record, 1, sizeof(nul_record) - 1, fp) == sizeof(nul_record) - 1,
+           "write embedded-NUL fixture"); fclose(fp);
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, path, true, &errors) == -1,
+           "embedded NUL/trailing JSONL data was accepted");
+    ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
+           "embedded NUL file partially modified graph");
+
+    fp = fopen(path, "w"); ASSERT(fp, "create wrong-type fixture");
+    fputs("{\"id\":\"bad-labels\",\"labels\":\"not-array\"}\n", fp); fclose(fp);
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, path, true, &errors) == 0 && errors == 1,
+           "wrong-type labels field was silently ignored");
+    fp = fopen(path, "w"); ASSERT(fp, "create wrong-type properties fixture");
+    fputs("{\"id\":\"bad-properties\",\"properties\":[]}\n", fp); fclose(fp);
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, path, true, &errors) == 0 && errors == 1,
+           "wrong-type properties field was silently ignored");
+
+    fp = fopen(path, "w"); ASSERT(fp, "create over-limit fixture");
+    fputs("{\"id\":\"wide\",\"properties\":{", fp);
+    for (int i = 0; i < 257; ++i) fprintf(fp, "%s\"p%d\":%d", i ? "," : "", i, i);
+    fputs("}}\n", fp); fclose(fp);
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, path, true, &errors) == 0,
+           "over-limit properties were partially ingested");
+    ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
+           "over-limit record not reported/rejected");
+
+    fp = fopen(path, "w"); ASSERT(fp, "create label limit fixture");
+    fputs("{\"id\":\"many-labels\",\"labels\":[", fp);
+    for (int i = 0; i < 17; ++i) fprintf(fp, "%s\"L%d\"", i ? "," : "", i);
+    fputs("]}\n", fp); fclose(fp);
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, path, true, &errors) == 0,
+           "over-limit labels were partially ingested");
+    ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
+           "over-limit label record not reported/rejected");
+
+    const char *fifo = "/tmp/test_ingest_nonseekable_graph.jsonl";
+    unlink(fifo);
+    ASSERT(mkfifo(fifo, 0600) == 0, "create FIFO fixture");
+    pid_t writer = fork(); ASSERT(writer >= 0, "fork FIFO writer");
+    if (writer == 0) {
+        FILE *out = fopen(fifo, "w");
+        if (!out) _exit(2);
+        fputs("{\"id\":\"fifo\"}\n", out);
+        fclose(out);
+        _exit(0);
+    }
+    errors = 0;
+    ASSERT(qihse_graph_ingest_vertices_json(g, fifo, true, &errors) == -1,
+           "non-seekable input unexpectedly parsed through seek-based loader");
+    int status = 0;
+    ASSERT(waitpid(writer, &status, 0) == writer && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "FIFO writer failed");
+    ASSERT(errors == 1 && qihse_graph_vertex_count(g) == 0,
+           "non-seekable input partially modified graph");
+    unlink(fifo);
+    qihse_graph_destroy(g); remove(path); PASS();
+}
+
 static void test_indexed_incident_edges(void) {
     TEST("indexed adjacency: ordering, deletion, direction and self-loop");
     qihse_graph_t* g = qihse_graph_create();
@@ -521,6 +614,101 @@ static void test_indexed_incident_edges(void) {
     PASS();
 }
 
+static void test_graph_scoped_external_ids(void) {
+    TEST("external IDs are graph scoped and clear independently");
+    qihse_graph_t *a = qihse_graph_create(), *b = qihse_graph_create();
+    ASSERT(a && b, "graph alloc");
+    uint64_t a1 = qihse_graph_vertex_create(a, NULL, 0, NULL, NULL, 0);
+    uint64_t a2 = qihse_graph_vertex_create(a, NULL, 0, NULL, NULL, 0);
+    uint64_t b1 = qihse_graph_vertex_create(b, NULL, 0, NULL, NULL, 0);
+    qihse_graph_ingest_register_id(a, "shared-external", a2);
+    qihse_graph_ingest_register_id(b, "shared-external", b1);
+    ASSERT(qihse_graph_ingest_lookup_id(a, "shared-external") == a2,
+           "second graph registration contaminated first mapping");
+    ASSERT(qihse_graph_ingest_lookup_id(b, "shared-external") == b1,
+           "second graph mapping wrong");
+    qihse_graph_ingest_clear_ids(a);
+    ASSERT(qihse_graph_ingest_lookup_id(b, "shared-external") == b1,
+           "clearing one graph removed the other mapping");
+    qihse_graph_destroy(a);
+    ASSERT(qihse_graph_ingest_lookup_id(b, "shared-external") == b1,
+           "destroying one graph removed the other mapping");
+    qihse_graph_destroy(b);
+    (void)a1;
+    PASS();
+}
+
+static void test_graph_algorithm_regressions(void) {
+    TEST("directed SCC, path metrics, and full high degree traversal");
+    qihse_graph_t *g = qihse_graph_create(); ASSERT(g, "graph alloc");
+    uint64_t a = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t b = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t c = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    ASSERT(qihse_graph_edge_create(g, "E", a, b, NULL, NULL, 0), "edge a-b");
+    ASSERT(qihse_graph_edge_create(g, "E", b, c, NULL, NULL, 0), "edge b-c");
+    uint32_t components[3];
+    ASSERT(qihse_graph_scc(g, components, 3) == 3, "directed chain must have 3 SCCs");
+    ASSERT(components[0] != components[1] && components[1] != components[2],
+           "SCC labels collapsed one-way edges");
+    double close[3], between[3];
+    ASSERT(qihse_graph_closeness(g, close, 3) == 0, "closeness failed");
+    ASSERT(qihse_graph_betweenness(g, between, 3) == 0, "betweenness failed");
+    ASSERT(close[1] > close[0], "middle vertex should have smaller total distance");
+    ASSERT(between[1] > 0.99 && between[0] < 0.01 && between[2] < 0.01,
+           "Brandes path scores are incorrect");
+    qihse_graph_destroy(g);
+
+    g = qihse_graph_create(); ASSERT(g, "high degree graph alloc");
+    uint64_t hub = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t last_leaf = 0;
+    for (size_t i = 0; i < 1100; ++i) {
+        uint64_t leaf = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+        ASSERT(qihse_graph_edge_create(g, "E", hub, leaf, NULL, NULL, 0), "high degree edge");
+        last_leaf = leaf;
+    }
+    uint64_t *walk = calloc(1101, sizeof(*walk));
+    uint64_t short_path[2];
+    int64_t out[1101];
+    ASSERT(walk != NULL, "traversal allocation");
+    ASSERT(qihse_graph_bfs(g, hub, walk, 1101) == 1101, "BFS truncated degree above 256");
+    ASSERT(qihse_graph_degree_centrality(g, NULL, out, out, 1101) == 0,
+           "degree centrality failed");
+    ASSERT(out[0] == 1100, "degree centrality truncated outgoing degree");
+    ASSERT(qihse_graph_dijkstra(g, hub, last_leaf, short_path, 2) == 2,
+           "Dijkstra dropped a target after its former 1024-entry heap limit");
+    free(walk); qihse_graph_destroy(g);
+
+    g = qihse_graph_create(); ASSERT(g, "long path graph alloc");
+    uint64_t previous = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+    uint64_t first = previous, last = previous;
+    for (size_t i = 1; i < 1100; ++i) {
+        uint64_t next = qihse_graph_vertex_create(g, NULL, 0, NULL, NULL, 0);
+        ASSERT(qihse_graph_edge_create(g, "E", previous, next, NULL, NULL, 0), "long path edge");
+        previous = last = next;
+    }
+    uint64_t *long_path = calloc(1100, sizeof(*long_path));
+    ASSERT(long_path, "long path allocation");
+    errno = 0;
+    ASSERT(qihse_graph_dijkstra(g, first, last, long_path, 1099) == 0 && errno == ENOBUFS,
+           "insufficient path buffer must reject the incomplete path");
+    ASSERT(qihse_graph_dijkstra(g, first, last, long_path, 1100) == 1100,
+           "Dijkstra truncated or corrupted a path longer than 1024 vertices");
+    ASSERT(qihse_graph_has_cycle(g) == 0, "directed acyclic path reported a cycle");
+    uint64_t *topo = calloc(1100, sizeof(*topo));
+    ASSERT(topo, "topological order allocation");
+    ASSERT(qihse_graph_topo_sort(g, topo, 1100) == 1100,
+           "topological sort truncated a path longer than 1024 vertices");
+    ASSERT(topo[0] == first && topo[1099] == last,
+           "topological order does not preserve path direction");
+    ASSERT(qihse_graph_edge_create(g, "E", last, first, NULL, NULL, 0), "close path cycle");
+    ASSERT(qihse_graph_has_cycle(g) == 1, "directed cycle was not detected");
+    ASSERT(qihse_graph_topo_sort(g, topo, 1100) == 0,
+           "topological sort returned vertices for a cyclic graph");
+    free(topo);
+    free(long_path); qihse_graph_destroy(g);
+    PASS();
+}
+
 int main(void) {
 {
     /* Per-test audit/chain isolation (parallel aggregates). */
@@ -532,6 +720,8 @@ int main(void) {
     test_vertex_crud();
     test_edge_crud();
     test_indexed_incident_edges();
+    test_graph_scoped_external_ids();
+    test_graph_algorithm_regressions();
     test_label_index();
     test_bfs();
     test_dijkstra();
@@ -550,6 +740,7 @@ int main(void) {
     test_ingest_edges_csv();
     test_ingest_vertices_jsonl();
     test_ingest_edges_jsonl();
+    test_ingest_rejects_bad_jsonl_and_limits();
     
     printf("\n=== Results: %d passed, %d failed ===\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

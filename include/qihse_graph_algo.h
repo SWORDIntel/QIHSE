@@ -15,7 +15,8 @@ size_t qihse_graph_bfs(qihse_graph_t* g, uint64_t source, uint64_t* out, size_t 
 /* DFS: returns vertices in DFS order from source */
 size_t qihse_graph_dfs(qihse_graph_t* g, uint64_t source, uint64_t* out, size_t max_out);
 
-/* Dijkstra shortest path: returns path vertex IDs, 0 if no path */
+/* Dijkstra shortest path: returns the complete path vertex IDs, 0 if no path,
+ * allocation failure, or if max_path cannot hold the full path (errno=ENOBUFS). */
 size_t qihse_graph_dijkstra(qihse_graph_t* g, uint64_t source, uint64_t target,
                             uint64_t* out_path, size_t max_path);
 
@@ -52,7 +53,8 @@ int qihse_graph_has_cycle(qihse_graph_t* g);
 /* Topological sort: returns vertices in topo order, 0 if cycle exists */
 size_t qihse_graph_topo_sort(qihse_graph_t* g, uint64_t* out, size_t max_out);
 
-/* Jaccard similarity between two vertices' neighborhoods */
+/* Jaccard similarity between two vertices' neighborhoods. Returns NaN and
+ * sets errno if either adjacency lookup fails. */
 double qihse_graph_jaccard(qihse_graph_t* g, uint64_t a, uint64_t b);
 
 /* All-pairs shortest path (Floyd-Warshall, for small graphs) */
