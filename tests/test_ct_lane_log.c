@@ -2,7 +2,9 @@
 #define _GNU_SOURCE
 #endif
 #include <assert.h>
+#include <errno.h>
 #include <ftw.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,7 +80,10 @@ static qihse_kv_ct_writer_scope_t *write_lane(qihse_kv_store_t *store,
                        const unsigned char *token, const char *key,
                        const char *value) {
     qihse_kv_ct_writer_scope_t *scope = NULL;
-    assert(qihse_kv_ct_writer_scope_enter_lane(store, op, lane, token, &scope));
+    if (!qihse_kv_ct_writer_scope_enter_lane(store, op, lane, token, &scope)) {
+        fprintf(stderr, "writer scope failed lane=%s errno=%d\n", lane, errno);
+        abort();
+    }
     assert(qihse_kv_set_user(store, key, value, 4u, 1u, op));
     return scope;
 }
@@ -105,6 +110,43 @@ static void assert_value(qihse_kv_store_t *store, qihse_user_t *user,
     char *value = qihse_kv_get_user(store, key, user);
     assert(value && strcmp(value, expected) == 0);
     free(value);
+}
+
+typedef struct {
+    qihse_kv_store_t *store;
+    qihse_user_t *op;
+    qihse_user_t *peer;
+    const unsigned char *token;
+    const char *key;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    bool ready;
+    bool finish;
+    bool ok;
+} pending_lane_write_t;
+
+static void *pending_lane_write(void *opaque) {
+    pending_lane_write_t *work = opaque;
+    qihse_kv_ct_writer_scope_t *scope = NULL;
+    bool ok = qihse_kv_ct_writer_scope_enter_lane(work->store, work->op,
+        LANE_B, work->token, &scope) &&
+        qihse_kv_set_user(work->store, work->key, "b1", 4u, 1u, work->op);
+    pthread_mutex_lock(&work->mutex);
+    work->ready = true;
+    work->ok = ok;
+    pthread_cond_broadcast(&work->condition);
+    while (ok && !work->finish)
+        pthread_cond_wait(&work->condition, &work->mutex);
+    pthread_mutex_unlock(&work->mutex);
+    if (ok) {
+        ok = qihse_kv_ct_lane_source_ack(work->store, work->peer, LANE_B,
+            "peer-b", GEN_B, 1u) &&
+            qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL);
+    } else if (scope) {
+        qihse_kv_ct_writer_scope_leave(scope);
+    }
+    work->ok = ok;
+    return NULL;
 }
 
 int main(void) {
@@ -144,10 +186,17 @@ int main(void) {
     admit_source(store, op, peer, LANE_A, GEN_A);
     admit_source(store, op, peer, LANE_B, GEN_B);
 
+    pending_lane_write_t work_b = {.store = store, .op = op, .peer = peer,
+        .token = token_b, .key = key_b1, .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .condition = PTHREAD_COND_INITIALIZER};
+    pthread_t writer_b;
+    assert(pthread_create(&writer_b, NULL, pending_lane_write, &work_b) == 0);
+    pthread_mutex_lock(&work_b.mutex);
+    while (!work_b.ready) pthread_cond_wait(&work_b.condition, &work_b.mutex);
+    pthread_mutex_unlock(&work_b.mutex);
+    assert(work_b.ok);
     qihse_kv_ct_writer_scope_t *scope_a =
         write_lane(store, op, LANE_A, token_a, key_a1, "a1");
-    qihse_kv_ct_writer_scope_t *scope_b =
-        write_lane(store, op, LANE_B, token_b, key_b1, "b1");
     assert_source_read(store, peer, LANE_A, GEN_A, 0u, 1u);
     assert_source_read(store, peer, LANE_B, GEN_B, 0u, 1u);
     qihse_kv_ct_group_t *groups = NULL;
@@ -172,9 +221,13 @@ int main(void) {
     assert(after_a.st_size == 640 && after_b.st_size == before_b.st_size);
     assert_source_read(store, peer, LANE_A, GEN_A, 1u, 1u);
     assert_source_read(store, peer, LANE_B, GEN_B, 0u, 1u);
-    assert(qihse_kv_ct_lane_source_ack(store, peer, LANE_B,
-        "peer-b", GEN_B, 1u));
-    assert(qihse_kv_ct_writer_scope_finish(scope_b, 1000u, NULL));
+    pthread_mutex_lock(&work_b.mutex);
+    work_b.finish = true;
+    pthread_cond_broadcast(&work_b.condition);
+    pthread_mutex_unlock(&work_b.mutex);
+    assert(pthread_join(writer_b, NULL) == 0 && work_b.ok);
+    pthread_cond_destroy(&work_b.condition);
+    pthread_mutex_destroy(&work_b.mutex);
 
     qihse_kv_store_destroy(store);
     store = qihse_kv_store_create_user(op);
@@ -184,7 +237,7 @@ int main(void) {
     assert(qihse_kv_ct_lane_status(store, op, LANE_A, &status_a));
     assert(qihse_kv_ct_lane_status(store, op, LANE_B, &status_b));
     assert(status_a.acknowledged_position == 1u && status_a.durable_position == 1u);
-    assert(status_b.acknowledged_position == 0u && status_b.durable_position == 1u);
+    assert(status_b.acknowledged_position == 1u && status_b.durable_position == 1u);
     admit_source(store, op, peer, LANE_A, GEN_A);
     admit_source(store, op, peer, LANE_B, GEN_B);
 
