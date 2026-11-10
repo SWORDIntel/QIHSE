@@ -49,6 +49,13 @@ static void boundaries(void) {
     lookup(g, "ab", "", "cvalue", c);
     lookup(g, "", "abc", "value", d);
     lookup(g, "abc", "", "value", 0);
+    char long_a[180], long_b[180];
+    memset(long_a, 'q', sizeof(long_a)); memset(long_b, 'q', sizeof(long_b));
+    memcpy(long_a + 140, "alpha", 6); memcpy(long_b + 140, "bravo", 6);
+    uint64_t long_a_id = add(g, "long", "payload", long_a);
+    uint64_t long_b_id = add(g, "long", "payload", long_b);
+    lookup(g, "long", "payload", long_a, long_a_id);
+    lookup(g, "long", "payload", long_b, long_b_id);
     assert(qihse_graph_vertex_remove_property(g, long_id, "n"));
     lookup(g, "f", "n", "a_much_longer_value_than_the_first_allocation_113", 0);
     assert(qihse_graph_vertex_delete(g, short_id));

@@ -902,7 +902,19 @@ size_t qihse_graph_get_vertices_by_property(qihse_graph_t* g, const char* label,
     prop_entry_t* b = pmap_find(&g->prop_index, ckbuf, cklen);
     size_t n = 0;
     if (b && b->composite_key) {
-        for (size_t i = 0; i < b->count && n < max_out; ++i) out[n++] = b->ids[i];
+        for (size_t i = 0; i < b->count && n < max_out; ++i) {
+            graph_vertex_t **slot = vslot(g, b->ids[i]);
+            graph_vertex_t *vertex = slot ? *slot : NULL;
+            if (!vertex) continue;
+            if (label) {
+                bool found_label = false;
+                for (size_t l = 0; l < vertex->num_labels; ++l)
+                    if (strcmp(vertex->labels[l], label) == 0) { found_label = true; break; }
+                if (!found_label) continue;
+            }
+            const graph_prop_t *actual = graph_vertex_get_property(vertex, prop_name);
+            if (actual && graph_prop_equals(actual, value)) out[n++] = b->ids[i];
+        }
     }
     pthread_rwlock_unlock(&g->lock);
     return n;
