@@ -242,11 +242,18 @@ void qihse_resp_handle_client(int client_fd, qihse_kv_store_t* store, qihse_vect
                     resp_write_all(client_fd, reply, strlen(reply));
                 } else if (argc >= 3 + dim) {
                     float *vec = malloc(dim * sizeof(float));
+                    if (!vec) {
+                        const char* reply = "-ERR out of memory\r\n";
+                        resp_write_all(client_fd, reply, strlen(reply));
+                        continue;
+                    }
                     for (int i = 0; i < dim; i++) {
                         vec[i] = strtof(args[3 + i], NULL);
                     }
-                    qihse_vector_db_upsert_by_ids(vdb, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
-                    const char* reply = "+OK\r\n";
+                    bool stored = qihse_vector_db_upsert_by_ids_user(vdb,
+                        current_user, &id, vec, 1, dim, NULL, NULL, NULL, NULL);
+                    const char* reply = stored ? "+OK\r\n" :
+                                                 "-ERR vector upsert failed\r\n";
                     resp_write_all(client_fd, reply, strlen(reply));
                     free(vec);
                 } else {

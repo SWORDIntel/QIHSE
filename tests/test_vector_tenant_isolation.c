@@ -15,6 +15,7 @@
 #endif
 
 #include <assert.h>
+#include <dirent.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -114,8 +115,23 @@ static bool vec_tag_match(const void* metadata, size_t metadata_size, void* opaq
            memcmp(metadata, filter->tag, filter->len) == 0;
 }
 
+static void remove_test_data_dir(const char* path) {
+    DIR* dir = opendir(path);
+    assert(dir != NULL);
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        char item[512];
+        int n = snprintf(item, sizeof(item), "%s/%s", path, entry->d_name);
+        assert(n > 0 && (size_t)n < sizeof(item));
+        assert(unlink(item) == 0);
+    }
+    assert(closedir(dir) == 0);
+    assert(rmdir(path) == 0);
+}
+
 int main(void) {
-    char data_dir[] = "/tmp/qihse-vector-tenant-XXXXXX";
+    char data_dir[] = "./tests/qihse-vector-tenant-XXXXXX";
     assert(mkdtemp(data_dir) != NULL);
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
@@ -174,6 +190,26 @@ int main(void) {
     const char* cross_write[] = { "VECSET", "4", "2", "0.9", "0.1", "TAG", "t:7/private" };
     send_command(t8.fd, 7, cross_write);
     expect_contains(t8.fd, "NOPERM");
+    /* A tenant cannot collide with another tenant's existing ID by
+     * supplying its own allowed replacement TAG. The preimage collection
+     * must be checked before the upsert can replace vector or metadata. */
+    const char* id_collision[] = { "VECSET", "1", "2", "0.2", "0.8", "TAG", "t:8/private" };
+    send_command(t8.fd, 7, id_collision);
+    expect_contains(t8.fd, "NOPERM");
+    float preserved[2] = {0.0f, 0.0f};
+    size_t preserved_dims = 0u;
+    assert(qihse_vector_db_get_vector_by_id_user(vdb, operator_user, 1u,
+                                                  preserved, &preserved_dims));
+    assert(preserved_dims == 2u && fabsf(preserved[0] - 0.9f) < 1e-6f &&
+           fabsf(preserved[1] - 0.1f) < 1e-6f);
+    void* preserved_tag = NULL;
+    size_t preserved_tag_size = 0u;
+    assert(qihse_vector_db_get_metadata_by_id_user(vdb, operator_user, 1u,
+                                                    &preserved_tag,
+                                                    &preserved_tag_size));
+    assert(preserved_tag_size == strlen("t:7/private") &&
+           memcmp(preserved_tag, "t:7/private", preserved_tag_size) == 0);
+    free(preserved_tag);
     const char* cross_search[] = { "VECSEARCH", "2", "5", "0.9", "0.1", "TAG", "t:7/private" };
     send_command(t8.fd, 7, cross_search);
     expect_contains(t8.fd, "NOPERM");
@@ -258,6 +294,7 @@ int main(void) {
 
     qihse_vector_db_destroy(vdb);
     qihse_kv_store_destroy(store);
+    remove_test_data_dir(data_dir);
     printf("test_vector_tenant_isolation: all assertions passed\n");
     return 0;
 }

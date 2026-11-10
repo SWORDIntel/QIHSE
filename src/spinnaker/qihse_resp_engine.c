@@ -3064,6 +3064,9 @@ static bool qihse_resp_handle_increment(qihse_resp_session_t* session, const qih
     return stored ? qihse_resp_integer(session, value) : qihse_resp_error(session, "ERR increment failed");
 }
 
+static bool qihse_resp_tenant_key_allowed(uint32_t tenant,
+                                          const qihse_resp_arg_t* key);
+
 static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     if (request->argc < 4 || !session->server->vdb) return request->argc < 4 ? qihse_resp_wrong_arity(session, "vecset") : qihse_resp_error(session, "ERR vector database is not configured");
     uint64_t id;
@@ -3100,7 +3103,33 @@ static bool qihse_resp_handle_vecset(qihse_resp_session_t* session, const qihse_
     const void* metadata_values[1] = { metadata };
     size_t metadata_sizes[1] = { metadata_size };
     pthread_mutex_lock(&session->server->vdb_lock);
-    bool result = qihse_vector_db_upsert_by_ids(session->server->vdb, &id, vector, 1u, dims,
+    uint32_t tenant = session->user ? qihse_user_get_tenant_id(session->user) :
+                                      QIHSE_TENANT_INVALID;
+    bool tenant_owned = true;
+    if (tenant != QIHSE_TENANT_SYSTEM && tenant != QIHSE_TENANT_INVALID) {
+        void* old_tag_bytes = NULL;
+        size_t old_tag_size = 0u;
+        if (qihse_vector_db_get_metadata_by_id_user(session->server->vdb,
+                session->user, id, &old_tag_bytes, &old_tag_size)) {
+            qihse_resp_arg_t old_tag = {
+                .data = (const uint8_t*)old_tag_bytes,
+                .len = old_tag_size
+            };
+            tenant_owned = old_tag_size != 0u &&
+                           qihse_resp_tenant_key_allowed(tenant, &old_tag);
+            free(old_tag_bytes);
+        } else if (errno != ENOENT) {
+            tenant_owned = false;
+        }
+    }
+    if (!tenant_owned) {
+        pthread_mutex_unlock(&session->server->vdb_lock);
+        free(vector);
+        return qihse_resp_error(session,
+            "NOPERM vector ID belongs to another tenant collection");
+    }
+    bool result = qihse_vector_db_upsert_by_ids_user(session->server->vdb,
+                                                 session->user, &id, vector, 1u, dims,
                                                  metadata ? metadata_values : NULL,
                                                  metadata ? metadata_sizes : NULL, NULL, NULL);
     pthread_mutex_unlock(&session->server->vdb_lock);
@@ -10340,8 +10369,8 @@ static bool qihse_resp_handle_forensic(qihse_resp_session_t* session,
         const void* metas[1] = {metadata};
         size_t sizes[1] = {(size_t)n};
         pthread_mutex_lock(&server->forensic_lock);
-        bool ok = qihse_vector_db_upsert_by_ids(server->forensic_vdb, &id, vector,
-                           1u, 1024u, metas, sizes, NULL, NULL) &&
+        bool ok = qihse_vector_db_upsert_by_ids_user(server->forensic_vdb,
+                           session->user, &id, vector, 1u, 1024u, metas, sizes, NULL, NULL) &&
                   qihse_vector_db_flush(server->forensic_vdb);
         pthread_mutex_unlock(&server->forensic_lock);
         return ok ? qihse_resp_simple(session, "OK") :

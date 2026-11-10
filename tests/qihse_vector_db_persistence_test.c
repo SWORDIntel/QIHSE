@@ -6,6 +6,7 @@
 #include "../memory/include/qihse_memory.h"
 #include "qihse_vector_db.h"
 #include "../persistence/qihse_container.h"
+#include "../persistence/qihse_vector_store.h"
 #include "qihse_auth.h"
 
 #include <errno.h>
@@ -120,6 +121,7 @@ static bool test_stale_snapshot_tmp_files_ignored_after_checkpoint(void);
 static bool test_manifest_rejects_impossible_qmag_shape(void);
 static bool test_read_only_open_searches_and_rejects_add(void);
 static bool test_duplicate_vector_id_rejected(void);
+static bool test_mutations_preserve_labels_and_authorize_preimages(void);
 static bool test_corrupt_idmap_rebuilds_high_ids(void);
 static bool test_invalid_idmap_row_index_rebuilds_on_reopen(void);
 static bool test_missing_vectors_qtri_accepted(void);
@@ -234,6 +236,8 @@ int main(void) {
          test_read_only_open_searches_and_rejects_add},
         {"duplicate vector_id rejected",
          test_duplicate_vector_id_rejected},
+        {"update/upsert preserve labels and authorize batch preimages",
+         test_mutations_preserve_labels_and_authorize_preimages},
         {"corrupt idmap.qid rebuilds and high IDs survive",
          test_corrupt_idmap_rebuilds_high_ids},
         {"invalid idmap row index rebuilds on reopen",
@@ -332,7 +336,13 @@ int main(void) {
         return 1;
     }
 
+    const char* only_test = getenv("QIHSE_VECTOR_TEST_ONLY");
+    bool ran_test = false;
     for (size_t i = 0; i < ARRAY_LEN(tests); i++) {
+        if (only_test && *only_test && !strstr(tests[i].name, only_test)) {
+            continue;
+        }
+        ran_test = true;
         printf("RUN  %s\n", tests[i].name);
         if (!tests[i].fn()) {
             printf("FAIL %s\n", tests[i].name);
@@ -341,7 +351,13 @@ int main(void) {
         printf("PASS %s\n", tests[i].name);
     }
 
-    printf("PASS all qihse vector DB persistence tests\n");
+    if (!ran_test) {
+        fprintf(stderr, "FAIL: no vector persistence test matched QIHSE_VECTOR_TEST_ONLY\n");
+        return 2;
+    }
+
+    printf("PASS %s qihse vector DB persistence tests\n",
+           only_test && *only_test ? "selected" : "all");
     return 0;
 }
 
@@ -1939,6 +1955,214 @@ static bool test_duplicate_vector_id_rejected(void) {
                 "duplicate vector_id should be rejected");
 
     qihse_vector_db_destroy(db);
+    remove_tree(path);
+    free(path);
+    env_destroy(&env);
+    return true;
+}
+
+static bool test_mutations_preserve_labels_and_authorize_preimages(void) {
+    const uint64_t ids[] = {5001u, 5002u, 5003u};
+    const float original[][2] = {{1.0f, 0.0f}, {0.0f, 1.0f}, {3.0f, 4.0f}};
+    const float rejected[][2] = {{8.0f, 8.0f}, {9.0f, 9.0f}};
+    const float replacement_a[] = {-1.0f, -2.0f};
+    const float replacement_b[] = {-3.0f, -4.0f};
+    static const char tenant_tags[] = "t:7/private\0t:8/private\0";
+    test_env_t env;
+    TEST_ASSERT(env_init(&env), "environment should initialize");
+    char* path = make_temp_db_path("mutation_labels");
+    TEST_ASSERT(path != NULL, "temp database path should be created");
+
+    qihse_index_row_t rows[3];
+    memset(rows, 0, sizeof(rows));
+    for (size_t i = 0u; i < ARRAY_LEN(rows); i++) {
+        rows[i].vector_id = ids[i];
+        rows[i].vector_offset = i * sizeof(original[0]);
+        rows[i].commit_generation = 1u;
+        rows[i].row_flags = QIHSE_ROW_F_LIVE;
+    }
+    rows[0].classification = QIHSE_CLASS_SECRET;
+    rows[0].sci_compartment = QIHSE_SCI_SI;
+    rows[0].metadata_offset = 0u;
+    rows[0].metadata_size = sizeof("t:7/private");
+    rows[1].classification = QIHSE_CLASS_SECRET;
+    rows[1].sci_compartment = QIHSE_SCI_SI;
+    rows[1].metadata_offset = sizeof("t:7/private");
+    rows[1].metadata_size = sizeof("t:8/private");
+    rows[2].classification = QIHSE_CLASS_UNCLASSIFIED;
+    rows[2].sci_compartment = QIHSE_SCI_NONE;
+    qihse_vector_store_flush_t initial;
+    memset(&initial, 0, sizeof(initial));
+    initial.vector_dims = 2u;
+    initial.commit_generation = 1u;
+    initial.rows = rows;
+    initial.row_count = ARRAY_LEN(rows);
+    initial.vectors = original;
+    initial.vector_bytes = sizeof(original);
+    initial.metadata = tenant_tags;
+    initial.metadata_bytes = sizeof(tenant_tags);
+    TEST_ASSERT(qihse_vector_store_flush(path, &initial),
+                "classified vector snapshot should be written");
+
+    qihse_vector_db_t db = qihse_vector_db_open(
+        QIHSE_VECTOR_DB_INMEMORY, env.uma, path,
+        QIHSE_TEST_OPEN_FILE_BACKED);
+    TEST_ASSERT(db != NULL, "classified snapshot should open for mutation");
+    qihse_user_t* op = qihse_auth_get_user(0u);
+    qihse_user_t* low_clearance = qihse_auth_create_user(
+        op, 97u, QIHSE_ROLE_ANALYST, QIHSE_CLASS_CONFIDENTIAL, QIHSE_SCI_SI,
+        "MutationLowClearance123!", false);
+    qihse_user_t* missing_sci = qihse_auth_create_user(
+        op, 98u, QIHSE_ROLE_ANALYST, QIHSE_CLASS_TOP_SECRET, QIHSE_SCI_NONE,
+        "MutationMissingSci123!", false);
+    TEST_ASSERT(op && low_clearance && missing_sci,
+                "operator and negative-test principals should exist");
+    void* initial_tag = NULL;
+    size_t initial_tag_size = 0u;
+    bool initial_tag_ok = qihse_vector_db_get_metadata_by_id_user(db, op, ids[0],
+        &initial_tag, &initial_tag_size);
+    TEST_ASSERT(initial_tag_ok &&
+        initial_tag_size == sizeof("t:7/private") &&
+        memcmp(initial_tag, "t:7/private", strlen("t:7/private")) == 0,
+        "classified fixture metadata should load before mutation");
+    free(initial_tag);
+
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_update_by_id_user(db, op, ids[0],
+        replacement_a, 2u, NULL, 1u) && errno == EINVAL,
+        "NULL metadata with a nonzero size must be rejected");
+
+    size_t changed = 99u;
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_update_by_id_user(db, low_clearance, ids[0],
+        replacement_a, 2u, NULL, 0u) && errno == EACCES,
+        "low-clearance update should be denied");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_update_by_ids_user(db, low_clearance,
+        (const uint64_t[]){ids[2], ids[0]}, (const float*)rejected, 2u, 2u,
+        NULL, NULL, &changed) && errno == EACCES && changed == 0u,
+        "mixed public/secret update batch should be denied as a unit");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_upsert_by_ids_user(db, missing_sci,
+        (const uint64_t[]){ids[2], ids[1]}, (const float*)rejected, 2u, 2u,
+        NULL, NULL, NULL, NULL) && errno == EACCES,
+        "mixed public/SCI upsert batch should be denied as a unit");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_update_by_id(db, ids[0], replacement_a,
+        2u, NULL, 0u) && errno == EACCES,
+        "legacy context-free update must reject classified rows");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_delete_by_id(db, ids[1]) && errno == EACCES,
+        "legacy context-free delete must reject classified rows");
+
+    void* hidden_metadata = (void*)1;
+    size_t hidden_metadata_size = 99u;
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_get_metadata_by_id_user(db, low_clearance,
+        ids[0], &hidden_metadata, &hidden_metadata_size) && errno == EACCES &&
+        hidden_metadata == NULL && hidden_metadata_size == 0u,
+        "low-clearance principal must not read classified metadata");
+    hidden_metadata = (void*)1;
+    hidden_metadata_size = 99u;
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_get_metadata_by_id_user(db, missing_sci,
+        ids[1], &hidden_metadata, &hidden_metadata_size) && errno == EACCES &&
+        hidden_metadata == NULL && hidden_metadata_size == 0u,
+        "principal missing SCI must not read classified metadata");
+    hidden_metadata = (void*)1;
+    hidden_metadata_size = 99u;
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_get_metadata_by_id_user(db, NULL,
+        ids[0], &hidden_metadata, &hidden_metadata_size) && errno == EACCES &&
+        hidden_metadata == NULL && hidden_metadata_size == 0u,
+        "NULL principal must not read classified metadata");
+
+    float got[2] = {0.0f, 0.0f};
+    size_t got_dims = 0u;
+    TEST_ASSERT(qihse_vector_db_get_vector_by_id_user(db, op, ids[2], got,
+        &got_dims) && got_dims == 2u && got[0] == original[2][0] &&
+        got[1] == original[2][1],
+        "denied mixed batch must leave its earlier public row unchanged");
+
+    TEST_ASSERT(qihse_vector_db_update_by_id_user(db, op, ids[0],
+        replacement_a, 2u, NULL, 0u), "Operator update should succeed");
+    TEST_ASSERT(qihse_vector_db_upsert_by_ids_user(db, op, &ids[1],
+        replacement_b, 1u, 2u, NULL, NULL, NULL, NULL),
+        "Operator upsert should succeed");
+
+    /* Simulate process loss after committed WAL writes, before snapshot flush. */
+    qihse_vector_db_destroy(db);
+    db = qihse_vector_db_open(QIHSE_VECTOR_DB_INMEMORY, env.uma, path,
+                              QIHSE_TEST_OPEN_FILE_BACKED);
+    TEST_ASSERT(db != NULL, "unflushed mutation WAL should replay");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_get_vector_by_id_user(db, low_clearance,
+        ids[0], got, &got_dims) && errno == EACCES,
+        "replayed update must retain SECRET/SCI labels");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_get_vector_by_id_user(db, missing_sci,
+        ids[1], got, &got_dims) && errno == EACCES,
+        "replayed upsert must retain SECRET/SCI labels");
+    TEST_ASSERT(qihse_vector_db_get_vector_by_id_user(db, op, ids[0], got,
+        &got_dims) && got[0] == replacement_a[0] && got[1] == replacement_a[1],
+        "Operator should read the exact replayed update vector");
+    TEST_ASSERT(qihse_vector_db_get_vector_by_id_user(db, op, ids[1], got,
+        &got_dims) && got[0] == replacement_b[0] && got[1] == replacement_b[1],
+        "Operator should read the exact replayed upsert vector");
+    void* recovered_tag = NULL;
+    size_t recovered_tag_size = 0u;
+    TEST_ASSERT(qihse_vector_db_get_metadata_by_id_user(db, op, ids[0],
+        &recovered_tag, &recovered_tag_size) &&
+        recovered_tag_size == sizeof("t:7/private") &&
+        memcmp(recovered_tag, "t:7/private", sizeof("t:7/private")) == 0,
+        "metadata omitted from update must survive WAL replay");
+    free(recovered_tag);
+    recovered_tag = NULL;
+    recovered_tag_size = 0u;
+    TEST_ASSERT(qihse_vector_db_get_metadata_by_id_user(db, op, ids[1],
+        &recovered_tag, &recovered_tag_size) &&
+        recovered_tag_size == sizeof("t:8/private") &&
+        memcmp(recovered_tag, "t:8/private", sizeof("t:8/private")) == 0,
+        "metadata omitted from upsert must survive WAL replay");
+    free(recovered_tag);
+    const char clear_metadata = '\0';
+    TEST_ASSERT(qihse_vector_db_update_by_id_user(db, op, ids[2],
+        original[2], 2u, &clear_metadata, 0u),
+        "explicit zero metadata size should clear a row's metadata");
+    recovered_tag = (void*)1;
+    recovered_tag_size = 99u;
+    TEST_ASSERT(qihse_vector_db_get_metadata_by_id_user(db, op, ids[2],
+        &recovered_tag, &recovered_tag_size) && !recovered_tag &&
+        recovered_tag_size == 0u,
+        "explicit metadata clear should publish an empty value");
+
+    const uint64_t duplicate_ids[] = {6000u, 6000u};
+    const float duplicate_vectors[][2] = {{6.0f, 0.0f}, {0.0f, 6.0f}};
+    qihse_vector_db_persistence_stats_t before, after;
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &before),
+                "pre-duplicate mutation stats should be available");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_add_vectors(db, &duplicate_vectors[0][0],
+        ARRAY_LEN(duplicate_ids), 2u, duplicate_ids, NULL, NULL) &&
+        errno == EEXIST,
+        "duplicate IDs within one add batch must be rejected before WAL");
+    TEST_ASSERT(qihse_vector_db_get_persistence_stats(db, &after) &&
+        after.total_vectors == before.total_vectors &&
+        after.live_vectors == before.live_vectors &&
+        after.wal_bytes_pending == before.wal_bytes_pending,
+        "rejected duplicate batch must leave row counts and WAL unchanged");
+    qihse_vector_db_destroy(db);
+    db = qihse_vector_db_open(QIHSE_VECTOR_DB_INMEMORY, env.uma, path,
+                              QIHSE_TEST_OPEN_FILE_BACKED);
+    TEST_ASSERT(db != NULL, "database should reopen after duplicate rejection");
+    errno = 0;
+    TEST_ASSERT(!qihse_vector_db_get_vector_by_id_user(db, op, 6000u, got,
+        &got_dims) && errno == ENOENT,
+        "rejected duplicate batch must not reappear from WAL");
+
+    TEST_ASSERT(qihse_auth_destroy_user(op, 97u), "low-clearance user removed");
+    TEST_ASSERT(qihse_auth_destroy_user(op, 98u), "missing-SCI user removed");
+    TEST_ASSERT(close_db(db), "database should close after label verification");
     remove_tree(path);
     free(path);
     env_destroy(&env);

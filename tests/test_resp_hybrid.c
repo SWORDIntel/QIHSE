@@ -16,11 +16,13 @@
 #include "qihse_fts.h"
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
+#include "../persistence/qihse_vector_store.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static qihse_resp_server_t* g_server;
 
@@ -193,6 +195,65 @@ int main(void) {
                != NULL);
         printf("PASS vechybrid: index-bytes + backend-availability metrics "
                "emitted\n");
+    }
+
+    /* VECSET must carry the authenticated RESP principal through to the
+     * vector mutation layer. A classified preimage cannot be downgraded by
+     * the low user; Operator replacement keeps its row labels. */
+    {
+        char path[] = "/tmp/qihse_resp_vector_acl_XXXXXX";
+        int fd = mkstemp(path);
+        assert(fd >= 0 && close(fd) == 0 && unlink(path) == 0);
+        qihse_index_row_t row;
+        memset(&row, 0, sizeof(row));
+        row.vector_id = 444u;
+        row.row_flags = QIHSE_ROW_F_LIVE;
+        row.commit_generation = 1u;
+        row.classification = QIHSE_CLASS_SECRET;
+        row.sci_compartment = QIHSE_SCI_SI;
+        const float initial_vector[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        qihse_vector_store_flush_t flush;
+        memset(&flush, 0, sizeof(flush));
+        flush.vector_dims = 4u;
+        flush.commit_generation = 1u;
+        flush.rows = &row;
+        flush.row_count = 1u;
+        flush.vectors = initial_vector;
+        flush.vector_bytes = sizeof(initial_vector);
+        assert(qihse_vector_store_flush(path, &flush));
+        qihse_vector_db_t protected_vdb = qihse_vector_db_open(
+            QIHSE_VECTOR_DB_INMEMORY, NULL, path,
+            QIHSE_VDB_OPEN_FILE_BACKED);
+        assert(protected_vdb != NULL);
+        qihse_resp_server_config_t protected_cfg;
+        qihse_resp_server_config_init(&protected_cfg);
+        protected_cfg.auth_required = false;
+        protected_cfg.port = 0;
+        protected_cfg.store = store;
+        protected_cfg.vdb = protected_vdb;
+        protected_cfg.enable_uwp_bridge = true;
+        qihse_resp_server_t* protected_server =
+            qihse_resp_server_create(&protected_cfg);
+        assert(protected_server != NULL);
+        qihse_resp_server_t* prior_server = g_server;
+        g_server = protected_server;
+        const char* vecset[] = {"VECSET", "444", "4", "5", "6", "7", "8"};
+        assert(run_cmd(low, 7u, vecset, reply, sizeof(reply)));
+        assert(strstr(reply, "vector upsert failed") != NULL);
+        const char* vecget[] = {"VECGET", "444"};
+        assert(run_cmd(low, 2u, vecget, reply, sizeof(reply)));
+        assert(strstr(reply, "$-1\r\n") != NULL && strstr(reply, "5\r\n") == NULL);
+        assert(run_cmd(op, 7u, vecset, reply, sizeof(reply)));
+        assert(strcmp(reply, "+OK\r\n") == 0);
+        assert(run_cmd(op, 2u, vecget, reply, sizeof(reply)));
+        assert(strstr(reply, "$1\r\n5\r\n") != NULL);
+        assert(run_cmd(low, 2u, vecget, reply, sizeof(reply)));
+        assert(strstr(reply, "$-1\r\n") != NULL && strstr(reply, "5\r\n") == NULL);
+        g_server = prior_server;
+        qihse_resp_server_destroy(protected_server);
+        assert(qihse_vector_db_close(protected_vdb));
+        unlink(path);
+        printf("PASS resp VECSET: protected mutation denied to low user and retained for Operator\n");
     }
 
     qihse_resp_server_destroy(g_server);

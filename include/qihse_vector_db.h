@@ -357,6 +357,11 @@ typedef struct qihse_vector_query_s {
  */
 typedef struct qihse_vector_db_s* qihse_vector_db_t;
 
+/* A vector DB handle is not internally synchronized for concurrent mutation
+ * and read operations. Callers that share a handle across threads must hold
+ * one external lock across each complete operation and any coupled lookup /
+ * mutation sequence. The primary RESP server uses its vdb_lock for this. */
+
 /* ============================================================================
  * VECTOR DATABASE LIFECYCLE
  * ============================================================================ */
@@ -588,6 +593,9 @@ bool qihse_vector_db_delete_by_id(
     qihse_vector_db_t vdb,
     uint64_t vector_id
 );
+bool qihse_vector_db_delete_by_id_user(qihse_vector_db_t vdb,
+                                      qihse_user_t* user,
+                                      uint64_t vector_id);
 
 /**
  * Retrieve a single vector by external ID with user context authorization.
@@ -606,6 +614,13 @@ bool qihse_vector_db_get_vector_by_id_user(
     float* out_vector,
     size_t* out_dims
 );
+
+/* Retrieve a row's opaque metadata with the same classification/SCI gate as
+ * direct vector lookup. The caller owns *out_metadata (free it); absent
+ * metadata is returned as NULL/0. */
+bool qihse_vector_db_get_metadata_by_id_user(
+    qihse_vector_db_t vdb, qihse_user_t* user, uint64_t vector_id,
+    void** out_metadata, size_t* out_metadata_size);
 
 /**
  * Retrieve a single vector by external ID.
@@ -630,7 +645,9 @@ bool qihse_vector_db_get_vector_by_id(
  * @param vector_ids External vector IDs to delete
  * @param count Number of IDs
  * @param deleted_count Optional output count of deleted live rows
- * @return true if the batch completed, false on validation or storage failure
+ * Context-free compatibility form; it only deletes UNCLASSIFIED/NONE rows.
+ * Use the _user form for classified rows.
+ * @return true if the batch completed, false on validation, authorization, or storage failure
  */
 bool qihse_vector_db_delete_by_ids(
     qihse_vector_db_t vdb,
@@ -638,6 +655,9 @@ bool qihse_vector_db_delete_by_ids(
     size_t count,
     size_t* deleted_count
 );
+bool qihse_vector_db_delete_by_ids_user(
+    qihse_vector_db_t vdb, qihse_user_t* user,
+    const uint64_t* vector_ids, size_t count, size_t* deleted_count);
 
 /**
  * Replace one live vector by external ID.
@@ -649,8 +669,11 @@ bool qihse_vector_db_delete_by_ids(
  * @param vector_id External vector ID to update
  * @param vector Replacement vector
  * @param dims Replacement vector dimensions
- * @param metadata Optional replacement metadata bytes
+ * @param metadata Optional replacement metadata bytes; NULL with size 0
+ * preserves existing metadata, while non-NULL with size 0 clears it
  * @param metadata_size Replacement metadata size
+ * Context-free compatibility form; it only updates UNCLASSIFIED/NONE rows.
+ * Use the _user form for classified rows.
  * @return true if the vector was updated, false on failure or missing ID
  */
 bool qihse_vector_db_update_by_id(
@@ -661,6 +684,10 @@ bool qihse_vector_db_update_by_id(
     const void* metadata,
     size_t metadata_size
 );
+bool qihse_vector_db_update_by_id_user(
+    qihse_vector_db_t vdb, qihse_user_t* user, uint64_t vector_id,
+    const float* vector, size_t dims, const void* metadata,
+    size_t metadata_size);
 
 /**
  * Replace multiple live vectors by external ID in one batch.
@@ -671,9 +698,12 @@ bool qihse_vector_db_update_by_id(
  * @param count Number of vectors
  * @param dims Dimension count per replacement vector
  * @param metadata Optional replacement metadata pointers
- * @param metadata_sizes Optional replacement metadata sizes
+ * @param metadata_sizes NULL preserves existing metadata; a supplied zero
+ * size explicitly clears that row's metadata
  * @param updated_count Optional output count of updated live rows
- * @return true if the batch completed, false on validation or storage failure
+ * Context-free compatibility form; it only updates UNCLASSIFIED/NONE rows.
+ * Use the _user form for classified rows.
+ * @return true if the batch completed, false on validation, authorization, or storage failure
  */
 bool qihse_vector_db_update_by_ids(
     qihse_vector_db_t vdb,
@@ -685,6 +715,11 @@ bool qihse_vector_db_update_by_ids(
     const size_t* metadata_sizes,
     size_t* updated_count
 );
+bool qihse_vector_db_update_by_ids_user(
+    qihse_vector_db_t vdb, qihse_user_t* user,
+    const uint64_t* vector_ids, const float* vectors, size_t count,
+    size_t dims, const void* const* metadata,
+    const size_t* metadata_sizes, size_t* updated_count);
 
 /**
  * Insert missing IDs and replace existing IDs in one committed batch.
@@ -695,10 +730,13 @@ bool qihse_vector_db_update_by_ids(
  * @param count Number of vectors
  * @param dims Dimension count per vector
  * @param metadata Optional metadata pointers
- * @param metadata_sizes Optional metadata sizes
+ * @param metadata_sizes NULL preserves existing metadata; a supplied zero
+ * size explicitly clears that row's metadata (new rows start empty)
  * @param inserted_count Optional output count of inserted rows
  * @param updated_count Optional output count of updated rows
- * @return true if the batch completed, false on validation or storage failure
+ * Context-free compatibility form; it only updates UNCLASSIFIED/NONE rows.
+ * Use the _user form for classified rows.
+ * @return true if the batch completed, false on validation, authorization, or storage failure
  */
 bool qihse_vector_db_upsert_by_ids(
     qihse_vector_db_t vdb,
@@ -711,6 +749,12 @@ bool qihse_vector_db_upsert_by_ids(
     size_t* inserted_count,
     size_t* updated_count
 );
+bool qihse_vector_db_upsert_by_ids_user(
+    qihse_vector_db_t vdb, qihse_user_t* user,
+    const uint64_t* vector_ids, const float* vectors, size_t count,
+    size_t dims, const void* const* metadata,
+    const size_t* metadata_sizes, size_t* inserted_count,
+    size_t* updated_count);
 
 /**
  * Search vectors with QIHSE acceleration and instant access.

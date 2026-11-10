@@ -460,7 +460,8 @@ static uwp_route_result_t uwp_route_payload(uwp_socket_t client_fd, uwp_conn_t* 
                 if (!qihse_auth_can_access_object(current_user, 0, id, QIHSE_ACL_WRITE)) {
                     return UWP_ROUTE_ERR_PERM;
                 }
-                if (!qihse_vector_db_upsert_by_ids(ctx->vdb, &id, staging, 1, dims,
+                if (!qihse_vector_db_upsert_by_ids_user(ctx->vdb, current_user,
+                                                   &id, staging, 1, dims,
                                                    NULL, NULL, NULL, NULL)) {
                     return UWP_ROUTE_ERR_DISPATCH;
                 }
