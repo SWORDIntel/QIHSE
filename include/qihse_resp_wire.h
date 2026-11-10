@@ -28,6 +28,7 @@
 #include "qihse_task_scheduler.h"
 #include "qihse_cluster_maintenance.h"
 #include "qihse_resp_fts_namespace.h"
+#include "qihse_ct_group_config.h"
 
 typedef struct qihse_resp_server qihse_resp_server_t;
 
@@ -51,6 +52,7 @@ typedef struct qihse_resp_ct_activation_request qihse_resp_ct_activation_request
 typedef struct qihse_resp_ct_begin_request qihse_resp_ct_begin_request_t;
 typedef struct qihse_resp_ct_abort_request qihse_resp_ct_abort_request_t;
 typedef struct qihse_cluster_ct_activation_receipt qihse_cluster_ct_activation_receipt_t;
+typedef struct qihse_resp_ct_group_stage_receipt qihse_resp_ct_group_stage_receipt_t;
 typedef struct { const void* data; size_t len; } qihse_resp_ct_arg_t;
 typedef struct { unsigned char* data; size_t len; } qihse_resp_ct_reply_t;
 typedef bool (*qihse_resp_ct_activation_handler_fn)(void* context,
@@ -105,6 +107,13 @@ bool qihse_resp_ct_peer_command(qihse_resp_server_t* server,
 bool qihse_resp_ct_peer_command_to(qihse_resp_server_t* server,
     uint16_t target_topology_index, const char* expected_qkp_node_id,
     const qihse_resp_ct_arg_t* args, size_t argc, qihse_resp_ct_reply_t* out);
+/* Ask the selected QKP successor to bind the receiver lane described by an
+ * exact common RESERVED promotion claim. The recipient validates the claim
+ * and peer identities before persisting the receiver context. */
+bool qihse_resp_ct_promotion_successor_prepare(
+    void* context, uint16_t successor_index,
+    const qihse_kv_ct_lane_authority_claim_t* reserved_claim,
+    char* err, size_t err_cap);
 void qihse_resp_ct_reply_free(qihse_resp_ct_reply_t* reply);
 void qihse_resp_server_ct_control_only_set(qihse_resp_server_t* server,
                                            bool control_only);
@@ -113,6 +122,8 @@ bool qihse_resp_server_ct_ownership_set(qihse_resp_server_t* server,
 bool qihse_resp_server_ct_target_set(qihse_resp_server_t* server,
     qihse_ct_target_t* target);
 bool qihse_resp_server_ct_is_successor(qihse_resp_server_t* server);
+bool qihse_resp_server_ct_lane_is_receiver(qihse_resp_server_t* server,
+    const char* lane_id);
 /* Trusted ownership recovery and daemon lifecycle adapters, using the explicit
  * authenticated control principal already bound to the server. */
 bool qihse_resp_server_ct_authorize_promotion(void* context,
@@ -156,6 +167,18 @@ bool qihse_resp_ct_activation_receipt_validate(
     uint64_t config_epoch, uint64_t* out_target_lsn, unsigned char out_checksum[32]);
 void qihse_resp_ct_activation_receipt_free(
     qihse_cluster_ct_activation_receipt_t* receipt);
+bool qihse_resp_ct_group_stage_receipt_query_to(qihse_resp_server_t* server,
+    uint16_t target_topology_index, const char* expected_qkp_node_id,
+    const void* canonical_claim, size_t claim_len,
+    qihse_resp_ct_group_stage_receipt_t** out_receipt);
+bool qihse_resp_ct_group_stage_receipt_validate(
+    const qihse_resp_ct_group_stage_receipt_t* receipt,
+    const void* canonical_claim, size_t claim_len,
+    const char* expected_issuer_qkp_id,
+    const unsigned char expected_seal_digest[32],
+    uint64_t* out_source_cut, uint64_t* out_target_cursor);
+void qihse_resp_ct_group_stage_receipt_free(
+    qihse_resp_ct_group_stage_receipt_t* receipt);
 typedef struct qihse_resp_fts_namespace_registry qihse_resp_fts_namespace_registry_t;
 typedef struct {
     uint32_t tenant_id;
@@ -298,6 +321,11 @@ typedef struct {
     qihse_user_t* ct_control_principal; /* active startup Operator, borrowed */
     qihse_cluster_topology_qkp_id_fn ct_topology_qkp_id;
     void* ct_topology_qkp_id_context;
+    /* Optional per-range CT1 lanes. Each entry maps a stable lane ID and
+     * initial slot bitmap to explicit topology identities. The daemon owns
+     * the array for the duration of server creation; the server copies it. */
+    const qihse_ct_group_config_t* ct_groups;
+    size_t ct_group_count;
     /* R4 replicated namespaces: keys matching one of these globs are
      * SOVEREIGN-LOCAL (never MOVED/CLUSTERDOWN-routed) and are expected to
      * exist on every node. Boot-time source of truth; REPL.MARK adds more
