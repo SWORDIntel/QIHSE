@@ -419,14 +419,20 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
         bool exact = valid_finalized_txn(&finalized, transfer_id, source_index,
                 target_index, first_slot, last_slot) &&
             finalized_topology_matches(c, &finalized, source_index, target_index);
-        OPENSSL_cleanse(&finalized, sizeof(finalized));
         if (!exact) {
+            OPENSSL_cleanse(&finalized, sizeof(finalized));
             set_error(err, err_cap, "finalized CT2 retry tuple or trusted topology mapping differs");
             errno = EINVAL;
             return QIHSE_CLUSTER_TRANSFER_REJECTED;
         }
         progress(c, QIHSE_CLUSTER_TRANSFER_COMMITTING, 0, 0);
-        return QIHSE_CLUSTER_TRANSFER_COMMITTED;
+        /* A lost one-shot bus datagram must be repairable by an exact retry.
+         * Re-ask the pinned target to activate idempotently, verify its typed
+         * receipt, then republish the historical proof. Per-slot epochs make
+         * peers reject it if a newer transfer has superseded this one. */
+        bool announced = activate_and_publish(c, target_index, &finalized, err, err_cap);
+        OPENSSL_cleanse(&finalized, sizeof(finalized));
+        return announced ? QIHSE_CLUSTER_TRANSFER_COMMITTED : QIHSE_CLUSTER_TRANSFER_PENDING;
     }
     OPENSSL_cleanse(&finalized, sizeof(finalized));
 

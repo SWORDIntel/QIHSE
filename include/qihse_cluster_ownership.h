@@ -124,6 +124,16 @@ bool qihse_cluster_ownership_receive_ct_update(
     const qihse_cluster_bus_ct_slot_update_t* update,
     const qihse_cluster_ct_activation_receipt_t* receipt,
     char* err, size_t err_cap);
+/* Apply a signed target-origin CT1 promotion event after validating its exact
+ * journal digest, pinned QKP relationships and per-slot epoch. */
+bool qihse_cluster_ownership_receive_ct1_promotion(
+    qihse_cluster_ownership_context_t* context,
+    const qihse_cluster_bus_ct1_promotion_update_t* update,
+    char* err, size_t err_cap);
+void qihse_cluster_ownership_ct1_promotion_bus_callback(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_t* update,
+    void* ownership_context);
 
 /* Handler for ACTIVATE requests created only by the RESP QKP replication
  * endpoint after authenticating the configured source pin. It validates the

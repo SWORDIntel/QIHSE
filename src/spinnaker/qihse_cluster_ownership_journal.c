@@ -124,11 +124,14 @@ static bool txn_shape_valid(const qihse_cluster_ownership_txn_t* t) {
     if (t->next_generation[0]) {
         if (!bitmap_any || t->start != bitmap_first || t->end != bitmap_last) return false;
     } else if (bitmap_any) return false;
-    if (t->phase == QIHSE_OWNERSHIP_COMMITTED || t->phase == QIHSE_OWNERSHIP_FINALIZED)
+    if (t->phase == QIHSE_OWNERSHIP_COMMITTED || t->phase == QIHSE_OWNERSHIP_FINALIZED ||
+        t->phase == QIHSE_OWNERSHIP_ADOPTED)
         return (t->next_generation[0] || !strcmp(t->owner_id, t->target_id)) &&
                digest_nonzero(t->proof_digest) &&
                (!t->next_generation[0] || t->target_lsn >= t->source_lsn);
-    if (t->phase == QIHSE_OWNERSHIP_PREPARED || t->phase == QIHSE_OWNERSHIP_ABORTED) {
+    if (t->phase == QIHSE_OWNERSHIP_INTENT ||
+        t->phase == QIHSE_OWNERSHIP_PREPARED ||
+        t->phase == QIHSE_OWNERSHIP_ABORTED) {
         uint8_t v = 0;
         for (size_t i = 0; i < sizeof(t->proof_digest); ++i) v |= t->proof_digest[i];
         return v == 0 && (t->next_generation[0] || !strcmp(t->owner_id, t->source_id)) &&
@@ -310,7 +313,9 @@ typedef struct {
 } txn_state_t;
 static bool txn_state_cb(const qihse_cluster_ownership_txn_t* t, void* ctx) {
     txn_state_t* s = ctx;
-    if (t->phase == QIHSE_OWNERSHIP_PREPARED || t->phase == QIHSE_OWNERSHIP_COMMITTED) {
+    if (t->phase == QIHSE_OWNERSHIP_INTENT ||
+        t->phase == QIHSE_OWNERSHIP_PREPARED ||
+        t->phase == QIHSE_OWNERSHIP_COMMITTED) {
         s->pending = true; s->phase = t->phase; s->txn = *t;
     } else { s->pending = false; s->phase = t->phase; memset(&s->txn, 0, sizeof(s->txn)); }
     return true;
@@ -328,6 +333,17 @@ static bool same_txn(const qihse_cluster_ownership_txn_t* a,
            a->source_lsn == b->source_lsn && a->config_epoch == b->config_epoch &&
            memcmp(a->slot_bitmap, b->slot_bitmap, sizeof(a->slot_bitmap)) == 0;
 }
+static bool same_intent_prepare(const qihse_cluster_ownership_txn_t* intent,
+                                const qihse_cluster_ownership_txn_t* prepared) {
+    if (!intent || !prepared || intent->phase != QIHSE_OWNERSHIP_INTENT ||
+        prepared->phase != QIHSE_OWNERSHIP_PREPARED ||
+        (intent->source_lsn != 0u && intent->source_lsn != prepared->source_lsn))
+        return false;
+    qihse_cluster_ownership_txn_t a = *intent, b = *prepared;
+    a.phase = b.phase;
+    a.source_lsn = b.source_lsn;
+    return same_txn(&a, &b);
+}
 
 static int journal_append_txn_unlocked(
     const char* data_dir, const qihse_cluster_ownership_txn_t* txn) {
@@ -337,14 +353,23 @@ static int journal_append_txn_unlocked(
         data_dir, txn_state_cb, &state, &unresolved);
     if (replayed < 0) { if (!errno) errno = EBUSY; return -1; }
     bool transition_ok = false;
-    if (txn->phase == QIHSE_OWNERSHIP_PREPARED)
+    if (txn->phase == QIHSE_OWNERSHIP_INTENT)
         transition_ok = !state.pending;
+    else if (txn->phase == QIHSE_OWNERSHIP_PREPARED)
+        transition_ok = (!state.pending) ||
+            (state.pending && state.phase == QIHSE_OWNERSHIP_INTENT &&
+             same_intent_prepare(&state.txn, txn));
     else if (txn->phase == QIHSE_OWNERSHIP_COMMITTED || txn->phase == QIHSE_OWNERSHIP_ABORTED)
-        transition_ok = state.pending && state.phase == QIHSE_OWNERSHIP_PREPARED &&
-                        same_txn(&state.txn, txn);
+        transition_ok = state.pending &&
+            (state.phase == QIHSE_OWNERSHIP_PREPARED ||
+             (txn->phase == QIHSE_OWNERSHIP_ABORTED &&
+              state.phase == QIHSE_OWNERSHIP_INTENT)) &&
+            same_txn(&state.txn, txn);
     else if (txn->phase == QIHSE_OWNERSHIP_FINALIZED)
         transition_ok = state.pending && state.phase == QIHSE_OWNERSHIP_COMMITTED &&
                         same_txn(&state.txn, txn);
+    else if (txn->phase == QIHSE_OWNERSHIP_ADOPTED)
+        transition_ok = !state.pending && txn->next_generation[0];
     if (!transition_ok) {
         errno = EPROTO; return -1;
     }
@@ -390,47 +415,68 @@ int qihse_cluster_ownership_journal_replay_txn(
     if (journal_path(data_dir, path, sizeof(path)) != 0) { errno = ENAMETOOLONG; return -1; }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return errno == ENOENT ? 0 : -1;
+    uint8_t* frame = malloc(QIHSE_OWNERSHIP_JOURNAL_V2_FRAME);
+    if (!frame) { close(fd); errno = ENOMEM; return -1; }
     int replayed = 0; bool pending = false;
     qihse_cluster_ownership_phase_t active_phase = 0;
     qihse_cluster_ownership_txn_t active;
-    uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V2_FRAME];
     for (;;) {
         size_t length = 0;
-        int kind = read_exact_frame(fd, frame, sizeof(frame), &length);
+        int kind = read_exact_frame(fd, frame, QIHSE_OWNERSHIP_JOURNAL_V2_FRAME, &length);
         if (kind == 0) break;
-        if (kind < 0) { *out_unresolved = true; close(fd); errno = EILSEQ; return -1; }
+        if (kind < 0) { *out_unresolved = true; free(frame); close(fd); errno = EILSEQ; return -1; }
         if (kind == 1) {
             uint64_t stored = get_u64(frame + 57);
-            if (stored != fnv1a64(frame, 57u)) { *out_unresolved = true; close(fd); errno = EILSEQ; return -1; }
+            if (stored != fnv1a64(frame, 57u)) { *out_unresolved = true; free(frame); close(fd); errno = EILSEQ; return -1; }
             continue;
         }
         qihse_cluster_ownership_txn_t t;
-        if (!txn_decode(frame, &t)) { *out_unresolved = true; close(fd); errno = EILSEQ; return -1; }
-        if (t.phase == QIHSE_OWNERSHIP_PREPARED) {
-            if (pending) { *out_unresolved = true; close(fd); errno = EPROTO; return -1; }
-            active = t; pending = true; active_phase = QIHSE_OWNERSHIP_PREPARED;
+        if (!txn_decode(frame, &t)) { *out_unresolved = true; free(frame); close(fd); errno = EILSEQ; return -1; }
+        if (t.phase == QIHSE_OWNERSHIP_INTENT) {
+            if (pending) { *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1; }
+            active = t; pending = true; active_phase = QIHSE_OWNERSHIP_INTENT;
+        } else if (t.phase == QIHSE_OWNERSHIP_PREPARED) {
+            if (!pending) {
+                active = t; pending = true; active_phase = QIHSE_OWNERSHIP_PREPARED;
+            } else if (active_phase == QIHSE_OWNERSHIP_INTENT &&
+                       same_intent_prepare(&active, &t)) {
+                active = t; active_phase = QIHSE_OWNERSHIP_PREPARED;
+            } else {
+                *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1;
+            }
         } else if (t.phase == QIHSE_OWNERSHIP_COMMITTED) {
-            if (!pending || active_phase != QIHSE_OWNERSHIP_PREPARED || !same_txn(&active, &t)) {
-                *out_unresolved = true; close(fd); errno = EPROTO; return -1;
+            if (!pending ||
+                active_phase != QIHSE_OWNERSHIP_PREPARED ||
+                !same_txn(&active, &t)) {
+                *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1;
             }
             active = t; active_phase = QIHSE_OWNERSHIP_COMMITTED;
         } else if (t.phase == QIHSE_OWNERSHIP_FINALIZED) {
             if (!pending || active_phase != QIHSE_OWNERSHIP_COMMITTED || !same_txn(&active, &t)) {
-                *out_unresolved = true; close(fd); errno = EPROTO; return -1;
+                *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1;
             }
             pending = false; active_phase = QIHSE_OWNERSHIP_FINALIZED;
             memset(&active, 0, sizeof(active));
+        } else if (t.phase == QIHSE_OWNERSHIP_ADOPTED) {
+            if (pending || !t.next_generation[0]) {
+                *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1;
+            }
+            active_phase = QIHSE_OWNERSHIP_ADOPTED;
         } else {
-            if (!pending || active_phase != QIHSE_OWNERSHIP_PREPARED || !same_txn(&active, &t)) {
-                *out_unresolved = true; close(fd); errno = EPROTO; return -1;
+            if (!pending ||
+                (active_phase != QIHSE_OWNERSHIP_PREPARED &&
+                 active_phase != QIHSE_OWNERSHIP_INTENT) ||
+                !same_txn(&active, &t)) {
+                *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1;
             }
             pending = false; active_phase = QIHSE_OWNERSHIP_ABORTED;
             memset(&active, 0, sizeof(active));
         }
-        if (cb && !cb(&t, ctx)) { close(fd); errno = ECANCELED; return -1; }
+        if (cb && !cb(&t, ctx)) { free(frame); close(fd); errno = ECANCELED; return -1; }
         replayed++;
     }
     close(fd);
+    free(frame);
     *out_unresolved = pending;
     return replayed;
 }

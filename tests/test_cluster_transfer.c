@@ -167,7 +167,9 @@ bool qihse_resp_ct_peer_command_to(qihse_resp_server_t *server,
         return true;
     }
     if (!strcmp(verb, "ACTIVATE")) {
-        assert(argc == 14 && activated == 0);
+        /* ACTIVATE is intentionally idempotent: a source may retry after
+         * FINALIZED if the first bus announcement was lost. */
+        assert(argc == 14);
         assert(!strcmp(argv[11].data, "7"));
         assert(!strcmp(argv[12].data, "6"));
         event("activate");
@@ -545,8 +547,8 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
     }
     assert(commit < activation && activation < publish);
     assert(memcmp(received, image, sizeof(image)) == 0);
-    /* A lost final response is reconciled from the local FINALIZED journal,
-     * without exporting, contacting the peer, mutating, or publishing again. */
+    /* A finalized retry repairs a lost one-shot publication by repeating the
+     * idempotent pinned activation and refreshing proof-bearing publication. */
     finalized = committed;
     finalized.phase = QIHSE_OWNERSHIP_FINALIZED;
     size_t events_before_retry = event_count;
@@ -554,13 +556,17 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
     int publishes_before_retry = publish_calls;
     assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
         NULL, 0) == QIHSE_CLUSTER_TRANSFER_COMMITTED);
-    assert(event_count == events_before_retry && read_calls == reads_before_retry &&
-           publish_calls == publishes_before_retry);
+    assert(event_count == events_before_retry + 3 &&
+           read_calls == reads_before_retry &&
+           publish_calls == publishes_before_retry + 1);
+    assert(!strcmp(events[events_before_retry], "activate") &&
+           !strcmp(events[events_before_retry + 1], "activation-receipt") &&
+           !strcmp(events[events_before_retry + 2], "publish"));
     /* Reusing an immutable finalized ID with a different range is refused. */
     assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 11, 12,
         NULL, 0) == QIHSE_CLUSTER_TRANSFER_REJECTED);
-    assert(event_count == events_before_retry && read_calls == reads_before_retry &&
-           publish_calls == publishes_before_retry);
+    assert(event_count == events_before_retry + 3 && read_calls == reads_before_retry &&
+           publish_calls == publishes_before_retry + 1);
     qihse_cluster_ct_peer_receipt_t staged = {0};
     uint64_t target_lsn = 0;
     unsigned char checksum[32] = {0};

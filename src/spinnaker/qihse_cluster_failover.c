@@ -614,11 +614,31 @@ static bool fo_promote_ct_locked(qihse_cluster_failover_t* fo,
     for (size_t i = 0; i < range_count; ++i) {
         if (ranges[i].owner_index != failed_primary_index) continue;
         if (!qihse_cluster_topology_adopt_range(fo->topology, ranges[i].start,
-                ranges[i].end, replica_index, epoch) ||
-            (fo->bus && !qihse_cluster_bus_broadcast_slot_update(
-                fo->bus, ranges[i].start, ranges[i].end, replica_index))) {
+                ranges[i].end, replica_index, epoch)) {
             fo_set_err(err, err_cap, "durable promotion is pending topology recovery"); goto done;
         }
+    }
+    if (fo->bus) {
+        qihse_cluster_bus_ct1_promotion_update_t update;
+        memset(&update, 0, sizeof(update));
+        update.magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC;
+        update.start = txn.start; update.end = txn.end;
+        update.config_epoch = txn.config_epoch;
+        update.durable_cursor = txn.source_lsn;
+        snprintf(update.transfer_id, sizeof(update.transfer_id), "%s", txn.transfer_id);
+        snprintf(update.source_id, sizeof(update.source_id), "%s", txn.source_id);
+        snprintf(update.target_id, sizeof(update.target_id), "%s", txn.target_id);
+        snprintf(update.source_qkp_id, sizeof(update.source_qkp_id), "%s", txn.source_qkp_id);
+        snprintf(update.target_qkp_id, sizeof(update.target_qkp_id), "%s", txn.target_qkp_id);
+        snprintf(update.successor_id, sizeof(update.successor_id), "%s", txn.owner_id);
+        snprintf(update.successor_qkp_id, sizeof(update.successor_qkp_id), "%s", successor_qkp);
+        snprintf(update.generation, sizeof(update.generation), "%s", txn.generation);
+        snprintf(update.next_generation, sizeof(update.next_generation), "%s", txn.next_generation);
+        memcpy(update.slot_bitmap, txn.slot_bitmap, sizeof(update.slot_bitmap));
+        memcpy(update.promotion_digest, txn.proof_digest, sizeof(update.promotion_digest));
+        if (qihse_cluster_bus_ct1_promotion_seal(&update))
+            (void)qihse_cluster_bus_broadcast_ct1_promotion(fo->bus, &update);
+        OPENSSL_cleanse(&update, sizeof(update));
     }
     if (fo->bus) qihse_cluster_bus_broadcast_node_update(fo->bus, replica_index);
     if (fo->bus) qihse_cluster_bus_broadcast_node_update(fo->bus, new_successor_index);

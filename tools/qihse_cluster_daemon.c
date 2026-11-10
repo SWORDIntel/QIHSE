@@ -1454,6 +1454,7 @@ static void* ae_main(void* argument) {
 typedef struct {
     qihse_kv_store_t* store;
     qihse_resp_server_t* server;
+    qihse_cluster_maintenance_t* maintenance_gate;
     qihse_user_t* operator_user;
     qihse_user_t* replication_user;
     const qihse_qkp_config_t* qkp;
@@ -1467,14 +1468,19 @@ typedef struct {
     const char* failure_stage;
 } ct1_pull_ctx_t;
 
+static bool ct1_stopping(const ct1_pull_ctx_t* ctx) {
+    return !ctx || !ctx->stop ||
+        __atomic_load_n(ctx->stop, __ATOMIC_ACQUIRE) != 0;
+}
+
 static bool ct1_parse_hex32(const char* text, unsigned char out[32]) {
     if (!text || strlen(text) != 64u) return false;
     for (size_t i = 0u; i < 32u; ++i) {
         unsigned char a = (unsigned char)text[2u * i];
         unsigned char b = (unsigned char)text[2u * i + 1u];
-        unsigned hi = a >= '0' && a <= '9' ? a - '0' :
+        unsigned hi = a >= '0' && a <= '9' ? (unsigned)(a - '0') :
             (a >= 'a' && a <= 'f' ? a - 'a' + 10u : 255u);
-        unsigned lo = b >= '0' && b <= '9' ? b - '0' :
+        unsigned lo = b >= '0' && b <= '9' ? (unsigned)(b - '0') :
             (b >= 'a' && b <= 'f' ? b - 'a' + 10u : 255u);
         if (hi > 15u || lo > 15u) return false;
         out[i] = (unsigned char)((hi << 4u) | lo);
@@ -1546,10 +1552,15 @@ static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
     bool receiver_bound = qihse_kv_ct_receiver_status(ctx->store,
         ctx->replication_user, &receiver);
     if (!receiver_bound) {
-        if (!qihse_kv_ct_receiver_bind(ctx->store, ctx->operator_user,
+        bool admitted = !ctx->maintenance_gate || qihse_cluster_maintenance_enter(
+            ctx->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA);
+        bool bound = admitted && qihse_kv_ct_receiver_bind(ctx->store, ctx->operator_user,
                 ctx->qkp->replication_peer_node_id, ctx->qkp->node_id,
                 ctx->generation, QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
-                baseline_row_seq, NULL)) {
+                baseline_row_seq, NULL);
+        if (admitted && ctx->maintenance_gate)
+            qihse_cluster_maintenance_leave(ctx->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA);
+        if (!bound) {
             mini_resp_close(&source);
             return false;
         }
@@ -1606,7 +1617,7 @@ static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
         }
         uint64_t offset = 0u;
         ctx->failure_stage = "baseline read/write";
-        while (offset < total_bytes && !*ctx->stop) {
+        while (offset < total_bytes && !ct1_stopping(ctx)) {
             size_t amount = total_bytes - offset > (1u << 20)
                 ? (1u << 20) : (size_t)(total_bytes - offset);
             char offset_text[32], amount_text[32];
@@ -1641,11 +1652,19 @@ static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
         if (ok && !qihse_kv_ct_owner_token_get(ctx->store,
                 ctx->operator_user, ctx->ct_owner_token)) ok = false;
         ctx->failure_stage = "baseline install";
-        if (ok && !qihse_kv_ct_receiver_install_baseline(ctx->store,
+        bool gate_entered = !ctx->maintenance_gate;
+        if (ok && ctx->maintenance_gate)
+            gate_entered = qihse_cluster_maintenance_enter(ctx->maintenance_gate,
+                QIHSE_MAINT_WRITER_REPLICA);
+        bool admitted = gate_entered;
+        if (ok && admitted && !qihse_kv_ct_receiver_install_baseline(ctx->store,
                 ctx->operator_user, ctx->replication_user,
                 ctx->qkp->replication_peer_node_id,
                 ctx->generation, path, baseline_row_seq, baseline_digest,
                 ctx->ct_owner_token)) ok = false;
+        else if (ok && !admitted) ok = false;
+        if (ctx->maintenance_gate && gate_entered)
+            qihse_cluster_maintenance_leave(ctx->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA);
         (void)unlink(path);
         if (!ok) { mini_resp_close(&source); return false; }
         receiver_bound = qihse_kv_ct_receiver_status(ctx->store,
@@ -1662,7 +1681,7 @@ static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
     }
 
     uint64_t cursor = receiver.durable_cursor;
-    while (cursor < source_durable && !*ctx->stop) {
+    while (cursor < source_durable && !ct1_stopping(ctx)) {
         ctx->failure_stage = "group read/parse";
         char cursor_text[32];
         snprintf(cursor_text, sizeof(cursor_text), "%llu", (unsigned long long)cursor);
@@ -1736,9 +1755,16 @@ static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
         }
         uint64_t durable_cursor = 0u;
         ctx->failure_stage = "group apply";
-        if (valid) valid = qihse_kv_ct_receiver_apply(ctx->store,
-            ctx->replication_user, &group, &durable_cursor) &&
-            durable_cursor == position;
+        bool gate_entered = !ctx->maintenance_gate;
+        if (valid && ctx->maintenance_gate)
+            gate_entered = qihse_cluster_maintenance_enter(ctx->maintenance_gate,
+                QIHSE_MAINT_WRITER_REPLICA);
+        bool admitted = gate_entered;
+        if (valid && admitted) valid = qihse_kv_ct_receiver_apply(ctx->store,
+            ctx->replication_user, &group, &durable_cursor) && durable_cursor == position;
+        else if (valid && !admitted) valid = false;
+        if (ctx->maintenance_gate && gate_entered)
+            qihse_cluster_maintenance_leave(ctx->maintenance_gate, QIHSE_MAINT_WRITER_REPLICA);
         for (size_t i = 0u; i < group.count; ++i) {
             free(group.records[i].key);
             free(group.records[i].value);
@@ -1784,7 +1810,7 @@ static bool ct1_pull_once(ct1_pull_ctx_t* ctx) {
 
 static void* ct1_pull_main(void* argument) {
     ct1_pull_ctx_t* ctx = argument;
-    while (!*ctx->stop && qihse_resp_server_ct_is_successor(ctx->server)) {
+    while (!ct1_stopping(ctx) && qihse_resp_server_ct_is_successor(ctx->server)) {
         unsigned delay_ms = 250u;
         if (ct1_pull_once(ctx)) {
             delay_ms = 250u;
@@ -1800,7 +1826,7 @@ static void* ct1_pull_main(void* argument) {
         }
         struct timespec ts = {(time_t)(delay_ms / 1000u),
                               (long)(delay_ms % 1000u) * 1000000L};
-        while (!*ctx->stop && nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        while (!ct1_stopping(ctx) && nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
     }
     return NULL;
 }
@@ -3607,6 +3633,7 @@ int main(int argc, char** argv) {
             memset(&ct1_ctx, 0, sizeof(ct1_ctx));
             ct1_ctx.store = store;
             ct1_ctx.server = server;
+            ct1_ctx.maintenance_gate = maintenance_gate;
             ct1_ctx.operator_user = startup_operator;
             ct1_ctx.replication_user = replication_service_principal;
             ct1_ctx.qkp = &pqc;

@@ -98,6 +98,11 @@ extern bool qihse_resp_ct_activation_request_fields(
     unsigned char checksum[32]);
 extern qihse_user_t* qihse_resp_ct_begin_request_principal(
     const qihse_resp_ct_begin_request_t* request);
+
+static bool adopt_txn_ranges(qihse_cluster_topology_t* topology,
+                             qihse_cluster_bus_t* bus,
+                             const qihse_cluster_ownership_txn_t* txn,
+                             uint16_t owner_index);
 extern qihse_user_t* qihse_resp_ct_abort_request_principal(
     const qihse_resp_ct_abort_request_t* request);
 extern qihse_user_t* qihse_resp_ct_activation_request_principal(
@@ -217,6 +222,23 @@ static bool resolve_qkp_id(const qihse_cluster_ownership_context_t* c,
            strnlen(out, QIHSE_KV_CT_ID_MAX + 1u) <= QIHSE_KV_CT_ID_MAX;
 }
 
+static void ct_update_from_txn(const qihse_cluster_ownership_txn_t* txn,
+                               qihse_cluster_bus_ct_slot_update_t* update) {
+    memset(update, 0, sizeof(*update));
+    update->magic = QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC;
+    update->start = txn->start; update->end = txn->end;
+    update->config_epoch = txn->config_epoch;
+    update->source_lsn = txn->source_lsn; update->target_lsn = txn->target_lsn;
+    snprintf(update->transfer_id, sizeof(update->transfer_id), "%s", txn->transfer_id);
+    snprintf(update->source_id, sizeof(update->source_id), "%s", txn->source_id);
+    snprintf(update->target_id, sizeof(update->target_id), "%s", txn->target_id);
+    snprintf(update->source_qkp_id, sizeof(update->source_qkp_id), "%s", txn->source_qkp_id);
+    snprintf(update->target_qkp_id, sizeof(update->target_qkp_id), "%s", txn->target_qkp_id);
+    snprintf(update->generation, sizeof(update->generation), "%s", txn->generation);
+    snprintf(update->owner_id, sizeof(update->owner_id), "%s", txn->target_id);
+    memcpy(update->checksum, txn->proof_digest, sizeof(update->checksum));
+}
+
 static bool transfer_context(qihse_cluster_ownership_context_t* c,
                              const char* transfer_id, uint16_t source_index,
                              uint16_t target_index, uint16_t first,
@@ -266,6 +288,23 @@ bool qihse_cluster_ownership_transfer_prepare(
     uint16_t last, uint64_t* out_source_lsn, char* err, size_t err_cap) {
     if (out_source_lsn) *out_source_lsn = 0;
     if (!out_source_lsn) { set_error(err, err_cap, "source cut output is required"); return false; }
+    bool unresolved = false;
+    if (!qihse_cluster_ownership_replay_control(c, &unresolved, err, err_cap)) {
+        return false;
+    }
+    if (unresolved) {
+        qihse_cluster_ownership_txn_t recovered;
+        if (qihse_cluster_ownership_transfer_get_prepared(c, transfer_id,
+                &recovered, NULL, 0)) {
+            *out_source_lsn = recovered.source_lsn;
+            OPENSSL_cleanse(&recovered, sizeof(recovered));
+            set_error(err, err_cap, "");
+            return true;
+        }
+        if (!err || !err_cap || !err[0])
+            set_error(err, err_cap, "an existing transfer intent/fence must recover before preparing another range");
+        return false;
+    }
     qihse_cluster_node_t source, target;
     char source_qkp[QIHSE_KV_CT_ID_MAX + 1u], target_qkp[QIHSE_KV_CT_ID_MAX + 1u];
     if (!transfer_context(c, transfer_id, source_index, target_index, first, last,
@@ -282,19 +321,14 @@ bool qihse_cluster_ownership_transfer_prepare(
         set_error(err, err_cap, "principal cannot authorize the local CT owner capability");
         return false;
     }
-    uint64_t cut = 0;
-    bool fenced = qihse_kv_ct_fence_range(c->store, c->principal, transfer_id,
-        first, last, owner_token, &cut);
-    OPENSSL_cleanse(owner_token, sizeof(owner_token));
-    if (!fenced) {
-        set_error(err, err_cap, "KV store did not persist a range fence and source cut");
-        return false;
-    }
     const char* data_dir = qihse_kv_store_data_directory(c->store);
-    if (!data_dir) { set_error(err, err_cap, "KV store has no durable journal directory"); return false; }
+    if (!data_dir) {
+        OPENSSL_cleanse(owner_token, sizeof(owner_token));
+        set_error(err, err_cap, "KV store has no durable journal directory"); return false;
+    }
     qihse_cluster_ownership_txn_t txn;
     memset(&txn, 0, sizeof(txn));
-    txn.phase = QIHSE_OWNERSHIP_PREPARED;
+    txn.phase = QIHSE_OWNERSHIP_INTENT;
     txn.start = first; txn.end = last;
     snprintf(txn.transfer_id, sizeof(txn.transfer_id), "%s", transfer_id);
     snprintf(txn.source_id, sizeof(txn.source_id), "%s", source.id);
@@ -308,9 +342,23 @@ bool qihse_cluster_ownership_transfer_prepare(
         OPENSSL_cleanse(owner_token, sizeof(owner_token));
         set_error(err, err_cap, "topology config epoch exhausted"); return false;
     }
-    txn.source_lsn = cut;
     if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
-        set_error(err, err_cap, "range is fenced but PREPARED journal append failed; keep it fenced for recovery");
+        OPENSSL_cleanse(owner_token, sizeof(owner_token));
+        set_error(err, err_cap, "could not persist CT2 ownership intent before fencing");
+        return false;
+    }
+    uint64_t cut = 0;
+    bool fenced = qihse_kv_ct_fence_range(c->store, c->principal, transfer_id,
+        first, last, owner_token, &cut);
+    OPENSSL_cleanse(owner_token, sizeof(owner_token));
+    if (!fenced) {
+        set_error(err, err_cap, "KV store did not persist a range fence and source cut; intent remains recoverable");
+        return false;
+    }
+    txn.source_lsn = cut;
+    txn.phase = QIHSE_OWNERSHIP_PREPARED;
+    if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+        set_error(err, err_cap, "range is fenced; replay will bind the durable fence to its intent");
         return false;
     }
     *out_source_lsn = cut;
@@ -324,7 +372,9 @@ typedef struct {
 } pending_state_t;
 static bool pending_state_cb(const qihse_cluster_ownership_txn_t* t, void* ctx) {
     pending_state_t* s = ctx;
-    if (t->phase == QIHSE_OWNERSHIP_PREPARED || t->phase == QIHSE_OWNERSHIP_COMMITTED) {
+    if (t->phase == QIHSE_OWNERSHIP_INTENT ||
+        t->phase == QIHSE_OWNERSHIP_PREPARED ||
+        t->phase == QIHSE_OWNERSHIP_COMMITTED) {
         s->pending = true; s->txn = *t;
     }
     else { s->pending = false; memset(&s->txn, 0, sizeof(s->txn)); }
@@ -700,9 +750,8 @@ bool qihse_cluster_ownership_activate_target(
         set_error(err, err_cap, "target is active but FINALIZED replay evidence could not be persisted");
         return false;
     }
-    target.config_epoch = txn.config_epoch;
-    if (!qihse_cluster_topology_adopt_range(c->topology, txn.start, txn.end,
-            target_index, txn.config_epoch) ||
+    if (target.config_epoch < txn.config_epoch) target.config_epoch = txn.config_epoch;
+    if (!adopt_txn_ranges(c->topology, NULL, &txn, target_index) ||
         !qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) {
         set_error(err, err_cap, "target is active and committed; local topology activation needs replay");
         return false;
@@ -874,6 +923,44 @@ bool qihse_cluster_ownership_prepare_target_handler(
         .topology_target_id = topology_target_id,
         .config_epoch = config_epoch
     };
+    qihse_cluster_ownership_txn_t txn;
+    target_txn_from_tuple(&txn, transfer_id, topology_source_id,
+        topology_target_id, source_qkp_id, target_qkp_id, generation,
+        first_slot, last_slot, source_lsn, config_epoch);
+    const char* data_dir = qihse_kv_store_data_directory(c->store);
+    pending_state_t pending = {0}; bool unresolved = false;
+    int replayed = data_dir ? qihse_cluster_ownership_journal_replay_txn(
+        data_dir, pending_state_cb, &pending, &unresolved) : -1;
+    bool tuple_matches = replayed >= 0 && unresolved && pending.pending &&
+          (pending.txn.phase == QIHSE_OWNERSHIP_INTENT ||
+           pending.txn.phase == QIHSE_OWNERSHIP_PREPARED) &&
+          !strcmp(pending.txn.transfer_id, transfer_id) &&
+          !strcmp(pending.txn.source_id, topology_source_id) &&
+          !strcmp(pending.txn.target_id, topology_target_id) &&
+          !strcmp(pending.txn.source_qkp_id, source_qkp_id) &&
+          !strcmp(pending.txn.target_qkp_id, target_qkp_id) &&
+          !strcmp(pending.txn.generation, generation) &&
+          pending.txn.start == first_slot && pending.txn.end == last_slot &&
+          pending.txn.source_lsn == source_lsn &&
+          pending.txn.config_epoch == config_epoch;
+    if (replayed < 0 || (unresolved && !tuple_matches)) {
+        qihse_resp_ct_peer_receipt_free(receipt);
+        OPENSSL_cleanse(&claim, sizeof(claim));
+        set_error(err, err_cap, "a different target ownership transaction blocks this CT2 BEGIN");
+        goto done;
+    }
+    bool intent_written = false;
+    if (!unresolved) {
+        txn.phase = QIHSE_OWNERSHIP_INTENT;
+        if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+            qihse_resp_ct_peer_receipt_free(receipt);
+            OPENSSL_cleanse(&claim, sizeof(claim));
+            set_error(err, err_cap, "could not persist target CT2 intent before fencing");
+            goto done;
+        }
+        intent_written = true;
+    }
+
     unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
     uint64_t target_cut = 0;
     bool ok = qihse_kv_ct_owner_token_get(c->store, c->principal, owner_token) &&
@@ -883,33 +970,15 @@ bool qihse_cluster_ownership_prepare_target_handler(
     qihse_resp_ct_peer_receipt_free(receipt);
     OPENSSL_cleanse(&claim, sizeof(claim));
     if (!ok) {
-        set_error(err, err_cap, "target storage rejected the source PREPARED proof or durable fence");
+        set_error(err, err_cap, "target storage rejected the source PREPARED proof or durable fence; intent remains recoverable");
         goto done;
     }
-
-    qihse_cluster_ownership_txn_t txn;
-    target_txn_from_tuple(&txn, transfer_id, topology_source_id,
-        topology_target_id, source_qkp_id, target_qkp_id, generation,
-        first_slot, last_slot, source_lsn, config_epoch);
-    const char* data_dir = qihse_kv_store_data_directory(c->store);
-    pending_state_t pending = {0}; bool unresolved = false;
-    int replayed = data_dir ? qihse_cluster_ownership_journal_replay_txn(
-        data_dir, pending_state_cb, &pending, &unresolved) : -1;
-    bool journal_ok = replayed >= 0 &&
-        ((unresolved && pending.pending && pending.txn.phase == QIHSE_OWNERSHIP_PREPARED &&
-          !strcmp(pending.txn.transfer_id, transfer_id) &&
-          !strcmp(pending.txn.source_id, topology_source_id) &&
-          !strcmp(pending.txn.target_id, topology_target_id) &&
-          !strcmp(pending.txn.source_qkp_id, source_qkp_id) &&
-          !strcmp(pending.txn.target_qkp_id, target_qkp_id) &&
-          !strcmp(pending.txn.generation, generation) &&
-          pending.txn.start == first_slot && pending.txn.end == last_slot &&
-          pending.txn.source_lsn == source_lsn &&
-          pending.txn.config_epoch == config_epoch) ||
-         (!unresolved && qihse_cluster_ownership_journal_append_txn(data_dir, &txn) == 0));
-    if (!journal_ok) {
-        set_error(err, err_cap, "target range is fenced; matching PREPARED journal needs retry");
-        goto done;
+    if (intent_written || (unresolved && pending.txn.phase == QIHSE_OWNERSHIP_INTENT)) {
+        txn.phase = QIHSE_OWNERSHIP_PREPARED;
+        if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+            set_error(err, err_cap, "target is fenced; replay will bind the durable fence to its intent");
+            goto done;
+        }
     }
     *out_target_cut = target_cut;
     set_error(err, err_cap, "");
@@ -981,10 +1050,17 @@ bool qihse_cluster_ownership_abort_target_handler(
         .config_epoch = config_epoch
     };
     unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
-    bool ok = qihse_kv_ct_owner_token_get(c->store, c->principal, owner_token) &&
-        qihse_kv_ct_target_abort(c->store, c->principal, &claim,
-            verify_target_phase_receipt, &verify, owner_token);
+    qihse_kv_ct_transfer_status_detail_t fence_detail;
+    memset(&fence_detail, 0, sizeof(fence_detail));
+    bool status_ok = qihse_kv_ct_transfer_status_detail(c->store, c->principal,
+                                                        &fence_detail);
+    bool no_fence = status_ok && fence_detail.base.fence_state == 0u;
+    bool ok = no_fence ||
+        (qihse_kv_ct_owner_token_get(c->store, c->principal, owner_token) &&
+         qihse_kv_ct_target_abort(c->store, c->principal, &claim,
+            verify_target_phase_receipt, &verify, owner_token));
     OPENSSL_cleanse(owner_token, sizeof(owner_token));
+    OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
     qihse_resp_ct_peer_receipt_free(receipt);
     if (ok) {
         qihse_cluster_ownership_txn_t aborted;
@@ -1253,19 +1329,25 @@ bool qihse_cluster_ownership_transfer_publish(
         set_error(err, err_cap, "target is not durably activated for this exact committed transfer");
         return false;
     }
-    uint16_t current_owner = QIHSE_CLUSTER_NODE_NONE;
+    bool needs_apply = false;
     for (uint32_t slot = txn.start; slot <= txn.end; ++slot) {
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
         if (!qihse_cluster_topology_get_slot(c->topology, (uint16_t)slot,
-                &owner, NULL, NULL)) {
+                &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(c->topology,
+                (uint16_t)slot, &epoch)) {
             set_error(err, err_cap, "could not read source topology before publish");
             return false;
         }
-        if (slot == txn.start) current_owner = owner;
-        if (owner != current_owner || (owner != source_index && owner != target_index)) {
-            set_error(err, err_cap, "slot map changed outside this committed transfer");
+        if (epoch > txn.config_epoch || (epoch == txn.config_epoch && owner == target_index))
+            continue;
+        if (epoch == txn.config_epoch ||
+            (owner != source_index && owner != target_index)) {
+            set_error(err, err_cap, "slot map changed outside this committed transfer epoch");
             return false;
         }
+        needs_apply = true;
     }
     if (txn.phase == QIHSE_OWNERSHIP_COMMITTED) {
         qihse_cluster_ownership_txn_t finalized = txn;
@@ -1276,33 +1358,21 @@ bool qihse_cluster_ownership_transfer_publish(
         }
         txn = finalized;
     }
-    if (current_owner != target_index) {
-        if (!qihse_cluster_topology_adopt_range(c->topology, txn.start, txn.end,
-                target_index, txn.config_epoch)) {
+    if (needs_apply) {
+        if (!adopt_txn_ranges(c->topology, NULL, &txn, target_index)) {
             set_error(err, err_cap, "target activation is durable; source topology publish needs replay");
             return false;
         }
     }
-    target.config_epoch = txn.config_epoch;
-    if (!qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) {
+    if (needs_apply && target.config_epoch < txn.config_epoch)
+        target.config_epoch = txn.config_epoch;
+    if (needs_apply && !qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) {
         set_error(err, err_cap, "target activation is durable; node epoch publish needs replay");
         return false;
     }
     if (c->bus) {
         qihse_cluster_bus_ct_slot_update_t update;
-        memset(&update, 0, sizeof(update));
-        update.magic = QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC;
-        update.start = txn.start; update.end = txn.end;
-        update.config_epoch = txn.config_epoch;
-        update.source_lsn = txn.source_lsn; update.target_lsn = txn.target_lsn;
-        snprintf(update.transfer_id, sizeof(update.transfer_id), "%s", txn.transfer_id);
-        snprintf(update.source_id, sizeof(update.source_id), "%s", txn.source_id);
-        snprintf(update.target_id, sizeof(update.target_id), "%s", txn.target_id);
-        snprintf(update.source_qkp_id, sizeof(update.source_qkp_id), "%s", txn.source_qkp_id);
-        snprintf(update.target_qkp_id, sizeof(update.target_qkp_id), "%s", txn.target_qkp_id);
-        snprintf(update.generation, sizeof(update.generation), "%s", txn.generation);
-        snprintf(update.owner_id, sizeof(update.owner_id), "%s", txn.target_id);
-        memcpy(update.checksum, txn.proof_digest, sizeof(update.checksum));
+        ct_update_from_txn(&txn, &update);
         bool sent = qihse_cluster_bus_broadcast_ct_slot_update(c->bus, &update);
         OPENSSL_cleanse(&update, sizeof(update));
         if (!sent) {
@@ -1353,28 +1423,56 @@ bool qihse_cluster_ownership_receive_ct_update(
         return false;
     }
     uint16_t local_index = qihse_cluster_topology_local_node(c->topology);
-    uint16_t current_owner = QIHSE_CLUSTER_NODE_NONE;
+    bool already_target = true;
+    bool can_advance = true;
+    bool target_already_owns_eligible = true;
     for (uint32_t slot = u->start; slot <= u->end; ++slot) {
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
         if (!qihse_cluster_topology_get_slot(c->topology, (uint16_t)slot,
-                &owner, NULL, NULL)) {
+                &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(c->topology,
+                (uint16_t)slot, &epoch)) {
             set_error(err, err_cap, "could not read local slot ownership");
             return false;
         }
-        if (slot == u->start) current_owner = owner;
-        if (owner != current_owner ||
+        if (epoch > u->config_epoch || (epoch == u->config_epoch && owner == target_index))
+            continue;
+        if (epoch == u->config_epoch ||
             (owner != source_index && owner != target_index)) {
-            set_error(err, err_cap, "CT update conflicts with the current local slot map");
+            set_error(err, err_cap, "CT update conflicts with the local per-slot ownership epoch");
             return false;
         }
+        already_target = false;
+        can_advance = true;
+        if (owner != target_index) target_already_owns_eligible = false;
     }
-    if (current_owner == target_index) {
+    if (already_target) {
         set_error(err, err_cap, "");
         return true; /* replayed/duplicate activation; receipt was rechecked */
+    }
+    if (local_index == target_index && target_already_owns_eligible && can_advance) {
+        if (!adopt_txn_ranges(c->topology, NULL, &(qihse_cluster_ownership_txn_t){
+                .start = u->start, .end = u->end, .config_epoch = u->config_epoch
+            }, target_index)) {
+            set_error(err, err_cap, "target ownership is durable but its slot epochs need replay");
+            return false;
+        }
+        if (target.config_epoch < u->config_epoch) target.config_epoch = u->config_epoch;
+        if (!qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) {
+            set_error(err, err_cap, "target ownership is durable but its node epoch needs replay");
+            return false;
+        }
+        set_error(err, err_cap, "");
+        return true;
     }
     if (u->config_epoch == 0 || (local_index == target_index &&
         (source.role != QIHSE_CLUSTER_NODE_PRIMARY || target.role != QIHSE_CLUSTER_NODE_PRIMARY))) {
         set_error(err, err_cap, "target role or topology epoch is not valid for this ownership commit");
+        return false;
+    }
+    if (!can_advance) {
+        set_error(err, err_cap, "CT update cannot advance all slots at its proof epoch");
         return false;
     }
     const char* data_dir = qihse_kv_store_data_directory(c->store);
@@ -1443,7 +1541,7 @@ bool qihse_cluster_ownership_receive_ct_update(
         set_error(err, err_cap, "target is activated but FINALIZED replay evidence could not be persisted");
         return false;
     }
-    target.config_epoch = txn.config_epoch;
+    if (target.config_epoch < txn.config_epoch) target.config_epoch = txn.config_epoch;
     if (!qihse_cluster_topology_adopt_range(c->topology, txn.start, txn.end,
             target_index, txn.config_epoch) ||
         !qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) {
@@ -1495,44 +1593,114 @@ static bool ct1_recovery_digest(const qihse_cluster_ownership_txn_t* txn,
                                const char* successor_topology_id,
                                const char* successor_qkp_id,
                                uint8_t out[32]);
+static bool topology_node_owns_slots(qihse_cluster_topology_t* topology,
+                                    uint16_t node_index, bool* out_owns);
+
+static bool promotion_roles_can_apply(qihse_cluster_topology_t* topology,
+    uint64_t epoch, uint16_t source_index, uint16_t target_index,
+    uint16_t successor_index, qihse_cluster_node_t* source,
+    qihse_cluster_node_t* target, qihse_cluster_node_t* successor) {
+    if (!topology || !source || !target || !successor ||
+        source->config_epoch > epoch || target->config_epoch > epoch ||
+        successor->config_epoch > epoch || !successor->healthy ||
+        !((target->role == QIHSE_CLUSTER_NODE_PRIMARY) ||
+          (target->role == QIHSE_CLUSTER_NODE_REPLICA &&
+           target->primary_index == source_index)) ||
+        !((source->role == QIHSE_CLUSTER_NODE_PRIMARY) ||
+          (source->role == QIHSE_CLUSTER_NODE_REPLICA &&
+           source->primary_index == target_index))) return false;
+    bool successor_owns_slots = false;
+    if (!topology_node_owns_slots(topology, successor_index, &successor_owns_slots) ||
+        (successor_owns_slots &&
+         !(successor->role == QIHSE_CLUSTER_NODE_REPLICA &&
+           successor->primary_index == target_index))) return false;
+    target->role = QIHSE_CLUSTER_NODE_PRIMARY;
+    target->primary_index = QIHSE_CLUSTER_NODE_NONE;
+    target->healthy = true;
+    if (target->config_epoch < epoch) target->config_epoch = epoch;
+    source->role = QIHSE_CLUSTER_NODE_REPLICA;
+    source->primary_index = target_index;
+    if (source->config_epoch < epoch) source->config_epoch = epoch;
+    successor->role = QIHSE_CLUSTER_NODE_REPLICA;
+    successor->primary_index = target_index;
+    if (successor->config_epoch < epoch) successor->config_epoch = epoch;
+    return true;
+}
 
 static bool adopt_txn_ranges(qihse_cluster_topology_t* topology,
                              qihse_cluster_bus_t* bus,
                              const qihse_cluster_ownership_txn_t* txn,
                              uint16_t target_index) {
-    if (!txn->next_generation[0]) {
-        if (!qihse_cluster_topology_adopt_range(topology, txn->start, txn->end,
-                target_index, txn->config_epoch)) return false;
-        if (bus) (void)qihse_cluster_bus_broadcast_slot_update(
-            bus, txn->start, txn->end, target_index);
-        return true;
-    }
+    (void)bus; /* CT1/CT2 changes are announced with their proof-bearing event. */
     for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT;) {
-        if (!(txn->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) {
-            ++slot; continue;
+        bool included = txn->next_generation[0]
+            ? (txn->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u))) != 0
+            : slot >= txn->start && slot <= txn->end;
+        if (!included) { ++slot; continue; }
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        if (!qihse_cluster_topology_get_slot(topology, (uint16_t)slot, &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(topology, (uint16_t)slot, &epoch)) return false;
+        if (epoch > txn->config_epoch || (epoch == txn->config_epoch && owner == target_index)) {
+            ++slot; continue; /* a newer or already-applied proof wins */
         }
+        if (epoch == txn->config_epoch) return false; /* same epoch, conflicting owner */
         uint32_t first = slot++;
-        while (slot < QIHSE_CLUSTER_SLOT_COUNT &&
-               (txn->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
+        while (slot < QIHSE_CLUSTER_SLOT_COUNT) {
+            bool next_included = txn->next_generation[0]
+                ? (txn->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u))) != 0
+                : slot >= txn->start && slot <= txn->end;
+            if (!next_included) break;
+            uint16_t next_owner = QIHSE_CLUSTER_NODE_NONE;
+            uint64_t next_epoch = 0;
+            if (!qihse_cluster_topology_get_slot(topology, (uint16_t)slot, &next_owner, NULL, NULL) ||
+                !qihse_cluster_topology_get_slot_epoch(topology, (uint16_t)slot, &next_epoch)) return false;
+            if (next_epoch >= txn->config_epoch || next_owner == target_index) break;
+            ++slot;
+        }
         uint32_t last = slot - 1u;
         if (!qihse_cluster_topology_adopt_range(topology, (uint16_t)first,
                 (uint16_t)last, target_index, txn->config_epoch)) return false;
-        if (bus) (void)qihse_cluster_bus_broadcast_slot_update(
-            bus, (uint16_t)first, (uint16_t)last, target_index);
     }
     return true;
+}
+
+static bool ct1_update_from_txn(const qihse_cluster_ownership_txn_t* txn,
+                                const char* successor_qkp,
+                                qihse_cluster_bus_ct1_promotion_update_t* update) {
+    if (!txn || !successor_qkp || !update || !txn->next_generation[0]) return false;
+    memset(update, 0, sizeof(*update));
+    update->magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC;
+    update->start = txn->start; update->end = txn->end;
+    update->config_epoch = txn->config_epoch;
+    update->durable_cursor = txn->source_lsn;
+    snprintf(update->transfer_id, sizeof(update->transfer_id), "%s", txn->transfer_id);
+    snprintf(update->source_id, sizeof(update->source_id), "%s", txn->source_id);
+    snprintf(update->target_id, sizeof(update->target_id), "%s", txn->target_id);
+    snprintf(update->source_qkp_id, sizeof(update->source_qkp_id), "%s", txn->source_qkp_id);
+    snprintf(update->target_qkp_id, sizeof(update->target_qkp_id), "%s", txn->target_qkp_id);
+    snprintf(update->successor_id, sizeof(update->successor_id), "%s", txn->owner_id);
+    snprintf(update->successor_qkp_id, sizeof(update->successor_qkp_id), "%s", successor_qkp);
+    snprintf(update->generation, sizeof(update->generation), "%s", txn->generation);
+    snprintf(update->next_generation, sizeof(update->next_generation), "%s", txn->next_generation);
+    memcpy(update->slot_bitmap, txn->slot_bitmap, sizeof(update->slot_bitmap));
+    memcpy(update->promotion_digest, txn->proof_digest, sizeof(update->promotion_digest));
+    return qihse_cluster_bus_ct1_promotion_seal(update);
 }
 
 static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) {
     replay_context_t* r = opaque;
     qihse_cluster_ownership_context_t* c = r->context;
-    if (txn->phase == QIHSE_OWNERSHIP_PREPARED || txn->phase == QIHSE_OWNERSHIP_COMMITTED) {
+    if (txn->phase == QIHSE_OWNERSHIP_INTENT ||
+        txn->phase == QIHSE_OWNERSHIP_PREPARED ||
+        txn->phase == QIHSE_OWNERSHIP_COMMITTED) {
         r->has_prepared = true;
         r->prepared = *txn;
         return true; /* resolve only the final outstanding phase after full replay */
     }
     uint16_t source_index, target_index;
     qihse_cluster_node_t source, target;
+    bool promotion_roles_applied = false;
     if (!qihse_cluster_topology_find_node(c->topology, txn->source_id, &source_index) ||
         !qihse_cluster_topology_find_node(c->topology, txn->target_id, &target_index) ||
         !qihse_cluster_topology_get_node(c->topology, source_index, &source) ||
@@ -1584,9 +1752,10 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
         }
         return true;
     }
-    if (txn->phase != QIHSE_OWNERSHIP_FINALIZED) return false;
+    if (txn->phase != QIHSE_OWNERSHIP_FINALIZED &&
+        txn->phase != QIHSE_OWNERSHIP_ADOPTED) return false;
     if (txn->next_generation[0]) {
-        if (local_index != target_index) {
+        if (txn->phase == QIHSE_OWNERSHIP_FINALIZED && local_index != target_index) {
             set_error(r->err, r->err_cap, "finalized CT1 promotion journal is not on its promoted target");
             r->failed = true; return false;
         }
@@ -1621,31 +1790,55 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
                 r->failed = true; return false;
             }
         }
-        if (!qihse_kv_ct_source_status(c->store, c->principal, &promoted) ||
-            strcmp(promoted.source_id, target_qkp) ||
-            strcmp(promoted.successor_id, successor_qkp) ||
-            strcmp(promoted.generation, txn->next_generation)) {
+        bool durable_target = txn->phase == QIHSE_OWNERSHIP_ADOPTED ||
+            (qihse_kv_ct_source_status(c->store, c->principal, &promoted) &&
+             !strcmp(promoted.source_id, target_qkp) &&
+             !strcmp(promoted.successor_id, successor_qkp) &&
+             !strcmp(promoted.generation, txn->next_generation));
+        if (!durable_target) {
             OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
             set_error(r->err, r->err_cap, "finalized CT1 journal disagrees with the persisted promoted generation");
             r->failed = true; return false;
         }
+        if (txn->phase == QIHSE_OWNERSHIP_FINALIZED && local_index == target_index && c->bus) {
+            qihse_cluster_bus_ct1_promotion_update_t update;
+            if (!ct1_update_from_txn(txn, successor_qkp, &update)) {
+                OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+                set_error(r->err, r->err_cap, "could not rebuild signed CT1 promotion anti-entropy record");
+                r->failed = true; return false;
+            }
+            (void)qihse_cluster_bus_broadcast_ct1_promotion(c->bus, &update);
+            OPENSSL_cleanse(&update, sizeof(update));
+        }
         OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
-        successor_node.role = QIHSE_CLUSTER_NODE_REPLICA;
-        successor_node.primary_index = target_index;
-        successor_node.config_epoch = txn->config_epoch;
-        if (!qihse_cluster_topology_upsert_node(c->topology, &successor_node, NULL)) {
+        bool apply_roles = promotion_roles_can_apply(c->topology,
+            txn->config_epoch, source_index, target_index, successor_index,
+            &source, &target, &successor_node);
+        promotion_roles_applied = apply_roles;
+        if (apply_roles &&
+            (!qihse_cluster_topology_upsert_node(c->topology, &source, NULL) ||
+             !qihse_cluster_topology_upsert_node(c->topology, &successor_node, NULL))) {
             set_error(r->err, r->err_cap, "finalized CT1 promoted source is durable; successor role replay failed");
             r->failed = true; return false;
         }
-        target.role = QIHSE_CLUSTER_NODE_PRIMARY;
-        target.primary_index = QIHSE_CLUSTER_NODE_NONE;
-        target.healthy = true;
     }
-    target.config_epoch = txn->config_epoch;
-    if (!qihse_cluster_topology_upsert_node(c->topology, &target, NULL) ||
+    bool update_target_node = !txn->next_generation[0] || promotion_roles_applied;
+    if (update_target_node && target.config_epoch < txn->config_epoch)
+        target.config_epoch = txn->config_epoch;
+    if ((update_target_node && !qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) ||
         !adopt_txn_ranges(c->topology, NULL, txn, target_index)) {
         set_error(r->err, r->err_cap, "finalized ownership could not be restored locally");
         r->failed = true; return false;
+    }
+    if (!txn->next_generation[0] && c->bus && local_index == source_index) {
+        /* Seed bounded anti-entropy from the complete, checksummed journal.
+         * Per-slot cache replacement keeps only the greatest ownership epoch;
+         * each receiver still fetches this exact typed activation receipt from
+         * the configured QKP target before it adopts the range. */
+        qihse_cluster_bus_ct_slot_update_t update;
+        ct_update_from_txn(txn, &update);
+        (void)qihse_cluster_bus_broadcast_ct_slot_update(c->bus, &update);
+        OPENSSL_cleanse(&update, sizeof(update));
     }
     r->has_prepared = false;
     memset(&r->prepared, 0, sizeof(r->prepared));
@@ -1670,6 +1863,161 @@ static bool ct1_recovery_digest(const qihse_cluster_ownership_txn_t* txn,
     if (ok) ok = EVP_DigestFinal_ex(md, out, &n) == 1 && n == 32;
     EVP_MD_CTX_free(md);
     return ok;
+}
+
+bool qihse_cluster_ownership_receive_ct1_promotion(
+    qihse_cluster_ownership_context_t* c,
+    const qihse_cluster_bus_ct1_promotion_update_t* u,
+    char* err, size_t err_cap) {
+    if (!c || !u || u->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC ||
+        u->reserved || !u->config_epoch || u->start > u->end ||
+        u->end >= QIHSE_CLUSTER_SLOT_COUNT || !u->transfer_id[0] ||
+        !u->source_id[0] || !u->target_id[0] || !u->successor_id[0] ||
+        !u->generation[0] || !u->next_generation[0]) {
+        set_error(err, err_cap, "signed CT1 promotion tuple is malformed");
+        return false;
+    }
+    qihse_cluster_bus_ct1_promotion_update_t sealed = *u;
+    if (!qihse_cluster_bus_ct1_promotion_seal(&sealed) ||
+        CRYPTO_memcmp(sealed.event_digest, u->event_digest, 32u) != 0) {
+        OPENSSL_cleanse(&sealed, sizeof(sealed));
+        set_error(err, err_cap, "CT1 event digest does not bind its full promotion bitmap");
+        return false;
+    }
+    OPENSSL_cleanse(&sealed, sizeof(sealed));
+    uint16_t source_index = QIHSE_CLUSTER_NODE_NONE;
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    uint16_t successor_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t source, target, successor;
+    char source_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    char target_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    char successor_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    if (!qihse_cluster_topology_find_node(c->topology, u->source_id, &source_index) ||
+        !qihse_cluster_topology_find_node(c->topology, u->target_id, &target_index) ||
+        !qihse_cluster_topology_find_node(c->topology, u->successor_id, &successor_index) ||
+        !qihse_cluster_topology_get_node(c->topology, source_index, &source) ||
+        !qihse_cluster_topology_get_node(c->topology, target_index, &target) ||
+        !qihse_cluster_topology_get_node(c->topology, successor_index, &successor) ||
+        !resolve_qkp_id(c, source.id, source_qkp) ||
+        !resolve_qkp_id(c, target.id, target_qkp) ||
+        !resolve_qkp_id(c, successor.id, successor_qkp) ||
+        strcmp(source_qkp, u->source_qkp_id) || strcmp(target_qkp, u->target_qkp_id) ||
+        strcmp(successor_qkp, u->successor_qkp_id) ||
+        source_index == target_index || successor_index == target_index ||
+        successor_index == source_index) {
+        set_error(err, err_cap, "CT1 event identities do not match trusted topology/QKP pins");
+        return false;
+    }
+    /* The successor may have acquired unrelated slots since this promotion.
+     * The target signature and promotion digest bind the successor selected by
+     * the authorized local promotion path; current slotlessness is not a
+     * historical validity condition. */
+    bool target_relationship_current = target.role == QIHSE_CLUSTER_NODE_PRIMARY ||
+        (target.role == QIHSE_CLUSTER_NODE_REPLICA && target.primary_index == source_index);
+    if (!target_relationship_current && target.config_epoch <= u->config_epoch) {
+        set_error(err, err_cap, "signed CT1 target is not the configured replica of the previous owner");
+        return false;
+    }
+    qihse_cluster_ownership_txn_t txn;
+    memset(&txn, 0, sizeof(txn));
+    txn.phase = QIHSE_OWNERSHIP_ADOPTED;
+    txn.start = QIHSE_CLUSTER_SLOT_COUNT;
+    txn.end = 0;
+    txn.config_epoch = u->config_epoch;
+    txn.source_lsn = u->durable_cursor;
+    txn.target_lsn = u->durable_cursor;
+    snprintf(txn.transfer_id, sizeof(txn.transfer_id), "%s", u->transfer_id);
+    snprintf(txn.source_id, sizeof(txn.source_id), "%s", u->source_id);
+    snprintf(txn.target_id, sizeof(txn.target_id), "%s", u->target_id);
+    snprintf(txn.source_qkp_id, sizeof(txn.source_qkp_id), "%s", u->source_qkp_id);
+    snprintf(txn.target_qkp_id, sizeof(txn.target_qkp_id), "%s", u->target_qkp_id);
+    snprintf(txn.generation, sizeof(txn.generation), "%s", u->generation);
+    snprintf(txn.next_generation, sizeof(txn.next_generation), "%s", u->next_generation);
+    snprintf(txn.owner_id, sizeof(txn.owner_id), "%s", u->successor_id);
+    memcpy(txn.slot_bitmap, u->slot_bitmap, sizeof(txn.slot_bitmap));
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(txn.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        if (slot < txn.start) txn.start = (uint16_t)slot;
+        txn.end = (uint16_t)slot;
+    }
+    bool run_is_bound = true;
+    for (uint32_t slot = u->start; slot <= u->end; ++slot)
+        if (!(txn.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) {
+            run_is_bound = false;
+            break;
+        }
+    if ((u->start > 0u && (txn.slot_bitmap[(u->start - 1u) / 8u] &
+            (uint8_t)(1u << ((u->start - 1u) % 8u)))) ||
+        (u->end + 1u < QIHSE_CLUSTER_SLOT_COUNT &&
+            (txn.slot_bitmap[(u->end + 1u) / 8u] &
+             (uint8_t)(1u << ((u->end + 1u) % 8u))))) run_is_bound = false;
+    if (!run_is_bound || txn.start >= QIHSE_CLUSTER_SLOT_COUNT ||
+        strcmp(txn.transfer_id, u->transfer_id) || txn.start > u->start || txn.end < u->end) {
+        set_error(err, err_cap, "CT1 event range is not contained in its durable slot bitmap");
+        return false;
+    }
+    uint8_t expected_digest[32] = {0};
+    if (!ct1_recovery_digest(&txn, txn.owner_id, u->successor_qkp_id, expected_digest) ||
+        CRYPTO_memcmp(expected_digest, u->promotion_digest, 32u) != 0) {
+        OPENSSL_cleanse(expected_digest, sizeof(expected_digest));
+        set_error(err, err_cap, "CT1 event does not match the target's durable promotion proof fingerprint");
+        return false;
+    }
+    memcpy(txn.proof_digest, expected_digest, sizeof(txn.proof_digest));
+    OPENSSL_cleanse(expected_digest, sizeof(expected_digest));
+
+    bool needs_apply = false;
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(txn.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        if (!qihse_cluster_topology_get_slot(c->topology, (uint16_t)slot, &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(c->topology, (uint16_t)slot, &epoch)) {
+            set_error(err, err_cap, "could not read local slot epoch for CT1 promotion");
+            return false;
+        }
+        if (epoch > txn.config_epoch || (epoch == txn.config_epoch && owner == target_index)) continue;
+        if (epoch == txn.config_epoch || (owner != source_index && owner != target_index)) {
+            set_error(err, err_cap, "CT1 event conflicts with a newer or same-epoch owner");
+            return false;
+        }
+        needs_apply = true;
+    }
+    if (!needs_apply) { set_error(err, err_cap, ""); return true; }
+    bool apply_roles = promotion_roles_can_apply(c->topology,
+        txn.config_epoch, source_index, target_index, successor_index,
+        &source, &target, &successor);
+    if (!apply_roles && target.role != QIHSE_CLUSTER_NODE_PRIMARY) {
+        /* This signed event is historical and the promoted node has since
+         * become a replica. Do not route stale slots to a non-primary; a
+         * newer promotion proof is responsible for those ownership changes. */
+        set_error(err, err_cap, "");
+        return true;
+    }
+    const char* data_dir = qihse_kv_store_data_directory(c->store);
+    if (!data_dir || qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+        set_error(err, err_cap, "could not persist the signed CT1 adoption before routing slots");
+        return false;
+    }
+    if ((apply_roles &&
+         (!qihse_cluster_topology_upsert_node(c->topology, &target, NULL) ||
+          !qihse_cluster_topology_upsert_node(c->topology, &source, NULL) ||
+          !qihse_cluster_topology_upsert_node(c->topology, &successor, NULL))) ||
+        !adopt_txn_ranges(c->topology, NULL, &txn, target_index)) {
+        set_error(err, err_cap, "CT1 adoption is durable but local topology replay is required");
+        return false;
+    }
+    OPENSSL_cleanse(&txn, sizeof(txn));
+    set_error(err, err_cap, "");
+    return true;
+}
+
+void qihse_cluster_ownership_ct1_promotion_bus_callback(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_t* update, void* opaque) {
+    (void)bus;
+    char err[192];
+    (void)qihse_cluster_ownership_receive_ct1_promotion(opaque, update, err, sizeof(err));
 }
 
 static bool topology_node_owns_slots(qihse_cluster_topology_t* topology,
@@ -1983,29 +2331,110 @@ static bool ownership_replay_impl(
      * which transaction is last. Validate any remaining live fence against
      * that final journal state so a deferred historical ABORTED record cannot
      * hide an unrelated transfer. */
-    qihse_kv_ct_transfer_status_t fence_status;
-    memset(&fence_status, 0, sizeof(fence_status));
-    if (!qihse_kv_ct_transfer_status(c->store, c->principal, &fence_status)) {
+    qihse_kv_ct_transfer_status_detail_t fence_detail;
+    memset(&fence_detail, 0, sizeof(fence_detail));
+    if (!qihse_kv_ct_transfer_status_detail(c->store, c->principal, &fence_detail)) {
         set_error(err, err_cap, "durable CT transfer status unavailable during journal recovery");
         return false;
     }
-    if (fence_status.fence_state == 1u) {
-        const qihse_cluster_ownership_txn_t* pending =
-            (*out_unresolved && ctx.has_prepared) ? &ctx.prepared : NULL;
-        bool matches_pending = pending &&
-            !strcmp(fence_status.transfer_id, pending->transfer_id) &&
-            fence_status.first_slot == pending->start &&
-            fence_status.last_slot == pending->end &&
-            fence_status.cut_position == pending->source_lsn &&
-            !strcmp(fence_status.source_id, pending->source_qkp_id) &&
-            !strcmp(fence_status.generation, pending->generation);
-        if (!matches_pending) {
-            OPENSSL_cleanse(&fence_status, sizeof(fence_status));
-            set_error(err, err_cap, "active CT source fence does not match the final unfinished ownership transaction");
+    qihse_kv_ct_transfer_status_t* fence_status = &fence_detail.base;
+    uint16_t local_index = qihse_cluster_topology_local_node(c->topology);
+    if (*out_unresolved && ctx.has_prepared &&
+        ctx.prepared.phase == QIHSE_OWNERSHIP_INTENT) {
+        qihse_cluster_ownership_txn_t intent = ctx.prepared;
+        uint16_t source_index = QIHSE_CLUSTER_NODE_NONE;
+        uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+        bool nodes_ok = qihse_cluster_topology_find_node(c->topology,
+                intent.source_id, &source_index) &&
+            qihse_cluster_topology_find_node(c->topology,
+                intent.target_id, &target_index);
+        if (!nodes_ok || (local_index != source_index && local_index != target_index)) {
+            OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
+            set_error(err, err_cap, "CT2 intent is not local to its configured source or target");
+            return false;
+        }
+        if (fence_status->fence_state == 0u && local_index == source_index &&
+            intent.source_lsn == 0u) {
+            /* No source fence means this intent never returned a source cut,
+             * so no target request could have been issued. Close the orphan
+             * intent durably and permit a fresh attempt. */
+            intent.phase = QIHSE_OWNERSHIP_ABORTED;
+            if (qihse_cluster_ownership_journal_append_txn(data_dir, &intent) != 0) {
+                OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
+                set_error(err, err_cap, "unfenced CT2 source intent could not be closed as aborted");
+                return false;
+            }
+            *out_unresolved = false;
+            ctx.has_prepared = false;
+            memset(&ctx.prepared, 0, sizeof(ctx.prepared));
+        } else if (fence_status->fence_state == 1u) {
+            bool common = fence_status->mode == 1u &&
+                !strcmp(fence_status->transfer_id, intent.transfer_id) &&
+                fence_status->first_slot == intent.start &&
+                fence_status->last_slot == intent.end;
+            bool source_match = local_index == source_index && common &&
+                !strcmp(fence_status->source_id, intent.source_qkp_id) &&
+                !strcmp(fence_status->generation, intent.generation) &&
+                (!intent.source_lsn || intent.source_lsn == fence_status->cut_position);
+            bool target_match = local_index == target_index && common &&
+                !strcmp(fence_status->source_id, intent.target_qkp_id) &&
+                !strcmp(fence_detail.transfer_source_id, intent.source_qkp_id) &&
+                !strcmp(fence_detail.transfer_source_generation, intent.generation) &&
+                fence_detail.transfer_source_cut == intent.source_lsn;
+            if (!source_match && !target_match) {
+                OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
+                set_error(err, err_cap, "durable CT2 fence does not match its pre-fence intent");
+                return false;
+            }
+            if (source_match) intent.source_lsn = fence_status->cut_position;
+            intent.phase = QIHSE_OWNERSHIP_PREPARED;
+            if (qihse_cluster_ownership_journal_append_txn(data_dir, &intent) != 0) {
+                OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
+                set_error(err, err_cap, "matching durable CT2 fence could not be bound to PREPARED intent");
+                return false;
+            }
+            ctx.prepared = intent;
+            ctx.has_prepared = true;
+            *out_unresolved = true;
+        } else if (local_index == target_index && fence_status->fence_state == 0u) {
+            /* Source may retry BEGIN; the target intent is deliberately kept
+             * unresolved until it either acquires the exact durable fence or
+             * receives a proof-bearing ABORT. */
+        } else {
+            OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
+            set_error(err, err_cap, "CT2 intent has an incompatible durable fence state");
             return false;
         }
     }
-    OPENSSL_cleanse(&fence_status, sizeof(fence_status));
+    if (fence_status->fence_state == 1u) {
+        const qihse_cluster_ownership_txn_t* pending =
+            (*out_unresolved && ctx.has_prepared) ? &ctx.prepared : NULL;
+        uint16_t source_index = QIHSE_CLUSTER_NODE_NONE;
+        uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+        bool nodes_ok = pending &&
+            qihse_cluster_topology_find_node(c->topology, pending->source_id, &source_index) &&
+            qihse_cluster_topology_find_node(c->topology, pending->target_id, &target_index);
+        bool common = nodes_ok && fence_status->mode == 1u &&
+            !strcmp(fence_status->transfer_id, pending->transfer_id) &&
+            fence_status->first_slot == pending->start &&
+            fence_status->last_slot == pending->end;
+        bool source_match = common && local_index == source_index &&
+            fence_status->cut_position == pending->source_lsn &&
+            !strcmp(fence_status->source_id, pending->source_qkp_id) &&
+            !strcmp(fence_status->generation, pending->generation);
+        bool target_match = common && local_index == target_index &&
+            !strcmp(fence_status->source_id, pending->target_qkp_id) &&
+            !strcmp(fence_detail.transfer_source_id, pending->source_qkp_id) &&
+            !strcmp(fence_detail.transfer_source_generation, pending->generation) &&
+            fence_detail.transfer_source_cut == pending->source_lsn;
+        bool matches_pending = source_match || target_match;
+        if (!matches_pending) {
+            OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
+            set_error(err, err_cap, "active CT fence does not match the final unfinished ownership transaction");
+            return false;
+        }
+    }
+    OPENSSL_cleanse(&fence_detail, sizeof(fence_detail));
     if (*out_unresolved && ctx.has_prepared && ctx.prepared.next_generation[0]) {
         if (!resume_prepared_ct1(c, &ctx.prepared, err, err_cap)) return false;
         *out_unresolved = false;

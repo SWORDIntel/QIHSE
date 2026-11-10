@@ -47,7 +47,12 @@ typedef enum {
     QIHSE_OWNERSHIP_ABORTED = 3,
     /* Target activation was verified and the transaction may be replayed
      * locally without depending on mutable/current peer seal state. */
-    QIHSE_OWNERSHIP_FINALIZED = 4
+    QIHSE_OWNERSHIP_FINALIZED = 4,
+    /* Durable transfer intent written before a KV fence. Recovery can now
+     * distinguish a crash before fencing from a fence whose follow-up phase
+     * append was interrupted. */
+    QIHSE_OWNERSHIP_INTENT = 5,
+    QIHSE_OWNERSHIP_ADOPTED = 6
 } qihse_cluster_ownership_phase_t;
 
 typedef struct {

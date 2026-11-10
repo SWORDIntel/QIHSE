@@ -24,6 +24,51 @@ static void make_node(qihse_cluster_node_t* node, const char* id_seed, const cha
     node->healthy = true;
 }
 
+/* A delayed A->B proof can arrive after B->C superseded only the middle of
+ * its range. The old proof must fill still-lagging A slots without reclaiming
+ * the newer C slots or changing their epoch. */
+static void test_partial_range_supersession_is_monotonic(void) {
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo);
+    qihse_cluster_node_t a, b, c;
+    make_node(&a, "overlap-A", "127.0.0.1", 7100, 17100,
+        QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&b, "overlap-B", "127.0.0.1", 7101, 17101,
+        QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    make_node(&c, "overlap-C", "127.0.0.1", 7102, 17102,
+        QIHSE_CLUSTER_NODE_PRIMARY, QIHSE_CLUSTER_NODE_NONE);
+    uint16_t ai, bi, ci;
+    assert(qihse_cluster_topology_upsert_node(topo, &a, &ai));
+    assert(qihse_cluster_topology_upsert_node(topo, &b, &bi));
+    assert(qihse_cluster_topology_upsert_node(topo, &c, &ci));
+    assert(qihse_cluster_topology_adopt_range(topo, 100, 110, ai, 8));
+    assert(qihse_cluster_topology_adopt_range(topo, 100, 110, bi, 10));
+    assert(qihse_cluster_topology_adopt_range(topo, 104, 106, ci, 11));
+    /* Simulate a lagging peer: outer runs still show A while the newer
+     * overlapping middle already reflects C. */
+    assert(qihse_cluster_topology_adopt_range(topo, 100, 103, ai, 8));
+    assert(qihse_cluster_topology_adopt_range(topo, 107, 110, ai, 8));
+    assert(qihse_cluster_topology_adopt_range(topo, 100, 110, bi, 10));
+    for (uint16_t slot = 100; slot <= 110; ++slot) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        assert(qihse_cluster_topology_get_slot(topo, slot, &owner, NULL, NULL));
+        assert(qihse_cluster_topology_get_slot_epoch(topo, slot, &epoch));
+        if (slot >= 104 && slot <= 106) {
+            assert(owner == ci && epoch == 11);
+        } else {
+            assert(owner == bi && epoch == 10);
+        }
+    }
+    /* Equal-epoch conflicting ownership is rejected atomically. */
+    assert(!qihse_cluster_topology_adopt_range(topo, 100, 110, ai, 10));
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    assert(qihse_cluster_topology_get_slot(topo, 100, &owner, NULL, NULL));
+    assert(owner == bi);
+    qihse_cluster_topology_destroy(topo);
+    puts("PASS partial range supersession preserves newer per-slot ownership");
+}
+
 /* Test 1: an unproven replica cannot inherit a primary's slots. */
 static void test_primary_failover(void) {
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
@@ -742,6 +787,7 @@ int main(void) {
     test_takeover_promotion_lock_order();
     test_non_coordinator_does_not_trip_cooldown();
     test_maintenance_fences_failover_callbacks();
+    test_partial_range_supersession_is_monotonic();
     printf("cluster failover tests passed\n");
     return 0;
 }

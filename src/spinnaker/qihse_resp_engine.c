@@ -11759,6 +11759,8 @@ bool qihse_resp_server_ct_ownership_set(qihse_resp_server_t* server,
     server->ct_ownership_context = context;
     qihse_cluster_bus_set_ct_slot_update_callback(server->bus,
         qihse_cluster_ownership_bus_update_callback, context);
+    qihse_cluster_bus_set_ct1_promotion_update_callback(server->bus,
+        qihse_cluster_ownership_ct1_promotion_bus_callback, context);
     return true;
 }
 

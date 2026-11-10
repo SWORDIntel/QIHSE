@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <openssl/evp.h>
 
 #include "qihse_cluster_ownership.h"
 #include "qihse_cluster_ownership_journal.h"
@@ -84,6 +85,151 @@ static qihse_cluster_ownership_txn_t finalized_ct2(const char* id,
     memset(c.proof_digest, 0x6b, sizeof(c.proof_digest));
     c.phase = QIHSE_OWNERSHIP_FINALIZED;
     return c;
+}
+
+typedef struct {
+    char node[4][QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char pin[4][QIHSE_KV_CT_ID_MAX + 1u];
+} promotion_pin_map_t;
+
+static bool promotion_peer_id(void* opaque, const char* topology_id,
+                              char out[QIHSE_KV_CT_ID_MAX + 1u]) {
+    promotion_pin_map_t* map = opaque;
+    if (!map || !topology_id || !out) return false;
+    for (size_t i = 0; i < 4; ++i) {
+        if (!strcmp(map->node[i], topology_id)) {
+            snprintf(out, QIHSE_KV_CT_ID_MAX + 1u, "%s", map->pin[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void promotion_seal_fields(qihse_cluster_bus_ct1_promotion_update_t* u) {
+    char cursor[32];
+    snprintf(cursor, sizeof(cursor), "%llu", (unsigned long long)u->durable_cursor);
+    const char* fields[] = {u->source_id, u->target_id, u->source_qkp_id,
+        u->target_qkp_id, u->successor_id, u->successor_qkp_id,
+        u->generation, u->next_generation, cursor};
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    assert(md);
+    unsigned int n = 0;
+    assert(EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1);
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+        assert(EVP_DigestUpdate(md, fields[i], strlen(fields[i])) == 1);
+    assert(EVP_DigestFinal_ex(md, u->promotion_digest, &n) == 1 && n == 32);
+    EVP_MD_CTX_free(md);
+    assert(qihse_cluster_bus_ct1_promotion_seal(u));
+}
+
+static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
+                                                    qihse_user_t* op) {
+    qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
+    assert(topo);
+    promotion_pin_map_t pins;
+    memset(&pins, 0, sizeof(pins));
+    const char* seeds[] = {"promotion-A", "promotion-B", "promotion-S", "promotion-C"};
+    const char* pin_names[] = {"pin-A", "pin-B", "pin-S", "pin-C"};
+    qihse_cluster_node_t nodes[4];
+    uint16_t ix[4];
+    for (size_t i = 0; i < 4; ++i) {
+        memset(&nodes[i], 0, sizeof(nodes[i]));
+        qihse_cluster_node_id_from_seed(seeds[i], strlen(seeds[i]), nodes[i].id);
+        snprintf(pins.node[i], sizeof(pins.node[i]), "%s", nodes[i].id);
+        snprintf(pins.pin[i], sizeof(pins.pin[i]), "%s", pin_names[i]);
+        snprintf(nodes[i].host, sizeof(nodes[i].host), "127.0.0.1");
+        nodes[i].port = (uint16_t)(7200 + i);
+        nodes[i].bus_port = (uint16_t)(17200 + i);
+        nodes[i].role = QIHSE_CLUSTER_NODE_PRIMARY;
+        nodes[i].primary_index = QIHSE_CLUSTER_NODE_NONE;
+        nodes[i].healthy = true;
+        nodes[i].config_epoch = i == 1 ? 10u : 8u;
+        assert(qihse_cluster_topology_upsert_node(topo, &nodes[i], &ix[i]));
+    }
+    assert(qihse_cluster_topology_adopt_range(topo, 100, 110, ix[0], 8u));
+    assert(qihse_cluster_topology_adopt_range(topo, 104, 106, ix[3], 11u));
+
+    qihse_cluster_bus_ct1_promotion_update_t event;
+    memset(&event, 0, sizeof(event));
+    event.magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC;
+    event.start = 100; event.end = 110; event.config_epoch = 10;
+    event.durable_cursor = 55;
+    snprintf(event.transfer_id, sizeof(event.transfer_id), "ct1-overlap-A-B");
+    snprintf(event.source_id, sizeof(event.source_id), "%s", pins.node[0]);
+    snprintf(event.target_id, sizeof(event.target_id), "%s", pins.node[1]);
+    snprintf(event.source_qkp_id, sizeof(event.source_qkp_id), "%s", pins.pin[0]);
+    snprintf(event.target_qkp_id, sizeof(event.target_qkp_id), "%s", pins.pin[1]);
+    snprintf(event.successor_id, sizeof(event.successor_id), "%s", pins.node[2]);
+    snprintf(event.successor_qkp_id, sizeof(event.successor_qkp_id), "%s", pins.pin[2]);
+    snprintf(event.generation, sizeof(event.generation), "generation-old");
+    snprintf(event.next_generation, sizeof(event.next_generation), "generation-new");
+    for (uint32_t slot = 100; slot <= 110; ++slot)
+        event.slot_bitmap[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+    promotion_seal_fields(&event);
+
+    qihse_cluster_ownership_context_t ownership = {
+        .topology = topo, .store = store, .principal = op,
+        .peer_id = promotion_peer_id, .peer_id_context = &pins
+    };
+    char err[256];
+    qihse_cluster_bus_ct1_promotion_update_t forged = event;
+    forged.target_id[0] = forged.target_id[0] == 'a' ? 'b' : 'a';
+    assert(!qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &forged, err, sizeof(err)));
+    forged = event;
+    snprintf(forged.successor_id, sizeof(forged.successor_id), "untrusted-successor");
+    snprintf(forged.successor_qkp_id, sizeof(forged.successor_qkp_id), "pin-untrusted");
+    promotion_seal_fields(&forged);
+    assert(!qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &forged, err, sizeof(err)));
+
+    /* The bus handler has verified the target signature; ownership validation
+     * persists ADOPTED, updates the still-lagging outer runs, and skips only
+     * the newer B->C middle slots. */
+    assert(qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &event, err, sizeof(err)));
+    for (uint16_t slot = 100; slot <= 110; ++slot) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        assert(qihse_cluster_topology_get_slot(topo, slot, &owner, NULL, NULL));
+        assert(qihse_cluster_topology_get_slot_epoch(topo, slot, &epoch));
+        if (slot >= 104 && slot <= 106) assert(owner == ix[3] && epoch == 11u);
+        else assert(owner == ix[1] && epoch == 10u);
+    }
+
+    /* A still older signed event must not demote a target that has since
+     * become a replica at a newer node epoch. The local source's old slot is
+     * left for the newer primary's proof to reconcile. */
+    nodes[0].role = QIHSE_CLUSTER_NODE_PRIMARY;
+    nodes[0].primary_index = QIHSE_CLUSTER_NODE_NONE;
+    nodes[0].config_epoch = 20;
+    nodes[1].role = QIHSE_CLUSTER_NODE_REPLICA;
+    nodes[1].primary_index = ix[3];
+    nodes[1].config_epoch = 20;
+    nodes[2].config_epoch = 20;
+    nodes[3].config_epoch = 20;
+    qihse_cluster_topology_t* stale_topo = qihse_cluster_topology_create();
+    assert(stale_topo);
+    for (size_t i = 0; i < 4; ++i) assert(qihse_cluster_topology_upsert_node(
+        stale_topo, &nodes[i], &ix[i]));
+    assert(qihse_cluster_topology_adopt_range(stale_topo, 100, 100, ix[0], 8u));
+    assert(qihse_cluster_topology_adopt_range(stale_topo, 101, 110, ix[3], 20u));
+    ownership.topology = stale_topo;
+    snprintf(event.transfer_id, sizeof(event.transfer_id), "ct1-stale-role-check");
+    event.config_epoch = 10;
+    promotion_seal_fields(&event);
+    assert(qihse_cluster_ownership_receive_ct1_promotion(&ownership,
+        &event, err, sizeof(err)));
+    qihse_cluster_node_t check;
+    assert(qihse_cluster_topology_get_node(stale_topo, ix[1], &check));
+    assert(check.role == QIHSE_CLUSTER_NODE_REPLICA && check.primary_index == ix[3]);
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    assert(qihse_cluster_topology_get_slot(stale_topo, 100, &owner, NULL, NULL));
+    assert(owner == ix[0]);
+
+    qihse_cluster_topology_destroy(stale_topo);
+    qihse_cluster_topology_destroy(topo);
+    puts("[PASS] signed CT1 promotion validates pins, preserves overlap, and skips stale role rollback");
 }
 
 typedef struct {
@@ -198,6 +344,64 @@ int main(void) {
     assert(qihse_cluster_ownership_journal_append_txn(dir_cross_domain,
         &cross_domain_commit) == 0);
     puts("[PASS] CT2 source/target cursors are independent domains");
+
+    /* A durable INTENT must survive the crash window before the backing CT
+     * fence is installed. A matching PREPARED frame may then bind the exact
+     * observed cut and continue through the normal terminal transition. */
+    char dir_intent[] = "./tests/.qihse_journal_intent_XXXXXX";
+    assert(mkdtemp(dir_intent));
+    qihse_cluster_ownership_txn_t intent = txn(QIHSE_OWNERSHIP_INTENT);
+    strcpy(intent.transfer_id, "ct2-intent-crash-window");
+    intent.source_lsn = 0;
+    assert(qihse_cluster_ownership_journal_append_txn(dir_intent, &intent) == 0);
+    memset(&tr, 0, sizeof(tr)); unresolved = false;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir_intent, on_txn, &tr,
+        &unresolved) == 1);
+    assert(unresolved && tr.last == QIHSE_OWNERSHIP_INTENT);
+    qihse_cluster_ownership_txn_t intent_prepared = intent;
+    intent_prepared.phase = QIHSE_OWNERSHIP_PREPARED;
+    intent_prepared.source_lsn = 1234;
+    assert(qihse_cluster_ownership_journal_append_txn(dir_intent,
+        &intent_prepared) == 0);
+    qihse_cluster_ownership_txn_t intent_committed = intent_prepared;
+    intent_committed.phase = QIHSE_OWNERSHIP_COMMITTED;
+    intent_committed.target_lsn = 1234;
+    strcpy(intent_committed.owner_id, intent_committed.target_id);
+    memset(intent_committed.proof_digest, 0x71,
+        sizeof(intent_committed.proof_digest));
+    assert(qihse_cluster_ownership_journal_append_txn(dir_intent,
+        &intent_committed) == 0);
+    qihse_cluster_ownership_txn_t intent_finalized = intent_committed;
+    intent_finalized.phase = QIHSE_OWNERSHIP_FINALIZED;
+    assert(qihse_cluster_ownership_journal_append_txn(dir_intent,
+        &intent_finalized) == 0);
+    memset(&tr, 0, sizeof(tr)); unresolved = true;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir_intent, on_txn, &tr,
+        &unresolved) == 4);
+    assert(!unresolved && tr.last == QIHSE_OWNERSHIP_FINALIZED);
+    puts("[PASS] durable CT2 intent binds the fence cut after restart");
+
+    /* A peer's proof-bearing CT1 promotion is journaled as ADOPTED before
+     * routing changes. Replay must preserve that terminal peer-side record. */
+    char dir_adopted[] = "./tests/.qihse_journal_adopted_XXXXXX";
+    assert(mkdtemp(dir_adopted));
+    qihse_cluster_ownership_txn_t adopted = txn(QIHSE_OWNERSHIP_ADOPTED);
+    strcpy(adopted.transfer_id, "ct1-signed-adoption");
+    strcpy(adopted.next_generation, "generation-4");
+    strcpy(adopted.owner_id, "node-c");
+    adopted.start = 10; adopted.end = 12;
+    adopted.target_lsn = adopted.source_lsn;
+    adopted.slot_bitmap[10 / 8u] |= (uint8_t)(1u << (10 % 8u));
+    adopted.slot_bitmap[11 / 8u] |= (uint8_t)(1u << (11 % 8u));
+    adopted.slot_bitmap[12 / 8u] |= (uint8_t)(1u << (12 % 8u));
+    memset(adopted.proof_digest, 0x72, sizeof(adopted.proof_digest));
+    assert(qihse_cluster_ownership_journal_append_txn(dir_adopted, &adopted) == 0);
+    memset(&tr, 0, sizeof(tr)); unresolved = true;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir_adopted, on_txn, &tr,
+        &unresolved) == 1);
+    assert(!unresolved && tr.last == QIHSE_OWNERSHIP_ADOPTED);
+    puts("[PASS] signed CT1 adoption is durable before local routing");
+
     qihse_cluster_ownership_txn_t abort_prepare = txn(QIHSE_OWNERSHIP_PREPARED);
     strcpy(abort_prepare.transfer_id, "ct2-abort-1");
     assert(qihse_cluster_ownership_journal_append_txn(dir3, &abort_prepare) == 0);
@@ -304,6 +508,7 @@ int main(void) {
     assert(store);
     const char* store_dir = qihse_kv_store_data_directory(store);
     assert(store_dir && *store_dir);
+    test_signed_ct1_promotion_supersession(store, op);
     qihse_cluster_ownership_context_t ownership = {.store = store, .principal = op};
 
     qihse_cluster_ownership_txn_t old_final = finalized_ct2(
@@ -406,7 +611,8 @@ int main(void) {
     qihse_kv_store_destroy(store);
     qihse_audit_shutdown();
     const char* fixtures[] = {dir, dir2, dir3, dir_cross_domain, dir_race,
-                             dir_multi, dir4, dir5, auth_dir};
+                             dir_multi, dir4, dir5, auth_dir, dir_intent,
+                             dir_adopted};
     for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); ++i)
         remove_fixture(fixtures[i]);
     printf("[PASS] finalized CT2 retry survives later phases; getters require active system Operator\n");

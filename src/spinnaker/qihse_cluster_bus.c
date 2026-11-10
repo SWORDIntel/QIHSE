@@ -101,6 +101,8 @@ struct qihse_cluster_bus {
     void* on_takeover_user_data;
     qihse_cluster_bus_on_ct_slot_update_cb on_ct_slot_update;
     void* on_ct_slot_update_user_data;
+    qihse_cluster_bus_on_ct1_promotion_update_cb on_ct1_promotion_update;
+    void* on_ct1_promotion_update_user_data;
     pthread_mutex_t ct_queue_lock;
     pthread_cond_t ct_queue_cond;
     pthread_t ct_worker;
@@ -108,6 +110,14 @@ struct qihse_cluster_bus {
     bool ct_worker_running;
     qihse_cluster_bus_ct_slot_update_t ct_queue[64];
     size_t ct_queue_head, ct_queue_count;
+    qihse_cluster_bus_ct_slot_update_t* ct_announcements; /* latest proof per slot */
+    struct ct1_announcement* ct1_announcements;
+    size_t ct1_announcement_count, ct1_announcement_cap;
+    uint32_t* ct1_slot_announcement; /* event index + 1, zero means none */
+    uint16_t ct1_announce_cursor;
+    uint64_t ct1_announce_round;
+    uint16_t ct_announce_cursor;
+    uint64_t last_ct_announce_ms;
     void (*on_group_update)(qihse_cluster_bus_t* bus, uint64_t update_id, const char* group,
                             const uint8_t* payload, size_t payload_len,
                             uint16_t sender_index, void* user_data);
@@ -169,6 +179,11 @@ struct qihse_cluster_bus {
     size_t veil_key_len;
 };
 
+typedef struct ct1_announcement {
+    qihse_cluster_bus_ct1_promotion_update_t update;
+    uint64_t announced_round;
+} ct1_announcement_t;
+
 static void* qihse_bus_ct_worker(void* opaque) {
     qihse_cluster_bus_t* bus = (qihse_cluster_bus_t*)opaque;
     for (;;) {
@@ -196,6 +211,20 @@ static void qihse_bus_handle_group_update(qihse_cluster_bus_t* bus, uint16_t sen
                                           const uint8_t* payload, size_t payload_len);
 static void qihse_bus_handle_group_ack(qihse_cluster_bus_t* bus, uint16_t sender,
                                        const uint8_t* payload, size_t payload_len);
+static bool qihse_bus_valid_ct_slot_update(
+    const qihse_cluster_bus_ct_slot_update_t* update);
+static bool qihse_bus_same_ct_proof(
+    const qihse_cluster_bus_ct_slot_update_t* a,
+    const qihse_cluster_bus_ct_slot_update_t* b);
+static bool qihse_bus_valid_ct1_promotion(
+    const qihse_cluster_bus_ct1_promotion_update_t* update);
+static bool qihse_bus_valid_ct1_promotion_event(
+    const qihse_cluster_bus_ct1_promotion_update_t* update);
+static bool qihse_bus_ct1_promotion_digest(
+    const qihse_cluster_bus_ct1_promotion_update_t* update, uint8_t out[32]);
+static void qihse_bus_handle_ct1_promotion_update(qihse_cluster_bus_t* bus,
+    uint16_t sender, const uint8_t* payload, size_t payload_len,
+    bool signature_verified, const qihse_uuid_t* signer);
 
 static uint64_t qihse_bus_now_ms(void) {
 #ifdef _WIN32
@@ -810,6 +839,100 @@ static bool qihse_bus_valid_ct_slot_update(
     return any != 0;
 }
 
+static bool qihse_bus_ct1_promotion_fields_valid(
+    const qihse_cluster_bus_ct1_promotion_update_t* u) {
+    if (!u || u->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC || u->reserved ||
+        u->start > u->end || u->end >= QIHSE_CLUSTER_SLOT_COUNT || !u->config_epoch ||
+        !memchr(u->transfer_id, 0, sizeof(u->transfer_id)) || !u->transfer_id[0] ||
+        !memchr(u->source_id, 0, sizeof(u->source_id)) || !u->source_id[0] ||
+        !memchr(u->target_id, 0, sizeof(u->target_id)) || !u->target_id[0] ||
+        !memchr(u->source_qkp_id, 0, sizeof(u->source_qkp_id)) || !u->source_qkp_id[0] ||
+        !memchr(u->target_qkp_id, 0, sizeof(u->target_qkp_id)) || !u->target_qkp_id[0] ||
+        !memchr(u->successor_id, 0, sizeof(u->successor_id)) || !u->successor_id[0] ||
+        !memchr(u->successor_qkp_id, 0, sizeof(u->successor_qkp_id)) || !u->successor_qkp_id[0] ||
+        !memchr(u->generation, 0, sizeof(u->generation)) || !u->generation[0] ||
+        !memchr(u->next_generation, 0, sizeof(u->next_generation)) || !u->next_generation[0] ||
+        !strcmp(u->source_id, u->target_id) || !strcmp(u->source_qkp_id, u->target_qkp_id) ||
+        !strcmp(u->next_generation, u->generation)) return false;
+    uint8_t any = 0;
+    for (size_t i = 0; i < sizeof(u->promotion_digest); ++i) any |= u->promotion_digest[i];
+    if (!any) return false;
+    uint8_t digest[32];
+    bool ok = qihse_bus_ct1_promotion_digest(u, digest) &&
+        CRYPTO_memcmp(digest, u->event_digest, 32u) == 0;
+    OPENSSL_cleanse(digest, sizeof(digest));
+    return ok;
+}
+
+static bool qihse_bus_valid_ct1_promotion(
+    const qihse_cluster_bus_ct1_promotion_update_t* u) {
+    if (!qihse_bus_ct1_promotion_fields_valid(u)) return false;
+    for (uint32_t slot = u->start; slot <= u->end; ++slot)
+        if (!(u->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) return false;
+    if ((u->start > 0u && (u->slot_bitmap[(u->start - 1u) / 8u] &
+            (uint8_t)(1u << ((u->start - 1u) % 8u)))) ||
+        (u->end + 1u < QIHSE_CLUSTER_SLOT_COUNT &&
+            (u->slot_bitmap[(u->end + 1u) / 8u] &
+             (uint8_t)(1u << ((u->end + 1u) % 8u))))) return false;
+    return true;
+}
+
+static bool qihse_bus_valid_ct1_promotion_event(
+    const qihse_cluster_bus_ct1_promotion_update_t* u) {
+    if (!qihse_bus_ct1_promotion_fields_valid(u)) return false;
+    uint32_t first = QIHSE_CLUSTER_SLOT_COUNT, last = 0;
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(u->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        if (slot < first) first = slot;
+        last = slot;
+    }
+    return first == u->start && last == u->end;
+}
+
+static bool qihse_bus_ct1_promotion_digest(
+    const qihse_cluster_bus_ct1_promotion_update_t* update, uint8_t out[32]) {
+    if (!update || !out) return false;
+    qihse_cluster_bus_ct1_promotion_update_t canonical = *update;
+    canonical.start = 0; canonical.end = 0;
+    memset(canonical.event_digest, 0, sizeof(canonical.event_digest));
+    unsigned int n = 0;
+    bool ok = EVP_Digest(&canonical,
+        offsetof(qihse_cluster_bus_ct1_promotion_update_t, event_digest),
+        out, &n, EVP_sha256(), NULL) == 1 && n == 32;
+    OPENSSL_cleanse(&canonical, sizeof(canonical));
+    return ok;
+}
+
+bool qihse_cluster_bus_ct1_promotion_seal(
+    qihse_cluster_bus_ct1_promotion_update_t* update) {
+    if (!update) return false;
+    return qihse_bus_ct1_promotion_digest(update, update->event_digest);
+}
+
+static void qihse_bus_handle_ct1_promotion_update(qihse_cluster_bus_t* bus,
+    uint16_t sender, const uint8_t* payload, size_t payload_len,
+    bool signature_verified, const qihse_uuid_t* signer) {
+    if (!bus || !bus->on_ct1_promotion_update || !signature_verified || !signer ||
+        payload_len != sizeof(qihse_cluster_bus_ct1_promotion_update_t)) return;
+    qihse_cluster_bus_ct1_promotion_update_t update;
+    memcpy(&update, payload, sizeof(update));
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t target;
+    bool authorized = qihse_bus_valid_ct1_promotion(&update) &&
+        qihse_cluster_topology_find_node(bus->topology, update.target_id, &target_index) &&
+        sender == target_index &&
+        qihse_cluster_topology_get_node(bus->topology, target_index, &target) &&
+        target.has_uuid && CRYPTO_memcmp(target.node_uuid, signer->bytes, 16u) == 0;
+    if (authorized && (!bus->maintenance_gate || qihse_cluster_maintenance_enter(
+            bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT))) {
+        bus->on_ct1_promotion_update(bus, &update,
+                                     bus->on_ct1_promotion_update_user_data);
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT);
+    }
+    OPENSSL_cleanse(&update, sizeof(update));
+}
+
 static void qihse_bus_handle_ct_slot_update(qihse_cluster_bus_t* bus,
         const uint8_t* payload, size_t payload_len) {
     if (payload_len != sizeof(qihse_cluster_bus_ct_slot_update_t) ||
@@ -821,13 +944,26 @@ static void qihse_bus_handle_ct_slot_update(qihse_cluster_bus_t* bus,
     if (!qihse_cluster_topology_find_node(bus->topology, update.source_id, &source_index) ||
         !qihse_cluster_topology_find_node(bus->topology, update.target_id, &target_index) ||
         source_index == target_index || update.config_epoch == 0) return;
-    uint16_t current_owner = QIHSE_CLUSTER_NODE_NONE;
+    bool has_stale_slot = false;
     for (uint32_t slot = update.start; slot <= update.end; ++slot) {
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
         if (!qihse_cluster_topology_get_slot(bus->topology, (uint16_t)slot,
-                &owner, NULL, NULL)) return;
-        if (slot == update.start) current_owner = owner;
-        if (owner != current_owner || owner != source_index) return;
+                &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(bus->topology,
+                (uint16_t)slot, &epoch)) return;
+        if (epoch > update.config_epoch ||
+            (epoch == update.config_epoch && owner == target_index)) continue;
+        if (epoch == update.config_epoch ||
+            (owner != source_index && owner != target_index)) return;
+        has_stale_slot = true;
+    }
+    /* Historical transfers may arrive after a peer missed the original UDP
+     * announcement. Only queue if this proof advances every slot; same-epoch
+     * duplicates are already complete and older events must never roll back. */
+    if (!has_stale_slot) {
+        __atomic_add_fetch(&bus->stats.slot_updates_received, 1u, __ATOMIC_RELAXED);
+        return;
     }
     pthread_mutex_lock(&bus->ct_queue_lock);
     if (!bus->ct_worker_running || bus->ct_queue_count >= 64u) {
@@ -1043,6 +1179,9 @@ static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
 static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
                                        const uint8_t* data, size_t len) {
     uint8_t plain[QIHSE_BUS_MAX_DATAGRAM];
+    qihse_uuid_t signer_uuid;
+    memset(&signer_uuid, 0, sizeof(signer_uuid));
+    bool signature_verified = false;
     if (bus->veil_key) {
         /* Veiled receive path: peel nonce/padding, de-XOR, then parse the
          * inner frame. Malformed wrappers are dropped silently (UDP). */
@@ -1070,8 +1209,7 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         size_t sig_total = 3u + 16u + (size_t)sig_len + 6u;
         if (sig_len == 0u || sig_len > 4627u || sig_total > len) return;
         size_t tr = len - sig_total; /* trailer start */
-        qihse_uuid_t signer;
-        memcpy(signer.bytes, data + tr + 3u, 16u);
+        memcpy(signer_uuid.bytes, data + tr + 3u, 16u);
         bool verified = false;
         /* The ALGORITHM OF RECORD is the enrolled identity's, not the
          * trailer byte (advisory only) — the signature must verify under
@@ -1079,7 +1217,7 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         if (bus->federation_store && bus->federation_user) {
             qihse_federation_node_identity_t ident;
             bool have = qihse_federation_node_identity_read(
-                bus->federation_store, bus->federation_user, &signer, &ident);
+                bus->federation_store, bus->federation_user, &signer_uuid, &ident);
             if (have && ident.trust == QIHSE_TRUST_APPROVED) {
                 verified = qihse_federation_verify(
                     ident.sig_alg, ident.public_key, ident.public_key_len,
@@ -1091,8 +1229,8 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
             } else if (getenv("QBS_DBG")) {
                 fprintf(stderr,
                         "[qbs] have=0 signer=%02x%02x%02x%02x\n",
-                        signer.bytes[0], signer.bytes[1], signer.bytes[2],
-                        signer.bytes[3]);
+                        signer_uuid.bytes[0], signer_uuid.bytes[1], signer_uuid.bytes[2],
+                        signer_uuid.bytes[3]);
             }
         }
         if (!verified) {
@@ -1102,6 +1240,7 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         }
         __atomic_add_fetch(&bus->stats.signed_ops_accepted, 1u,
                            __ATOMIC_RELAXED);
+        signature_verified = true;
         trailer_len = sig_total;
     }
 
@@ -1124,7 +1263,12 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         case QIHSE_BUS_MSG_PONG:        qihse_bus_handle_pong(bus, sender, payload, payload_len); break;
         case QIHSE_BUS_MSG_MEET:        qihse_bus_handle_meet(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_FAIL:        qihse_bus_handle_fail(bus, sender, payload, payload_len); break;
-        case QIHSE_BUS_MSG_SLOT_UPDATE: qihse_bus_handle_slot_update(bus, payload, payload_len); break;
+        case QIHSE_BUS_MSG_SLOT_UPDATE:
+            if (payload_len == sizeof(qihse_cluster_bus_ct1_promotion_update_t))
+                qihse_bus_handle_ct1_promotion_update(bus, sender, payload, payload_len,
+                                                       signature_verified, &signer_uuid);
+            else qihse_bus_handle_slot_update(bus, payload, payload_len);
+            break;
         case QIHSE_BUS_MSG_NODE_UPDATE: qihse_bus_handle_node_update(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_NODE_OBS:    qihse_bus_handle_node_obs(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_NODE_CAP:    qihse_bus_handle_node_cap(bus, payload, payload_len); break;
@@ -1421,6 +1565,98 @@ static void* qihse_bus_thread(void* arg) {
             qihse_bus_send_heartbeat(bus);
             last_heartbeat = now;
         }
+        if (now - bus->last_ct_announce_ms >= 2000u) {
+            /* UDP has no acknowledgement. Reannounce a bounded slice of the
+             * current proof-per-slot cache each cycle; epoch checks on receive
+             * make repeats idempotent and prevent historical rollback. */
+            bus->last_ct_announce_ms = now;
+            for (unsigned sent = 0; sent < 64u; ++sent) {
+                qihse_cluster_bus_ct_slot_update_t update;
+                bool found = false;
+                pthread_mutex_lock(&bus->ct_queue_lock);
+                for (uint32_t scanned = 0; scanned < QIHSE_CLUSTER_SLOT_COUNT; ++scanned) {
+                    uint16_t slot = bus->ct_announce_cursor;
+                    bus->ct_announce_cursor = (uint16_t)((slot + 1u) % QIHSE_CLUSTER_SLOT_COUNT);
+                    if (bus->ct_announcements &&
+                        bus->ct_announcements[slot].magic == QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC) {
+                        update = bus->ct_announcements[slot];
+                        /* Receipt validation is over the exact original range.
+                         * Never narrow start/end to the surviving cache run:
+                         * a newer overlapping transfer may have replaced the
+                         * middle slots, while this proof still covers both
+                         * remaining sides. The receiver applies only slots
+                         * whose per-slot epoch is older. Send each retained
+                         * proof tuple once per cycle, even if its cache entries
+                         * are now discontiguous. */
+                        bool earlier_copy = false;
+                        for (uint32_t prior = update.start; prior < slot; ++prior) {
+                            if (qihse_bus_same_ct_proof(&update,
+                                    &bus->ct_announcements[prior])) {
+                                earlier_copy = true;
+                                break;
+                            }
+                        }
+                        if (!earlier_copy) {
+                            bus->ct_announce_cursor = (uint16_t)((slot + 1u) % QIHSE_CLUSTER_SLOT_COUNT);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&bus->ct_queue_lock);
+                if (!found) break;
+                (void)qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+                    (const uint8_t*)&update, sizeof(update));
+                OPENSSL_cleanse(&update, sizeof(update));
+            }
+            bus->ct1_announce_round++;
+            if (bus->ct1_announce_round == 0) {
+                bus->ct1_announce_round = 1;
+                for (size_t i = 0; i < bus->ct1_announcement_count; ++i)
+                    bus->ct1_announcements[i].announced_round = 0;
+            }
+            /* Keep the proof tuple for every slot that still depends on it.
+             * Later promotions replace only their covered slots; older
+             * disjoint or partially superseded events continue to converge. */
+            for (unsigned sent = 0; sent < 64u; ++sent) {
+                qihse_cluster_bus_ct1_promotion_update_t update;
+                bool found = false;
+                pthread_mutex_lock(&bus->ct_queue_lock);
+                for (uint32_t scanned = 0; scanned < QIHSE_CLUSTER_SLOT_COUNT; ++scanned) {
+                    uint16_t slot = bus->ct1_announce_cursor;
+                    bus->ct1_announce_cursor = (uint16_t)((slot + 1u) % QIHSE_CLUSTER_SLOT_COUNT);
+                    uint32_t event_id = bus->ct1_slot_announcement
+                        ? bus->ct1_slot_announcement[slot] : 0;
+                    if (!event_id || event_id > bus->ct1_announcement_count) continue;
+                    ct1_announcement_t* event = &bus->ct1_announcements[event_id - 1u];
+                    if (event->announced_round == bus->ct1_announce_round) continue;
+                    event->announced_round = bus->ct1_announce_round;
+                    update = event->update;
+                    found = true;
+                    break;
+                }
+                pthread_mutex_unlock(&bus->ct_queue_lock);
+                if (!found) break;
+                /* Wire ranges are contiguous bitmap runs, while event_digest
+                 * binds the unchanged complete promotion bitmap and tuple. */
+                uint32_t slot = update.start;
+                uint32_t full_end = update.end;
+                while (slot <= full_end) {
+                    if (!(update.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) {
+                        ++slot;
+                        continue;
+                    }
+                    uint32_t first = slot++;
+                    while (slot <= full_end &&
+                           (update.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
+                    update.start = (uint16_t)first;
+                    update.end = (uint16_t)(slot - 1u);
+                    (void)qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+                        (const uint8_t*)&update, sizeof(update));
+                }
+                OPENSSL_cleanse(&update, sizeof(update));
+            }
+        }
         (void)qihse_bus_send_fed_statement(bus);
         qihse_cluster_bus_check_health(bus);
 #ifdef _WIN32
@@ -1447,6 +1683,8 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_fail_user_data = config->on_fail_user_data;
     bus->on_ct_slot_update = config->on_ct_slot_update;
     bus->on_ct_slot_update_user_data = config->on_ct_slot_update_user_data;
+    bus->on_ct1_promotion_update = config->on_ct1_promotion_update;
+    bus->on_ct1_promotion_update_user_data = config->on_ct1_promotion_update_user_data;
     bus->on_group_update = config->on_group_update;
     bus->on_group_update_user_data = config->on_group_update_user_data;
     bus->on_group_ack = config->on_group_ack;
@@ -1512,6 +1750,20 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         return NULL;
     }
     if (pthread_cond_init(&bus->ct_queue_cond, NULL) != 0) {
+        pthread_mutex_destroy(&bus->ct_queue_lock);
+        pthread_mutex_destroy(&bus->lock);
+        OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        free(bus);
+        return NULL;
+    }
+    bus->ct_announcements = calloc(QIHSE_CLUSTER_SLOT_COUNT,
+                                    sizeof(*bus->ct_announcements));
+    bus->ct1_slot_announcement = calloc(QIHSE_CLUSTER_SLOT_COUNT,
+                                        sizeof(*bus->ct1_slot_announcement));
+    if (!bus->ct_announcements || !bus->ct1_slot_announcement) {
+        free(bus->ct_announcements);
+        free(bus->ct1_slot_announcement);
+        pthread_cond_destroy(&bus->ct_queue_cond);
         pthread_mutex_destroy(&bus->ct_queue_lock);
         pthread_mutex_destroy(&bus->lock);
         OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
@@ -1634,6 +1886,9 @@ void qihse_cluster_bus_destroy(qihse_cluster_bus_t* bus) {
     free(bus->cap_free_ram_mb);
     free(bus->cap_load_pct);
     free(bus->cap_present);
+    free(bus->ct_announcements);
+    free(bus->ct1_announcements);
+    free(bus->ct1_slot_announcement);
     OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
     free(bus);
 }
@@ -1660,13 +1915,158 @@ bool qihse_cluster_bus_broadcast_ct_slot_update(
     const qihse_cluster_bus_ct_slot_update_t* update) {
     if (!bus || !update || !qihse_bus_valid_ct_slot_update(update) ||
         !bus->running) return false;
-    qihse_cluster_node_t owner;
     uint16_t owner_index = QIHSE_CLUSTER_NODE_NONE;
     if (!qihse_cluster_topology_find_node(bus->topology, update->owner_id, &owner_index) ||
-        !qihse_cluster_topology_get_node(bus->topology, owner_index, &owner) ||
-        owner.config_epoch != update->config_epoch) return false;
+        update->config_epoch == 0u) return false;
+    pthread_mutex_lock(&bus->ct_queue_lock);
+    for (uint32_t slot = update->start; slot <= update->end; ++slot) {
+        qihse_cluster_bus_ct_slot_update_t* old = &bus->ct_announcements[slot];
+        if (old->magic == QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC &&
+            old->config_epoch > update->config_epoch) continue;
+        if (old->magic == QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC &&
+            old->config_epoch == update->config_epoch &&
+            !qihse_bus_same_ct_proof(old, update)) continue;
+        *old = *update;
+    }
+    pthread_mutex_unlock(&bus->ct_queue_lock);
     return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
         (const uint8_t*)update, sizeof(*update));
+}
+
+static bool qihse_bus_same_ct_proof(
+    const qihse_cluster_bus_ct_slot_update_t* a,
+    const qihse_cluster_bus_ct_slot_update_t* b) {
+    return a && b && b->magic == QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC &&
+        a->start == b->start && a->end == b->end &&
+        a->config_epoch == b->config_epoch && a->source_lsn == b->source_lsn &&
+        a->target_lsn == b->target_lsn &&
+        !strcmp(a->transfer_id, b->transfer_id) &&
+        !strcmp(a->source_id, b->source_id) &&
+        !strcmp(a->target_id, b->target_id) &&
+        !strcmp(a->source_qkp_id, b->source_qkp_id) &&
+        !strcmp(a->target_qkp_id, b->target_qkp_id) &&
+        !strcmp(a->generation, b->generation) &&
+        CRYPTO_memcmp(a->checksum, b->checksum, sizeof(a->checksum)) == 0;
+}
+
+static void qihse_bus_prune_ct1_events_locked(qihse_cluster_bus_t* bus) {
+    if (!bus || !bus->ct1_announcement_count) return;
+    uint8_t* used = calloc(bus->ct1_announcement_count, 1u);
+    uint32_t* remap = calloc(bus->ct1_announcement_count, sizeof(*remap));
+    if (!used || !remap) { free(used); free(remap); return; }
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        uint32_t id = bus->ct1_slot_announcement[slot];
+        if (id && id <= bus->ct1_announcement_count) used[id - 1u] = 1u;
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < bus->ct1_announcement_count; ++i) {
+        if (!used[i]) continue;
+        if (kept != i) bus->ct1_announcements[kept] = bus->ct1_announcements[i];
+        remap[i] = (uint32_t)(++kept);
+    }
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        uint32_t id = bus->ct1_slot_announcement[slot];
+        bus->ct1_slot_announcement[slot] = id && id <= bus->ct1_announcement_count
+            ? remap[id - 1u] : 0u;
+    }
+    bus->ct1_announcement_count = kept;
+    free(used);
+    free(remap);
+}
+
+bool qihse_cluster_bus_broadcast_ct1_promotion(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_t* update) {
+    if (!bus || !update || !bus->running || !bus->federation_sign_key ||
+        !bus->has_local_node_uuid || !qihse_bus_valid_ct1_promotion_event(update)) return false;
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    if (!qihse_cluster_topology_find_node(bus->topology, update->target_id, &target_index) ||
+        target_index != bus->local_node_index) return false;
+    pthread_mutex_lock(&bus->ct_queue_lock);
+    size_t event_index = bus->ct1_announcement_count;
+    for (size_t i = 0; i < bus->ct1_announcement_count; ++i) {
+        if (CRYPTO_memcmp(bus->ct1_announcements[i].update.event_digest,
+                          update->event_digest, 32u) == 0) {
+            event_index = i;
+            break;
+        }
+    }
+    bool eligible = false;
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        uint32_t id = bus->ct1_slot_announcement[slot];
+        if (!id || id > bus->ct1_announcement_count ||
+            bus->ct1_announcements[id - 1u].update.config_epoch < update->config_epoch ||
+            (bus->ct1_announcements[id - 1u].update.config_epoch == update->config_epoch &&
+             CRYPTO_memcmp(bus->ct1_announcements[id - 1u].update.event_digest,
+                           update->event_digest, 32u) == 0))
+            eligible = true;
+    }
+    bool cached = false;
+    if (eligible && event_index == bus->ct1_announcement_count) {
+        if (bus->ct1_announcement_count >= QIHSE_CLUSTER_SLOT_COUNT) {
+            qihse_bus_prune_ct1_events_locked(bus);
+            event_index = bus->ct1_announcement_count;
+        }
+        if (bus->ct1_announcement_count < QIHSE_CLUSTER_SLOT_COUNT) {
+            if (bus->ct1_announcement_count == bus->ct1_announcement_cap) {
+                size_t cap = bus->ct1_announcement_cap ? bus->ct1_announcement_cap * 2u : 8u;
+                if (cap > QIHSE_CLUSTER_SLOT_COUNT) cap = QIHSE_CLUSTER_SLOT_COUNT;
+                ct1_announcement_t* events = realloc(bus->ct1_announcements,
+                    cap * sizeof(*events));
+                if (events) {
+                    bus->ct1_announcements = events;
+                    bus->ct1_announcement_cap = cap;
+                }
+            }
+            if (bus->ct1_announcement_count < bus->ct1_announcement_cap) {
+                event_index = bus->ct1_announcement_count++;
+                memset(&bus->ct1_announcements[event_index], 0,
+                    sizeof(bus->ct1_announcements[event_index]));
+                bus->ct1_announcements[event_index].update = *update;
+            }
+        }
+    }
+    if (event_index < bus->ct1_announcement_count &&
+        CRYPTO_memcmp(bus->ct1_announcements[event_index].update.event_digest,
+                      update->event_digest, 32u) == 0) {
+        uint32_t id = (uint32_t)event_index + 1u;
+        for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+            if (!(update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+            uint32_t old_id = bus->ct1_slot_announcement[slot];
+            if (old_id && old_id <= bus->ct1_announcement_count) {
+                const qihse_cluster_bus_ct1_promotion_update_t* old_update =
+                    &bus->ct1_announcements[old_id - 1u].update;
+                if (old_update->config_epoch > update->config_epoch ||
+                    (old_update->config_epoch == update->config_epoch &&
+                     CRYPTO_memcmp(old_update->event_digest, update->event_digest, 32u) != 0))
+                    continue;
+            }
+            bus->ct1_slot_announcement[slot] = id;
+        }
+        cached = true;
+        qihse_bus_prune_ct1_events_locked(bus);
+    }
+    pthread_mutex_unlock(&bus->ct_queue_lock);
+    if (!cached) return false;
+    bool ok = true;
+    uint32_t slot = update->start;
+    while (slot <= update->end) {
+        if (!(update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) {
+            ++slot;
+            continue;
+        }
+        uint32_t first = slot++;
+        while (slot <= update->end &&
+               (update->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) ++slot;
+        qihse_cluster_bus_ct1_promotion_update_t run = *update;
+        run.start = (uint16_t)first;
+        run.end = (uint16_t)(slot - 1u);
+        if (!qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+                (const uint8_t*)&run, sizeof(run))) ok = false;
+        OPENSSL_cleanse(&run, sizeof(run));
+    }
+    return ok;
 }
 
 void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
@@ -1718,6 +2118,14 @@ void qihse_cluster_bus_set_ct_slot_update_callback(
     if (!bus || bus->running) return;
     bus->on_ct_slot_update = cb;
     bus->on_ct_slot_update_user_data = user_data;
+}
+
+void qihse_cluster_bus_set_ct1_promotion_update_callback(
+    qihse_cluster_bus_t* bus,
+    qihse_cluster_bus_on_ct1_promotion_update_cb cb, void* user_data) {
+    if (!bus) return;
+    bus->on_ct1_promotion_update = cb;
+    bus->on_ct1_promotion_update_user_data = user_data;
 }
 
 void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,

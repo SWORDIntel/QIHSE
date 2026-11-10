@@ -153,7 +153,7 @@ int main(void) {
         700u, 710u, token, &source_cut));
     assert(!qihse_cluster_ownership_replay_control(&ownership, &unresolved,
         error, sizeof(error)));
-    assert(strstr(error, "active CT source fence does not match"));
+    assert(strstr(error, "active CT fence does not match"));
 
     OPENSSL_cleanse(token, sizeof(token));
     qihse_cluster_topology_destroy(topology);

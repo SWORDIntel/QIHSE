@@ -199,6 +199,28 @@ typedef struct {
     uint8_t checksum[32];
 } qihse_cluster_bus_ct_slot_update_t;
 
+/* Signed target-origin CT1 promotion announcement. The full bitmap and both
+ * generations bind every disjoint range to one durable promotion record. */
+#define QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC 0x31504351u /* "QCP1" */
+typedef struct {
+    uint32_t magic;
+    uint16_t start, end;
+    uint16_t reserved;
+    uint64_t config_epoch, durable_cursor;
+    char transfer_id[65];
+    char source_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char target_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char source_qkp_id[65];
+    char target_qkp_id[65];
+    char successor_id[QIHSE_CLUSTER_NODE_ID_LEN + 1u];
+    char successor_qkp_id[65];
+    char generation[65];
+    char next_generation[65];
+    uint8_t slot_bitmap[QIHSE_CLUSTER_SLOT_COUNT / 8u];
+    uint8_t promotion_digest[32];
+    uint8_t event_digest[32];
+} qihse_cluster_bus_ct1_promotion_update_t;
+
 typedef struct qihse_cluster_bus qihse_cluster_bus_t;
 
 typedef void (*qihse_cluster_bus_on_fail_cb)(qihse_cluster_topology_t* topology,
@@ -217,6 +239,9 @@ typedef void (*qihse_cluster_bus_on_takeover_cb)(qihse_cluster_topology_t* topol
 typedef void (*qihse_cluster_bus_on_ct_slot_update_cb)(
     qihse_cluster_bus_t* bus,
     const qihse_cluster_bus_ct_slot_update_t* update, void* user_data);
+typedef void (*qihse_cluster_bus_on_ct1_promotion_update_cb)(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_t* update, void* user_data);
 
 typedef struct {
     qihse_cluster_topology_t* topology;
@@ -236,6 +261,8 @@ typedef struct {
      * invokes ownership-journal validation before adopting it. */
     qihse_cluster_bus_on_ct_slot_update_cb on_ct_slot_update;
     void* on_ct_slot_update_user_data;
+    qihse_cluster_bus_on_ct1_promotion_update_cb on_ct1_promotion_update;
+    void* on_ct1_promotion_update_user_data;
     /* Group update push. on_group_update fires on every member when an update
      * frame arrives; on_group_ack fires on the pusher when a member reports
      * applied/rejected. Both run on the bus thread: keep them short. */
@@ -378,6 +405,9 @@ void qihse_cluster_bus_set_takeover_callback(qihse_cluster_bus_t* bus,
 void qihse_cluster_bus_set_ct_slot_update_callback(
     qihse_cluster_bus_t* bus, qihse_cluster_bus_on_ct_slot_update_cb cb,
     void* user_data);
+void qihse_cluster_bus_set_ct1_promotion_update_callback(
+    qihse_cluster_bus_t* bus,
+    qihse_cluster_bus_on_ct1_promotion_update_cb cb, void* user_data);
 
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching
@@ -404,6 +434,11 @@ bool qihse_cluster_bus_broadcast_slot_update(qihse_cluster_bus_t* bus,
 bool qihse_cluster_bus_broadcast_ct_slot_update(
     qihse_cluster_bus_t* bus,
     const qihse_cluster_bus_ct_slot_update_t* update);
+bool qihse_cluster_bus_broadcast_ct1_promotion(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_t* update);
+bool qihse_cluster_bus_ct1_promotion_seal(
+    qihse_cluster_bus_ct1_promotion_update_t* update);
 
 /* Broadcast a node metadata update (role change, health change). */
 bool qihse_cluster_bus_broadcast_node_update(qihse_cluster_bus_t* bus,
