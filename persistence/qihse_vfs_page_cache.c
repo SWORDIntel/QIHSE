@@ -27,6 +27,43 @@
 #include <stdio.h>
 #include <inttypes.h>
 
+typedef struct {
+    size_t count;
+    size_t capacity;
+    char (*keys)[18];
+    bool failed;
+} cache_key_list_t;
+
+static void cache_disable(qihse_vfs_page_cache_t* cache)
+{
+    if (!cache || !cache->kv) return;
+    qihse_kv_store_destroy(cache->kv);
+    cache->kv = NULL;
+}
+
+static bool cache_key_count_cb(const char* key, const char* value, void* user_data)
+{
+    (void)value;
+    cache_key_list_t* list = user_data;
+    if (!list || !key || strlen(key) != 17u || key[0] != 'P') return true;
+    if (list->count == SIZE_MAX) list->failed = true;
+    else list->count++;
+    return !list->failed;
+}
+
+static bool cache_key_copy_cb(const char* key, const char* value, void* user_data)
+{
+    (void)value;
+    cache_key_list_t* list = user_data;
+    if (!list || !key || strlen(key) != 17u || key[0] != 'P') return true;
+    if (list->count >= list->capacity) {
+        list->failed = true;
+        return false;
+    }
+    memcpy(list->keys[list->count++], key, 18u);
+    return true;
+}
+
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
 /* Format the KV key for a given page number into key_buf (must be >= 18 bytes). */
@@ -166,23 +203,45 @@ void qihse_vfs_cache_evict_above(qihse_vfs_page_cache_t* cache,
 {
     if (!cache || !cache->kv) return;
 
-    /*
-     * The KV store has no range-delete API yet.  We scan pages starting at
-     * cutoff_id upwards until we fail to find a key.  This is O(n) over the
-     * number of pages to evict — acceptable since VACUUM/TRUNCATE is rare.
-     *
-     * We cap the scan at 2^20 pages (~4 GB at 4 KB pages) to bound the loop.
-     */
-    char key[18];
-    uint64_t id = cutoff_id;
-    const uint64_t SCAN_LIMIT = cutoff_id + (1u << 20);
-
-    while (id < SCAN_LIMIT) {
-        fmt_page_key(key, id);
-        if (!qihse_kv_exists_user(cache->kv, key, NULL)) break;
-        qihse_kv_del_user(cache->kv, key, NULL);
-        id++;
+    /* Enumerate actual keys: page IDs are sparse, so probing upward from the
+     * cutoff can stop at a hole and miss later pages. Do not mutate the KV
+     * store from its read-locked iteration callback. Two bounded passes let us
+     * allocate the exact key list before performing any deletions. */
+    cache_key_list_t count = {0};
+    if (!qihse_kv_foreach_prefix_user(cache->kv, "P", NULL,
+                                      cache_key_count_cb, &count) || count.failed ||
+        count.count > SIZE_MAX / sizeof(*count.keys)) {
+        cache_disable(cache);
+        return;
     }
+    if (count.count == 0u) return;
+
+    char (*keys)[18] = calloc(count.count, sizeof(*keys));
+    if (!keys) { cache_disable(cache); return; }
+    cache_key_list_t copy = {.capacity = count.count, .keys = keys};
+    if (!qihse_kv_foreach_prefix_user(cache->kv, "P", NULL,
+                                      cache_key_copy_cb, &copy) || copy.failed ||
+        copy.count != count.count) {
+        free(keys);
+        cache_disable(cache);
+        return;
+    }
+
+    bool ok = true;
+    for (size_t i = 0; i < copy.count; i++) {
+        uint64_t page_id = 0u;
+        for (size_t j = 1; j < 17u; j++) {
+            unsigned char c = (unsigned char)keys[i][j];
+            unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+                             c >= 'a' && c <= 'f' ? (unsigned)(c - 'a') + 10u : 16u;
+            if (digit > 15u) { page_id = UINT64_MAX; break; }
+            page_id = (page_id << 4) | digit;
+        }
+        if (page_id >= cutoff_id && !qihse_kv_del_user(cache->kv, keys[i], NULL))
+            ok = false;
+    }
+    free(keys);
+    if (!ok) cache_disable(cache);
 }
 
 /* ── Flush ───────────────────────────────────────────────────────────────── */

@@ -132,6 +132,18 @@ uint64_t qihse_event_stream_replay(
     qihse_es_replay_cb callback,
     void* user_data);
 
+/* Legacy/unclassified-topic checked replay; it retains the same topic/path and
+ * security boundary as qihse_event_stream_replay and does not address scoped
+ * V2 logs. Checked replay distinguishes an empty topic (success, count 0) from a
+ * missing, malformed, torn, unreadable, allocation-failed, or callback-aborted
+ * replay. out_count reports the committed records delivered before any error. */
+bool qihse_event_stream_replay_checked(
+    qihse_event_stream_t* stream,
+    const char* topic,
+    qihse_es_replay_cb callback,
+    void* user_data,
+    uint64_t* out_count);
+
 /* Truncate any uncommitted (torn) tail records after the last valid commit. */
 bool qihse_event_stream_truncate_torn_tail(
     qihse_event_stream_t* stream,

@@ -438,6 +438,11 @@ static int checkpoint_flush_fails(void* ctx) {
     return -1;
 }
 
+static int checkpoint_flush_count(void* ctx) {
+    (*(int*)ctx)++;
+    return 0;
+}
+
 static void test_crash_recovery(void) {
     char dir[] = "build/test_txn_rec_XXXXXX";
     assert(mkdtemp(dir));
@@ -502,6 +507,42 @@ static void test_crash_recovery(void) {
     qihse_txn_manager_destroy(mgr);
     remove_wal_dir(dir);
     printf("PASS crash recovery: analysis/redo/undo, committed visible, uncommitted aborted\n");
+}
+
+static void test_failed_redo_blocks_checkpoint(void) {
+    char dir[] = "build/test_txn_redo_fail_XXXXXX";
+    assert(mkdtemp(dir));
+    qihse_wal_t* wal = qihse_wal_create(dir, 64 * 1024,
+                                        QIHSE_WAL_DURABILITY_FDATASYNC);
+    assert(wal);
+    assert(qihse_wal_append_begin(wal, 91) != 0);
+    /* WAL permits this key size, but MVCC rejects it; force a redo failure
+     * after analysis has already identified the transaction as committed. */
+    char too_long[QIHSE_MVCC_MAX_KEY];
+    memset(too_long, 'k', sizeof(too_long));
+    assert(qihse_wal_append(wal, 91, QIHSE_MVCC_ENGINE_KV,
+                            QIHSE_WAL_OP_INSERT, too_long, sizeof(too_long),
+                            "value", 5) != 0);
+    assert(qihse_wal_append_commit(wal, 91) != 0);
+    qihse_wal_destroy(wal);
+
+    qihse_txn_manager_t* mgr = qihse_txn_manager_create();
+    qihse_mvcc_store_t* store = qihse_mvcc_store_create(8);
+    wal = qihse_wal_create(dir, 64 * 1024, QIHSE_WAL_DURABILITY_NONE);
+    assert(mgr && store && wal);
+    qihse_recovery_t* rec = qihse_recovery_create(mgr, store, wal);
+    assert(rec);
+    assert(qihse_recovery_replay(rec) == -1);
+    int flush_calls = 0;
+    assert(qihse_recovery_checkpoint(rec, checkpoint_flush_count, &flush_calls) == -1);
+    assert(flush_calls == 0);
+    assert(qihse_recovery_replay(rec) == -1);
+
+    qihse_recovery_destroy(rec);
+    qihse_wal_destroy(wal);
+    qihse_mvcc_store_destroy(store);
+    qihse_txn_manager_destroy(mgr);
+    remove_wal_dir(dir);
 }
 
 /* ── 6. SERIALIZABLE OCC ────────────────────────────────────────────────── */
@@ -775,6 +816,7 @@ int main(void) {
     test_savepoints();
     test_wal_append_replay();
     test_crash_recovery();
+    test_failed_redo_blocks_checkpoint();
     test_serializable_occ();
     test_two_phase_commit();
     test_terminal_transition_races();

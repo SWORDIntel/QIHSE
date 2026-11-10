@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <nmmintrin.h>   /* SSE4.2 _mm_crc32_u64 */
@@ -19,10 +20,11 @@
 
 /* ---- Runtime CPU detection ---- */
 
-static int g_sse42_available = -1;  /* -1 = not checked, 0 = no, 1 = yes */
+static pthread_once_t g_cpu_caps_once = PTHREAD_ONCE_INIT;
+static bool g_sse42_available;
+static bool g_bmi1_available;
 
-bool qihse_crc32c_available(void) {
-    if (g_sse42_available >= 0) return g_sse42_available != 0;
+static void detect_cpu_caps(void) {
 #if defined(QIHSE_HAVE_SSE42)
     /* Check SSE4.2 via CPUID */
     uint32_t eax, ebx, ecx, edx;
@@ -33,23 +35,37 @@ bool qihse_crc32c_available(void) {
         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
         : "a"(eax)
     );
-    g_sse42_available = (ecx & (1u << 20)) ? 1 : 0;
+    g_sse42_available = (ecx & (1u << 20)) != 0;
 #else
-    g_sse42_available = 1;  /* assume available on x86-64 */
+    g_sse42_available = true;  /* assume available on x86-64 */
 #endif
 #else
-    g_sse42_available = 0;
+    g_sse42_available = false;
 #endif
-    return g_sse42_available != 0;
+
+#if defined(__x86_64__) || defined(_M_X64)
+    unsigned int max_leaf = 0, leaf_b = 0, leaf_c = 0, leaf_d = 0;
+    __asm__ volatile("cpuid" : "=a"(max_leaf), "=b"(leaf_b), "=c"(leaf_c), "=d"(leaf_d)
+                     : "a"(0), "c"(0));
+    if (max_leaf >= 7) {
+        __asm__ volatile("cpuid" : "=a"(max_leaf), "=b"(leaf_b), "=c"(leaf_c), "=d"(leaf_d)
+                         : "a"(7), "c"(0));
+        g_bmi1_available = (leaf_b & (1u << 3)) != 0;
+    }
+#endif
+}
+
+bool qihse_crc32c_available(void) {
+    (void)pthread_once(&g_cpu_caps_once, detect_cpu_caps);
+    return g_sse42_available;
 }
 
 /* ---- Software CRC32C fallback (table-based) ---- */
 
 static uint32_t crc32c_table[256];
-static int crc32c_table_init = 0;
+static pthread_once_t crc32c_table_once = PTHREAD_ONCE_INIT;
 
 static void init_crc32c_table(void) {
-    if (crc32c_table_init) return;
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t crc = i;
         for (int j = 0; j < 8; j++) {
@@ -57,11 +73,10 @@ static void init_crc32c_table(void) {
         }
         crc32c_table[i] = crc;
     }
-    crc32c_table_init = 1;
 }
 
 static uint32_t crc32c_soft(const void* data, size_t size) {
-    init_crc32c_table();
+    (void)pthread_once(&crc32c_table_once, init_crc32c_table);
     const uint8_t* p = (const uint8_t*)data;
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < size; i++) {
@@ -90,21 +105,8 @@ static uint32_t crc32c_soft(const void* data, size_t size) {
  */
 
 static inline bool qihse_has_bmi1(void) {
-    static int cached = -1;
-    if (__builtin_expect(cached != -1, 1)) return cached == 1;
-#if defined(__x86_64__) || defined(_M_X64)
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
-    if (eax >= 7) {
-        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
-        if (ebx & (1u << 3)) {
-            cached = 1;
-            return true;
-        }
-    }
-#endif
-    cached = 0;
-    return false;
+    (void)pthread_once(&g_cpu_caps_once, detect_cpu_caps);
+    return g_bmi1_available;
 }
 
 #if defined(__x86_64__) && defined(__GNUC__)

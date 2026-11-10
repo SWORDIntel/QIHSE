@@ -47,6 +47,9 @@ extern "C" {
 
 /* Prefix embedded in the payload to carry the file offset. */
 #define QIHSE_VFS_WAL_OFFSET_SIZE  8u   /* sizeof(uint64_t) */
+/* The flat replay image is held in memory. Refuse implausibly large or
+ * malicious offsets before allocation; normal SQLite WALs are much smaller. */
+#define QIHSE_VFS_WAL_MAX_BYTES    ((size_t)1u << 30)
 
 typedef struct {
     qihse_event_stream_t* stream;    /* Marmalade handle */

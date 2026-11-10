@@ -328,40 +328,75 @@ bool qihse_event_stream_has_event_id(
 
 /* ── Recovery ────────────────────────────────────────────────────────────── */
 
+static bool pread_fully_at(int fd, void* buffer, size_t size, uint64_t offset)
+{
+    size_t done = 0u;
+    while (done < size) {
+        ssize_t n = pread(fd, (uint8_t*)buffer + done, size - done,
+                          (off_t)(offset + done));
+        if (n > 0) { done += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
 uint64_t qihse_event_stream_replay(
         qihse_event_stream_t* stream,
         const char* topic,
         qihse_es_replay_cb callback,
         void* user_data) {
-    if (!stream || !topic || !callback) return 0;
+    uint64_t count = 0;
+    (void)qihse_event_stream_replay_checked(stream, topic, callback, user_data, &count);
+    return count;
+}
+
+bool qihse_event_stream_replay_checked(
+        qihse_event_stream_t* stream,
+        const char* topic,
+        qihse_es_replay_cb callback,
+        void* user_data,
+        uint64_t* out_count) {
+    if (out_count) *out_count = 0;
+    if (!stream || !topic || !callback || !topic_is_safe(topic)) return false;
 
     int fd = open_topic(stream, topic, false);
-    if (fd < 0) return 0;
+    if (fd < 0) return false;
 
     struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return 0; }
+    if (fstat(fd, &st) != 0 || st.st_size < 0) { close(fd); return false; }
     uint64_t file_size = (uint64_t)st.st_size;
     uint64_t offset = 0;
     uint64_t count = 0;
+    bool ok = true;
 
     while (offset < file_size) {
         qihse_es_record_header_t hdr;
-        if (pread(fd, &hdr, sizeof(hdr), offset) != (ssize_t)sizeof(hdr)) break;
-        if (!validate_header(&hdr, offset)) break;
-        if (!(hdr.flags & QIHSE_ES_F_COMMITTED)) break;
+        uint64_t remaining = file_size - offset;
+        if (remaining < sizeof(hdr) ||
+            !pread_fully_at(fd, &hdr, sizeof(hdr), offset) ||
+            !validate_header(&hdr, offset) ||
+            hdr.flags != QIHSE_ES_F_COMMITTED ||
+            hdr.payload_size > remaining - sizeof(hdr)) {
+            ok = false;
+            break;
+        }
 
         uint8_t* payload = NULL;
         if (hdr.payload_size > 0) {
             payload = malloc(hdr.payload_size);
-            if (!payload) break;
-            if (pread(fd, payload, hdr.payload_size, offset + sizeof(hdr)) != (ssize_t)hdr.payload_size) {
+            if (!payload) { ok = false; break; }
+            if (!pread_fully_at(fd, payload, (size_t)hdr.payload_size,
+                                offset + sizeof(hdr))) {
                 free(payload);
+                ok = false;
                 break;
             }
         }
 
         if (!callback(&hdr, payload, hdr.payload_size, user_data)) {
             free(payload);
+            ok = false;
             break;
         }
         free(payload);
@@ -369,8 +404,9 @@ uint64_t qihse_event_stream_replay(
         offset += sizeof(hdr) + hdr.payload_size;
     }
 
-    close(fd);
-    return count;
+    if (close(fd) != 0) ok = false;
+    if (out_count) *out_count = count;
+    return ok && offset == file_size;
 }
 
 bool qihse_event_stream_truncate_torn_tail(

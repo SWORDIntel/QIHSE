@@ -32,7 +32,10 @@ static bool wal_buf_grow(qihse_vfs_wal_t* wal, size_t new_size)
 
     /* Round up to next 64 KB boundary to amortise reallocations. */
     size_t cap = wal->replay_cap ? wal->replay_cap : (64u * 1024u);
-    while (cap < new_size) cap *= 2u;
+    while (cap < new_size) {
+        if (cap > SIZE_MAX / 2u) return false;
+        cap *= 2u;
+    }
 
     uint8_t* p = (uint8_t*)realloc(wal->replay_buf, cap);
     if (!p) return false;
@@ -101,7 +104,7 @@ static bool rebuild_cb(const qihse_es_record_header_t* hdr,
     qihse_vfs_wal_t* wal = (qihse_vfs_wal_t*)user_data;
     (void)hdr;
 
-    if (payload_size < QIHSE_VFS_WAL_OFFSET_SIZE) return true; /* skip corrupt */
+    if (!payload || payload_size < QIHSE_VFS_WAL_OFFSET_SIZE) return false;
 
     /* Extract the embedded byte offset (little-endian uint64_t). */
     uint64_t file_offset = 0u;
@@ -122,7 +125,10 @@ static bool rebuild_cb(const qihse_es_record_header_t* hdr,
     size_t         frame_size = payload_size - QIHSE_VFS_WAL_OFFSET_SIZE;
 
     /* Ensure the replay buffer is large enough. */
+    if (file_offset > (uint64_t)SIZE_MAX ||
+        frame_size > SIZE_MAX - (size_t)file_offset) return false;
     size_t needed = (size_t)file_offset + frame_size;
+    if (needed > QIHSE_VFS_WAL_MAX_BYTES) return false;
     if (!wal_buf_grow(wal, needed)) return false;  /* stop on OOM */
 
     memcpy(wal->replay_buf + file_offset, frame_data, frame_size);
@@ -138,20 +144,24 @@ bool qihse_vfs_wal_rebuild_flat(qihse_vfs_wal_t* wal)
 
     /* Reset the flat image. */
     wal->replay_len = 0u;
+    wal->replayed = false;
     /* Do not free replay_buf — reuse the allocation. */
 
     /* 1. Discard any uncommitted torn tail from a previous crash. */
-    qihse_event_stream_truncate_torn_tail(wal->stream, QIHSE_VFS_WAL_TOPIC);
+    if (!qihse_event_stream_truncate_torn_tail(wal->stream, QIHSE_VFS_WAL_TOPIC))
+        return false;
 
     /* 2. Replay all committed records into the flat buffer. */
-    uint64_t records_replayed =
-        qihse_event_stream_replay(wal->stream,
-                                   QIHSE_VFS_WAL_TOPIC,
-                                   rebuild_cb,
-                                   wal);
-
-    /* replay returns the count of records processed; 0 is valid for empty WAL. */
-    (void)records_replayed;
+    uint64_t records_replayed = 0;
+    if (!qihse_event_stream_replay_checked(wal->stream,
+                                            QIHSE_VFS_WAL_TOPIC,
+                                            rebuild_cb,
+                                            wal,
+                                            &records_replayed)) {
+        wal->replay_len = 0u;
+        return false;
+    }
+    (void)records_replayed; /* 0 is valid for an empty WAL. */
 
     wal->replayed = true;
     return true;
@@ -165,6 +175,10 @@ bool qihse_vfs_wal_append(qihse_vfs_wal_t* wal,
 {
     if (!wal || !wal->stream || !data || size == 0u) return false;
     if (offset < 0) return false;
+    if (size > QIHSE_ES_MAX_PAYLOAD - QIHSE_VFS_WAL_OFFSET_SIZE ||
+        (uint64_t)offset > (uint64_t)SIZE_MAX ||
+        size > SIZE_MAX - (size_t)offset ||
+        (uint64_t)offset + size > QIHSE_VFS_WAL_MAX_BYTES) return false;
 
     /* Build payload = [8-byte LE offset][frame bytes]. */
     size_t payload_len = QIHSE_VFS_WAL_OFFSET_SIZE + size;
@@ -204,6 +218,10 @@ bool qihse_vfs_wal_append(qihse_vfs_wal_t* wal,
          * duplicate rejection. */
         if (wal->replayed) {
             uint64_t uoff = (uint64_t)offset;
+            if (uoff > (uint64_t)SIZE_MAX || size > SIZE_MAX - (size_t)uoff) {
+                wal->replayed = false;
+                return true;
+            }
             size_t needed = (size_t)uoff + size;
             if (wal_buf_grow(wal, needed)) {
                 memcpy(wal->replay_buf + uoff, data, size);
@@ -228,7 +246,8 @@ bool qihse_vfs_wal_read(qihse_vfs_wal_t* wal,
     }
 
     uint64_t uoff = (uint64_t)offset;
-    if (uoff + size > wal->replay_len) return false; /* short read */
+    if (uoff > (uint64_t)wal->replay_len ||
+        size > wal->replay_len - (size_t)uoff) return false; /* short read */
 
     memcpy(buf, wal->replay_buf + uoff, size);
     return true;
@@ -240,7 +259,7 @@ uint64_t qihse_vfs_wal_size(qihse_vfs_wal_t* wal)
 {
     if (!wal) return 0u;
     if (!wal->replayed) {
-        qihse_vfs_wal_rebuild_flat(wal);
+        if (!qihse_vfs_wal_rebuild_flat(wal)) return 0u;
     }
     return (uint64_t)wal->replay_len;
 }

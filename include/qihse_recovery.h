@@ -26,6 +26,9 @@ typedef struct qihse_recovery_s {
     uint64_t* aborted_txns;
     int       aborted_count;
     int       aborted_capacity;
+    /* Fail closed after any incomplete replay; checkpointing could otherwise
+     * discard WAL needed to recover mutations that were not applied. */
+    bool      replay_failed;
 } qihse_recovery_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */

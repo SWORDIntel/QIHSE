@@ -193,6 +193,12 @@ static bool replay_count_cb(const qihse_es_record_header_t* h, const uint8_t* p,
     return true;
 }
 
+static bool replay_abort_cb(const qihse_es_record_header_t* h, const uint8_t* p,
+                            size_t s, void* ud) {
+    (void)h; (void)p; (void)s; (void)ud;
+    return false;
+}
+
 static void test_replay(void) {
     TEST("replay: all committed records replayed in order");
     char* dir = make_temp_dir();
@@ -295,6 +301,10 @@ static void test_corruption_detection(void) {
     int cnt = 0;
     uint64_t n = qihse_event_stream_replay(es, "corrupt", replay_count_cb, &cnt);
     ASSERT(n == 0, "replay should return 0 for corrupt record, got %lu", n);
+    uint64_t checked_count = 99;
+    ASSERT(!qihse_event_stream_replay_checked(es, "corrupt", replay_count_cb,
+                                               &cnt, &checked_count) && checked_count == 0,
+           "checked replay must distinguish committed corruption from empty topic");
     qihse_event_stream_destroy(es);
 
     struct stat before, after;
@@ -306,6 +316,33 @@ static void test_corruption_detection(void) {
     ASSERT(stat(path, &after) == 0 && after.st_size == before.st_size,
            "committed corruption was truncated");
 
+    rm_rf(dir);
+    free(dir);
+}
+
+static void test_checked_replay_outcomes(void) {
+    TEST("checked replay distinguishes empty, complete, and callback-aborted replay");
+    char* dir = make_temp_dir();
+    qihse_event_stream_t* es = qihse_event_stream_create(dir);
+    uint64_t count = 99;
+    ASSERT(es && qihse_event_stream_truncate_torn_tail(es, "empty"),
+           "create empty topic failed");
+    ASSERT(qihse_event_stream_replay_checked(es, "empty", replay_count_cb,
+                                               NULL, &count) && count == 0,
+           "empty replay should be successful with zero records");
+
+    uint8_t eid[QIHSE_ES_EVENT_ID_SIZE];
+    make_event_id(777, eid);
+    ASSERT(qihse_event_stream_append_record(es, "checked", 1, eid,
+              (const uint8_t*)"row", 3) != 0, "append failed");
+    int delivered = 0;
+    ASSERT(qihse_event_stream_replay_checked(es, "checked", replay_count_cb,
+              &delivered, &count) && count == 1 && delivered == 1,
+           "complete replay should report delivered count");
+    ASSERT(!qihse_event_stream_replay_checked(es, "checked", replay_abort_cb,
+              NULL, &count) && count == 0,
+           "callback abort must not be reported as complete replay");
+    qihse_event_stream_destroy(es);
     rm_rf(dir);
     free(dir);
 }
@@ -724,6 +761,7 @@ int main(void) {
     test_replay();
     test_torn_tail_recovery();
     test_corruption_detection();
+    test_checked_replay_outcomes();
     test_iteration();
     test_duplicate_rejection();
     test_sha384_integrity();

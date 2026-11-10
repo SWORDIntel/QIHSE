@@ -209,30 +209,40 @@ void qihse_recovery_destroy(qihse_recovery_t* rec) {
 
 /* ── Helper: add to committed/aborted arrays ────────────────────────────── */
 
-static void rec_add_committed(qihse_recovery_t* rec, uint64_t txn_id) {
+static bool rec_add_committed(qihse_recovery_t* rec, uint64_t txn_id) {
     if (rec->committed_count >= rec->committed_capacity) {
         int new_cap = rec->committed_capacity == 0 ? 64 : rec->committed_capacity * 2;
-        rec->committed_txns = realloc(rec->committed_txns,
-                                      new_cap * sizeof(uint64_t));
+        if (new_cap < rec->committed_capacity ||
+            (size_t)new_cap > SIZE_MAX / sizeof(uint64_t)) return false;
+        uint64_t* grown = realloc(rec->committed_txns,
+                                  (size_t)new_cap * sizeof(uint64_t));
+        if (!grown) return false;
+        rec->committed_txns = grown;
         rec->committed_capacity = new_cap;
     }
     rec->committed_txns[rec->committed_count++] = txn_id;
+    return true;
 }
 
-static void rec_add_aborted(qihse_recovery_t* rec, uint64_t txn_id) {
+static bool rec_add_aborted(qihse_recovery_t* rec, uint64_t txn_id) {
     if (rec->aborted_count >= rec->aborted_capacity) {
         int new_cap = rec->aborted_capacity == 0 ? 64 : rec->aborted_capacity * 2;
-        rec->aborted_txns = realloc(rec->aborted_txns,
-                                    new_cap * sizeof(uint64_t));
+        if (new_cap < rec->aborted_capacity ||
+            (size_t)new_cap > SIZE_MAX / sizeof(uint64_t)) return false;
+        uint64_t* grown = realloc(rec->aborted_txns,
+                                  (size_t)new_cap * sizeof(uint64_t));
+        if (!grown) return false;
+        rec->aborted_txns = grown;
         rec->aborted_capacity = new_cap;
     }
     rec->aborted_txns[rec->aborted_count++] = txn_id;
+    return true;
 }
 
 /* ── Crash recovery replay ──────────────────────────────────────────────── */
 
 int qihse_recovery_replay(qihse_recovery_t* rec) {
-    if (!rec) return -1;
+    if (!rec || rec->replay_failed) return -1;
 
     /* Initialize analysis data */
     qihse_rec_analysis_t analysis;
@@ -244,6 +254,7 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
     int n_replayed = qihse_wal_replay(rec->wal, start_lsn,
                                       recovery_replay_cb, &ctx);
     if (n_replayed < 0 || ctx.failed) {
+        rec->replay_failed = true;
         free(analysis.txns);
         for (int i = 0; i < analysis.record_count; i++) {
             free(analysis.record_keys[i]);
@@ -258,14 +269,23 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
     /* Build committed/aborted lists and register in txn manager */
     for (int i = 0; i < analysis.txn_count; i++) {
         if (analysis.txns[i].status == 1) {
-            rec_add_committed(rec, analysis.txns[i].txn_id);
+            if (!rec_add_committed(rec, analysis.txns[i].txn_id)) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
             qihse_txn_register_committed(rec->txn_mgr, analysis.txns[i].txn_id);
         } else if (analysis.txns[i].status == 2) {
-            rec_add_aborted(rec, analysis.txns[i].txn_id);
+            if (!rec_add_aborted(rec, analysis.txns[i].txn_id)) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
             qihse_txn_register_aborted(rec->txn_mgr, analysis.txns[i].txn_id);
         } else {
             /* Active (uncommitted) — treat as aborted (undo phase) */
-            rec_add_aborted(rec, analysis.txns[i].txn_id);
+            if (!rec_add_aborted(rec, analysis.txns[i].txn_id)) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
             qihse_txn_register_aborted(rec->txn_mgr, analysis.txns[i].txn_id);
         }
     }
@@ -282,21 +302,30 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
 
         switch (r->op_type) {
         case QIHSE_WAL_OP_INSERT:
-            qihse_mvcc_insert(rec->mvcc, r->engine_id,
+            if (qihse_mvcc_insert(rec->mvcc, r->engine_id,
                              key, r->key_length,
                              value, r->value_length,
-                             r->txn_id);
+                             r->txn_id) != 0) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
             break;
         case QIHSE_WAL_OP_UPDATE:
-            qihse_mvcc_update(rec->mvcc, r->engine_id,
+            if (qihse_mvcc_update(rec->mvcc, r->engine_id,
                              key, r->key_length,
                              value, r->value_length,
-                             r->txn_id);
+                             r->txn_id) != 0) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
             break;
         case QIHSE_WAL_OP_DELETE:
-            qihse_mvcc_delete(rec->mvcc, r->engine_id,
+            if (qihse_mvcc_delete(rec->mvcc, r->engine_id,
                              key, r->key_length,
-                             r->txn_id);
+                             r->txn_id) != 0) {
+                rec->replay_failed = true;
+                goto replay_cleanup;
+            }
             break;
         default:
             break;
@@ -312,7 +341,8 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
         }
     }
 
-    /* Cleanup analysis data */
+replay_cleanup:
+    /* Cleanup analysis data on both successful and failed redo. */
     free(analysis.txns);
     for (int i = 0; i < analysis.record_count; i++) {
         free(analysis.record_keys[i]);
@@ -322,7 +352,7 @@ int qihse_recovery_replay(qihse_recovery_t* rec) {
     free(analysis.record_keys);
     free(analysis.record_values);
 
-    return 0;
+    return rec->replay_failed ? -1 : 0;
 }
 
 /* ── Checkpoint ─────────────────────────────────────────────────────────── */
@@ -331,7 +361,7 @@ int qihse_recovery_checkpoint(qihse_recovery_t* rec,
                               qihse_recovery_flush_cb flush_cb,
                               void* flush_ctx)
 {
-    if (!rec) return -1;
+    if (!rec || rec->replay_failed) return -1;
 
     /* 1. Flush all engine state via callback */
     if (flush_cb) {
