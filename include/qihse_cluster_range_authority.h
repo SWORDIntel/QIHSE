@@ -97,6 +97,11 @@ bool qihse_cluster_range_authority_verify_claim_user(
 bool qihse_cluster_range_authority_verify_claim(
     void* verifier, const qihse_kv_ct_lane_authority_claim_t* claim,
     bool require_final_decision);
+/* Receiver reconfiguration requires an operation that is still RESERVED;
+ * an old finalized operation cannot reset a later generation's context. */
+bool qihse_cluster_range_authority_verify_reservation_claim(
+    void* verifier, const qihse_kv_ct_lane_authority_claim_t* claim,
+    bool require_final_decision);
 /* Separate abort verifier: ordinary reservation/final verification never
  * authorizes releasing an aborted operation's durable local fence. */
 bool qihse_cluster_range_authority_verify_aborted_claim_user(

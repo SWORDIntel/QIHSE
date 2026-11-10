@@ -536,6 +536,23 @@ bool qihse_cluster_range_authority_verify_aborted_claim_user(void* opaque,
         CRYPTO_memcmp(digest, decision.evidence_digest, 32) == 0;
 }
 
+bool qihse_cluster_range_authority_verify_reservation_claim(void* opaque,
+    const qihse_kv_ct_lane_authority_claim_t* c, bool require_final) {
+    qihse_cluster_range_verifier_t* verifier = opaque;
+    if (require_final || !verifier || !c || c->final_decision_index ||
+        digest_present(c->final_decision_digest) ||
+        !qihse_cluster_range_authority_verify_claim(opaque, c, false)) return false;
+    qihse_consensus_range_request_t request = {0};
+    qihse_consensus_range_grant_t grant = {0};
+    qihse_consensus_range_decision_t decision = {0};
+    qihse_consensus_range_phase_t phase = QIHSE_RANGE_PHASE_NONE;
+    return qihse_consensus_mesh_range_lookup_user(verifier->authority->mesh,
+        verifier->principal, c->transfer_id, &request, &grant, &decision, &phase) &&
+        phase == QIHSE_RANGE_PHASE_RESERVED && claim_request_matches(c, &request) &&
+        grant.reserve_index == c->reserve_index && grant.grant_epoch == c->grant_epoch &&
+        CRYPTO_memcmp(grant.reserve_digest, c->reserve_digest, 32) == 0;
+}
+
 bool qihse_cluster_range_authority_verify_aborted_claim(void* opaque,
     const qihse_kv_ct_lane_authority_claim_t* c, bool require_terminal) {
     (void)require_terminal; /* This verifier always requires committed ABORT. */

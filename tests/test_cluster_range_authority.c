@@ -261,6 +261,13 @@ int main(void) {
     assert(qihse_cluster_range_authority_reserve(&a, op, &transaction, NULL, 0));
     assert(resolve_calls == resolutions && state_calls == 1 && reserve_calls == 1);
     assert(qihse_cluster_range_authority_check_reserved(&a, op, &transaction, NULL, 0));
+    qihse_kv_ct_lane_authority_claim_t reserved_claim;
+    qihse_cluster_range_verifier_t reserved_verifier = {.authority = &a, .principal = op};
+    assert(qihse_cluster_range_authority_claim(&a, op, &transaction, &reserved_claim));
+    assert(qihse_cluster_range_authority_verify_reservation_claim(&reserved_verifier,
+        &reserved_claim, false));
+    assert(!qihse_cluster_range_authority_verify_reservation_claim(&reserved_verifier,
+        &reserved_claim, true));
     transaction.source_lsn = 4; transaction.target_lsn = 6;
     memset(transaction.proof_digest, 7, 32);
     qihse_cluster_ct_activation_receipt_t receipt = {.valid = false};
@@ -271,6 +278,8 @@ int main(void) {
     assert(!finalize_calls);
     assert(qihse_cluster_range_authority_finalize(&a, op, &transaction, &receipt, NULL, 0));
     assert(finalize_calls == 1);
+    assert(!qihse_cluster_range_authority_verify_reservation_claim(&reserved_verifier,
+        &reserved_claim, false)); /* finalized reservations cannot reset a receiver */
     assert(qihse_cluster_range_authority_check_finalized(&a, op, &transaction, NULL, 0));
     qihse_kv_ct_lane_authority_claim_t claim;
     assert(qihse_cluster_range_authority_claim(&a, op, &transaction, &claim));
