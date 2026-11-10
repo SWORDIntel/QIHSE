@@ -800,6 +800,13 @@ test-resp-hybrid: lib
 	$(CC) $(CFLAGS) -o tests/test_resp_hybrid tests/test_resp_hybrid.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_resp_hybrid
 
+.PHONY: test-vector-tenant-isolation
+test-vector-tenant-isolation: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_vector_tenant_isolation tests/test_vector_tenant_isolation.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_tenant_isolation
+
+test-serial: test-vector-tenant-isolation
+
 .PHONY: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
 test-container-lifecycle: lib
@@ -1402,10 +1409,51 @@ test-txn: lib
 # failures deterministically; this standalone test links the WAL implementation
 # directly so the shim cannot affect unrelated library users.
 test-wal-durability:
-	$(CC) $(CFLAGS) -Dfdatasync=qihse_test_fdatasync \
-	    -Dfsync=qihse_test_fsync -o tests/test_wal_durability \
+	$(CC) $(CFLAGS) -UNDEBUG -Dfdatasync=qihse_test_fdatasync \
+	    -Dfsync=qihse_test_fsync -Dclose=qihse_test_close -o tests/test_wal_durability \
 	    tests/test_wal_durability.c src/tractable/qihse_wal.c -pthread
 	./tests/test_wal_durability
+
+.PHONY: test-arena-bounds test-mvcc-gc-failure test-file-posix-io test-backup-merge-concurrent test-sql-delete-failures test-repl-close-failure
+test-arena-bounds:
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_arena_bounds tests/test_arena_bounds.c src/black_hole/qihse_arena.c
+	./tests/test_arena_bounds
+
+test-mvcc-gc-failure:
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--wrap=qihse_arena_alloc -Wl,--wrap=malloc \
+	    -o tests/test_mvcc_gc_failure tests/test_mvcc_gc_failure.c \
+	    src/tractable/qihse_mvcc.c src/black_hole/qihse_arena.c -pthread
+	./tests/test_mvcc_gc_failure
+
+test-file-posix-io:
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_file_posix_io tests/test_file_posix_io.c persistence/qihse_file_posix.c
+	./tests/test_file_posix_io
+
+test-repl-close-failure:
+	$(CC) $(CFLAGS) -UNDEBUG -Dclose=qihse_test_close -c \
+	    src/tractable/qihse_wal.c -o tests/test_repl_close_wal.o
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_repl_close_failure \
+	    tests/test_repl_close_failure.c src/spinnaker/qihse_repl.c \
+	    tests/test_repl_close_wal.o -pthread
+	./tests/test_repl_close_failure
+
+test-backup-merge-concurrent: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_BACKUP_TEST -Wl,--export-dynamic \
+	    -o tests/test_backup_merge_concurrent tests/test_backup_merge_concurrent.c \
+	    src/tractable/qihse_backup.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_backup_merge_concurrent
+
+test-sql-delete-failures: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_TABLE_STORE_TESTING -Wl,--export-dynamic \
+	    -o tests/test_table_delete_failures tests/test_table_store_txn.c \
+	    src/tractable/qihse_table_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_table_delete_failures
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_TABLE_STORE_TESTING -Wl,--export-dynamic \
+	    -o tests/test_sql_delete_failures tests/test_sql_dml_exec.c \
+	    src/tractable/qihse_table_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_sql_delete_failures
+
+test-serial: test-arena-bounds test-mvcc-gc-failure test-file-posix-io test-backup-merge-concurrent test-sql-delete-failures test-repl-close-failure
 
 # MVCC delete semantics in both directions: a committed DELETE hides the row
 # whatever aborted writers preceded it, and it hides nothing a reader of an

@@ -129,6 +129,55 @@ periodic overlap announcement regression as well. These are focused checks,
 not a full-suite result. No service was restarted or data migrated in this
 repair batch.
 
+### Additional storage and mutation repairs (2026-11-10)
+
+The next source-review pass reproduced further correctness failures and
+integrated these repairs:
+
+| Area | Confirmed defect | Repair and focused evidence |
+| --- | --- | --- |
+| MVCC | Cutoff-only vacuum removed the last committed value when its superseding transaction had aborted. An update could stamp the old version before its replacement allocation failed. Commit-status callbacks ran under the store lock and could disagree about the same transaction within one read. | Committed-aware collection retains aborted/active predecessors; legacy cutoff-only entry points conservatively remove nothing. One reservation precedes mutation publication. Reads snapshot version metadata and resolve each transaction once outside the store lock. Fault-injected allocation, reentrant callback, rollback/vacuum and existing delete/transaction cases pass; the standalone fault fixture passes ASan/UBSan with leak detection enabled. |
+| Arena | Size rounding/header arithmetic could wrap, returning undersized storage; block payloads did not satisfy their intended alignment. | Overflow is rejected before allocation and block payloads are explicitly aligned. Boundary/alignment checks and an isolated ASan/UBSan run with leak detection enabled pass. |
+| Backup merge | Concurrent merges targeting one output could share a guessed scratch filename and mix raw records. | Each call reserves its own private scratch file and retains cleanup ownership across sealing failure. A barrier-synchronized regression verifies distinct scratch files, a complete restored union, and unchanged source containers. Concurrent calls may still collide at the output sealer; failure is reported rather than combining their scratch streams. |
+| SQL DELETE | Failed table deletion was reported as a successful zero-row operation; stats refresh could append new rows after failing to clear the previous view. | Keep the existing boolean ABI and distinguish no-match from failure through errno. Propagate failure through SQL and stop refresh before appending. Instrumented generation-exhaustion tests preserve original rows and rollback state. |
+| File/WAL close | File I/O could partially run before discovering an unrepresentable final offset; WAL shutdown discarded sync/close failures. | Preflight the entire offset range. Checked WAL destruction returns the first persistence/close error; the legacy void wrapper reports it. Close is attempted once, including EINTR. Focused range, sync and close-failure tests pass. |
+| Replica retry | Propagating a staged WAL close error after applying its DELETE left the watermark unchanged and made retry fail on the already deleted key. | Replay now captures the validated operation, closes the stage, then applies the mutation. A real-WAL fixture injects a directory-close failure and verifies unchanged data/watermark, successful retry and duplicate no-op. |
+| Vector mutation | UPDATE/UPSERT appended replacement rows as unclassified, metadata omission dropped TAGs, and duplicate IDs in a batch could create multiple live rows. A tenant could replace another tenant's global vector ID by supplying its own TAG. | Authenticated mutation forms authorize all preimages before WAL/mutation, preserve classification/SCI and omitted metadata, and reject duplicates during admission and replay. RESP checks existing TAG ownership under its vector lock and propagates the session principal. Focused persistence/replay, protected update and tenant-collision cases pass. |
+
+MVCC collection still only unlinks obsolete versions: arena memory and delete
+intents remain retained until store destruction. This repair does not supply
+arena compaction, a durable transaction coordinator or an authenticated CT
+promotion chain. The additional targets are wired into the existing suite for
+future runs; the full suite remains stopped at the user's request.
+
+Vector handles still require callers to synchronize shared access. The primary
+RESP server holds its existing vector lock; adding authenticated mutation
+forms does not make the native handle or every legacy/UWP sharing arrangement
+internally thread-safe. Omitted batch metadata (`metadata_sizes == NULL`)
+preserves existing bytes; supplied zero sizes explicitly clear them. The
+single-row form distinguishes omitted NULL/0 from a supplied pointer/0.
+
+The standalone arena, MVCC and replica-close fault checks passed ASan/UBSan
+with leak detection enabled. The selected vector mutation regression passed
+with its changed units instrumented by ASan/UBSan and leak detection disabled;
+this is scoped sanitizer evidence, not a sanitizer run of the whole library.
+
+The combined library and daemon build passes. Integrated focused runs pass
+for vector persistence, RESP hybrid/protected mutation, tenant collision and
+replica apply, alongside the MVCC/transaction, SQL and backup checks above.
+The generated API-count gate passes. Suite discovery includes all seven
+additional focused targets; discovery is not execution of the full suite.
+
+Reproduce the additional checks from the checkout root:
+
+```sh
+make -j8 lib cluster-daemon
+make -o lib test-arena-bounds test-mvcc-gc-failure test-file-posix-io \
+  test-wal-durability test-repl-close-failure test-txn test-mvcc-delete \
+  test-sql-delete-failures test-backup-merge-concurrent
+make -o lib test-persist test-resp-hybrid test-vector-tenant-isolation test-repl
+```
+
 ## Resolved: expiry sweep and SSTable compaction
 
 The standalone daemon now defaults to a 30-second KV sweep cadence (`--kv-sweep-interval`, with `0` explicitly disabling it). In the earlier 2026-11-05 verification, authenticated QKP `PING` returned `PONG`; INFO reported sweep interval `30`, sweeper running, one live SST file, no degraded SST index, and healthy status. The previous 1,227 live SST files were compacted to one. The suite passed 164 targets at that time. The 2026-11-09 deployment obtained authenticated INFO and verified healthy SST indexing, a 30-second sweep interval and an active sweeper.
