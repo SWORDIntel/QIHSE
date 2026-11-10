@@ -1948,10 +1948,12 @@ Operator may use `OWNER.SNAPSHOT.BEGIN`, `OWNER.SNAPSHOT.READ <offset>
 <length>`, and `OWNER.SNAPSHOT.END` on one authenticated session. BEGIN returns
 `[byte_length, source_change_seq]`; READ returns at most 512 KiB and must stay
 on the same session. The result contains locally owned live rows plus
-node-local rows, with their normal KV snapshot metadata. It is refused as a
-whole if any row is outside the Operator's clearance/SCI. The immutable
-snapshot's sequence watermark is captured with its bytes. These commands do
-not require or change `REPL.MARKS` or replication cursors. The inventory omits
+node-local rows, with their normal KV snapshot metadata. BEGIN requires an
+admitted CT owner and refuses the whole snapshot if any row is outside the
+Operator's clearance/SCI. The immutable snapshot's sequence watermark is
+captured with its bytes; once begun, READ and END can finish even if CT
+admission changes while the snapshot is streamed. These commands do not
+require or change `REPL.MARKS` or replication cursors. The inventory omits
 tombstones and expired rows, so it supports current live-state comparison; it
 is not a cross-node deletion-history backup. It is available only when the
 server is a configured CT range owner with a usable CT source.

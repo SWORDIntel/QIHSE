@@ -13783,7 +13783,7 @@ static bool qihse_resp_handle_owner_snapshot_begin(qihse_resp_session_t* s,
     qihse_kv_ct_source_status_t ct_status = {0};
     pthread_rwlock_wrlock(&s->server->kv_lock);
     bool source_ready = qihse_kv_ct_source_status(s->server->store, principal,
-                                                   &ct_status);
+                                                   &ct_status) && ct_status.admitted;
     int rc = source_ready
         ? qihse_kv_replica_snapshot_create(s->server->store, principal, "*", &snapshot)
         : -1;
@@ -18322,10 +18322,19 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session,
          (qihse_resp_arg_equal(&request->argv[1], "CT2") &&
           qihse_resp_arg_equal(&request->argv[2], "TRANSFER"))) &&
         qihse_resp_session_is_system_operator(session);
+    /* OWNER.SNAPSHOT is a read-only, immutable inventory pinned at BEGIN.
+     * Its handler enforces full-ceiling Operator authorization and checks
+     * owner admission before creating the snapshot. Let READ/END finish that
+     * already-authorized snapshot even if CT briefly fences the live writer
+     * while a large inventory is being streamed. */
+    bool owner_snapshot_command = request &&
+        (qihse_resp_command_is(request, "OWNER.SNAPSHOT.BEGIN") ||
+         qihse_resp_command_is(request, "OWNER.SNAPSHOT.READ") ||
+         qihse_resp_command_is(request, "OWNER.SNAPSHOT.END"));
     /* Authentication and narrowly scoped CT protocol/control verbs must be
      * reachable while the writer gate is disarmed. Their handlers perform
      * the relevant QKP/Operator authorization before any state transition. */
-    if (ct_control || operator_ct_command) {
+    if (ct_control || operator_ct_command || owner_snapshot_command) {
         bool ct1 = server && request && qihse_resp_command_is(request, "REPL.CT1");
         if (ct1) pthread_mutex_lock(&server->ct_config_lock);
         bool result = qihse_resp_dispatch_unscoped(session, request, keep_open);
