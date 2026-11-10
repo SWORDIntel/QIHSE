@@ -20,6 +20,10 @@ static int fail_owner_token;
 static int read_calls;
 static int publish_calls;
 static int abort_calls;
+static bool force_prepare_failure_after_fence;
+static bool force_prepare_definite_failure;
+static bool suppress_prepared_recovery;
+static unsigned prepared_lookup_count;
 static bool force_export_failure;
 static int export_failure_errno;
 static bool force_abort_failure;
@@ -274,6 +278,9 @@ void qihse_kv_ct_range_snapshot_destroy(qihse_kv_ct_range_snapshot_t *snapshot) 
 bool qihse_cluster_ownership_transfer_get_prepared(qihse_cluster_ownership_context_t *c,
     const char *id, qihse_cluster_ownership_txn_t *out, char *err, size_t cap) {
     (void)c; (void)err; (void)cap;
+    if (force_prepare_failure_after_fence && prepared_lookup_count++ == 0)
+        return false;
+    if (suppress_prepared_recovery) return false;
     if (pending.phase != QIHSE_OWNERSHIP_PREPARED || strcmp(id, pending.transfer_id)) return false;
     *out = pending;
     return true;
@@ -296,11 +303,14 @@ bool qihse_cluster_ownership_transfer_get_finalized(qihse_cluster_ownership_cont
     return true;
 }
 
-bool qihse_cluster_ownership_transfer_prepare(qihse_cluster_ownership_context_t *c,
+bool qihse_cluster_ownership_transfer_prepare_ex(qihse_cluster_ownership_context_t *c,
     const char *id, uint16_t src, uint16_t dst, uint16_t first, uint16_t last,
-    uint64_t *cut, char *err, size_t cap) {
+    uint64_t *cut, bool *fence_may_be_active, char *err, size_t cap) {
     (void)err; (void)cap;
+    assert(fence_may_be_active);
+    *fence_may_be_active = false;
     event("prepare");
+    if (force_prepare_definite_failure) return false;
     memset(&pending, 0, sizeof(pending));
     pending.phase = QIHSE_OWNERSHIP_PREPARED;
     strcpy(pending.transfer_id, id);
@@ -314,10 +324,11 @@ bool qihse_cluster_ownership_transfer_prepare(qihse_cluster_ownership_context_t 
     pending.config_epoch = 7;
     pending.source_lsn = 4;
     *cut = pending.source_lsn;
+    *fence_may_be_active = true;
     assert(src == 1 && dst == 2);
     c->topology = (qihse_cluster_topology_t *)(uintptr_t)3;
     c->peer_id = peer_id;
-    return true;
+    return !force_prepare_failure_after_fence;
 }
 
 bool qihse_cluster_ownership_transfer_commit(qihse_cluster_ownership_context_t *c,
@@ -522,6 +533,63 @@ static void test_pre_wire_failures_abort_only_new_prepare(void) {
     snapshot_size_override = 0;
 }
 
+static void test_prepare_failure_after_fence_is_pending(void) {
+    qihse_cluster_ownership_context_t ownership = {0};
+    ownership.store = (qihse_kv_store_t *)(uintptr_t)1;
+    ownership.principal = (qihse_user_t *)(uintptr_t)2;
+    ownership.data_principal = (qihse_user_t *)(uintptr_t)3;
+    ownership.resp_server = (qihse_resp_server_t *)(uintptr_t)3;
+    ownership.topology = (qihse_cluster_topology_t *)(uintptr_t)4;
+    ownership.peer_id = peer_id;
+    qihse_cluster_transfer_context_t context = {.ownership = &ownership};
+    event_count = 0;
+    read_calls = 0;
+    force_prepare_failure_after_fence = true;
+    prepared_lookup_count = 0;
+    char err[192] = {0};
+    assert(qihse_cluster_transfer_range(&context, "transfer-prepare-fault",
+        1, 2, 10, 12, err, sizeof(err)) == QIHSE_CLUSTER_TRANSFER_PENDING);
+    assert(strstr(err, "source remains fenced") != NULL);
+    assert(event_count == 1 && !strcmp(events[0], "prepare"));
+    assert(read_calls == 0);
+    force_prepare_failure_after_fence = false;
+    prepared_lookup_count = 0;
+
+    /* If journal replay cannot recover PREPARED, the explicit outcome flag
+     * still prevents a false REJECTED result after fence acquisition began. */
+    pending.phase = 0;
+    force_prepare_failure_after_fence = true;
+    suppress_prepared_recovery = true;
+    prepared_lookup_count = 0;
+    memset(err, 0, sizeof(err));
+    assert(qihse_cluster_transfer_range(&context, "transfer-prepare-unknown",
+        1, 2, 10, 12, err, sizeof(err)) == QIHSE_CLUSTER_TRANSFER_PENDING);
+    assert(strstr(err, "source may remain fenced") != NULL);
+    assert(read_calls == 0);
+    suppress_prepared_recovery = false;
+    force_prepare_failure_after_fence = false;
+    prepared_lookup_count = 0;
+}
+
+static void test_definite_prepare_rejection_stays_rejected(void) {
+    qihse_cluster_ownership_context_t ownership = {0};
+    ownership.store = (qihse_kv_store_t *)(uintptr_t)1;
+    ownership.principal = (qihse_user_t *)(uintptr_t)2;
+    ownership.data_principal = (qihse_user_t *)(uintptr_t)3;
+    ownership.resp_server = (qihse_resp_server_t *)(uintptr_t)3;
+    ownership.topology = (qihse_cluster_topology_t *)(uintptr_t)4;
+    ownership.peer_id = peer_id;
+    qihse_cluster_transfer_context_t context = {.ownership = &ownership};
+    event_count = 0;
+    read_calls = 0;
+    force_prepare_definite_failure = true;
+    assert(qihse_cluster_transfer_range(&context, "transfer-definite-reject",
+        1, 2, 10, 12, NULL, 0) == QIHSE_CLUSTER_TRANSFER_REJECTED);
+    assert(event_count == 1 && !strcmp(events[0], "prepare"));
+    assert(read_calls == 0);
+    force_prepare_definite_failure = false;
+}
+
 static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) {
     qihse_cluster_ownership_context_t ownership = {0};
     ownership.store = (qihse_kv_store_t *)(uintptr_t)1;
@@ -586,6 +654,8 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
 int main(void) {
     test_low_authorization_refused_before_export_or_qkp();
     test_pre_wire_failures_abort_only_new_prepare();
+    test_prepare_failure_after_fence_is_pending();
+    test_definite_prepare_rejection_stays_rejected();
     event_count = 0; read_calls = 0; publish_calls = 0; activated = 0;
     durable_offset = 0; dropped_first_chunk_ack = 0;
     memset(received, 0, sizeof(received));

@@ -44,11 +44,20 @@ typedef struct {
 
 /* Persist the source range fence and a PREPARED journal phase before the
  * caller snapshots/sends data. Returns the exact durable source cut through
- * out_source_lsn. A failed append leaves the store fence active. */
+ * out_source_lsn. The legacy form preserves its ABI; use _ex when the caller
+ * must distinguish definite pre-fence rejection from an uncertain durable
+ * intent/fence outcome. */
 bool qihse_cluster_ownership_transfer_prepare(
     qihse_cluster_ownership_context_t* context, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first_slot,
     uint16_t last_slot, uint64_t* out_source_lsn, char* err, size_t err_cap);
+/* Extended outcome for the transfer manager. out_fence_may_be_active is true
+ * when durable intent/fence state may have been written despite failure. */
+bool qihse_cluster_ownership_transfer_prepare_ex(
+    qihse_cluster_ownership_context_t* context, const char* transfer_id,
+    uint16_t source_index, uint16_t target_index, uint16_t first_slot,
+    uint16_t last_slot, uint64_t* out_source_lsn,
+    bool* out_fence_may_be_active, char* err, size_t err_cap);
 
 /* Read the matching durable PREPARED source descriptor for the transfer
  * manager. The descriptor binds both topology IDs and configured QKP IDs. */

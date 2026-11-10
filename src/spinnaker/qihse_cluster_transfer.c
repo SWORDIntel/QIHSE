@@ -463,10 +463,31 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
     bool newly_prepared = false;
     if (!qihse_cluster_ownership_transfer_get_prepared(c->ownership, transfer_id,
             &txn, NULL, 0)) {
-        if (!qihse_cluster_ownership_transfer_prepare(c->ownership, transfer_id,
+        bool fence_may_be_active = false;
+        if (!qihse_cluster_ownership_transfer_prepare_ex(c->ownership, transfer_id,
                 source_index, target_index, first_slot, last_slot,
-                &prepared_cut, err, err_cap))
+                &prepared_cut, &fence_may_be_active, err, err_cap)) {
+            /* PREPARE can fail after INTENT and the KV fence are durable but
+             * before PREPARED was appended. Recovery may now bind that fence
+             * to the intent; report the unresolved outcome as PENDING instead
+             * of claiming that no transfer was prepared. */
+            bool recovered = qihse_cluster_ownership_transfer_get_prepared(
+                c->ownership, transfer_id, &txn, NULL, 0);
+            if (recovered && txn.phase == QIHSE_OWNERSHIP_PREPARED &&
+                !strcmp(txn.transfer_id, transfer_id)) {
+                OPENSSL_cleanse(&txn, sizeof(txn));
+                set_error(err, err_cap,
+                    "CT2 prepare failed after fencing; source remains fenced and recovery is required");
+                return QIHSE_CLUSTER_TRANSFER_PENDING;
+            }
+            OPENSSL_cleanse(&txn, sizeof(txn));
+            if (fence_may_be_active) {
+                set_error(err, err_cap,
+                    "CT2 prepare outcome is unresolved after fencing began; source may remain fenced");
+                return QIHSE_CLUSTER_TRANSFER_PENDING;
+            }
             return QIHSE_CLUSTER_TRANSFER_REJECTED;
+        }
         newly_prepared = true;
         progress(c, QIHSE_CLUSTER_TRANSFER_FENCED, 0, 0);
         memset(&txn, 0, sizeof(txn));

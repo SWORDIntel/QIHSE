@@ -282,21 +282,29 @@ static bool transfer_context(qihse_cluster_ownership_context_t* c,
     return true;
 }
 
-bool qihse_cluster_ownership_transfer_prepare(
+bool qihse_cluster_ownership_transfer_prepare_ex(
     qihse_cluster_ownership_context_t* c, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first,
-    uint16_t last, uint64_t* out_source_lsn, char* err, size_t err_cap) {
+    uint16_t last, uint64_t* out_source_lsn, bool* out_fence_may_be_active,
+    char* err, size_t err_cap) {
     if (out_source_lsn) *out_source_lsn = 0;
-    if (!out_source_lsn) { set_error(err, err_cap, "source cut output is required"); return false; }
+    if (out_fence_may_be_active) *out_fence_may_be_active = false;
+    if (!out_source_lsn || !out_fence_may_be_active) {
+        set_error(err, err_cap, "source cut and fence state outputs are required");
+        return false;
+    }
     bool unresolved = false;
     if (!qihse_cluster_ownership_replay_control(c, &unresolved, err, err_cap)) {
+        *out_fence_may_be_active = true;
         return false;
     }
     if (unresolved) {
+        *out_fence_may_be_active = true;
         qihse_cluster_ownership_txn_t recovered;
         if (qihse_cluster_ownership_transfer_get_prepared(c, transfer_id,
                 &recovered, NULL, 0)) {
             *out_source_lsn = recovered.source_lsn;
+            *out_fence_may_be_active = true;
             OPENSSL_cleanse(&recovered, sizeof(recovered));
             set_error(err, err_cap, "");
             return true;
@@ -342,12 +350,20 @@ bool qihse_cluster_ownership_transfer_prepare(
         OPENSSL_cleanse(owner_token, sizeof(owner_token));
         set_error(err, err_cap, "topology config epoch exhausted"); return false;
     }
+    /* Append can fail after a complete intent frame reaches durable storage.
+     * Treat storage errors as unresolved until recovery proves otherwise;
+     * known state-machine/identity refusals are definite non-writes. */
+    *out_fence_may_be_active = true;
     if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+        if (errno == EEXIST || errno == EPROTO || errno == EINVAL)
+            *out_fence_may_be_active = false;
         OPENSSL_cleanse(owner_token, sizeof(owner_token));
         set_error(err, err_cap, "could not persist CT2 ownership intent before fencing");
         return false;
     }
     uint64_t cut = 0;
+    /* The KV operation can report failure after its durable fence transition
+     * has reached storage. Preserve an unknown result from this point. */
     bool fenced = qihse_kv_ct_fence_range(c->store, c->principal, transfer_id,
         first, last, owner_token, &cut);
     OPENSSL_cleanse(owner_token, sizeof(owner_token));
@@ -364,6 +380,16 @@ bool qihse_cluster_ownership_transfer_prepare(
     *out_source_lsn = cut;
     set_error(err, err_cap, "");
     return true;
+}
+
+bool qihse_cluster_ownership_transfer_prepare(
+    qihse_cluster_ownership_context_t* c, const char* transfer_id,
+    uint16_t source_index, uint16_t target_index, uint16_t first,
+    uint16_t last, uint64_t* out_source_lsn, char* err, size_t err_cap) {
+    bool fence_may_be_active = false;
+    return qihse_cluster_ownership_transfer_prepare_ex(c, transfer_id,
+        source_index, target_index, first, last, out_source_lsn,
+        &fence_may_be_active, err, err_cap);
 }
 
 typedef struct {
