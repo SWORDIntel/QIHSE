@@ -120,12 +120,10 @@ int qihse_repl_ship_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, size
 /* ── Replica-side apply ─────────────────────────────────────────────────── */
 
 /* The applier does not hand-parse a record into a store mutation: it stages
- * the received bytes as the only record of a private WAL segment and drives
- * qihse_wal_replay() over it.  The WAL layer therefore owns every decision
- * about whether the bytes are a record (header, declared lengths, CRC32), and
- * the store mutation runs in the replay callback, which the WAL layer calls
- * only after it has accepted the record — a refused record never reaches the
- * store, so there is nothing to roll back. */
+ * received bytes as the only record of a private WAL segment and drives
+ * qihse_wal_replay() over it. The callback validates and captures the decoded
+ * operation; the store is mutated only after replay and checked close both
+ * succeed, so a reported staging failure can safely be retried. */
 
 #define REPL_APPLY_SEGMENT_SIZE (1u << 20)
 
@@ -184,46 +182,78 @@ static char* repl_field_str(const void* field, uint32_t len) {
 }
 
 typedef struct repl_apply_seen_s {
-    qihse_kv_store_t* store;
     uint64_t          lsn;      /* the LSN the caller declared for this record */
-    bool              refused;  /* the record or the store refused the mutation */
+    qihse_wal_op_t    op;
+    char*             key;
+    char*             value;
+    bool              captured;
+    bool              refused;  /* WAL validation or operation decoding refused */
 } repl_apply_seen_t;
 
 static bool repl_apply_cb(const qihse_wal_record_t* record, const void* key,
                           uint32_t key_len, const void* value, uint32_t value_len,
                           void* user_data) {
     repl_apply_seen_t* seen = (repl_apply_seen_t*)user_data;
-    if (!record || record->lsn != seen->lsn) { seen->refused = true; return false; }
+    if (!record || record->lsn != seen->lsn || seen->captured) {
+        seen->refused = true;
+        return false;
+    }
 
     switch (record->op_type) {
     case QIHSE_WAL_OP_INSERT:
     case QIHSE_WAL_OP_UPDATE: {
         char* k = repl_field_str(key, key_len);
         char* v = repl_field_str(value, value_len);
-        bool ok = (k && v && qihse_kv_set(seen->store, k, v, 0u, 0u));
-        free(k);
-        free(v);
-        if (!ok) { seen->refused = true; return false; }
-        return true;
+        if (!k || !v) {
+            free(k);
+            free(v);
+            seen->refused = true;
+            return false;
+        }
+        seen->key = k;
+        seen->value = v;
+        break;
     }
     case QIHSE_WAL_OP_DELETE: {
         char* k = repl_field_str(key, key_len);
-        bool ok = (k && qihse_kv_del(seen->store, k));
-        free(k);
-        /* A false from the store is a refusal, not a no-op: a context-free
-         * principal cannot distinguish "the key is absent" from "the key is
-         * present but above its clearance", so neither is reported as
-         * applied. */
-        if (!ok) { seen->refused = true; return false; }
-        return true;
+        if (!k) {
+            seen->refused = true;
+            return false;
+        }
+        seen->key = k;
+        break;
     }
     case QIHSE_WAL_OP_BEGIN:
     case QIHSE_WAL_OP_COMMIT:
     case QIHSE_WAL_OP_ABORT:
     case QIHSE_WAL_OP_CHECKPOINT:
-        return true;   /* no store mutation; the position still advances */
+        break;   /* no store mutation; the position still advances */
     default:
         seen->refused = true;
+        return false;
+    }
+    seen->op = record->op_type;
+    seen->captured = true;
+    return true;
+}
+
+static bool repl_apply_captured(qihse_kv_store_t* store,
+                                const repl_apply_seen_t* seen) {
+    switch (seen->op) {
+    case QIHSE_WAL_OP_INSERT:
+    case QIHSE_WAL_OP_UPDATE:
+        return seen->key && seen->value &&
+               qihse_kv_set(store, seen->key, seen->value, 0u, 0u);
+    case QIHSE_WAL_OP_DELETE:
+        /* A false from the store is a refusal, not a no-op: the context-free
+         * adapter cannot distinguish absent from classified data. */
+        return seen->key && qihse_kv_del(store, seen->key);
+    case QIHSE_WAL_OP_BEGIN:
+    case QIHSE_WAL_OP_COMMIT:
+    case QIHSE_WAL_OP_ABORT:
+    case QIHSE_WAL_OP_CHECKPOINT:
+        return true;
+    default:
         return false;
     }
 }
@@ -301,7 +331,6 @@ int qihse_repl_apply_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, siz
 
     repl_apply_seen_t seen;
     memset(&seen, 0, sizeof(seen));
-    seen.store = ctx->store;
     seen.lsn = lsn;
 
     int replayed = -1;
@@ -315,7 +344,11 @@ int qihse_repl_apply_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, siz
     }
     unlink(ctx->stage_seg);   /* the staging area holds one record at a time */
 
-    if (replayed != 1 || seen.refused) {
+    bool applied = replayed == 1 && !seen.refused && seen.captured;
+    if (applied) applied = repl_apply_captured(ctx->store, &seen);
+    free(seen.key);
+    free(seen.value);
+    if (!applied) {
         pthread_mutex_unlock(&ctx->lock);
         return -1;
     }

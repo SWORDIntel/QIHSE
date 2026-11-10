@@ -85,12 +85,13 @@ qihse_kv_store_t* qihse_repl_get_store(qihse_repl_context_t* ctx);
  * of a private WAL segment and replayed through the WAL layer's own
  * qihse_wal_replay(), so the length rules and the CRC32 check that decide
  * whether a record is valid are the WAL layer's, not a second copy of them.
- * The store mutation happens in the replay callback, which the WAL layer
- * invokes only after it has accepted the record, so a refused record cannot
- * be partially applied.  INSERT/UPDATE write the key, DELETE removes it, and
- * BEGIN/COMMIT/ABORT/CHECKPOINT carry no store mutation and only advance the
- * position.  The applier writes through the KV layer's unclassified-only
- * entry points: a WAL record carries no classification or SCI, so it cannot
+ * The replay callback captures the validated operation; the applier mutates
+ * the store only after replay and checked staging close both succeed, so a
+ * reported failure leaves the record safe to retry. INSERT/UPDATE write the
+ * key, DELETE removes it, and BEGIN/COMMIT/ABORT/CHECKPOINT carry no store
+ * mutation and only advance the position. The applier writes through the KV
+ * layer's unclassified-only entry points: a WAL record carries no
+ * classification or SCI, so it cannot
  * express a classified write, and a mutation that the store refuses (for
  * example an overwrite of a classified row) refuses the whole record.
  *
