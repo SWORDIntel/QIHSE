@@ -638,10 +638,8 @@ int qihse_backup_owner_snapshot_create(qihse_kv_store_t* kv, qihse_user_t* user,
     close(seed_fd);
     container_pending = true;
     memcpy(container_path, unique_path, strlen(unique_path) + 1u);
-    bool published = false;
     int seal_rc = backup_seal_container(container_path, BACKUP_OWNER_DATA, 0u,
-            source_seq, raw_path, principal, generation, &published, NULL);
-    if (published) container_pending = false;
+            source_seq, raw_path, principal, generation, NULL, NULL);
     if (seal_rc != QIHSE_BACKUP_EXPORT_OK) {
         raw_pending = false; /* sealer always consumes the data path */
         goto done;
@@ -712,7 +710,12 @@ bool qihse_backup_owner_snapshot_read(qihse_backup_owner_snapshot_t* snapshot,
         ssize_t n = pread(snapshot->fd, (char*)out + done, want - done,
                           (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        if (n <= 0) {
+            int saved_errno = n == 0 ? EIO : errno;
+            if (done) memset(out, 0, done);
+            errno = saved_errno;
+            return false;
+        }
         done += (size_t)n;
     }
     if (!owner_snapshot_authorized(snapshot, user)) {
@@ -773,6 +776,9 @@ int qihse_backup_owner_data_user(qihse_kv_store_t* kv, qihse_user_t* user,
     if (rename(tmp_path, output_path) != 0 || !backup_fsync_parent(output_path)) {
         unlink(tmp_path); rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
     }
+    if (!owner_snapshot_authorized(snapshot, snapshot->principal)) {
+        rc = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
+    }
     backup_header_t h;
     FILE* verify = backup_open_read(output_path);
     uint8_t header[BACKUP_HEADER_BYTES];
@@ -782,6 +788,9 @@ int qihse_backup_owner_data_user(qihse_kv_store_t* kv, qihse_user_t* user,
         rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
     }
     fclose(verify);
+    if (!owner_snapshot_authorized(snapshot, snapshot->principal)) {
+        rc = QIHSE_BACKUP_EXPORT_DENIED; errno = EACCES; goto done;
+    }
     backup_info_commit(info, &h);
     rc = QIHSE_BACKUP_EXPORT_OK;
 done:
