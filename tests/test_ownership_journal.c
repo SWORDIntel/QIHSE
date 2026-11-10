@@ -16,6 +16,20 @@
 #include "qihse_cluster_ownership_journal.h"
 #include "qihse_audit.h"
 
+#ifdef QIHSE_OWNERSHIP_JOURNAL_TEST_WRAP_FSYNC
+static bool fail_next_fsync_after_success;
+int __real_fsync(int fd);
+int __wrap_fsync(int fd) {
+    int rc = __real_fsync(fd);
+    if (rc == 0 && fail_next_fsync_after_success) {
+        fail_next_fsync_after_success = false;
+        errno = EINVAL;
+        return -1;
+    }
+    return rc;
+}
+#endif
+
 static void remove_fixture(const char* path) {
     DIR* dir = opendir(path);
     assert(dir);
@@ -433,6 +447,35 @@ int main(void) {
         &unresolved) == 4);
     assert(!unresolved && tr.last == QIHSE_OWNERSHIP_FINALIZED);
     puts("[PASS] durable CT2 intent binds the fence cut after restart");
+
+#ifdef QIHSE_OWNERSHIP_JOURNAL_TEST_WRAP_FSYNC
+    /* fsync can report EINVAL after the complete INTENT frame has reached the
+     * journal. The append result must say a write may have occurred; errno is
+     * not a safe proxy for side effects. A duplicate-ID preflight rejection
+     * must leave that result false. */
+    char dir_write_outcome[] = "./tests/.qihse_journal_write_outcome_XXXXXX";
+    assert(mkdtemp(dir_write_outcome));
+    qihse_cluster_ownership_txn_t uncertain_intent = txn(QIHSE_OWNERSHIP_INTENT);
+    strcpy(uncertain_intent.transfer_id, "ct2-fsync-einval-after-write");
+    uncertain_intent.source_lsn = 0;
+    bool write_may_have_occurred = false;
+    fail_next_fsync_after_success = true;
+    errno = 0;
+    assert(qihse_cluster_ownership_journal_append_txn_ex(dir_write_outcome,
+        &uncertain_intent, &write_may_have_occurred) == -1 && errno == EINVAL);
+    assert(write_may_have_occurred && !fail_next_fsync_after_success);
+    memset(&tr, 0, sizeof(tr)); unresolved = false;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir_write_outcome,
+        on_txn, &tr, &unresolved) == 1);
+    assert(unresolved && tr.last == QIHSE_OWNERSHIP_INTENT);
+    write_may_have_occurred = true;
+    errno = 0;
+    assert(qihse_cluster_ownership_journal_append_txn_ex(dir_write_outcome,
+        &uncertain_intent, &write_may_have_occurred) == -1 && errno == EEXIST);
+    assert(!write_may_have_occurred);
+    remove_fixture(dir_write_outcome);
+    puts("[PASS] journal append reports uncertain writes independently of errno");
+#endif
 
     /* A peer's proof-bearing CT1 promotion is journaled as ADOPTED before
      * routing changes. Replay must preserve that terminal peer-side record. */

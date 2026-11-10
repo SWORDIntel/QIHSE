@@ -350,7 +350,9 @@ static bool same_intent_prepare(const qihse_cluster_ownership_txn_t* intent,
 }
 
 static int journal_append_txn_unlocked(
-    const char* data_dir, const qihse_cluster_ownership_txn_t* txn) {
+    const char* data_dir, const qihse_cluster_ownership_txn_t* txn,
+    bool* out_write_may_have_occurred) {
+    if (out_write_may_have_occurred) *out_write_may_have_occurred = false;
     if (!data_dir || !txn_shape_valid(txn)) { errno = EINVAL; return -1; }
     txn_state_t state = {
         .new_intent_id = txn->phase == QIHSE_OWNERSHIP_INTENT
@@ -395,6 +397,7 @@ static int journal_append_txn_unlocked(
         (st.st_mode & 077) != 0 || st.st_nlink != 1) {
         int e = errno ? errno : EACCES; close(fd); errno = e; return -1;
     }
+    if (out_write_may_have_occurred) *out_write_may_have_occurred = true;
     int ok = write_all(fd, frame, sizeof(frame));
     if (ok == 0 && fsync(fd) != 0) ok = -1;
     if (ok == 0 && created && fsync_data_dir(data_dir) != 0) ok = -1;
@@ -406,9 +409,20 @@ static int journal_append_txn_unlocked(
 
 int qihse_cluster_ownership_journal_append_txn(
     const char* data_dir, const qihse_cluster_ownership_txn_t* txn) {
+    bool write_may_have_occurred = false;
+    return qihse_cluster_ownership_journal_append_txn_ex(
+        data_dir, txn, &write_may_have_occurred);
+}
+
+int qihse_cluster_ownership_journal_append_txn_ex(
+    const char* data_dir, const qihse_cluster_ownership_txn_t* txn,
+    bool* out_write_may_have_occurred) {
+    if (out_write_may_have_occurred) *out_write_may_have_occurred = false;
+    if (!out_write_may_have_occurred) { errno = EINVAL; return -1; }
     int lockfd = journal_lock_acquire(data_dir);
     if (lockfd < 0) return -1;
-    int result = journal_append_txn_unlocked(data_dir, txn);
+    int result = journal_append_txn_unlocked(data_dir, txn,
+        out_write_may_have_occurred);
     int saved = errno;
     journal_lock_release(lockfd);
     errno = saved;

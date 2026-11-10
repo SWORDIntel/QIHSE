@@ -104,6 +104,13 @@ int qihse_cluster_ownership_journal_replay(const char* data_dir,
  * replayed offline from this node's durable journal. */
 int qihse_cluster_ownership_journal_append_txn(
     const char* data_dir, const qihse_cluster_ownership_txn_t* txn);
+/* Extended append result. out_write_may_have_occurred stays false through
+ * validation and file preflight, then becomes true immediately before the
+ * journal frame write. A later fsync/close failure cannot prove the frame was
+ * absent from durable storage. */
+int qihse_cluster_ownership_journal_append_txn_ex(
+    const char* data_dir, const qihse_cluster_ownership_txn_t* txn,
+    bool* out_write_may_have_occurred);
 
 /* Replay v2 state-machine records in order. The callback sees each validated
  * transition. out_unresolved is true if a transfer ends PREPARED, or replay

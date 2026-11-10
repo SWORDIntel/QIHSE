@@ -285,26 +285,26 @@ static bool transfer_context(qihse_cluster_ownership_context_t* c,
 bool qihse_cluster_ownership_transfer_prepare_ex(
     qihse_cluster_ownership_context_t* c, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first,
-    uint16_t last, uint64_t* out_source_lsn, bool* out_fence_may_be_active,
+    uint16_t last, uint64_t* out_source_lsn, bool* out_recovery_may_be_needed,
     char* err, size_t err_cap) {
     if (out_source_lsn) *out_source_lsn = 0;
-    if (out_fence_may_be_active) *out_fence_may_be_active = false;
-    if (!out_source_lsn || !out_fence_may_be_active) {
+    if (out_recovery_may_be_needed) *out_recovery_may_be_needed = false;
+    if (!out_source_lsn || !out_recovery_may_be_needed) {
         set_error(err, err_cap, "source cut and fence state outputs are required");
         return false;
     }
     bool unresolved = false;
     if (!qihse_cluster_ownership_replay_control(c, &unresolved, err, err_cap)) {
-        *out_fence_may_be_active = true;
+        *out_recovery_may_be_needed = true;
         return false;
     }
     if (unresolved) {
-        *out_fence_may_be_active = true;
+        *out_recovery_may_be_needed = true;
         qihse_cluster_ownership_txn_t recovered;
         if (qihse_cluster_ownership_transfer_get_prepared(c, transfer_id,
                 &recovered, NULL, 0)) {
             *out_source_lsn = recovered.source_lsn;
-            *out_fence_may_be_active = true;
+            *out_recovery_may_be_needed = true;
             OPENSSL_cleanse(&recovered, sizeof(recovered));
             set_error(err, err_cap, "");
             return true;
@@ -350,17 +350,18 @@ bool qihse_cluster_ownership_transfer_prepare_ex(
         OPENSSL_cleanse(owner_token, sizeof(owner_token));
         set_error(err, err_cap, "topology config epoch exhausted"); return false;
     }
-    /* Append can fail after a complete intent frame reaches durable storage.
-     * Treat storage errors as unresolved until recovery proves otherwise;
-     * known state-machine/identity refusals are definite non-writes. */
-    *out_fence_may_be_active = true;
-    if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
-        if (errno == EEXIST || errno == EPROTO || errno == EINVAL)
-            *out_fence_may_be_active = false;
+    bool intent_write_may_have_occurred = false;
+    int intent_result = qihse_cluster_ownership_journal_append_txn_ex(
+        data_dir, &txn, &intent_write_may_have_occurred);
+    *out_recovery_may_be_needed = intent_write_may_have_occurred;
+    if (intent_result != 0) {
         OPENSSL_cleanse(owner_token, sizeof(owner_token));
         set_error(err, err_cap, "could not persist CT2 ownership intent before fencing");
         return false;
     }
+    /* The intent is now recorded. From here on, caller recovery must not
+     * report a definite rejection until it verifies the source fence state. */
+    *out_recovery_may_be_needed = true;
     uint64_t cut = 0;
     /* The KV operation can report failure after its durable fence transition
      * has reached storage. Preserve an unknown result from this point. */
@@ -386,10 +387,10 @@ bool qihse_cluster_ownership_transfer_prepare(
     qihse_cluster_ownership_context_t* c, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first,
     uint16_t last, uint64_t* out_source_lsn, char* err, size_t err_cap) {
-    bool fence_may_be_active = false;
+    bool recovery_may_be_needed = false;
     return qihse_cluster_ownership_transfer_prepare_ex(c, transfer_id,
         source_index, target_index, first, last, out_source_lsn,
-        &fence_may_be_active, err, err_cap);
+        &recovery_may_be_needed, err, err_cap);
 }
 
 typedef struct {

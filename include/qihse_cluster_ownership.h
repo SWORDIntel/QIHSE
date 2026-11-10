@@ -51,13 +51,13 @@ bool qihse_cluster_ownership_transfer_prepare(
     qihse_cluster_ownership_context_t* context, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first_slot,
     uint16_t last_slot, uint64_t* out_source_lsn, char* err, size_t err_cap);
-/* Extended outcome for the transfer manager. out_fence_may_be_active is true
- * when durable intent/fence state may have been written despite failure. */
+/* Extended outcome for the transfer manager. out_recovery_may_be_needed is
+ * true when durable intent/fence state may have been written despite failure. */
 bool qihse_cluster_ownership_transfer_prepare_ex(
     qihse_cluster_ownership_context_t* context, const char* transfer_id,
     uint16_t source_index, uint16_t target_index, uint16_t first_slot,
     uint16_t last_slot, uint64_t* out_source_lsn,
-    bool* out_fence_may_be_active, char* err, size_t err_cap);
+    bool* out_recovery_may_be_needed, char* err, size_t err_cap);
 
 /* Read the matching durable PREPARED source descriptor for the transfer
  * manager. The descriptor binds both topology IDs and configured QKP IDs. */
