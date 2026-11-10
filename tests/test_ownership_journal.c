@@ -422,6 +422,16 @@ int main(void) {
     assert(qihse_cluster_ownership_journal_replay_txn(dir_intent, on_txn, &tr,
         &unresolved) == 4);
     assert(!unresolved && tr.last == QIHSE_OWNERSHIP_FINALIZED);
+    qihse_cluster_ownership_txn_t finalized_id_reuse = intent;
+    finalized_id_reuse.phase = QIHSE_OWNERSHIP_INTENT;
+    finalized_id_reuse.end++;
+    errno = 0;
+    assert(qihse_cluster_ownership_journal_append_txn(dir_intent,
+        &finalized_id_reuse) == -1 && errno == EEXIST);
+    memset(&tr, 0, sizeof(tr)); unresolved = true;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir_intent, on_txn, &tr,
+        &unresolved) == 4);
+    assert(!unresolved && tr.last == QIHSE_OWNERSHIP_FINALIZED);
     puts("[PASS] durable CT2 intent binds the fence cut after restart");
 
     /* A peer's proof-bearing CT1 promotion is journaled as ADOPTED before
@@ -454,6 +464,16 @@ int main(void) {
     memset(&tr, 0, sizeof(tr)); unresolved = true;
     n = qihse_cluster_ownership_journal_replay_txn(dir3, on_txn, &tr, &unresolved);
     assert(n == 8 && !unresolved && tr.count == 8 && tr.last == QIHSE_OWNERSHIP_ABORTED);
+    qihse_cluster_ownership_txn_t aborted_id_reuse = abort_prepare;
+    aborted_id_reuse.phase = QIHSE_OWNERSHIP_INTENT;
+    aborted_id_reuse.start++;
+    errno = 0;
+    assert(qihse_cluster_ownership_journal_append_txn(dir3,
+        &aborted_id_reuse) == -1 && errno == EEXIST);
+    memset(&tr, 0, sizeof(tr)); unresolved = true;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir3, on_txn, &tr,
+        &unresolved) == 8);
+    assert(!unresolved && tr.last == QIHSE_OWNERSHIP_ABORTED);
     printf("[PASS] v1 compatibility + v2 CT1/CT2 prepare/commit recovery ordering\n");
 
     /* Two processes/threads may race to finalize one PREPARED transfer. The

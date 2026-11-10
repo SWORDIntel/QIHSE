@@ -98,8 +98,10 @@ int qihse_cluster_ownership_journal_replay(const char* data_dir,
                                            void* ctx);
 
 /* Append + fsync a v2 transfer phase. Sequence: PREPARED→COMMITTED→FINALIZED,
- * or PREPARED→ABORTED. FINALIZED means target activation was verified and
- * can be replayed offline from this node's durable journal. */
+ * or PREPARED→ABORTED. A transfer_id is single-use in this journal: exact
+ * retries query the existing phase, and a terminal ID is never restarted as
+ * a new INTENT. FINALIZED means target activation was verified and can be
+ * replayed offline from this node's durable journal. */
 int qihse_cluster_ownership_journal_append_txn(
     const char* data_dir, const qihse_cluster_ownership_txn_t* txn);
 

@@ -310,9 +310,13 @@ typedef struct {
     bool pending;
     qihse_cluster_ownership_phase_t phase;
     qihse_cluster_ownership_txn_t txn;
+    const char* new_intent_id;
+    bool transfer_id_seen;
 } txn_state_t;
 static bool txn_state_cb(const qihse_cluster_ownership_txn_t* t, void* ctx) {
     txn_state_t* s = ctx;
+    if (s->new_intent_id && !strcmp(s->new_intent_id, t->transfer_id))
+        s->transfer_id_seen = true;
     if (t->phase == QIHSE_OWNERSHIP_INTENT ||
         t->phase == QIHSE_OWNERSHIP_PREPARED ||
         t->phase == QIHSE_OWNERSHIP_COMMITTED) {
@@ -348,10 +352,15 @@ static bool same_intent_prepare(const qihse_cluster_ownership_txn_t* intent,
 static int journal_append_txn_unlocked(
     const char* data_dir, const qihse_cluster_ownership_txn_t* txn) {
     if (!data_dir || !txn_shape_valid(txn)) { errno = EINVAL; return -1; }
-    txn_state_t state = {0}; bool unresolved = false;
+    txn_state_t state = {
+        .new_intent_id = txn->phase == QIHSE_OWNERSHIP_INTENT
+            ? txn->transfer_id : NULL
+    };
+    bool unresolved = false;
     int replayed = qihse_cluster_ownership_journal_replay_txn(
         data_dir, txn_state_cb, &state, &unresolved);
     if (replayed < 0) { if (!errno) errno = EBUSY; return -1; }
+    if (state.transfer_id_seen) { errno = EEXIST; return -1; }
     bool transition_ok = false;
     if (txn->phase == QIHSE_OWNERSHIP_INTENT)
         transition_ok = !state.pending;

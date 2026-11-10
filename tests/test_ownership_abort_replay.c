@@ -1,6 +1,7 @@
 /* Regression coverage for idempotent recovery of a completed CT2 abort. */
 #include <assert.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,18 @@ int main(void) {
     assert(qihse_cluster_ownership_replay_control(&ownership, &unresolved,
         error, sizeof(error)));
     assert(!unresolved);
+
+    /* A terminal transfer ID cannot be restarted for another range. INTENT
+     * is rejected before the source can persist a new range fence. */
+    qihse_cluster_ownership_txn_t reused_id = aborted;
+    reused_id.phase = QIHSE_OWNERSHIP_INTENT;
+    reused_id.start++;
+    errno = 0;
+    assert(qihse_cluster_ownership_journal_append_txn(data_dir,
+        &reused_id) == -1 && errno == EEXIST);
+    qihse_kv_ct_transfer_status_t after_reuse = {0};
+    assert(qihse_kv_ct_transfer_status(store, operator, &after_reuse));
+    assert(after_reuse.fence_state == 0u);
 
     /* A later unfinished transaction may already own the active fence when
      * replay reaches the older ABORTED entry. The old entry must defer to the
