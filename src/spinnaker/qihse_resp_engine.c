@@ -5780,6 +5780,27 @@ static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const
 }
 
 /* ---- Key/generic commands ---- */
+static bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key);
+
+/* AIMEM's canonical rows and control records are accessed through the typed
+ * AIMEM API. Raw KV commands must not read, manufacture or mutate them. */
+static bool qihse_resp_key_is_aimem_internal(const void* data, size_t len) {
+    const unsigned char* p = data;
+    size_t off = 0u;
+    static const char* const prefixes[] = {"aimem:", "aimemv:", "aimem-"};
+    if (!p) return false;
+    if (len >= 2u && p[0] == 't' && p[1] == ':') {
+        off = 2u;
+        while (off < len && p[off] >= '0' && p[off] <= '9') off++;
+        if (off == 2u || off >= len || p[off] != '/') return false;
+        off++;
+    }
+    for (size_t i = 0u; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t n = strlen(prefixes[i]);
+        if (len - off >= n && memcmp(p + off, prefixes[i], n) == 0) return true;
+    }
+    return false;
+}
 
 /* KEYS/SCAN share one bounded collector: authorization-filtered iteration
  * (qihse_kv_foreach_user honors the session principal exactly like GET/SET),
@@ -5793,6 +5814,8 @@ typedef struct {
     size_t cap;
     char** keys;
     size_t count;
+    bool allow_aimem_internal;
+    uint32_t tenant;
 } key_list_t;
 
 static void key_list_free(key_list_t* list) {
@@ -5806,6 +5829,11 @@ static void key_list_free(key_list_t* list) {
 static bool qihse_resp_keys_collect_cb(const char* key, const char* value, void* user_data) {
     (void)value;
     key_list_t* list = (key_list_t*)user_data;
+    if (list->tenant != QIHSE_TENANT_SYSTEM) {
+        qihse_resp_arg_t scoped_key = {.data = (const uint8_t*)key, .len = strlen(key)};
+        if (!qihse_resp_tenant_key_allowed(list->tenant, &scoped_key)) return true;
+    }
+    if (!list->allow_aimem_internal && qihse_resp_key_is_aimem_internal(key, strlen(key))) return true;
     if (list->pattern && fnmatch(list->pattern, key, 0) != 0) return true;
     if (list->count >= list->cap) return false;
     list->keys[list->count] = strdup(key);
@@ -5838,6 +5866,11 @@ static bool qihse_resp_keys_collect(qihse_resp_session_t* session, const char* p
     memset(list, 0, sizeof(*list));
     list->pattern = pattern;
     list->cap = cap ? cap : QIHSE_RESP_KEYS_MAX;
+    list->allow_aimem_internal = session && session->user &&
+        qihse_user_get_tenant_id(session->user) == QIHSE_TENANT_SYSTEM &&
+        qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR;
+    list->tenant = session && session->user ?
+        qihse_user_get_tenant_id(session->user) : QIHSE_TENANT_SYSTEM;
     list->keys = (char**)calloc(list->cap, sizeof(char*));
     if (!list->keys) return false;
     pthread_rwlock_rdlock(&session->server->kv_lock);
@@ -5863,6 +5896,18 @@ static bool qihse_resp_keys_collect(qihse_resp_session_t* session, const char* p
         }
     }
     pthread_rwlock_unlock(&session->server->kv_lock);
+    return true;
+}
+
+typedef struct { bool allow_aimem_internal; uint32_t tenant; size_t count; } qihse_resp_key_count_t;
+static bool qihse_resp_count_visible_key_cb(const char* key, void* user_data) {
+    qihse_resp_key_count_t* c = user_data;
+    if (c->tenant != QIHSE_TENANT_SYSTEM) {
+        qihse_resp_arg_t scoped_key = {.data = (const uint8_t*)key, .len = strlen(key)};
+        if (!qihse_resp_tenant_key_allowed(c->tenant, &scoped_key)) return true;
+    }
+    if (!c->allow_aimem_internal && qihse_resp_key_is_aimem_internal(key, strlen(key))) return true;
+    c->count++;
     return true;
 }
 
@@ -7335,10 +7380,27 @@ static bool qihse_resp_handle_flushdb(qihse_resp_session_t* session, const qihse
 static bool qihse_resp_handle_dbsize(qihse_resp_session_t* session, const qihse_resp_request_t* request) {
     (void)request;
     if (!session->server->store) return qihse_resp_integer(session, 0);
-    pthread_rwlock_wrlock(&session->server->kv_lock);
-    /* Authorization-aware count: callers see only records they may read. */
-    size_t count = qihse_kv_count_user(session->server->store, session->user);
-    pthread_rwlock_unlock(&session->server->kv_lock);
+    size_t count;
+    bool operator = session->user &&
+        qihse_user_get_tenant_id(session->user) == QIHSE_TENANT_SYSTEM &&
+        qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR;
+    if (operator) {
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        count = qihse_kv_count_user(session->server->store, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+    } else {
+        qihse_resp_key_count_t visible = {
+            .allow_aimem_internal = false,
+            .tenant = session->user ? qihse_user_get_tenant_id(session->user) : QIHSE_TENANT_SYSTEM,
+            .count = 0u
+        };
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool ok = qihse_kv_foreach_key_user(session->server->store, session->user,
+            qihse_resp_count_visible_key_cb, &visible);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!ok) return qihse_resp_error(session, "ERR key count failed");
+        count = visible.count;
+    }
     return qihse_resp_integer(session, (int64_t)count);
 }
 
@@ -9393,6 +9455,8 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
             free(hits);
             return qihse_resp_error(session, recall_error == ETIMEDOUT
                 ? "ERR AIMEM semantic projection deadline exceeded"
+                : recall_error == EAGAIN
+                ? "ERR AIMEM semantic projection is building; retry shortly"
                 : "ERR AIMEM semantic projection unavailable or stale");
         }
         bool emitted = qihse_resp_array(session, found);
@@ -10102,10 +10166,17 @@ static bool qihse_resp_tenant_quota(qihse_resp_session_t* session, const qihse_r
 }
 
 static bool qihse_resp_tenant_scope(qihse_resp_session_t* session, const qihse_resp_request_t* request, const qihse_resp_keyset_t* keys, uint32_t tenant) {
-    if (tenant == QIHSE_TENANT_SYSTEM) return true;
+    bool operator = session && session->user &&
+        qihse_user_get_role(session->user) == QIHSE_ROLE_OPERATOR &&
+        tenant == QIHSE_TENANT_SYSTEM;
     for (size_t i = 0; i < keys->count; i++) {
         const qihse_resp_arg_t* key = &request->argv[keys->indexes[i]];
-        if (!qihse_resp_tenant_key_allowed(tenant, key)) {
+        if (!operator && qihse_resp_key_is_aimem_internal(key->data, key->len)) {
+            qihse_resp_error(session, "NOPERM AIMEM records require the typed AIMEM interface");
+            return false;
+        }
+        if (!operator && tenant != QIHSE_TENANT_SYSTEM &&
+            !qihse_resp_tenant_key_allowed(tenant, key)) {
             char buffer[160];
             int len = snprintf(buffer, sizeof(buffer), "NOPERM key '%.*s' is outside tenant namespace t:%u/",
                                key->len > 96 ? 96 : (int)key->len, (const char*)key->data, tenant);
@@ -13828,16 +13899,23 @@ static bool qihse_resp_handle_owner_snapshot_read(qihse_resp_session_t* s,
         !qihse_resp_parse_u64_arg(&r->argv[2], &length) || length == 0u ||
         length > QIHSE_OWNER_SNAPSHOT_READ_MAX)
         return qihse_resp_error(s, "ERR usage: OWNER.SNAPSHOT.READ offset length (length <= 524288)");
-    if (!qihse_resp_owner_snapshot_allowed(s))
+    if (!qihse_resp_owner_snapshot_allowed(s)) {
+        qihse_resp_owner_snapshot_clear(s);
         return qihse_resp_error(s, "NOPERM active full-ceiling system Operator required");
+    }
     if (!s->owner_snapshot || !s->owner_snapshot_user)
         return qihse_resp_error(s, "ERR begin owner snapshot on this session first");
     if (!qihse_auth_validate_handle_generation(s->owner_snapshot_user,
-                                                s->owner_snapshot_generation))
+                                                s->owner_snapshot_generation)) {
+        qihse_resp_owner_snapshot_clear(s);
         return qihse_resp_error(s, "NOPERM owner snapshot principal generation changed");
+    }
     size_t capacity = (size_t)length;
     char* data = malloc(capacity);
-    if (!data) return qihse_resp_error(s, "ERR owner snapshot read allocation failed");
+    if (!data) {
+        qihse_resp_owner_snapshot_clear(s);
+        return qihse_resp_error(s, "ERR owner snapshot read allocation failed");
+    }
     size_t got = 0u;
     bool ok = offset <= s->owner_snapshot_size &&
         qihse_kv_replica_snapshot_read(s->owner_snapshot, s->owner_snapshot_user,
@@ -13848,6 +13926,7 @@ static bool qihse_resp_handle_owner_snapshot_read(qihse_resp_session_t* s,
     if (!ok) {
         if (got) OPENSSL_cleanse(data, got);
         free(data);
+        qihse_resp_owner_snapshot_clear(s);
         return qihse_resp_error(s, "ERR owner snapshot read failed or authorization changed");
     }
     bool sent = qihse_resp_bulk(s, data, got);
@@ -13859,8 +13938,7 @@ static bool qihse_resp_handle_owner_snapshot_read(qihse_resp_session_t* s,
 static bool qihse_resp_handle_owner_snapshot_end(qihse_resp_session_t* s,
                                                   const qihse_resp_request_t* r) {
     if (r->argc != 1u) return qihse_resp_wrong_arity(s, "owner.snapshot.end");
-    if (!qihse_resp_owner_snapshot_allowed(s))
-        return qihse_resp_error(s, "NOPERM active full-ceiling system Operator required");
+    /* Releasing session-local resources is allowed after authorization loss. */
     qihse_resp_owner_snapshot_clear(s);
     return qihse_resp_simple(s, "OK");
 }
@@ -14168,7 +14246,7 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"setex", dsp_setex_s, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"psetex", dsp_setex_ms, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"del", dsp_del, DSP_BUSY_WRITE | DSP_KEY_ALLKV},
-    {"unlink", dsp_del, DSP_BUSY_WRITE},
+    {"unlink", dsp_del, DSP_BUSY_WRITE | DSP_KEY_ALLKV},
     {"exists", dsp_exists, DSP_KEY_ALLKV},
     {"mget", qihse_resp_handle_mget, DSP_KEY_ALLKV},
     {"mset", qihse_resp_handle_mset, DSP_BUSY_WRITE | DSP_KEY_ODDKV},
@@ -14228,10 +14306,10 @@ static const qihse_resp_dispatch_ent_t g_dispatch_table[] = {
     {"getrange", qihse_resp_handle_getrange, DSP_KEY_1KV}, {"setrange", qihse_resp_handle_setrange, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"incrby", dsp_incrby, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"decrby", dsp_decrby, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"incrbyfloat", qihse_resp_handle_incrbyfloat, DSP_BUSY_WRITE | DSP_KEY_1KV},
-    {"msetnx", qihse_resp_handle_msetnx, DSP_BUSY_WRITE}, {"persist", qihse_resp_handle_persist, DSP_KEY_1KV},
+    {"msetnx", qihse_resp_handle_msetnx, DSP_BUSY_WRITE | DSP_KEY_ODDKV}, {"persist", qihse_resp_handle_persist, DSP_KEY_1KV},
     {"expireat", dsp_expireat, DSP_BUSY_WRITE | DSP_KEY_1KV}, {"pexpireat", dsp_pexpireat, DSP_BUSY_WRITE | DSP_KEY_1KV},
     {"copy", qihse_resp_handle_copy, DSP_BUSY_WRITE | DSP_KEY_12KV}, {"randomkey", qihse_resp_handle_randomkey, 0},
-    {"touch", qihse_resp_handle_touch, 0}, {"object", qihse_resp_handle_object, DSP_KEY_1KV},
+    {"touch", qihse_resp_handle_touch, DSP_KEY_ALLKV}, {"object", qihse_resp_handle_object, DSP_KEY_1KV},
     {"flushdb", qihse_resp_handle_flushdb, DSP_BUSY_WRITE}, {"flushall", qihse_resp_handle_flushdb, DSP_BUSY_WRITE},
     {"dbsize", qihse_resp_handle_dbsize, 0}, {"time", qihse_resp_handle_time, 0},
     {"save", qihse_resp_handle_save, DSP_BUSY_WRITE}, {"bgsave", qihse_resp_handle_bgsave, 0},

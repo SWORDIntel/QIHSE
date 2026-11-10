@@ -4,6 +4,7 @@
 #include "qihse_auth.h"
 #include "qihse_kv_store.h"
 #include "qihse_resp_wire.h"
+#include "qihse_federation.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -526,6 +527,45 @@ int main(void) {
         "project-alpha", "", "", "" };
     scoped_get[2] = scoped_id;
     expect_contains(guest, 7u, scoped_get, "alpha scoped marker");
+    /* Raw KV access cannot bypass typed AIMEM ownership or mutate its control
+     * namespace. Enumeration also omits canonical rows and receipts. */
+    char raw_aimem_key[96];
+    char raw_doc_id[17];
+    uint32_t guest_tenant = qihse_user_get_tenant_id(guest);
+    snprintf(raw_doc_id, sizeof raw_doc_id, "%.*s%.*s%.*s",
+        8, scoped_id, 4, scoped_id + 9u, 4, scoped_id + 14u);
+    snprintf(raw_aimem_key, sizeof raw_aimem_key, "t:%u/aimem:%s",
+        (unsigned)guest_tenant, raw_doc_id);
+    const char* raw_aimem_get[] = { "GET", raw_aimem_key };
+    const char* raw_aimem_set[] = { "SET", raw_aimem_key, "forged" };
+    char forged_grant_key[160];
+    snprintf(forged_grant_key, sizeof forged_grant_key,
+        "t:%u/aimem-grant:project-alpha:9044:9045", (unsigned)guest_tenant);
+    const char* raw_aimem_grant[] = { "SET", forged_grant_key, "read:v1" };
+    char forget_seed[128], forged_receipt_key[160];
+    const char* forget_retry = "forged-receipt-key";
+    int forget_seed_len = snprintf(forget_seed, sizeof forget_seed,
+        "QH-HAX:forget-key:v1:%u:%u:%s", (unsigned)guest_tenant,
+        (unsigned)qihse_user_get_id(guest), forget_retry);
+    qihse_uuid_t forged_receipt_uuid;
+    char forged_receipt_id[QIHSE_UUID_STR_LEN + 1u];
+    assert(forget_seed_len > 0 && (size_t)forget_seed_len < sizeof forget_seed &&
+        qihse_uuid_from_seed(forget_seed, (size_t)forget_seed_len, &forged_receipt_uuid) &&
+        qihse_uuid_format(&forged_receipt_uuid, forged_receipt_id));
+    snprintf(forged_receipt_key, sizeof forged_receipt_key,
+        "t:%u/aimem-forget:%u:%s", (unsigned)guest_tenant,
+        (unsigned)qihse_user_get_id(guest), forged_receipt_id);
+    const char* raw_forged_receipt[] = { "SET", forged_receipt_key,
+        "D|forged-completed-forget-receipt" };
+    const char* raw_aimem_keys[] = { "KEYS", "t:*/*aimem*" };
+    const char* raw_aimem_scan[] = { "SCAN", "0", "MATCH", "t:*/*aimem*" };
+    expect_contains(guest, 2u, raw_aimem_get, "NOPERM AIMEM records");
+    expect_contains(guest, 3u, raw_aimem_set, "NOPERM AIMEM records");
+    expect_contains(guest, 3u, raw_aimem_grant, "NOPERM AIMEM records");
+    expect_contains(guest, 3u, raw_forged_receipt, "NOPERM AIMEM records");
+    expect_contains(guest, 2u, raw_aimem_keys, "*0\r\n");
+    expect_contains(guest, 4u, raw_aimem_scan, "*0\r\n");
+    expect_contains(op, 2u, raw_aimem_get, "alpha scoped marker");
     const char* scoped_wrong_project[] = { "AIMEM", "GET-SCOPED", "placeholder",
         "project-beta", "", "", "" };
     scoped_wrong_project[2] = scoped_id;
