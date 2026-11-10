@@ -4020,6 +4020,20 @@ bool qihse_kv_ct_target_abort(qihse_kv_store_t* store,
     return ok;
 }
 
+static void ct_transfer_status_fill_locked(qihse_kv_store_t* store,
+    qihse_kv_ct_transfer_status_t* out) {
+    out->mode = store->ct_mode;
+    out->fence_state = store->ct_fence_state;
+    out->transfer_phase = store->ct_transfer_phase;
+    out->first_slot = store->ct_fence_first;
+    out->last_slot = store->ct_fence_last;
+    out->cut_position = store->ct_fence_cut_position;
+    memcpy(out->transfer_id, store->ct_transfer_id, sizeof(out->transfer_id));
+    memcpy(out->source_id, store->ct_source_id, sizeof(out->source_id));
+    memcpy(out->target_id, store->ct_target_id, sizeof(out->target_id));
+    memcpy(out->generation, store->ct_generation, sizeof(out->generation));
+}
+
 bool qihse_kv_ct_transfer_status(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_kv_ct_transfer_status_t* out) {
     if (out) memset(out, 0, sizeof(*out));
@@ -4027,18 +4041,27 @@ bool qihse_kv_ct_transfer_status(qihse_kv_store_t* store,
     kv_store_rdlock(store);
     bool ok = store->ct_enabled && !store->recovery_pending &&
         ct_admin(control_principal);
+    if (ok) ct_transfer_status_fill_locked(store, out);
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_ct_transfer_status_detail(qihse_kv_store_t* store,
+    qihse_user_t* control_principal,
+    qihse_kv_ct_transfer_status_detail_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!store || !out || !ct_admin(control_principal)) return false;
+    kv_store_rdlock(store);
+    bool ok = store->ct_enabled && !store->recovery_pending &&
+        ct_admin(control_principal);
     if (ok) {
-        out->mode = store->ct_mode;
-        out->fence_state = store->ct_fence_state;
-        out->transfer_phase = store->ct_transfer_phase;
-        out->first_slot = store->ct_fence_first;
-        out->last_slot = store->ct_fence_last;
-        out->cut_position = store->ct_fence_cut_position;
-        memcpy(out->transfer_id, store->ct_transfer_id,
-               sizeof(out->transfer_id));
-        memcpy(out->source_id, store->ct_source_id, sizeof(out->source_id));
-        memcpy(out->target_id, store->ct_target_id, sizeof(out->target_id));
-        memcpy(out->generation, store->ct_generation, sizeof(out->generation));
+        ct_transfer_status_fill_locked(store, &out->base);
+        memcpy(out->transfer_source_id, store->ct_transfer_source_id,
+               sizeof(out->transfer_source_id));
+        memcpy(out->transfer_source_generation,
+               store->ct_transfer_source_generation,
+               sizeof(out->transfer_source_generation));
+        out->transfer_source_cut = store->ct_transfer_source_cut;
     }
     kv_store_unlock(store);
     return ok;

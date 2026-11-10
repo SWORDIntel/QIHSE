@@ -175,6 +175,15 @@ typedef struct {
 } qihse_kv_ct_transfer_status_t;
 bool qihse_kv_ct_transfer_status(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_kv_ct_transfer_status_t* out);
+typedef struct {
+    qihse_kv_ct_transfer_status_t base;
+    char transfer_source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char transfer_source_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t transfer_source_cut;
+} qihse_kv_ct_transfer_status_detail_t;
+bool qihse_kv_ct_transfer_status_detail(qihse_kv_store_t* store,
+    qihse_user_t* control_principal,
+    qihse_kv_ct_transfer_status_detail_t* out);
 bool qihse_kv_ct_fence_finish(qihse_kv_store_t* store, qihse_user_t* principal,
     const char* transfer_id, bool transferred,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
