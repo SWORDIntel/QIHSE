@@ -38,9 +38,19 @@ def command(session, *args):
     return parse_resp_frame(session.execute_resp(*args))
 
 
-def expect_ok(reply, operation):
-    if not isinstance(reply, tuple) or reply[0] != "status":
+def write_when_ready(session, key, value, operation, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reply = command(session, "SET", key, value)
+        if isinstance(reply, tuple) and reply[0] == "status":
+            return
+        if (isinstance(reply, tuple) and reply[0] == "error" and
+                any(marker in reply[1] for marker in
+                    (b"TRYAGAIN", b"CLUSTERDOWN"))):
+            time.sleep(0.1)
+            continue
         raise AssertionError(f"{operation}: {reply!r}")
+    raise AssertionError(f"{operation}: owner lane never became writable")
 
 
 def tag_for(first, last, label):
@@ -251,6 +261,11 @@ def main():
             if name == "joiner":
                 extra.extend(["--replication-principal-clearance", str(target_clearance),
                               "--replication-principal-sci", str(target_sci)])
+            if not brain:
+                # Group mode defaults every daemon to an acting brain. Keep
+                # this setup phase observation-only so no range moves before
+                # writes, replication, and the explicit authorization probe.
+                extra.extend(["--brain", "--brain-interval", "30"])
             if brain:
                 brain_dir = cluster.root / "brain-a"
                 brain_dir.mkdir(mode=0o700, exist_ok=True)
@@ -295,8 +310,8 @@ def main():
         keys = {name: f"{{{tags[name]}}}:ring-seed" for name in NODES}
         values = {name: f"ring-value-{name}" for name in NODES}
         for name in NODES:
-            expect_ok(command(admins[name], "SET", keys[name], values[name]),
-                      f"write {name} owned group")
+            write_when_ready(admins[name], keys[name], values[name],
+                             f"write {name} owned group")
         for group, (outbound, inbound) in lane_clients.items():
             wait_drained(outbound, inbound, group_ids[group], group)
         # Public GET remains fenced on receiver-owned slots, including for the
@@ -334,7 +349,7 @@ def main():
         cluster.processes["joiner"].wait(timeout=15)
         admins["joiner"] = start("joiner", target_clearance=0, target_sci=0)
 
-        # Start the brain only after all three groups have data and receiver
+        # Enable brain actuation only after all three groups have data and receiver
         # cursors. A->C is the only expected transfer; the lane selector clamps
         # the proposed slots to group A's current admitted range.
         admins["lead"].close()
@@ -389,8 +404,8 @@ def main():
         wait_value(admins["joiner"], keys["joiner"], values["joiner"])
         wait_value(admins["joiner"], protected_key, protected_value.encode())
         post_transfer_key = f"{{{tags['joiner']}}}:post-transfer-write"
-        expect_ok(command(admins["joiner"], "SET", post_transfer_key,
-                          "C remains a live owner"), "write C-owned group after CT2")
+        write_when_ready(admins["joiner"], post_transfer_key,
+                         "C remains a live owner", "write C-owned group after CT2")
         for group, (outbound, inbound) in lane_clients.items():
             wait_drained(outbound, inbound, group_ids[group], group)
         # B is C's replica for group C, so its ordinary GET is intentionally
