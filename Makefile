@@ -240,7 +240,8 @@ endif
 
 SRCS_BASE += src/black_hole/qihse_ct_codec.c src/spinnaker/qihse_cluster_ownership.c \
     src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c \
-    src/spinnaker/qihse_cluster_range_authority.c
+    src/spinnaker/qihse_cluster_range_authority.c \
+    src/spinnaker/qihse_cluster_certificate_recovery.c
 SRCS=$(SRCS_BASE)
 
 ifeq ($(LIB_TARGET),qihse.dll)
@@ -559,6 +560,15 @@ test-cluster-range-authority: lib
 	LD_LIBRARY_PATH=. ./tests/test_cluster_range_authority
 
 test-serial: test-cluster-range-authority
+
+.PHONY: test-cluster-certificate-recovery
+test-cluster-certificate-recovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_cluster_certificate_recovery tests/test_cluster_certificate_recovery.c \
+	    src/spinnaker/qihse_cluster_certificate_recovery.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_cluster_certificate_recovery
+
+test-serial: test-cluster-certificate-recovery
 
 .PHONY: test-ct-range-export-tenant
 test-ct-range-export-tenant: lib

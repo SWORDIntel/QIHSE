@@ -345,6 +345,8 @@ bool qihse_cluster_range_authority_claim(void* opaque,
     if (phase == QIHSE_RANGE_PHASE_FINALIZED) {
         c->final_decision_index = decision.decision_index;
         memcpy(c->final_decision_digest, decision.decision_digest, 32);
+        if (r.op == QIHSE_RANGE_OP_PROMOTION)
+            memcpy(c->promotion_event_digest, decision.evidence_digest, 32);
     }
     if (r.op == QIHSE_RANGE_OP_PROMOTION) {
         unsigned length = 0;
@@ -398,8 +400,7 @@ bool qihse_cluster_range_authority_verify_claim_user(void* opaque,
     if (r.op == QIHSE_RANGE_OP_PROMOTION) {
         /* The original signed QCP2 was durably replicated before FINALIZE.
          * Its canonical event digest remains verifiable after later hops. */
-        return digest_present(c->certificate_head_digest) &&
-            digest_present(c->image_digest) && digest_present(c->promotion_event_digest) &&
+        return digest_present(c->promotion_event_digest) &&
             CRYPTO_memcmp(c->promotion_event_digest, decision.evidence_digest, 32) == 0;
     }
     qihse_cluster_ownership_txn_t t = {0};
