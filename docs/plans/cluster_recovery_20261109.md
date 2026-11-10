@@ -1,25 +1,44 @@
 # Three-host cluster recovery and native upgrade
 
 Date: 2026-11-09 (updated 2026-11-10)
-Status: all nine original stores were backed up and reconciled into one
+Status at publication: the live three-node cluster is functional. T420,
+T320 and 730xd answer authenticated data commands and report the same
+16,384-slot ownership map with `cluster_state:ok`. The nine original stores
+were backed up and reconciled into one
 authenticated union. That union was restored into a fresh generation and
 independently compared as 271,434 identical records with zero additions or
 conflicts. CT2 then distributed ownership across T420, 730xd and T320. Six
 recovery services are enabled and active. A replay-order fix was natively
 deployed on 730xd; all three owners now answer data commands and report the
 same six-peer map, `cluster_state:ok`, and 16,384/16,384 assigned slots. The
-required full suite passed 204 targets with zero failures. Per-owner key counts
-sum to 271,462 at the latest probe, 28 above the authenticated union count;
-this count difference is not yet classified by a fresh record-level backup
-comparison. All 309 AIMEM records remain visible on 730xd. Keep the nine
-original backups and merged union intact while reconciling this live inventory
-and confirming CT1 stream health.
+required full suite passed 204 targets with zero failures. A fresh
+authenticated record-level comparison against the three current owners found
+271,468 unique keys: none from the union are missing, and 34 current-only
+keys are 17 Sentinel host-monitor artifact/chunk pairs on 730xd. Their chunk
+payloads all match their manifest size and SHA-256. Another 123 overlapping
+Sentinel manifests differ only in `captured_at_unix`; payload SHA-256 and
+source metadata are unchanged. A further 61,799 records differ only by
+node-local change sequence. The complete key list and metadata are in the
+operator reconciliation report. All 309 AIMEM records remain visible on
+730xd. This is a functional baseline, not a claim that migration and balancing
+are finished. Severe technical debt remains: R5 only balances slot counts and
+is disabled for this heterogeneous layout; generic RESP `MIGRATE` still opens
+a cleartext connection and is rejected by QKP-only peers; and the live cluster
+reports its FTS projection unavailable. The owner inventory is a point-in-time
+snapshot, not a complete restore backup. Keep the nine original backups and
+merged union intact while the recent recovery and migration work is reviewed.
+
+After that inventory was captured, an explicitly requested Sentinel cleanup
+removed 100 Sentinel keys from 730xd and two from T420 before the bulk command
+stalled. No other records were changed; current live `DBSIZE` totals 271,368.
+The inventory and reconciliation counts above therefore describe the earlier
+captured state, not the live counts at publication.
 
 Step 1 checkpoint: the demonstrated 730xd-to-T320 alias ARP failure was
 repaired at the user's request using a persistent verified neighbour mapping.
-T320 subsequently reported the peer connected and cluster state OK. Ownership
-maps still disagree; data recovery and deployment remain in progress.
-See [network evidence and repair](../validation/cluster_membership_20261109.md).
+The later identical `CLUSTER SLOTS` views supersede the earlier ownership-map
+disagreement recorded during that checkpoint. See [network evidence and
+repair](../validation/cluster_membership_20261109.md).
 
 ## Decision
 
@@ -51,6 +70,12 @@ completion roadmap.
   all-peer convergence, preserved values/TTL, writes and donor restart. The
   test retries only the documented CT1 reconciliation `TRYAGAIN` during
   startup; it still requires every peer to converge before its deadline.
+- The owner-inventory comparison against the preserved backup union is
+  complete. The 34 owner-only keys are Sentinel v1 host-monitor artifact
+  manifests and their matching one-chunk payloads; all 17 payloads verify
+  against their manifest size and SHA-256. The 123 changed overlapping
+  records are manifests whose only changed JSON field is the capture time.
+  No union keys are absent from the current owners.
 - CT1 primary/successor roles belong to logical daemon processes, not physical
   hosts. The three-host placement can spread primary-owned ranges across all
   machines; the cluster has no machine-wide primary. `--replica-of` supplies
@@ -143,7 +168,7 @@ does not assign a permanent primary role to a physical host.
 | Network and membership | The 730xd-to-T320 neighbor repair is in place. Reconcile the live ownership maps and prove bus membership before cutover. |
 | Automatic balancing | Populated-owner R5 CT2 balancing is implemented and tested **by slot count**. It has no bytes/capacity weighting, so it must stay disabled for this uneven three-host layout until a capacity-aware policy is implemented and tested. Keep CT1 replica role mapping explicit in each process configuration; dynamic remote role discovery/reassignment remains open. |
 | Automatic failover | Still open: connect an authenticated quorum/authority decision to CT1 promotion, complete generation/listener recovery, and provision successor capacity after a host failure. |
-| Recovery and memory preservation | The authenticated bounded merge and transfer locality checks are tested. Refresh live inventories, preserve conflicts and scoped AIMEM state, and verify the restored union before reopening writes. |
+| Recovery and memory preservation | The authenticated bounded merge and transfer locality checks are tested. The current owner inventory is now compared record-by-record against the preserved union; retain the source backups and finish the remaining CT1 health checks. |
 
 The recovery helper must preserve distinct records, labels, SCI, tenant
 attribution and absolute expiry. Deduplicate only verified identical records.
