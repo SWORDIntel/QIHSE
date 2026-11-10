@@ -95,6 +95,8 @@ int main(void) {
     assert(qihse_cluster_key_is_node_local("t:7/aimem:abc"));
     assert(qihse_cluster_key_is_node_local("t:7/aimem-index-gen:p:3:pending"));
     assert(qihse_cluster_key_is_node_local("t:7/aimem-forget:42:receipt"));
+    assert(qihse_cluster_key_is_node_local("t:7/aimem-idem:42:request"));
+    assert(qihse_cluster_key_is_node_local("aimem-idem:42:request"));
     assert(!qihse_cluster_key_is_node_local("t:7/app:new"));
     assert(!qihse_cluster_key_is_node_local("t:no/aimem:abc"));
     assert(!qihse_cluster_key_is_node_local("sabot/tool:key"));
@@ -109,13 +111,14 @@ int main(void) {
     assert(qihse_cluster_topology_assign_range(topo,0,16383,peer));
     qihse_kv_clear_user(s,op);
     const char* families[]={"aimem:","aimemv:","aimem-knowledge:","aimem-grant:","aimem-forget:",
-        "aimem-index-state:","aimem-index-gen:","aimem-handoff:","aimem-maint:"};
+        "aimem-index-state:","aimem-index-gen:","aimem-handoff:","aimem-maint:","aimem-idem:"};
     for(size_t i=0;i<sizeof families/sizeof families[0];i++) {char key[128];
         snprintf(key,sizeof key,"t:7/%sprotected",families[i]);
         assert(qihse_kv_set_user(s,key,"protected",5,9,op));}
     assert(qihse_kv_set_user(s,"t:7/app:key","shardable",0,0,op));
+    assert(qihse_kv_set_user(s,"aimem-idem:legacy:request","local",0,0,op));
     assert(qihse_cluster_reclaim_foreign_slots(s,topo,local,op)==1);
-    assert(qihse_kv_count_user(s,op)==9);
+    assert(qihse_kv_count_user(s,op)==11);
     qihse_cluster_topology_destroy(topo);qihse_kv_store_destroy(s);
     aimem_fixture_cleanup(dir);
     puts("PASS authenticated bounded backup merge, conflict preservation, scoped AIMEM reclaim");

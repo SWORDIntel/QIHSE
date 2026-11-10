@@ -38,7 +38,7 @@ bool qihse_cluster_key_is_node_local(const char* key) {
         static const char* const families[] = {
             "aimem:", "aimemv:", "aimem-knowledge:", "aimem-grant:",
             "aimem-forget:", "aimem-index-state:", "aimem-handoff:",
-            "aimem-maint:", "aimem-index-gen:",
+            "aimem-maint:", "aimem-index-gen:", "aimem-idem:",
         };
         for (size_t i = 0; i < sizeof(families)/sizeof(families[0]); i++)
             if (!strncmp(scoped, families[i], strlen(families[i]))) return true;
@@ -47,6 +47,7 @@ bool qihse_cluster_key_is_node_local(const char* key) {
     static const char* const prefixes[] = {
         "aimem:",
         "aimemv:",
+        "aimem-idem:",
         "fabric:",
         "fednode:",
         "federation/node/",
