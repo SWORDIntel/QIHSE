@@ -25,6 +25,10 @@ static unsigned abort_calls;
 static bool resolver_available = true;
 static qihse_cluster_ownership_txn_t local_abort;
 static uint16_t local_node_index = 1;
+static uint16_t common_owner[16384], cached_owner[16384];
+static uint64_t common_epoch[16384], cached_epoch[16384];
+static bool bad_common_pin;
+static unsigned adopted;
 static const char source_generation[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 bool qihse_consensus_mesh_range_genesis_user(qihse_consensus_mesh_t* mesh,
@@ -41,10 +45,12 @@ bool qihse_consensus_mesh_range_state_user(qihse_consensus_mesh_t* mesh,
     state_calls++;
     for (unsigned s = 0; s < 16384; ++s) if (bitmap[s / 8] & (1u << (s % 8))) {
         slots[s].slot = (uint16_t)s;
-        strcpy(slots[s].owner_topology_id, "node-a");
-        strcpy(slots[s].owner_qkp_id, "qkp-a");
+        uint16_t owner = common_owner[s] ? common_owner[s] : 1;
+        strcpy(slots[s].owner_topology_id, owner == 1 ? "node-a" : owner == 2 ? "node-b" : "node-c");
+        strcpy(slots[s].owner_qkp_id, owner == 1 ? "qkp-a" : owner == 2 ? "qkp-b" : "qkp-c");
+        if (bad_common_pin && s == 11) strcpy(slots[s].owner_qkp_id, "untrusted-pin");
         memset(slots[s].group_id, '1', 64);
-        slots[s].epoch = 100;
+        slots[s].epoch = common_epoch[s] ? common_epoch[s] : 100;
     }
     memset(digest, 2, 32); *index = 1; return true;
 }
@@ -112,8 +118,33 @@ bool qihse_cluster_ownership_transfer_get_aborted(qihse_cluster_ownership_contex
 bool qihse_cluster_topology_find_node(const qihse_cluster_topology_t* topology,
     const char* id, uint16_t* out) {
     assert(topology);
-    if (strcmp(id, "node-a")) return false;
-    *out = 1; return true;
+    if (!strcmp(id, "node-a")) *out = 1;
+    else if (!strcmp(id, "node-b")) *out = 2;
+    else if (!strcmp(id, "node-c")) *out = 3;
+    else return false;
+    return true;
+}
+bool qihse_cluster_topology_get_slot(const qihse_cluster_topology_t* t, uint16_t slot,
+    uint16_t* owner, qihse_cluster_slot_state_t* state, uint16_t* peer) {
+    assert(t && slot < 16384);
+    if (owner) *owner = cached_owner[slot];
+    if (state) *state = QIHSE_CLUSTER_SLOT_STABLE;
+    if (peer) *peer = QIHSE_CLUSTER_NODE_NONE;
+    return true;
+}
+bool qihse_cluster_topology_get_slot_epoch(const qihse_cluster_topology_t* t,
+    uint16_t slot, uint64_t* epoch) {
+    assert(t && slot < 16384 && epoch); *epoch = cached_epoch[slot]; return true;
+}
+bool qihse_cluster_topology_adopt_range(qihse_cluster_topology_t* t,
+    uint16_t first, uint16_t last, uint16_t owner, uint64_t epoch) {
+    assert(t && first <= last && last < 16384); adopted++;
+    for (unsigned s = first; s <= last; ++s) {
+        if (cached_epoch[s] == epoch && cached_owner[s] != owner) return false;
+        if (cached_epoch[s] >= epoch) continue;
+        cached_epoch[s] = epoch; cached_owner[s] = owner;
+    }
+    return true;
 }
 uint16_t qihse_cluster_topology_local_node(const qihse_cluster_topology_t* topology) {
     assert(topology); return local_node_index;
@@ -336,6 +367,31 @@ int main(void) {
     assert(!qihse_cluster_range_authority_verify_claim(&verifier, &claim, true));
     transaction.slot_bitmap[1] |= 8;
     assert(!qihse_cluster_range_authority_check_reserved(&a, op, &transaction, NULL, 0));
+    uint8_t selected[2048] = {0}; selected[1] = 0x1c;
+    for (unsigned s = 10; s <= 12; ++s) {
+        common_owner[s] = 2; common_epoch[s] = 102;
+        cached_owner[s] = 1; cached_epoch[s] = 100;
+    }
+    /* An intervening CT2 transition can change one slot independently of
+     * promotion ancestry. Routing comes from the actual committed map. */
+    common_owner[11] = 3; common_epoch[11] = 103;
+    unsigned queried = state_calls;
+    assert(!qihse_cluster_range_authority_refresh(&a, low, selected, NULL, 0));
+    assert(!qihse_cluster_range_authority_refresh(&a, NULL, selected, NULL, 0));
+    assert(state_calls == queried && !adopted);
+    bad_common_pin = true;
+    assert(!qihse_cluster_range_authority_refresh(&a, op, selected, NULL, 0));
+    assert(!adopted && cached_owner[10] == 1); /* validate whole map before adoption */
+    bad_common_pin = false;
+    assert(qihse_cluster_range_authority_refresh(&a, op, selected, NULL, 0));
+    assert(cached_owner[10] == 2 && cached_owner[11] == 3 && cached_owner[12] == 2);
+    assert(cached_epoch[11] == 103);
+    common_owner[11] = 2; common_epoch[11] = 101;
+    assert(qihse_cluster_range_authority_refresh(&a, op, selected, NULL, 0));
+    assert(cached_owner[11] == 3 && cached_epoch[11] == 103); /* no rollback */
+    common_owner[11] = 2; common_epoch[11] = 103;
+    assert(!qihse_cluster_range_authority_refresh(&a, op, selected, NULL, 0));
+    assert(cached_owner[11] == 3); /* equal-epoch conflicting authority diagnosed */
     puts("PASS range authority adapter: scoped claims, immutable retry, typed activation and durable promotion binding");
     return 0;
 }

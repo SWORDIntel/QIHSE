@@ -114,6 +114,58 @@ bool qihse_cluster_range_authority_initialize(
     return true;
 }
 
+bool qihse_cluster_range_authority_refresh(void* opaque,
+    qihse_user_t* principal,
+    const uint8_t bitmap[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES],
+    char* error, size_t cap) {
+    qihse_cluster_range_authority_t* a = opaque;
+    if (!a || !a->mesh || !a->local_ownership || !bitmap ||
+        !operator_active(principal) || !a->local_ownership->topology ||
+        !a->local_ownership->peer_id)
+        return fail(error, cap, "active system Operator and common routing context are required");
+    bool any = false;
+    for (size_t i = 0; i < QIHSE_CONSENSUS_RANGE_BITMAP_BYTES; ++i) any |= bitmap[i] != 0;
+    if (!any) return fail(error, cap, "routing refresh needs an explicit nonempty slot set");
+    qihse_consensus_range_slot_t* state = calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*state));
+    uint16_t* owners = calloc(QIHSE_CONSENSUS_RANGE_SLOT_COUNT, sizeof(*owners));
+    uint8_t digest[32]; uint64_t index = 0;
+    qihse_cluster_ownership_context_t* local = a->local_ownership;
+    bool ok = state && owners && qihse_consensus_mesh_range_state_user(a->mesh,
+        principal, bitmap, budget(a), state, digest, &index) && index != 0;
+    /* Validate the complete response and pin mapping before any mutation.
+     * Authority cannot be supplied as a caller-built slot map. */
+    for (uint32_t s = 0; ok && s < QIHSE_CONSENSUS_RANGE_SLOT_COUNT; ++s) {
+        if (!(bitmap[s / 8u] & (1u << (s % 8u)))) continue;
+        char qkp[65] = {0}; uint64_t old_epoch = 0;
+        uint16_t old_owner = QIHSE_CLUSTER_NODE_NONE;
+        ok = state[s].slot == s && state[s].epoch &&
+            text_valid(state[s].owner_topology_id, sizeof(state[s].owner_topology_id)) &&
+            text_valid(state[s].owner_qkp_id, sizeof(state[s].owner_qkp_id)) &&
+            hex_valid(state[s].group_id, 64) &&
+            qihse_cluster_topology_find_node(local->topology,
+                state[s].owner_topology_id, &owners[s]) &&
+            local->peer_id(local->peer_id_context, state[s].owner_topology_id, qkp) &&
+            text_valid(qkp, sizeof(qkp)) && !strcmp(qkp, state[s].owner_qkp_id) &&
+            qihse_cluster_topology_get_slot(local->topology, (uint16_t)s,
+                &old_owner, NULL, NULL) &&
+            qihse_cluster_topology_get_slot_epoch(local->topology, (uint16_t)s, &old_epoch) &&
+            (old_epoch != state[s].epoch || old_owner == owners[s]);
+    }
+    for (uint32_t s = 0; ok && s < QIHSE_CONSENSUS_RANGE_SLOT_COUNT;) {
+        if (!(bitmap[s / 8u] & (1u << (s % 8u)))) { ++s; continue; }
+        uint32_t first = s;
+        uint16_t owner = owners[s]; uint64_t epoch = state[s].epoch;
+        while (++s < QIHSE_CONSENSUS_RANGE_SLOT_COUNT &&
+            (bitmap[s / 8u] & (1u << (s % 8u))) && owners[s] == owner && state[s].epoch == epoch) {}
+        ok = operator_active(principal) && qihse_cluster_topology_adopt_range(
+            local->topology, (uint16_t)first, (uint16_t)(s - 1u), owner, epoch);
+    }
+    free(owners); free(state);
+    if (!ok) return fail(error, cap, "committed routing map or trusted pin/epoch reconciliation is unavailable");
+    if (error && cap) error[0] = 0;
+    return true;
+}
+
 bool qihse_cluster_range_authority_reserve(void* opaque,
     qihse_user_t* principal, qihse_cluster_ownership_txn_t* t,
     char* error, size_t cap) {

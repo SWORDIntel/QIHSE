@@ -113,6 +113,14 @@ The client verifies signatures and common FINAL decisions, filters other
 attempts, checks the complete selected chain, then journals/applies links in
 order. Network recovery runs on the proof worker outside the bus mutex.
 
+Routing is reconciled from the authenticated committed mesh owner map after
+common initialization and when decisions advance. This also repairs mixed
+histories where CT2 changes a group's bitmap between promotions; promotion
+certificates alone cannot describe that intervening transfer. Refresh checks
+the entire selected map against trusted QKP identities before adoption and
+preserves newer local epochs. It does not admit KV data or change group roles.
+Historical journals/certificates cannot overwrite a newer committed map.
+
 `REPL.CT1 CERTPAGE <lane> <after-sha256> <capacity>` returns one RESP bulk of
 existing KV page records: BE32 length, SHA-256 digest, exact envelope. An
 authenticated pinned observer can fetch authority metadata even if it is not
