@@ -26,6 +26,10 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 
 static qihse_kv_store_t* g_store;
@@ -79,7 +83,7 @@ static void fixture_up(fixture_t* f, bool require_signed, const char* tag) {
     snprintf(f->peer.hostname, sizeof(f->peer.hostname), "signed-peer");
     snprintf(f->peer.boot_id, sizeof(f->peer.boot_id), "signed-boot");
     f->peer.identity_kind = QIHSE_IDENTITY_HOST_AGENT;
-    assert(qihse_federation_node_keygen_alg(dir, QIHSE_SIG_ML_DSA_65,
+    assert(qihse_federation_node_keygen_alg(dir, QIHSE_SIG_ML_DSA_87,
                                             &f->peer));
     assert(qihse_federation_node_enroll_request(g_store, g_op, &f->peer));
     assert(qihse_federation_node_enroll_approve(g_store, g_op,
@@ -175,7 +179,7 @@ static size_t append_trailer(uint8_t* out, size_t cap, const uint8_t* frame,
 }
 
 static void test_signed_roundtrip(fixture_t* f) {
-    uint8_t frame[512], dgram[4096];
+    uint8_t frame[512], dgram[QIHSE_CLUSTER_BUS_MAX_DATAGRAM];
     qihse_cluster_node_t local_node, remote_node;
     assert(qihse_cluster_topology_get_node(f->topology, 0u, &local_node));
     assert(qihse_cluster_topology_get_node(f->topology, 1u, &remote_node));
@@ -201,13 +205,6 @@ static void test_signed_roundtrip(fixture_t* f) {
                                    local_node.id, local_node.config_epoch);
     size_t dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
                                  f->peer_pkey, &f->peer);
-    fprintf(stderr,
-            "[tdbg] dlen=%zu trailer@64: alg=%02x lo=%02x hi=%02x "
-            "uuid=%02x%02x%02x%02x (expect %02x%02x%02x%02x)\n",
-            dlen, dgram[64], dgram[65], dgram[66], dgram[67], dgram[68],
-            dgram[69], dgram[70], f->peer.node_id.bytes[0],
-            f->peer.node_id.bytes[1], f->peer.node_id.bytes[2],
-            f->peer.node_id.bytes[3]);
     assert(qihse_cluster_bus_inject(f->bus, dgram, dlen, "127.0.0.1", 17001));
     qihse_cluster_bus_stats_t st;
     qihse_cluster_bus_stats(f->bus, &st);
@@ -249,7 +246,7 @@ static void test_signed_roundtrip(fixture_t* f) {
 }
 
 static void test_tampered_dropped(fixture_t* f) {
-    uint8_t frame[512], dgram[4096];
+    uint8_t frame[512], dgram[QIHSE_CLUSTER_BUS_MAX_DATAGRAM];
     size_t flen = build_slot_frame(frame, sizeof(frame), 200u, 299u, NULL, 0u);
     size_t dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
                                  f->peer_pkey, &f->peer);
@@ -263,7 +260,7 @@ static void test_tampered_dropped(fixture_t* f) {
 }
 
 static void test_unenrolled_signer_dropped(fixture_t* f) {
-    uint8_t frame[512], dgram[4096];
+    uint8_t frame[512], dgram[QIHSE_CLUSTER_BUS_MAX_DATAGRAM];
     size_t flen = build_slot_frame(frame, sizeof(frame), 300u, 399u, NULL, 0u);
     size_t dlen = append_trailer(dgram, sizeof(dgram), frame, flen,
                                  f->stranger_pkey, &f->stranger);
@@ -308,6 +305,90 @@ static void test_require_signed_ops(void) {
            "liveness unaffected\n");
 }
 
+static uint16_t reserve_udp_port(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    assert(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    socklen_t len = sizeof(addr);
+    assert(getsockname(fd, (struct sockaddr*)&addr, &len) == 0);
+    uint16_t port = ntohs(addr.sin_port);
+    close(fd);
+    return port;
+}
+
+static void test_real_sender_wire_and_max_payload(void) {
+    fixture_t f;
+    fixture_up(&f, true, "producer");
+
+    /* Recreate the receiver with a known loopback port and a pinned signer.
+     * Sending through send_frame exercises production BE header encoding,
+     * signature selection, trailer sizing, UDP emission and receive verify. */
+    qihse_cluster_bus_destroy(f.bus);
+    f.bus = NULL;
+    qihse_cluster_bus_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.topology = f.topology;
+    cfg.local_node_index = 0;
+    cfg.bus_port = reserve_udp_port();
+    cfg.bind_address = "127.0.0.1";
+    cfg.federation_store = g_store;
+    cfg.federation_user = g_op;
+    cfg.require_signed_ops = true;
+    cfg.local_node_uuid = &f.peer.node_id;
+    cfg.federation_sign_key = f.peer_pkey;
+    f.bus = qihse_cluster_bus_create(&cfg);
+    assert(f.bus && qihse_cluster_bus_start(f.bus));
+
+    uint8_t payload[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];
+    memset(payload, 0x5a, sizeof(payload));
+    uint8_t max_sig[4627];
+    size_t max_sig_len = sizeof(max_sig);
+    assert(qihse_federation_sign(f.peer_pkey, payload, 1u, max_sig,
+                                 &max_sig_len));
+    assert(max_sig_len == sizeof(max_sig));
+    assert(QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX == 25u + 4627u);
+    assert(QIHSE_CLUSTER_BUS_MAX_DATAGRAM ==
+           QIHSE_CLUSTER_BUS_HEADER_SIZE + QIHSE_CLUSTER_BUS_MAX_PAYLOAD +
+               25u + 4627u);
+    assert(qihse_cluster_bus_send_frame(f.bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+                                       payload, sizeof(payload), "127.0.0.1",
+                                       cfg.bus_port));
+
+    qihse_cluster_bus_stats_t st;
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+    bool received = false;
+    for (unsigned i = 0; i < 2000u; ++i) {
+        qihse_cluster_bus_stats(f.bus, &st);
+        if (st.signed_ops_accepted == 1u) { received = true; break; }
+        nanosleep(&pause, NULL);
+    }
+    assert(received);
+    assert(st.signed_ops_rejected == 0u);
+    assert(st.unsigned_ops_refused == 0u);
+
+    /* Unsigned liveness is intentionally still accepted on this hardened
+     * receiver; signing the operational class must not gate PONG. */
+    uint8_t pong[40] = {0};
+    assert(qihse_cluster_bus_send_frame(f.bus, QIHSE_BUS_MSG_PONG, pong,
+                                       sizeof(pong), "127.0.0.1", cfg.bus_port));
+    received = false;
+    for (unsigned i = 0; i < 2000u; ++i) {
+        qihse_cluster_bus_stats(f.bus, &st);
+        if (st.received >= 2u) { received = true; break; }
+        nanosleep(&pause, NULL);
+    }
+    assert(received);
+    assert(st.signed_ops_accepted == 1u);
+    assert(st.unsigned_ops_refused == 0u);
+    fixture_down(&f);
+    printf("PASS (s5) production sender emits pinned signature trailer at max payload; unsigned PONG remains live\n");
+}
+
 int main(void) {
     fixture_t f;
     fixture_up(&f, false, "a");
@@ -316,6 +397,7 @@ int main(void) {
     test_unenrolled_signer_dropped(&f);
     fixture_down(&f);
     test_require_signed_ops();
+    test_real_sender_wire_and_max_payload();
 
     qihse_kv_store_destroy(g_store);
     printf("bus signed-ops tests passed\n");

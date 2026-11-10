@@ -74,7 +74,7 @@ extern "C" {
  * with signed_ops_rejected.  cfg.require_signed_ops additionally refuses
  * unsigned signed-class frames (hardened clusters).  Loopback/legacy
  * senders without signing keys keep working while the flag is unset. */
-#define QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX (4u + 16u + 4627u)
+#define QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX (25u + 4627u)
 #define QIHSE_CLUSTER_BUS_MAX_DATAGRAM \
     (QIHSE_CLUSTER_BUS_HEADER_SIZE + QIHSE_CLUSTER_BUS_MAX_PAYLOAD + \
      QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX)

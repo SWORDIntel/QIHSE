@@ -538,11 +538,15 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
     /* Signed ops class: append an ML-DSA trailer over header+payload when
      * this node has a signing identity.  Bootstrap/liveness/discovery
      * frames never sign (pre-enrollment, no authority). */
-    if (bus->federation_sign_key && bus->has_local_node_uuid && len >= 8u &&
-        qihse_bus_msg_signed_class(
-            (uint32_t)(data[4] | ((uint32_t)data[5] << 8) |
-                       ((uint32_t)data[6] << 16) |
-                       ((uint32_t)data[7] << 24)))) {
+    uint32_t frame_magic = 0, frame_type = 0, frame_sender = 0, frame_payload_len = 0;
+    const bool parsed_frame = qihse_bus_parse_header(data, len, &frame_magic,
+        &frame_type, &frame_sender, &frame_payload_len) &&
+        (size_t)frame_payload_len == len - QIHSE_CLUSTER_BUS_HEADER_SIZE;
+    (void)frame_magic;
+    (void)frame_sender;
+    const bool should_sign = bus->federation_sign_key && bus->has_local_node_uuid &&
+        parsed_frame && qihse_bus_msg_signed_class(frame_type);
+    if (should_sign) {
         size_t signed_buf_cap = QIHSE_CLUSTER_BUS_HEADER_SIZE +
                                 QIHSE_CLUSTER_BUS_MAX_PAYLOAD +
                                 QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX;
@@ -550,9 +554,10 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
         if (!signed_buf) return false;
         uint8_t sig[4627];
         size_t sig_len = sizeof(sig);
-        if (qihse_federation_sign(bus->federation_sign_key, data, len, sig,
-                                  &sig_len) &&
-            len + 4u + 16u + sig_len <= signed_buf_cap) {
+        bool sign_ok = qihse_federation_sign(bus->federation_sign_key, data, len, sig,
+                                  &sig_len);
+        if (sign_ok && sig_len > 0u && sig_len <= sizeof(sig) &&
+            len <= signed_buf_cap - (25u + sig_len)) {
             uint8_t* t = signed_buf;
             memcpy(t, data, len);
             t += len;
@@ -562,6 +567,7 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
             memcpy(t, bus->local_node_uuid.bytes, 16u);
             t += 16u;
             memcpy(t, sig, sig_len);
+            t += sig_len;
             /* Footer mirrors alg+len so a reader can locate everything from
              * the end of the datagram alone. */
             *t++ = 1;
@@ -569,7 +575,7 @@ static bool qihse_bus_send_datagram(qihse_cluster_bus_t* bus,
             *t++ = (uint8_t)(sig_len >> 8);
             *t++ = 'Q'; *t++ = 'B'; *t++ = 'S'; /* end tag */
             wire = signed_buf;
-            wire_len = len + 4u + 2u + 16u + sig_len + 6u;
+            wire_len = len + 25u + sig_len;
         } else {
             free(signed_buf);
             signed_buf = NULL;
@@ -1201,7 +1207,7 @@ static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
 
 static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
                                        const uint8_t* data, size_t len) {
-    uint8_t plain[QIHSE_BUS_MAX_DATAGRAM];
+    uint8_t plain[QIHSE_CLUSTER_BUS_MAX_DATAGRAM];
     qihse_uuid_t signer_uuid;
     memset(&signer_uuid, 0, sizeof(signer_uuid));
     bool signature_verified = false;
@@ -2316,7 +2322,7 @@ size_t qihse_cluster_bus_poll(qihse_cluster_bus_t* bus) {
     if (!bus || bus->sock_fd < 0) return 0;
     size_t processed = 0;
     /* Sized for a fully veiled maximum frame: [nonce][pad_len][64B pad][frame]. */
-    uint8_t buffer[QIHSE_BUS_MAX_DATAGRAM + QIHSE_BUS_VEIL_OVERHEAD];
+    uint8_t buffer[QIHSE_CLUSTER_BUS_MAX_DATAGRAM + QIHSE_BUS_VEIL_OVERHEAD];
     for (int i = 0; i < 64; i++) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
