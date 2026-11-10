@@ -73,6 +73,45 @@ static void copy_snapshot(qihse_kv_replica_snapshot_t *snapshot,
     assert(fclose(out) == 0);
 }
 
+static qihse_kv_store_t *open_authorized_snapshot(qihse_kv_store_t *store,
+                                                  qihse_user_t *principal) {
+    qihse_kv_replica_snapshot_t *snapshot = NULL;
+    assert(qihse_kv_replica_snapshot_create(store, principal, "*", &snapshot) == 0);
+    assert(snapshot);
+    FILE *file = tmpfile();
+    assert(file);
+    uint64_t size = 0u;
+    assert(qihse_kv_replica_snapshot_size(snapshot, principal, &size));
+    unsigned char buffer[8192];
+    uint64_t offset = 0u;
+    while (offset < size) {
+        size_t count = 0u;
+        assert(qihse_kv_replica_snapshot_read(snapshot, principal, offset,
+                                               buffer, sizeof(buffer), &count));
+        assert(count > 0u && fwrite(buffer, 1u, count, file) == count);
+        offset += count;
+    }
+    qihse_kv_replica_snapshot_destroy(snapshot);
+    assert(fflush(file) == 0);
+    rewind(file);
+    qihse_kv_store_t *detached = qihse_kv_open_snapshot_user(
+        file, principal, 64u << 20u, 200000u);
+    fclose(file);
+    assert(detached);
+    return detached;
+}
+
+static void assert_snapshot_value(qihse_kv_store_t *snapshot,
+                                  qihse_user_t *principal,
+                                  const char *key, const char *expected) {
+    char *value = NULL;
+    assert(qihse_kv_snapshot_get_record_user(snapshot, key, principal,
+                                              &value, NULL));
+    if (expected) assert(value && strcmp(value, expected) == 0);
+    else assert(value == NULL);
+    free(value);
+}
+
 static qihse_user_t *make_operator(void) {
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("CtBaseOperator1!"));
@@ -228,10 +267,17 @@ static int target_process(const char *data_dir, const char *image_path,
     assert(qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
         operator_user, TARGET_LANE, selected_slots, image_path,
         (uint64_t)row_seq_text, 0u, digest, target_token));
-    /* Receiver-owned slots are intentionally unreadable until promotion. The
-     * installer itself verifies the imported range's semantic digest. */
-    assert_value(store, operator_user, retained_key, "keep-this-slot");
-    assert_value(store, operator_user, other_key, "keep-other-lane");
+    /* Inspect via an authenticated detached snapshot; live receiver reads
+     * remain fenced until promotion. */
+    qihse_kv_store_t *detached = open_authorized_snapshot(store, operator_user);
+    assert_snapshot_value(detached, operator_user, source_key,
+                          "classified-baseline");
+    assert_snapshot_value(detached, operator_user, stale_key, NULL);
+    assert_snapshot_value(detached, operator_user, retained_key,
+                          "keep-this-slot");
+    assert_snapshot_value(detached, operator_user, other_key,
+                          "keep-other-lane");
+    qihse_kv_store_destroy(detached);
 
     qihse_kv_ct_lane_status_t status = {0};
     assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
@@ -263,14 +309,27 @@ static int target_process(const char *data_dir, const char *image_path,
             &mode, &frame_bytes) == 0);
         assert(fclose(delta) == 0);
         qihse_ct_codec_clear(&group);
-        /* Receiver data remains fenced from ordinary reads until promotion. */
+        detached = open_authorized_snapshot(store, operator_user);
+        assert_snapshot_value(detached, operator_user, source_key,
+                              "updated-after-baseline");
+        assert_snapshot_value(detached, operator_user, stale_key,
+                              "recreated-after-baseline");
+        qihse_kv_store_destroy(detached);
     }
 
     qihse_kv_store_destroy(store);
     store = qihse_kv_store_create_user(operator_user);
     assert(store);
-    assert_value(store, operator_user, retained_key, "keep-this-slot");
-    assert_value(store, operator_user, other_key, "keep-other-lane");
+    detached = open_authorized_snapshot(store, operator_user);
+    assert_snapshot_value(detached, operator_user, source_key, partial
+        ? "classified-baseline" : "updated-after-baseline");
+    assert_snapshot_value(detached, operator_user, stale_key,
+        partial ? NULL : "recreated-after-baseline");
+    assert_snapshot_value(detached, operator_user, retained_key,
+                          "keep-this-slot");
+    assert_snapshot_value(detached, operator_user, other_key,
+                          "keep-other-lane");
+    qihse_kv_store_destroy(detached);
     assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
     assert(status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
            status.durable_position == (partial ? 0u : 1u) &&
