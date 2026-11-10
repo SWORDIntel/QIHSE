@@ -55,10 +55,24 @@ static void boundaries(void) {
     lookup(g, "f", "n", "a", 0);
     qihse_graph_destroy(g);
 }
+static void update_index(void) {
+    qihse_graph_t *g = qihse_graph_create(); assert(g);
+    uint64_t id = add(g, "Function", "status", "queued");
+    const char *key = "status";
+    graph_prop_t changed = graph_prop_make_string("running");
+    assert(qihse_graph_vertex_update(g, id, &key, &changed, 1));
+    lookup(g, "Function", "status", "queued", 0);
+    lookup(g, "Function", "status", "running", id);
+    assert(qihse_graph_vertex_update(g, id, &key, &changed, 1));
+    lookup(g, "Function", "status", "running", id);
+    graph_prop_free(&changed);
+    qihse_graph_destroy(g);
+}
 int main(int argc, char **argv) {
     size_t count = argc > 1 ? strtoul(argv[1], NULL, 10) : 4000;
     assert(count > 0 && count <= 1000000);
     boundaries();
+    update_index();
     qihse_graph_t *g = qihse_graph_create(); assert(g);
     const char *label = "Function", *keys[] = {"name", "file"};
     char name[96], file[96];

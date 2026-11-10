@@ -151,6 +151,20 @@ size_t qihse_graph_vertex_count(qihse_graph_t* g);
 size_t qihse_graph_edge_count(qihse_graph_t* g);
 size_t qihse_graph_all_vertex_ids(qihse_graph_t* g, uint64_t* out, size_t max_out);
 
+/* Graph-scoped external ID map used by bulk ingesters. All operations are
+ * synchronized with the graph handle and mappings are released on destroy. */
+bool qihse_graph_external_id_register(qihse_graph_t* g, const char* external_id,
+                                      uint64_t internal_id);
+uint64_t qihse_graph_external_id_lookup(qihse_graph_t* g, const char* external_id);
+void qihse_graph_external_id_clear(qihse_graph_t* g);
+
+/* Allocates and returns every matching neighbor. Caller frees *out. Returns
+ * zero and sets *out=NULL for an empty result or allocation failure. */
+size_t qihse_graph_get_neighbors_all(qihse_graph_t* g, uint64_t vertex_id,
+                                     graph_dir_t direction,
+                                     const char* edge_type_filter,
+                                     graph_adj_t** out);
+
 #ifdef __cplusplus
 }
 #endif

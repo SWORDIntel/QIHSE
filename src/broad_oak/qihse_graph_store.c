@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* ---- internal hash map: string key -> dynamic uint64_t id set ---- */
 
@@ -146,6 +147,11 @@ typedef struct {
     size_t count;
 } prop_map_t;
 
+typedef struct {
+    char *key;
+    uint64_t id;
+} external_id_entry_t;
+
 static void pmap_init(prop_map_t* m, size_t nb) {
     m->num_buckets = nb ? nb : 256;
     m->buckets = calloc(m->num_buckets, sizeof(prop_entry_t));
@@ -207,6 +213,8 @@ static void pmap_add(prop_map_t* m, const char* label, const char* prop,
     } else {
         free(ck);
     }
+    for (size_t i = 0; i < b->count; ++i)
+        if (b->ids[i] == id) return;
     if (b->count == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 8;
         b->ids = realloc(b->ids, b->cap * sizeof(uint64_t));
@@ -259,6 +267,10 @@ struct qihse_graph_s {
     str_id_map_t outgoing_edges;
     str_id_map_t incoming_edges;
     prop_map_t prop_index;
+    /* External import IDs belong to this graph handle. Protected by lock. */
+    external_id_entry_t *external_ids;
+    size_t external_id_count;
+    size_t external_id_cap;
 
     qihse_arena_t* arena; /* scratch arena for returned transient objects */
 };
@@ -402,6 +414,8 @@ void qihse_graph_destroy(qihse_graph_t* g) {
     simap_destroy(&g->outgoing_edges);
     simap_destroy(&g->incoming_edges);
     pmap_destroy(&g->prop_index);
+    for (size_t i = 0; i < g->external_id_count; ++i) free(g->external_ids[i].key);
+    free(g->external_ids);
     if (g->arena) qihse_arena_destroy(g->arena);
     pthread_rwlock_destroy(&g->lock);
     free(g);
@@ -487,6 +501,12 @@ bool qihse_graph_vertex_update(qihse_graph_t* g, uint64_t vertex_id,
             v->prop_vals[j] = graph_prop_dup(&prop_vals[i]);
             v->num_props++;
         } else {
+            char old_value[128];
+            prop_to_str(&v->prop_vals[j], old_value, sizeof(old_value));
+            if (v->num_labels == 0)
+                pmap_remove_id(&g->prop_index, "", v->prop_keys[j], old_value, vertex_id);
+            else for (size_t l = 0; l < v->num_labels; ++l)
+                pmap_remove_id(&g->prop_index, v->labels[l], v->prop_keys[j], old_value, vertex_id);
             graph_prop_free(&v->prop_vals[j]);
             v->prop_vals[j] = graph_prop_dup(&prop_vals[i]);
         }
@@ -728,16 +748,11 @@ bool qihse_graph_edge_delete(qihse_graph_t* g, uint64_t edge_id) {
 
 /* ---- adjacency / lookups ---- */
 
-size_t qihse_graph_get_neighbors(qihse_graph_t* g, uint64_t vertex_id,
-                                 graph_dir_t direction,
-                                 const char* edge_type_filter,
-                                 graph_adj_t* out, size_t max_out) {
-    if (!g || !out || max_out == 0) return 0;
-    pthread_rwlock_rdlock(&g->lock);
-    if (vertex_id >= g->v_cap || !g->vertices[vertex_id]) {
-        pthread_rwlock_unlock(&g->lock);
-        return 0;
-    }
+static size_t copy_neighbors_locked(qihse_graph_t* g, uint64_t vertex_id,
+                                    graph_dir_t direction,
+                                    const char* edge_type_filter,
+                                    graph_adj_t* out, size_t max_out) {
+    if (vertex_id >= g->v_cap || !g->vertices[vertex_id]) return 0;
     char key[32];
     vertex_key(vertex_id, key);
     id_set_t* out_set = simap_get(&g->outgoing_edges, key);
@@ -782,7 +797,64 @@ size_t qihse_graph_get_neighbors(qihse_graph_t* g, uint64_t vertex_id,
                             edge->end_vertex_id : edge->start_vertex_id;
         snprintf(slot->edge_type, sizeof(slot->edge_type), "%s", edge->type);
     }
+    return count;
+}
+
+size_t qihse_graph_get_neighbors(qihse_graph_t* g, uint64_t vertex_id,
+                                 graph_dir_t direction,
+                                 const char* edge_type_filter,
+                                 graph_adj_t* out, size_t max_out) {
+    if (!g || !out || max_out == 0) return 0;
+    pthread_rwlock_rdlock(&g->lock);
+    size_t count = copy_neighbors_locked(g, vertex_id, direction,
+                                         edge_type_filter, out, max_out);
     pthread_rwlock_unlock(&g->lock);
+    return count;
+}
+
+size_t qihse_graph_get_neighbors_all(qihse_graph_t* g, uint64_t vertex_id,
+                                     graph_dir_t direction,
+                                     const char* edge_type_filter,
+                                     graph_adj_t** out) {
+    if (!out) { errno = EINVAL; return 0; }
+    *out = NULL;
+    errno = 0;
+    if (!g || (direction != GRAPH_DIR_OUTGOING && direction != GRAPH_DIR_INCOMING &&
+               direction != GRAPH_DIR_BOTH)) { errno = EINVAL; return 0; }
+    pthread_rwlock_rdlock(&g->lock);
+    if (vertex_id >= g->v_cap || !g->vertices[vertex_id]) {
+        pthread_rwlock_unlock(&g->lock);
+        return 0;
+    }
+    char key[32];
+    vertex_key(vertex_id, key);
+    id_set_t* outgoing = simap_get(&g->outgoing_edges, key);
+    id_set_t* incoming = simap_get(&g->incoming_edges, key);
+    size_t capacity = 0;
+    if (direction != GRAPH_DIR_INCOMING && outgoing) capacity = outgoing->count;
+    if (direction != GRAPH_DIR_OUTGOING && incoming) {
+        if (incoming->count > SIZE_MAX - capacity) {
+            pthread_rwlock_unlock(&g->lock);
+            errno = EOVERFLOW;
+            return 0;
+        }
+        capacity += incoming->count;
+    }
+    if (capacity > SIZE_MAX / sizeof(graph_adj_t)) {
+        pthread_rwlock_unlock(&g->lock);
+        errno = EOVERFLOW;
+        return 0;
+    }
+    graph_adj_t* result = capacity ? malloc(capacity * sizeof(*result)) : NULL;
+    if (capacity && !result) {
+        pthread_rwlock_unlock(&g->lock);
+        errno = ENOMEM;
+        return 0;
+    }
+    size_t count = copy_neighbors_locked(g, vertex_id, direction,
+                                         edge_type_filter, result, capacity);
+    pthread_rwlock_unlock(&g->lock);
+    *out = result;
     return count;
 }
 
@@ -861,4 +933,58 @@ size_t qihse_graph_all_vertex_ids(qihse_graph_t* g, uint64_t* out, size_t max_ou
         if (g->vertices[i]) out[n++] = g->vertices[i]->id;
     pthread_rwlock_unlock(&g->lock);
     return n;
+}
+
+bool qihse_graph_external_id_register(qihse_graph_t* g, const char* external_id,
+                                      uint64_t internal_id) {
+    if (!g || !external_id || !*external_id || !internal_id) return false;
+    pthread_rwlock_wrlock(&g->lock);
+    for (size_t i = 0; i < g->external_id_count; ++i) {
+        if (!strcmp(g->external_ids[i].key, external_id)) {
+            g->external_ids[i].id = internal_id;
+            pthread_rwlock_unlock(&g->lock);
+            return true;
+        }
+    }
+    if (g->external_id_count == g->external_id_cap) {
+        size_t cap = g->external_id_cap ? g->external_id_cap * 2 : 64;
+        if (cap < g->external_id_cap || cap > SIZE_MAX / sizeof(*g->external_ids)) {
+            pthread_rwlock_unlock(&g->lock);
+            return false;
+        }
+        external_id_entry_t *next = realloc(g->external_ids, cap * sizeof(*next));
+        if (!next) { pthread_rwlock_unlock(&g->lock); return false; }
+        g->external_ids = next;
+        g->external_id_cap = cap;
+    }
+    char *copy = strdup(external_id);
+    if (!copy) { pthread_rwlock_unlock(&g->lock); return false; }
+    g->external_ids[g->external_id_count++] = (external_id_entry_t){copy, internal_id};
+    pthread_rwlock_unlock(&g->lock);
+    return true;
+}
+
+uint64_t qihse_graph_external_id_lookup(qihse_graph_t* g, const char* external_id) {
+    if (!g || !external_id) return 0;
+    pthread_rwlock_rdlock(&g->lock);
+    uint64_t id = 0;
+    for (size_t i = 0; i < g->external_id_count; ++i) {
+        if (!strcmp(g->external_ids[i].key, external_id)) {
+            id = g->external_ids[i].id;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&g->lock);
+    return id;
+}
+
+void qihse_graph_external_id_clear(qihse_graph_t* g) {
+    if (!g) return;
+    pthread_rwlock_wrlock(&g->lock);
+    for (size_t i = 0; i < g->external_id_count; ++i) free(g->external_ids[i].key);
+    free(g->external_ids);
+    g->external_ids = NULL;
+    g->external_id_count = 0;
+    g->external_id_cap = 0;
+    pthread_rwlock_unlock(&g->lock);
 }
