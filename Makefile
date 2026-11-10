@@ -395,6 +395,17 @@ test-backup-cli: backup-cli
 	$(CC) $(CFLAGS) -o tests/test_backup_cli tests/test_backup_cli.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_backup_cli
 
+.PHONY: test-owner-snapshot-sdk
+test-owner-snapshot-sdk:
+	python3 tests/test_owner_snapshot_sdk.py -v
+
+.PHONY: test-ops-scripts
+test-ops-scripts:
+	bash tests/ops/test_build_native.sh
+	bash tests/ops/test_cluster_rolling_restart.sh
+
+test-serial: test-owner-snapshot-sdk test-ops-scripts
+
 .PHONY: test-kv-durable-batch test-kv-restore-durability
 test-kv-durable-batch: lib
 	@mkdir -p build && chmod 0700 build
