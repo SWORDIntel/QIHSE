@@ -742,6 +742,86 @@ int main(void) {
     assert(!qihse_cluster_ownership_transfer_get_committed(&denied,
         "terminal-retry-current", &got, NULL, 0));
     assert_txn_zero(&got);
+    qihse_cluster_ownership_txn_t current_final = current_commit;
+    current_final.phase = QIHSE_OWNERSHIP_FINALIZED;
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &current_final) == 0);
+
+    /* FINALIZED replay is local and idempotent when the target is offline.
+     * It repairs only slots still at this transfer's source epoch; a later
+     * owner and the target's current role remain untouched. */
+    promotion_pin_map_t finish_pins;
+    memset(&finish_pins, 0, sizeof(finish_pins));
+    qihse_cluster_topology_t* finish_topology = qihse_cluster_topology_create();
+    assert(finish_topology);
+    qihse_cluster_node_t finish_nodes[3];
+    uint16_t finish_ix[3];
+    const char* finish_seeds[] = {"finish-finalized-source", "finish-finalized-target",
+                                  "finish-finalized-later-owner"};
+    const char* finish_qkps[] = {"finish-qkp-a", "finish-qkp-b", "finish-qkp-c"};
+    for (size_t i = 0; i < 3; ++i) {
+        memset(&finish_nodes[i], 0, sizeof(finish_nodes[i]));
+        qihse_cluster_node_id_from_seed(finish_seeds[i], strlen(finish_seeds[i]),
+                                        finish_nodes[i].id);
+        snprintf(finish_pins.node[i], sizeof(finish_pins.node[i]), "%s", finish_nodes[i].id);
+        snprintf(finish_pins.pin[i], sizeof(finish_pins.pin[i]), "%s", finish_qkps[i]);
+        snprintf(finish_nodes[i].host, sizeof(finish_nodes[i].host), "127.0.0.1");
+        finish_nodes[i].port = (uint16_t)(7400 + i);
+        finish_nodes[i].bus_port = (uint16_t)(17400 + i);
+        finish_nodes[i].role = i == 0 ? QIHSE_CLUSTER_NODE_PRIMARY :
+            QIHSE_CLUSTER_NODE_REPLICA;
+        finish_nodes[i].primary_index = i == 0 ? QIHSE_CLUSTER_NODE_NONE : finish_ix[0];
+        finish_nodes[i].healthy = true;
+        finish_nodes[i].config_epoch = 5;
+        assert(qihse_cluster_topology_upsert_node(finish_topology,
+            &finish_nodes[i], &finish_ix[i]));
+    }
+    assert(qihse_cluster_topology_set_local_node(finish_topology, finish_ix[0]));
+    assert(qihse_cluster_topology_adopt_range(finish_topology, 100, 100, finish_ix[0], 10));
+    assert(qihse_cluster_topology_adopt_range(finish_topology, 101, 101, finish_ix[2], 30));
+    assert(qihse_cluster_topology_adopt_range(finish_topology, 102, 102, finish_ix[1], 20));
+    qihse_cluster_ownership_txn_t finish_txn = finalized_ct2(
+        "finish-finalized-local", 100, 102, 20);
+    snprintf(finish_txn.source_id, sizeof(finish_txn.source_id), "%s", finish_nodes[0].id);
+    snprintf(finish_txn.target_id, sizeof(finish_txn.target_id), "%s", finish_nodes[1].id);
+    snprintf(finish_txn.owner_id, sizeof(finish_txn.owner_id), "%s", finish_nodes[1].id);
+    snprintf(finish_txn.source_qkp_id, sizeof(finish_txn.source_qkp_id), "%s", finish_qkps[0]);
+    snprintf(finish_txn.target_qkp_id, sizeof(finish_txn.target_qkp_id), "%s", finish_qkps[1]);
+    qihse_cluster_ownership_txn_t finish_prepare = finish_txn;
+    finish_prepare.phase = QIHSE_OWNERSHIP_PREPARED;
+    finish_prepare.target_lsn = 0;
+    memset(finish_prepare.proof_digest, 0, sizeof(finish_prepare.proof_digest));
+    snprintf(finish_prepare.owner_id, sizeof(finish_prepare.owner_id), "%s",
+             finish_prepare.source_id);
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &finish_prepare) == 0);
+    qihse_cluster_ownership_txn_t finish_commit = finish_txn;
+    finish_commit.phase = QIHSE_OWNERSHIP_COMMITTED;
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &finish_commit) == 0);
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &finish_txn) == 0);
+    qihse_cluster_ownership_context_t finish_ownership = {
+        .topology = finish_topology, .store = store, .principal = op,
+        .peer_id = promotion_peer_id, .peer_id_context = &finish_pins
+    };
+    assert(qihse_cluster_ownership_transfer_finish_finalized(&finish_ownership,
+        finish_txn.transfer_id, NULL, 0));
+    uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+    uint64_t epoch = 0;
+    assert(qihse_cluster_topology_get_slot(finish_topology, 100, &owner, NULL, NULL));
+    assert(qihse_cluster_topology_get_slot_epoch(finish_topology, 100, &epoch));
+    assert(owner == finish_ix[1] && epoch == 20);
+    assert(qihse_cluster_topology_get_slot(finish_topology, 101, &owner, NULL, NULL));
+    assert(qihse_cluster_topology_get_slot_epoch(finish_topology, 101, &epoch));
+    assert(owner == finish_ix[2] && epoch == 30);
+    assert(qihse_cluster_topology_get_slot(finish_topology, 102, &owner, NULL, NULL));
+    assert(qihse_cluster_topology_get_slot_epoch(finish_topology, 102, &epoch));
+    assert(owner == finish_ix[1] && epoch == 20);
+    qihse_cluster_node_t finish_target;
+    assert(qihse_cluster_topology_get_node(finish_topology, finish_ix[1], &finish_target));
+    assert(finish_target.role == QIHSE_CLUSTER_NODE_REPLICA &&
+           finish_target.primary_index == finish_ix[0] && finish_target.config_epoch == 20);
+    assert(!qihse_cluster_ownership_transfer_finish_finalized(&finish_ownership,
+        "wrong-finalized-id", NULL, 0));
+    qihse_cluster_topology_destroy(finish_topology);
+
     assert(qihse_auth_destroy_user(op, 991u));
     memset(&got, 0xa5, sizeof(got));
     assert(!qihse_cluster_ownership_transfer_get_finalized(&denied,

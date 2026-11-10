@@ -73,6 +73,13 @@ bool qihse_cluster_ownership_transfer_get_committed(
 bool qihse_cluster_ownership_transfer_get_finalized(
     qihse_cluster_ownership_context_t* context, const char* transfer_id,
     qihse_cluster_ownership_txn_t* out_txn, char* err, size_t err_cap);
+/* Finish local routing after a durable CT2 FINALIZED record. This is safe to
+ * retry without contacting the target: the journal already records the exact
+ * activated receipt. Only unsuperseded slots are applied; proof announcement
+ * is best-effort and cannot undo the durable completion. */
+bool qihse_cluster_ownership_transfer_finish_finalized(
+    qihse_cluster_ownership_context_t* context, const char* transfer_id,
+    char* err, size_t err_cap);
 
 /* Produce source-phase evidence only from the local durable journal and
  * storage state. PREPARED returns the actual frozen-range digest; ABORTED

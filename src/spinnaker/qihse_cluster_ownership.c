@@ -510,6 +510,92 @@ bool qihse_cluster_ownership_transfer_get_finalized(
     return true;
 }
 
+bool qihse_cluster_ownership_transfer_finish_finalized(
+    qihse_cluster_ownership_context_t* c, const char* transfer_id,
+    char* err, size_t err_cap) {
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) ||
+        !transfer_id || !*transfer_id || strlen(transfer_id) > QIHSE_OWNERSHIP_ID_MAX) {
+        set_error(err, err_cap, "active system Operator and ownership context are required");
+        errno = EACCES;
+        return false;
+    }
+    const char* data_dir = qihse_kv_store_data_directory(c->store);
+    find_txn_t found = {.transfer_id = transfer_id};
+    bool unresolved = false;
+    if (!data_dir || qihse_cluster_ownership_journal_replay_txn(
+            data_dir, find_txn_cb, &found, &unresolved) < 0 || !found.found ||
+        found.txn.phase != QIHSE_OWNERSHIP_FINALIZED || found.txn.next_generation[0] ||
+        strcmp(found.txn.owner_id, found.txn.target_id)) {
+        set_error(err, err_cap, "matching durable finalized CT2 result is unavailable");
+        return false;
+    }
+
+    qihse_cluster_ownership_txn_t txn = found.txn;
+    uint16_t source_index, target_index;
+    qihse_cluster_node_t source, target;
+    char source_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    char target_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    if (!c->peer_id ||
+        !qihse_cluster_topology_find_node(c->topology, txn.source_id, &source_index) ||
+        !qihse_cluster_topology_find_node(c->topology, txn.target_id, &target_index) ||
+        !qihse_cluster_topology_get_node(c->topology, source_index, &source) ||
+        !qihse_cluster_topology_get_node(c->topology, target_index, &target) ||
+        qihse_cluster_topology_local_node(c->topology) != source_index ||
+        !resolve_qkp_id(c, source.id, source_qkp) ||
+        !resolve_qkp_id(c, target.id, target_qkp) ||
+        strcmp(source_qkp, txn.source_qkp_id) || strcmp(target_qkp, txn.target_qkp_id)) {
+        set_error(err, err_cap, "finalized CT2 identities no longer match local topology/QKP pins");
+        OPENSSL_cleanse(&txn, sizeof(txn));
+        return false;
+    }
+
+    bool needs_apply = false;
+    for (uint32_t slot = txn.start; slot <= txn.end; ++slot) {
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        if (!qihse_cluster_topology_get_slot(c->topology, (uint16_t)slot,
+                &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(c->topology,
+                (uint16_t)slot, &epoch)) {
+            set_error(err, err_cap, "could not read local ownership before finalized replay");
+            OPENSSL_cleanse(&txn, sizeof(txn));
+            return false;
+        }
+        if (epoch > txn.config_epoch ||
+            (epoch == txn.config_epoch && owner == target_index)) continue;
+        if (epoch == txn.config_epoch ||
+            (owner != source_index && owner != target_index)) {
+            set_error(err, err_cap, "finalized CT2 proof conflicts with current slot ownership");
+            OPENSSL_cleanse(&txn, sizeof(txn));
+            return false;
+        }
+        needs_apply = true;
+    }
+
+    if (needs_apply && !adopt_txn_ranges(c->topology, NULL, &txn, target_index)) {
+        set_error(err, err_cap, "finalized CT2 slot ownership could not be replayed");
+        OPENSSL_cleanse(&txn, sizeof(txn));
+        return false;
+    }
+    if (target.config_epoch < txn.config_epoch) {
+        target.config_epoch = txn.config_epoch;
+        if (!qihse_cluster_topology_upsert_node(c->topology, &target, NULL)) {
+            set_error(err, err_cap, "finalized CT2 target node epoch could not be replayed");
+            OPENSSL_cleanse(&txn, sizeof(txn));
+            return false;
+        }
+    }
+    if (c->bus) {
+        qihse_cluster_bus_ct_slot_update_t update;
+        ct_update_from_txn(&txn, &update);
+        (void)qihse_cluster_bus_broadcast_ct_slot_update(c->bus, &update);
+        OPENSSL_cleanse(&update, sizeof(update));
+    }
+    OPENSSL_cleanse(&txn, sizeof(txn));
+    set_error(err, err_cap, "");
+    return true;
+}
+
 bool qihse_cluster_ownership_source_phase_receipt(
     qihse_cluster_ownership_context_t* c, const char* phase,
     const qihse_cluster_ownership_txn_t* expected,
