@@ -92,6 +92,9 @@ typedef struct {
     uint8_t* data;
     size_t len;
     size_t cap;
+    /* Internal builder/view/failure state; zero-initialized legacy builders
+     * remain valid. */
+    uint8_t _state;
 } bson_t;
 
 /* Largest accepted MongoDB message (16 MiB + framing headroom).  A declared

@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <regex.h>
 #include <time.h>
 #include <math.h>
@@ -14,12 +15,45 @@
 
 /* ---- BSON implementation ---- */
 
+enum { BSON_STATE_LEGACY = 0u, BSON_STATE_BUILDER = 1u,
+       BSON_STATE_VIEW = 2u, BSON_STATE_FAILED = 3u };
+
+static int bson_is_view(const bson_t* b) {
+    if (!b || !b->data) return 0;
+    if (b->_state == BSON_STATE_VIEW) return 1;
+    /* Source-compatible handling for pre-state aggregate-initialized views. */
+    if (b->_state == BSON_STATE_LEGACY && b->len >= 5u && b->len <= b->cap &&
+        b->len <= MONGO_MAX_BSON_SIZE && b->data[b->len - 1u] == 0) {
+        int32_t declared; memcpy(&declared, b->data, 4u);
+        return declared == (int32_t)b->len;
+    }
+    return 0;
+}
+
+static int bson_builder_valid(const bson_t* b) {
+    return b && b->data &&
+           (b->_state == BSON_STATE_BUILDER || b->_state == BSON_STATE_LEGACY) &&
+           !bson_is_view(b) &&
+           b->len >= 4u && b->len <= b->cap &&
+           b->cap <= MONGO_MAX_BSON_SIZE;
+}
+
+static int bson_fail(bson_t* b) {
+    if (b && b->data && b->_state != BSON_STATE_VIEW)
+        b->_state = BSON_STATE_FAILED;
+    return -1;
+}
+
 bson_t* bson_create(void) {
     bson_t* b = (bson_t*)calloc(1, sizeof(bson_t));
     if (!b) return NULL;
     b->cap = 256;
     b->data = (uint8_t*)calloc(b->cap, 1);
+    if (!b->data) { free(b); return NULL; }
     b->len = 4; /* reserve for document size */
+    b->_state = BSON_STATE_BUILDER;
+    int32_t initial_size = 5;
+    memcpy(b->data, &initial_size, 4u);
     return b;
 }
 
@@ -30,19 +64,50 @@ void bson_destroy(bson_t* b) {
 }
 
 static int bson_ensure(bson_t* b, size_t need) {
-    if (b->len + need > b->cap) {
-        while (b->len + need > b->cap) b->cap *= 2;
-        b->data = (uint8_t*)realloc(b->data, b->cap);
+    if (!bson_builder_valid(b)) return -1;
+    if (b->len >= MONGO_MAX_BSON_SIZE ||
+        need > MONGO_MAX_BSON_SIZE - b->len - 1u) {
+        b->_state = BSON_STATE_FAILED;
+        return -1;
     }
+    size_t required = b->len + need + 1u;
+    if (required <= b->cap) return 0;
+    size_t cap = b->cap;
+    while (cap < required) {
+        size_t grown = cap > MONGO_MAX_BSON_SIZE / 2u
+            ? MONGO_MAX_BSON_SIZE : cap * 2u;
+        if (grown <= cap) { b->_state = BSON_STATE_FAILED; return -1; }
+        cap = grown;
+    }
+    uint8_t* next = (uint8_t*)realloc(b->data, cap);
+    if (!next) { b->_state = BSON_STATE_FAILED; return -1; }
+    b->data = next;
+    b->cap = cap;
     return 0;
 }
 
-static int bson_append_type_and_key(bson_t* b, uint8_t type, const char* key) {
-    size_t klen = strlen(key) + 1;
-    bson_ensure(b, 1 + klen);
+static int bson_begin_element(bson_t* b, uint8_t type, const char* key,
+                              size_t value_size) {
+    if (!bson_builder_valid(b) || !key) return bson_fail(b);
+    size_t klen = strlen(key);
+    if (value_size > SIZE_MAX - klen - 2u ||
+        bson_ensure(b, 1u + klen + 1u + value_size) != 0)
+        return bson_fail(b);
     b->data[b->len++] = type;
-    memcpy(b->data + b->len, key, klen);
-    b->len += klen;
+    memcpy(b->data + b->len, key, klen + 1u);
+    b->len += klen + 1u;
+    return 0;
+}
+
+static int bson_append_raw_value(bson_t* b, const char* key, uint8_t type,
+                                 const uint8_t* value, size_t value_size) {
+    if ((!value && value_size)) return bson_fail(b);
+    if (bson_begin_element(b, type, key, value_size) != 0) return -1;
+    if (value_size) memcpy(b->data + b->len, value, value_size);
+    b->len += value_size;
+    int32_t serialized_size = (int32_t)(b->len + 1u);
+    memcpy(b->data, &serialized_size, 4u);
+    b->data[b->len] = 0;
     return 0;
 }
 
@@ -60,75 +125,65 @@ static int bson_append_type_and_key(bson_t* b, uint8_t type, const char* key) {
  * terminator, which a stock BSON parser rejects whenever the last element of
  * the nested document does not itself end in a 0x00 byte. */
 static int bson_embed(bson_t* b, const char* key, uint8_t type, const bson_t* sub) {
-    if (!b || !key || !sub || !sub->data || sub->len < 4) return -1;
-    int32_t declared = 0;
-    memcpy(&declared, sub->data, 4);
-    int serialized = (declared == (int32_t)sub->len);
-    size_t content = sub->len - 4;                 /* elements, prefix excluded */
-    size_t total = content + 4u + (serialized ? 0u : 1u);
-    if (total > MONGO_MAX_BSON_SIZE) return -1;
-    bson_append_type_and_key(b, type, key);
-    bson_ensure(b, total);
+    if (!b || !key || !sub || !sub->data || sub->len < 4) return bson_fail(b);
+    if (sub->_state == BSON_STATE_FAILED || sub->len > MONGO_MAX_BSON_SIZE ||
+        !bson_size(sub))
+        return bson_fail(b);
+    bool serialized = bson_is_view(sub);
+    size_t content = sub->len - 4u;
+    size_t total = sub->len + (serialized ? 0u : 1u);
+    if (serialized && sub->data[sub->len - 1u] != 0) return bson_fail(b);
+    if (total > MONGO_MAX_BSON_SIZE) return bson_fail(b);
+    if (bson_begin_element(b, type, key, total) != 0) return -1;
     int32_t sz = (int32_t)total;
     memcpy(b->data + b->len, &sz, 4);
     b->len += 4;
     memcpy(b->data + b->len, sub->data + 4, content);
     b->len += content;
     if (!serialized) b->data[b->len++] = 0x00;
+    int32_t serialized_size = (int32_t)(b->len + 1u);
+    memcpy(b->data, &serialized_size, 4u);
+    b->data[b->len] = 0;
     return 0;
 }
 
 int bson_append_int32(bson_t* b, const char* key, int32_t val) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_INT32, key);
-    bson_ensure(b, 4);
-    memcpy(b->data + b->len, &val, 4);
-    b->len += 4;
-    return 0;
+    return bson_append_raw_value(b, key, BSON_INT32, (const uint8_t*)&val, 4u);
 }
 
 int bson_append_int64(bson_t* b, const char* key, int64_t val) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_INT64, key);
-    bson_ensure(b, 8);
-    memcpy(b->data + b->len, &val, 8);
-    b->len += 8;
-    return 0;
+    return bson_append_raw_value(b, key, BSON_INT64, (const uint8_t*)&val, 8u);
 }
 
 int bson_append_double(bson_t* b, const char* key, double val) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_DOUBLE, key);
-    bson_ensure(b, 8);
-    memcpy(b->data + b->len, &val, 8);
-    b->len += 8;
-    return 0;
+    return bson_append_raw_value(b, key, BSON_DOUBLE, (const uint8_t*)&val, 8u);
 }
 
 int bson_append_string(bson_t* b, const char* key, const char* val) {
-    if (!b || !key || !val) return -1;
-    bson_append_type_and_key(b, BSON_STRING, key);
-    int32_t slen = (int32_t)(strlen(val) + 1);
-    bson_ensure(b, 4 + slen);
+    if (!val) return bson_fail(b);
+    size_t val_len = strlen(val);
+    if (val_len >= (size_t)INT32_MAX || val_len > MONGO_MAX_BSON_SIZE - 5u)
+        return bson_fail(b);
+    int32_t slen = (int32_t)(val_len + 1u);
+    if (bson_begin_element(b, BSON_STRING, key, 4u + (size_t)slen) != 0)
+        return -1;
     memcpy(b->data + b->len, &slen, 4);
     b->len += 4;
     memcpy(b->data + b->len, val, slen);
     b->len += slen;
+    int32_t serialized_size = (int32_t)(b->len + 1u);
+    memcpy(b->data, &serialized_size, 4u);
+    b->data[b->len] = 0;
     return 0;
 }
 
 int bson_append_bool(bson_t* b, const char* key, int val) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_BOOL, key);
-    bson_ensure(b, 1);
-    b->data[b->len++] = val ? 1 : 0;
-    return 0;
+    uint8_t byte = val ? 1u : 0u;
+    return bson_append_raw_value(b, key, BSON_BOOL, &byte, 1u);
 }
 
 int bson_append_null(bson_t* b, const char* key) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_NULL, key);
-    return 0;
+    return bson_append_raw_value(b, key, BSON_NULL, NULL, 0u);
 }
 
 int bson_append_document(bson_t* b, const char* key, const bson_t* sub) {
@@ -140,86 +195,79 @@ int bson_append_array(bson_t* b, const char* key, const bson_t* sub) {
 }
 
 int bson_append_binary(bson_t* b, const char* key, const uint8_t* data, size_t len) {
-    if (!b || !key || !data) return -1;
-    bson_append_type_and_key(b, BSON_BINARY, key);
+    if ((!data && len) || len > (size_t)INT32_MAX || len > MONGO_MAX_BSON_SIZE - 5u)
+        return bson_fail(b);
+    if (bson_begin_element(b, BSON_BINARY, key, 5u + len) != 0) return -1;
     int32_t slen = (int32_t)len;
-    bson_ensure(b, 5 + len);
     memcpy(b->data + b->len, &slen, 4);
     b->len += 4;
     b->data[b->len++] = 0x00;
     memcpy(b->data + b->len, data, len);
     b->len += len;
+    int32_t serialized_size = (int32_t)(b->len + 1u);
+    memcpy(b->data, &serialized_size, 4u);
+    b->data[b->len] = 0;
     return 0;
 }
 
 int bson_append_datetime(bson_t* b, const char* key, int64_t ms) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_DATETIME, key);
-    bson_ensure(b, 8);
-    memcpy(b->data + b->len, &ms, 8);
-    b->len += 8;
-    return 0;
+    return bson_append_raw_value(b, key, BSON_DATETIME, (const uint8_t*)&ms, 8u);
 }
 
 int bson_append_objectid(bson_t* b, const char* key, const uint8_t oid[12]) {
-    if (!b || !key || !oid) return -1;
-    bson_append_type_and_key(b, BSON_OBJECTID, key);
-    bson_ensure(b, 12);
-    memcpy(b->data + b->len, oid, 12);
-    b->len += 12;
-    return 0;
+    return bson_append_raw_value(b, key, BSON_OBJECTID, oid, 12u);
 }
 
 int bson_append_regex(bson_t* b, const char* key, const char* pattern, const char* options) {
-    if (!b || !key || !pattern) return -1;
+    if (!pattern) return bson_fail(b);
     if (!options) options = "";
-    bson_append_type_and_key(b, BSON_REGEX, key);
     size_t plen = strlen(pattern) + 1;
     size_t olen = strlen(options) + 1;
-    bson_ensure(b, plen + olen);
+    if (olen > SIZE_MAX - plen || bson_begin_element(b, BSON_REGEX, key, plen + olen) != 0)
+        return bson_fail(b);
     memcpy(b->data + b->len, pattern, plen);
     b->len += plen;
     memcpy(b->data + b->len, options, olen);
     b->len += olen;
+    int32_t serialized_size = (int32_t)(b->len + 1u);
+    memcpy(b->data, &serialized_size, 4u);
+    b->data[b->len] = 0;
     return 0;
 }
 
 int bson_append_timestamp(bson_t* b, const char* key, int32_t incr, int32_t ts) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_TIMESTAMP, key);
-    bson_ensure(b, 8);
-    memcpy(b->data + b->len, &incr, 4);
-    b->len += 4;
-    memcpy(b->data + b->len, &ts, 4);
-    b->len += 4;
-    return 0;
+    uint8_t raw[8]; memcpy(raw, &incr, 4u); memcpy(raw + 4u, &ts, 4u);
+    return bson_append_raw_value(b, key, BSON_TIMESTAMP, raw, sizeof(raw));
 }
 
 int bson_append_minkey(bson_t* b, const char* key) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_MINKEY, key);
-    return 0;
+    return bson_append_raw_value(b, key, BSON_MINKEY, NULL, 0u);
 }
 
 int bson_append_maxkey(bson_t* b, const char* key) {
-    if (!b || !key) return -1;
-    bson_append_type_and_key(b, BSON_MAXKEY, key);
-    return 0;
+    return bson_append_raw_value(b, key, BSON_MAXKEY, NULL, 0u);
 }
 
 size_t bson_size(const bson_t* b) {
-    if (!b) return 0;
-    int32_t sz = (int32_t)(b->len + 1);
-    memcpy(b->data, &sz, 4);
-    return b->len + 1;
+    if (!b || !b->data || b->_state == BSON_STATE_FAILED || b->len < 4u ||
+        b->len > MONGO_MAX_BSON_SIZE) return 0;
+    if (bson_is_view(b)) {
+        if (b->len > b->cap || b->data[b->len - 1u] != 0) return 0;
+        int32_t declared; memcpy(&declared, b->data, 4u);
+        return declared == (int32_t)b->len ? b->len : 0;
+    }
+    if (b->len >= MONGO_MAX_BSON_SIZE || b->len + 1u > b->cap) return 0;
+    int32_t declared; memcpy(&declared, b->data, 4u);
+    return declared == (int32_t)(b->len + 1u) && b->data[b->len] == 0
+        ? b->len + 1u : 0;
 }
 
 const uint8_t* bson_data(const bson_t* b) {
-    if (!b) return NULL;
-    int32_t sz = (int32_t)(b->len + 1);
-    memcpy(b->data, &sz, 4);
-    if (b->len < b->cap) b->data[b->len] = 0;
-    return b->data;
+    if (!b || !b->data || b->_state == BSON_STATE_FAILED) return NULL;
+    if (bson_is_view(b))
+        return bson_size(b) ? b->data : NULL;
+    if (!bson_size(b)) return NULL;
+    return bson_size(b) ? b->data : NULL;
 }
 
 /* ---- Raw element iterator (internal) ---- */
@@ -368,38 +416,48 @@ int bson_append_element(bson_t* b, const char* key, const bson_element_t* e, con
     if (!b || !key || !e) return -1;
     (void)raw;
     switch (e->type) {
-        case BSON_INT32: bson_append_int32(b, key, e->v.i32); break;
-        case BSON_INT64: bson_append_int64(b, key, e->v.i64); break;
-        case BSON_DATETIME: bson_append_datetime(b, key, e->v.i64); break;
-        case BSON_TIMESTAMP: bson_append_timestamp(b, key, 0, 0); break;
-        case BSON_DOUBLE: bson_append_double(b, key, e->v.d); break;
-        case BSON_STRING: bson_append_string(b, key, e->v.str); break;
-        case BSON_BOOL: bson_append_bool(b, key, e->v.b); break;
-        case BSON_NULL: bson_append_null(b, key); break;
-        case BSON_BINARY: bson_append_binary(b, key, e->v.bin.data, e->v.bin.len); break;
+        case BSON_INT32: return bson_append_int32(b, key, e->v.i32);
+        case BSON_INT64: return bson_append_int64(b, key, e->v.i64);
+        case BSON_DATETIME: return bson_append_datetime(b, key, e->v.i64);
+        case BSON_TIMESTAMP: return bson_append_timestamp(b, key, (int32_t)e->v.i64,
+                                                           (int32_t)(e->v.i64 >> 32));
+        case BSON_DOUBLE: return bson_append_double(b, key, e->v.d);
+        case BSON_STRING: return bson_append_string(b, key, e->v.str);
+        case BSON_BOOL: return bson_append_bool(b, key, e->v.b);
+        case BSON_NULL: return bson_append_null(b, key);
+        case BSON_BINARY: return bson_append_binary(b, key, e->v.bin.data, e->v.bin.len);
         case BSON_DOCUMENT:
         case BSON_ARRAY: {
-            bson_t view; view.data = (uint8_t*)e->v.doc.data; view.len = e->v.doc.len; view.cap = e->v.doc.len;
-            if (e->type == BSON_ARRAY) bson_append_array(b, key, &view);
-            else bson_append_document(b, key, &view);
-            break;
+            bson_t view; view.data = (uint8_t*)e->v.doc.data;
+            view.len = (size_t)e->v.doc.len; view.cap = (size_t)e->v.doc.len;
+            view._state = BSON_STATE_VIEW;
+            return e->type == BSON_ARRAY ? bson_append_array(b, key, &view) :
+                                           bson_append_document(b, key, &view);
         }
-        case BSON_OBJECTID: bson_append_objectid(b, key, e->v.oid.data); break;
-        case BSON_REGEX: bson_append_regex(b, key, e->v.regex.pattern, e->v.regex.options); break;
-        case BSON_MINKEY: bson_append_minkey(b, key); break;
-        case BSON_MAXKEY: bson_append_maxkey(b, key); break;
-        default: break;
+        case BSON_OBJECTID: return bson_append_objectid(b, key, e->v.oid.data);
+        case BSON_REGEX: return bson_append_regex(b, key, e->v.regex.pattern, e->v.regex.options);
+        case BSON_MINKEY: return bson_append_minkey(b, key);
+        case BSON_MAXKEY: return bson_append_maxkey(b, key);
+        default: return -1;
     }
-    return 0;
 }
 
 bson_t* bson_copy(const bson_t* src) {
-    if (!src) return NULL;
+    if (!src || !src->data || src->_state == BSON_STATE_FAILED) return NULL;
+    size_t serialized_size = bson_size(src);
+    if (!serialized_size || serialized_size > MONGO_MAX_BSON_SIZE) return NULL;
+    size_t payload_len = bson_is_view(src) ? src->len - 1u : src->len;
     bson_t* b = (bson_t*)calloc(1, sizeof(bson_t));
-    b->cap = src->len;
-    b->len = src->len;
-    b->data = (uint8_t*)malloc(src->len);
-    memcpy(b->data, src->data, src->len);
+    if (!b) return NULL;
+    b->cap = payload_len + 1u;
+    b->len = payload_len;
+    b->_state = BSON_STATE_BUILDER;
+    b->data = (uint8_t*)malloc(b->cap);
+    if (!b->data) { free(b); return NULL; }
+    memcpy(b->data, src->data, payload_len);
+    int32_t sz = (int32_t)(payload_len + 1u);
+    memcpy(b->data, &sz, 4u);
+    b->data[payload_len] = 0;
     return b;
 }
 
@@ -416,8 +474,9 @@ int bson_find_element(const bson_t* b, const char* key, bson_element_t* out) {
 static bson_t bson_view(const uint8_t* data, int32_t len) {
     bson_t v;
     v.data = (uint8_t*)data;
-    v.len = len;
-    v.cap = len;
+    v.len = len > 0 ? (size_t)len : 0u;
+    v.cap = v.len;
+    v._state = BSON_STATE_VIEW;
     return v;
 }
 
@@ -525,16 +584,22 @@ char* bson_to_json(const bson_t* b) {
 }
 
 void bson_remove_key(bson_t* b, const char* key) {
-    if (!b || !key) return;
+    if (!b || !key || !bson_builder_valid(b) || !bson_size(b)) return;
     bson_t* nb = bson_create();
+    if (!nb) return;
     size_t off = 0;
     raw_elem_t re;
     while (bson_raw_iter(b, &off, &re) == 0) {
         if (strcmp(re.key, key) == 0) continue;
-        bson_append_type_and_key(nb, (uint8_t)re.type, re.key);
-        bson_ensure(nb, re.value_len);
-        memcpy(nb->data + nb->len, re.value_ptr, re.value_len);
-        nb->len += re.value_len;
+        if (bson_append_raw_value(nb, re.key, (uint8_t)re.type,
+                                  re.value_ptr, re.value_len) != 0) {
+            bson_destroy(nb);
+            return;
+        }
+    }
+    if (off != (bson_is_view(b) ? b->len - 1u : b->len)) {
+        bson_destroy(nb);
+        return;
     }
     free(b->data);
     b->data = nb->data;
@@ -544,24 +609,36 @@ void bson_remove_key(bson_t* b, const char* key) {
 }
 
 int bson_set_field(bson_t* b, const char* key, const bson_element_t* e, const uint8_t* raw) {
-    if (!b || !key || !e) return -1;
+    if (!b || !key || !e || !bson_builder_valid(b) || !bson_size(b)) return -1;
     (void)raw;
     bson_t* nb = bson_create();
+    if (!nb) return -1;
     int found = 0;
     size_t off = 0;
     raw_elem_t re;
     while (bson_raw_iter(b, &off, &re) == 0) {
         if (strcmp(re.key, key) == 0) {
-            bson_append_element(nb, key, e, NULL);
+            if (bson_append_element(nb, key, e, NULL) != 0) {
+                bson_destroy(nb);
+                return -1;
+            }
             found = 1;
         } else {
-            bson_append_type_and_key(nb, (uint8_t)re.type, re.key);
-            bson_ensure(nb, re.value_len);
-            memcpy(nb->data + nb->len, re.value_ptr, re.value_len);
-            nb->len += re.value_len;
+            if (bson_append_raw_value(nb, re.key, (uint8_t)re.type,
+                                      re.value_ptr, re.value_len) != 0) {
+                bson_destroy(nb);
+                return -1;
+            }
         }
     }
-    if (!found) bson_append_element(nb, key, e, NULL);
+    if (off != (bson_is_view(b) ? b->len - 1u : b->len)) {
+        bson_destroy(nb);
+        return -1;
+    }
+    if (!found && bson_append_element(nb, key, e, NULL) != 0) {
+        bson_destroy(nb);
+        return -1;
+    }
     free(b->data);
     b->data = nb->data;
     b->len = nb->len;
@@ -1528,6 +1605,7 @@ static long mongo_doc_size(const uint8_t* buf, size_t limit, size_t off) {
     view.data = (uint8_t*)(uintptr_t)(const void*)(buf + off);
     view.len = (size_t)dlen;
     view.cap = (size_t)dlen;
+    view._state = BSON_STATE_VIEW;
     size_t walk = 0;
     bson_element_t e;
     while (bson_iter(&view, &walk, &e) == 0) { }
@@ -1643,6 +1721,7 @@ bson_t* mongo_msg_get_document(const mongo_msg_t* msg, size_t* offset) {
     view.data = (uint8_t*)(uintptr_t)(const void*)(msg->body + off);
     view.len = (size_t)dlen;
     view.cap = (size_t)dlen;
+    view._state = BSON_STATE_VIEW;
     bson_t* out = bson_copy(&view);
     if (!out) return NULL;
     *offset = off + (size_t)dlen;
@@ -1657,10 +1736,8 @@ bson_t* mongo_msg_get_document(const mongo_msg_t* msg, size_t* offset) {
  * bson_append_element(), which loses DECIMAL128 and TIMESTAMP values, on every
  * path that must not alter a document's bytes. */
 static void mongo_raw_copy_elem_key(bson_t* dst, const char* key, const raw_elem_t* re) {
-    bson_append_type_and_key(dst, (uint8_t)re->type, key);
-    bson_ensure(dst, re->value_len);
-    memcpy(dst->data + dst->len, re->value_ptr, re->value_len);
-    dst->len += re->value_len;
+    (void)bson_append_raw_value(dst, key, (uint8_t)re->type,
+                                re->value_ptr, re->value_len);
 }
 
 static void mongo_raw_copy_elem(bson_t* dst, const raw_elem_t* re) {
@@ -2112,17 +2189,26 @@ static int mongo_stage_run(bson_t** in, size_t n_in, const bson_t* stage,
             if (g == n_groups) {
                 if (n_groups == cap_groups) {
                     size_t ncap = cap_groups ? cap_groups * 2 : 8;
-                    bson_t** nk = (bson_t**)realloc(keys, ncap * sizeof(*nk));
-                    bson_t** na = (bson_t**)realloc(accs, ncap * sizeof(*na));
-                    bson_t** ni = (bson_t**)realloc(ids, ncap * sizeof(*ni));
-                    if (!nk || !na || !ni) {
-                        if (nk) keys = nk;
-                        if (na) accs = na;
-                        if (ni) ids = ni;
+                    if (ncap < cap_groups || ncap > SIZE_MAX / sizeof(*keys)) {
                         bson_destroy(key); bson_destroy(idv);
                         rc = -1;
                         break;
                     }
+                    bson_t** nk = (bson_t**)calloc(ncap, sizeof(*nk));
+                    bson_t** na = (bson_t**)calloc(ncap, sizeof(*na));
+                    bson_t** ni = (bson_t**)calloc(ncap, sizeof(*ni));
+                    if (!nk || !na || !ni) {
+                        free(nk); free(na); free(ni);
+                        bson_destroy(key); bson_destroy(idv);
+                        rc = -1;
+                        break;
+                    }
+                    if (n_groups) {
+                        memcpy(nk, keys, n_groups * sizeof(*nk));
+                        memcpy(na, accs, n_groups * sizeof(*na));
+                        memcpy(ni, ids, n_groups * sizeof(*ni));
+                    }
+                    free(keys); free(accs); free(ids);
                     keys = nk; accs = na; ids = ni; cap_groups = ncap;
                 }
                 bson_t* acc = bson_create();
