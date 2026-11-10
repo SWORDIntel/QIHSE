@@ -421,9 +421,16 @@ static void report_retention_unlocked(cg_state *st, struct json_object *manifest
     bool pruned = prune_snapshots_unlocked(st, manifest, &removed);
     if (!prune_runtimes_unlocked(st, &runtimes)) pruned = false;
     size_t shared_removed = 0; uint64_t shared_bytes = 0;
-    if (!generation_cleanup_unlocked(st, manifest, &shared_removed, &shared_bytes)) pruned = false;
-    json_int(report, "removed_shared_blocks", (int64_t)shared_removed);
-    json_int(report, "removed_shared_block_bytes", (int64_t)shared_bytes);
+    bool shared_complete = generation_cleanup_unlocked(st, manifest, &shared_removed, &shared_bytes);
+    if (!shared_complete) pruned = false;
+    if (shared_complete) {
+        json_int(report, "removed_shared_blocks", (int64_t)shared_removed);
+        json_int(report, "removed_shared_block_bytes", (int64_t)shared_bytes);
+    } else {
+        json_object_object_add(report, "removed_shared_blocks", json_object_new_null());
+        json_object_object_add(report, "removed_shared_block_bytes", json_object_new_null());
+    }
+    json_boolean(report, "shared_block_counts_complete", shared_complete);
     json_int(report, "removed_snapshots", (int64_t)removed);
     json_int(report, "removed_runtimes", (int64_t)runtimes);
     if (!pruned) json_text(report, "retention_warning", "storage cleanup incomplete");
