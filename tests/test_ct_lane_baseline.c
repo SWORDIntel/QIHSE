@@ -105,8 +105,9 @@ static void assert_snapshot_value(qihse_kv_store_t *snapshot,
                                   qihse_user_t *principal,
                                   const char *key, const char *expected) {
     char *value = NULL;
+    qihse_kv_record_meta_t metadata = {0};
     assert(qihse_kv_snapshot_get_record_user(snapshot, key, principal,
-                                              &value, NULL));
+                                              &value, &metadata));
     if (expected) assert(value && strcmp(value, expected) == 0);
     else assert(value == NULL);
     free(value);
