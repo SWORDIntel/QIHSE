@@ -92,6 +92,14 @@ def wait_drained(source_to_receiver, receiver_to_source, label):
     raise AssertionError(f"CT1 lane {label} did not drain")
 
 
+def pending_tuple(path):
+    fields = path.read_text().splitlines()[0].split()
+    if len(fields) != 8 or fields[0] != "QBP1":
+        raise AssertionError(f"malformed private CT2 pending fixture record: {fields!r}")
+    active, first, last = int(fields[1]), int(fields[2]), int(fields[3])
+    return active, first, last, fields[4], fields[5], fields[6], fields[7]
+
+
 def seed_classified_kv(cluster, node_name, key, value, classification=5, sci=1):
     """Seed an ordinary slot-owned row through the authenticated native API."""
     code = r"""
@@ -275,6 +283,12 @@ def main():
         denied_view = owner_map(admins["successor"])
         if denied_view is None or denied_view.get(7000) != topology["lead"]:
             raise AssertionError("clearance/SCI denial changed A ownership before authorization")
+        durable_pending_path = cluster.root / "brain-a" / "ct2-pending"
+        denied_pending = pending_tuple(durable_pending_path)
+        if (denied_pending[0] != 1 or denied_pending[3] != topology["lead"] or
+                denied_pending[4] != topology["joiner"] or
+                not (denied_pending[1] <= 7000 <= denied_pending[2] <= 8191)):
+            raise AssertionError(f"low-clearance target did not retain the exact A->C fenced tuple: {denied_pending!r}")
 
         # Raise C's data principal through the existing startup configuration.
         # The source brain retries the same fenced operation and the local
@@ -300,6 +314,9 @@ def main():
             time.sleep(0.2)
         else:
             raise AssertionError(f"CT2 multi-group transfer did not converge: {final!r}")
+        completed_pending = pending_tuple(durable_pending_path)
+        if completed_pending != (0, *denied_pending[1:]):
+            raise AssertionError(f"CT2 retry changed its durable tuple: {completed_pending!r} != {denied_pending!r}")
 
         # C now owns migrated group-A slots and continues owning group C, while
         # its source replica C->B and its pre-existing A receiver both remain.
