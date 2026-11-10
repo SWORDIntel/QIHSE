@@ -306,7 +306,7 @@ provide a recovery point. After new writes are accepted, simply restarting old
 stores would lose those writes; use forward recovery or an explicitly reconciled
 new backup instead. Do not promise an automatic rollback after cutover.
 
-## Current execution checkpoint (2026-11-10, after 730xd recovery)
+## Current execution checkpoint (2026-11-10, all six services upgraded)
 
 - Nine authenticated original full backups, three main-store delta exports,
   and the authenticated merged union remain preserved under
@@ -316,11 +316,17 @@ new backup instead. Do not promise an automatic rollback after cutover.
   owner was independently backed up and compared to it: 271,434 identical,
   zero additions and zero conflicts. The six cache inputs contributed 830
   exact duplicates; the merge recorded zero conflicting live keys.
-- Native recovery packages were built for each host from source revision
-  `8d79780b4556c9e2170e1d012d0f7f8203535946`; 730xd now runs the native
-  `cabe8dc` package. Six persistent recovery services are enabled and active:
-  owners A/B/C on T420/730xd/T320 and off-host successors on T320/T420/730xd.
-  The old services and old data directories remain stopped and untouched.
+- Native recovery packages for T420, 730xd, and T320 are built from
+  `cabe8dc93e1653dbfa96b0ce7b9f86b67b1beefd` with each host's own compiler and
+  ISA. T420 used GCC 16.1.0 with AVX/F16C; T320 used GCC 14.2.0 with AVX only;
+  730xd used GCC 14.2.0 with AVX2/FMA/F16C. Package checksums and launcher
+  smoke checks passed on all three hosts. All six recovery services now point
+  at their host's `native-*-cabe8dc` package and are active. Per-unit
+  pre-cabe8dc backups are preserved under
+  `/var/lib/qihse-maintenance/cluster-recovery-20261109/`; the original
+  services and data directories remain stopped and untouched. T420's native
+  build installed liboqs headers/libraries and oqsprovider under `/usr` while
+  resolving its dependency prefix; the QIHSE package itself is self-contained.
 - All three owners independently return the same six-peer cluster map, with
   all peers connected. Slot ownership is T420 `0–5039, 5041–5460` (5,460),
   T320 `5461–10921` (5,461), and 730xd `5040, 10922–16383` (5,463). Slot 5040
@@ -347,11 +353,16 @@ new backup instead. Do not promise an automatic rollback after cutover.
   209,941, and 52,661 (sum 271,462); compare this against the preserved union
   at record level before declaring inventory equality. No original backup was
   modified.
-- Authenticated CT1 source/target status shows the successors at the source's
-  acknowledged cursor. At capture, A and C each had one durable group beyond
-  their acknowledgement (25/24 and 23/22); B was advancing during expiry
-  processing and its target cursor matched the acknowledged cursor. Recheck
-  after quiescing writes before taking a consistent post-migration snapshot.
+- After the owner and successor restarts, authenticated CT1 checks show exact
+  source-acknowledgement/target-cursor matches: A 24/24, B 2389/2389, and C
+  22/22. Each target reports its baseline sealed and the configured generation
+  and peer IDs.
+- A coordinated attempt to make fresh offline owner backups did not produce
+  valid files: the CLI returned an API error for T420 and T320, and the first
+  730xd attempt used a nonexistent data path (`b-owner`; its unit uses
+  `owner-730xd`). All owners were restarted immediately and the cluster was
+  rechecked healthy. No `live-*-owner-cabe8dc.qbk` was created. The verified
+  pre-CT union and all original backups remain intact.
 - `AIMEM COUNT` reports 309 on B/730xd and 0 on A/T420 and C/T320. Those 309
   records are present in the verified union and remain on a live owner; CT2
   slot transfer does not distribute node-local AIMEM state. Do not retire the
