@@ -8300,6 +8300,12 @@ bool qihse_kv_ct_lane_transfer_status(qihse_kv_store_t* store,
         out_status->phase = state->phase;
         out_status->source_fenced = state->source_fenced;
         out_status->target_imported = state->target_imported;
+        out_status->source_cut = state->source_cut;
+        out_status->target_cursor = state->target_cursor;
+        memcpy(out_status->range_digest, state->range_digest,
+               sizeof(out_status->range_digest));
+        memcpy(out_status->image_digest, state->image_digest,
+               sizeof(out_status->image_digest));
         out_status->claim = state->claim;
     }
     kv_store_unlock(store);

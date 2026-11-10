@@ -99,6 +99,10 @@ typedef struct {
     uint8_t phase; /* 0 none, 1 reserved, 2 imported, 3 finalized intent */
     bool source_fenced;
     bool target_imported;
+    uint64_t source_cut;
+    uint64_t target_cursor;
+    uint8_t range_digest[32];
+    uint8_t image_digest[32];
     qihse_kv_ct_lane_authority_claim_t claim;
 } qihse_kv_ct_lane_transfer_status_t;
 
