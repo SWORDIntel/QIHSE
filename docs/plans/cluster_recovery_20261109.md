@@ -392,9 +392,36 @@ new backup instead. Do not promise an automatic rollback after cutover.
   change-sequence watermark under one snapshot lock, without changing
   replication state. This is an inventory source, not a complete recovery
   backup: tombstones and expired rows are omitted. The change is not yet
-  deployed to the three owners. Retain the verified union and all original
-  backups; after native rollout, export each owner and reconcile record
-  identities to explain the 28-row gap before changing or retiring any source.
+  deployed to the three owners at this 2026-11-09 checkpoint. Retain the
+  verified union and all original backups; after native rollout, export each
+  owner and reconcile record identities to explain the row gap before changing
+  or retiring any source.
+- **2026-11-10 live deployment:** commit `81a25eba750ea72c973d1d2f164776b3de0b234a`
+  adds the missing long-read behavior: `OWNER.SNAPSHOT.BEGIN` requires an
+  admitted CT owner, while the authenticated immutable `READ`/`END` commands
+  can finish if live CT writer admission changes during the stream. The focused
+  `make test-resp-cluster` passed. Native builds were produced on each host and
+  the three owner services now run versioned `native-*-81a25eb` packages. The
+  initial 730xd inventory attempt exposed the gate issue; after the fix, its
+  full 1,705,815,746-byte snapshot completed. Authenticated QKP `PING` and
+  `CLUSTER INFO` from all three owners report `PONG`, `cluster_state:ok`, all
+  16,384 slots assigned/OK, zero failed/pending-fail slots, six known nodes and
+  cluster size 3. Current `DBSIZE` values are 8,860 / 52,661 / 209,947.
+- The three authenticated owner inventories contain **271,468 unique live
+  keys**, with zero duplicate keys or conflicting observations across the
+  owners. They were assembled, with source-node and snapshot metadata, into
+  `/var/backups/qihse-recovery-20261109/owner-snapshot-09231bb/owner-inventory-merged.sqlite`
+  (2,148,167,680 bytes; SHA-256
+  `fb45a4d8fe01ff65f4c6765d03828456f90a0def706af97584e628f91350853c`; SQLite
+  `quick_check` is `ok`). Per-owner snapshot hashes and change-sequence
+  watermarks are in the adjacent manifest. This merged live inventory is not a
+  restore backup and does not replace the QBK union.
+- The preserved authenticated union remains 271,434 records with SHA-256
+  `bf400593bb9157329626f8bedb0932904fc5f9c599c19a7c25be61c7fc20ea3e`.
+  The live inventory has 34 more keys by count; a record-identity comparison
+  against the encrypted union has not yet been completed, so the 28-row gap
+  noted earlier is not yet explained. All originals and the verified union
+  remain untouched.
 - Automatic capacity-aware balancing, automatic failover promotion, and
   dynamic successor reassignment remain open roadmap items. Keep the current
   slot-count R5 automatic rebalancer disabled for this heterogeneous layout.
