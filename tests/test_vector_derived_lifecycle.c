@@ -3,6 +3,7 @@
 #endif
 #include "qihse_vector_db.h"
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include <assert.h>
 #include <errno.h>
 #include <ftw.h>
@@ -118,6 +119,7 @@ int main(void) {
     test_read_only_build_is_ephemeral(path);
     qihse_auth_shutdown_rate_limiter();
     qihse_auth_shutdown_volume_limiter();
+    qihse_audit_shutdown();
     assert(nftw(root, remove_entry, 16, FTW_DEPTH | FTW_PHYS) == 0);
     puts("PASS derived vector index invalidation, WAL freshness, and readonly builds");
     return 0;

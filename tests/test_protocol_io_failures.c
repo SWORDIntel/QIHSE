@@ -2,16 +2,20 @@
 #include <assert.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <limits.h>
 #include <unistd.h>
 
 extern bool qihse_test_bolt_write_all(int, const uint8_t*, size_t);
 extern int qihse_test_pg_write_all(int, const void*, size_t);
 extern int qihse_test_pg_parameter_status(int, const char*, const char*);
+extern int qihse_test_pg_tls_write_all(int, const void*, size_t);
 extern void* __real_malloc(size_t);
 extern void* __real_calloc(size_t, size_t);
 extern void* __real_realloc(void*, size_t);
@@ -19,6 +23,22 @@ extern ssize_t __real_send(int, const void*, size_t, int);
 
 static int malloc_fail = -1, calloc_fail = -1, realloc_fail = -1;
 static int send_mode, send_calls;
+static int ssl_mode, ssl_calls;
+
+int __wrap_SSL_write(void* ssl, const void* data, int length) {
+    (void)ssl; (void)data;
+    assert(length > 0);
+    ssl_calls++;
+    if (ssl_mode == 1) {
+        raise(SIGPIPE);
+        errno = EPIPE;
+        return -1;
+    }
+    assert(ssl_mode == 2);
+    if (ssl_calls == 1) assert(length == INT_MAX);
+    else assert(ssl_calls == 2 && length == 1);
+    return length;
+}
 
 static int fail_now(int* count) {
     if (*count < 0) return 0;
@@ -157,11 +177,39 @@ static void allocation_failures(void) {
     }
 }
 
+static void tls_writes(void) {
+    sigset_t before, after, block, pending;
+    assert(pthread_sigmask(SIG_SETMASK, NULL, &before) == 0);
+    ssl_mode = 1;
+    assert(qihse_test_pg_tls_write_all(-1, "x", 1) == -1 && errno == EPIPE);
+    assert(pthread_sigmask(SIG_SETMASK, NULL, &after) == 0);
+    assert(sigismember(&before, SIGPIPE) == sigismember(&after, SIGPIPE));
+    assert(sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 0);
+
+    /* A caller's already-pending SIGPIPE must not be consumed. */
+    sigemptyset(&block); sigaddset(&block, SIGPIPE);
+    assert(pthread_sigmask(SIG_BLOCK, &block, &before) == 0);
+    raise(SIGPIPE);
+    assert(qihse_test_pg_tls_write_all(-1, "x", 1) == -1);
+    assert(sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 1);
+    struct timespec zero = {0, 0};
+    assert(sigtimedwait(&block, NULL, &zero) == SIGPIPE);
+    assert(pthread_sigmask(SIG_SETMASK, &before, NULL) == 0);
+
+    size_t bytes = (size_t)INT_MAX + 1u;
+    void* mapping = mmap(NULL, bytes, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(mapping != MAP_FAILED);
+    ssl_mode = 2; ssl_calls = 0;
+    assert(qihse_test_pg_tls_write_all(-1, mapping, bytes) == 0 && ssl_calls == 2);
+    assert(munmap(mapping, bytes) == 0);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_DFL);
     socket_writes();
     bolt_frames();
     allocation_failures();
+    tls_writes();
     puts("PASS protocol partial/failed writes, large Bolt frames and allocation failures");
     return 0;
 }

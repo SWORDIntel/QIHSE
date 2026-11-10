@@ -1248,6 +1248,19 @@ test-aimem-projection-store:
 	$(CC) $(CFLAGS) -o tests/test_aimem_projection_store tests/test_aimem_projection_store.c src/spinnaker/qihse_aimem_projection_store.c -lsqlite3 -lcrypto -lm
 	./tests/test_aimem_projection_store
 
+.PHONY: test-aimem-projection-model-swap
+test-aimem-projection-model-swap: lib
+ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_aimem_projection_model_swap \
+	    tests/test_aimem_projection_model_swap.c -L. -lqihse $(LDFLAGS)
+	QIHSE_AIMEM_KEYSTONE_TEST_LIBRARY="$${QIHSE_AIMEM_KEYSTONE_TEST_LIBRARY:-../KEYSTONE/libkeystone.so}" \
+	    LD_LIBRARY_PATH=. ./tests/test_aimem_projection_model_swap
+else
+	@echo 'Set QIHSE_ENABLE_AIMEM_KEYSTONE=1 and QIHSE_AIMEM_KEYSTONE_INCLUDE to run this test' >&2
+	@false
+endif
+
 .PHONY: test-aimem-scope-index
 test-aimem-scope-index: lib
 	$(CC) $(CFLAGS) -o tests/test_aimem_scope_index tests/test_aimem_scope_index.c -L. -lqihse $(LDFLAGS)
@@ -1515,13 +1528,31 @@ test-serial: test-ownership-journal-write-status
 .PHONY: test-protocol-io-failures
 test-protocol-io-failures: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_PROTOCOL_IO_TESTING -Wl,--export-dynamic \
-	    -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=send \
+	    -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=send,--wrap=SSL_write \
 	    -o tests/test_protocol_io_failures tests/test_protocol_io_failures.c \
 	    src/spinnaker/qihse_bolt.c src/spinnaker/qihse_pg_wire.c \
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_protocol_io_failures
 
 test-serial: test-protocol-io-failures
+
+.PHONY: test-mongo-bson-builder
+test-mongo-bson-builder: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
+	    -o tests/test_mongo_bson_builder tests/test_mongo_bson_builder.c \
+	    src/spinnaker/qihse_mongo_wire.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_mongo_bson_builder
+
+test-serial: test-mongo-bson-builder
+
+.PHONY: test-vector-derived-lifecycle
+test-vector-derived-lifecycle: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_vector_derived_lifecycle \
+	    tests/test_vector_derived_lifecycle.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_derived_lifecycle
+
+test-serial: test-vector-derived-lifecycle
 
 test-backup-merge-concurrent: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_BACKUP_TEST -Wl,--export-dynamic \

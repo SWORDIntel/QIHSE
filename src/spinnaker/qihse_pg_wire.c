@@ -47,6 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -63,6 +64,7 @@
 #include <openssl/evp.h>
 #include <liburing.h>
 #include <poll.h>
+#include <signal.h>
 #include "qihse_af_xdp.h"
 #include "../../persistence/qihse_pqc_crypto.h"
 #else
@@ -132,6 +134,35 @@ struct qihse_pg_wire_listener {
     SSL_CTX* tls_ctx;
 };
 
+#ifndef _WIN32
+/* OpenSSL's socket BIO has no MSG_NOSIGNAL flag on Linux. Block SIGPIPE only
+ * in the writing thread, consume a newly generated instance, and restore the
+ * caller's mask and errno. A previously pending signal remains the caller's. */
+static int pg_ssl_write(SSL* ssl, const void* data, int length) {
+    sigset_t block, previous, pending;
+    sigemptyset(&block);
+    sigaddset(&block, SIGPIPE);
+    int error = pthread_sigmask(SIG_BLOCK, &block, &previous);
+    if (error) { errno = error; return -1; }
+    if (sigpending(&pending) != 0) {
+        int saved = errno;
+        (void)pthread_sigmask(SIG_SETMASK, &previous, NULL);
+        errno = saved;
+        return -1;
+    }
+    bool was_pending = sigismember(&pending, SIGPIPE) == 1;
+    int written = SSL_write(ssl, data, length);
+    int saved = errno;
+    if (written <= 0 && !was_pending) {
+        struct timespec zero = {0, 0};
+        while (sigtimedwait(&block, NULL, &zero) < 0 && errno == EINTR) {}
+    }
+    (void)pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    errno = saved;
+    return written;
+}
+#endif
+
 /* Write exactly n bytes, retrying on EINTR / short writes. */
 static int pg_write_all(int fd, const void* buf, size_t n) {
 #ifdef SO_NOSIGPIPE
@@ -143,7 +174,7 @@ static int pg_write_all(int fd, const void* buf, size_t n) {
         ssize_t w;
 #ifndef _WIN32
         if (current_ssl) {
-            w = SSL_write(current_ssl, p, (int)n);
+            w = pg_ssl_write(current_ssl, p, n > INT_MAX ? INT_MAX : (int)n);
             if (w <= 0) return -1;
         } else
 #endif
@@ -306,6 +337,14 @@ int qihse_test_pg_write_all(int fd, const void* buf, size_t len) {
 int qihse_test_pg_parameter_status(int fd, const char* name, const char* value) {
     return pg_send_parameter_status(fd, name, value);
 }
+#ifndef _WIN32
+int qihse_test_pg_tls_write_all(int fd, const void* data, size_t len) {
+    current_ssl = (SSL*)(uintptr_t)1;
+    int result = pg_write_all(fd, data, len);
+    current_ssl = NULL;
+    return result;
+}
+#endif
 #endif
 
 static int pg_send_backend_key_data(int fd, int32_t pid, int32_t secret) {
@@ -916,8 +955,11 @@ static int pg_handle_txn_control(int fd, const char* sql,
     if (ast->stmt_type == QIHSE_SQL_COMMIT) {
         if (session->failed) {
             /* PostgreSQL treats COMMIT in an aborted transaction as ROLLBACK. */
-            (void)qihse_txn_rollback((qihse_txn_manager_t*)ctx->txn_manager,
-                                     session->txn);
+            qihse_txn_manager_t* manager = ctx->txn_manager;
+            if (qihse_txn_rollback(manager, session->txn) != 0)
+                return pg_send_error_ready(fd, session, "25000",
+                                           "transaction rollback failed", true);
+            (void)qihse_txn_release(manager, session->txn);
             session->txn = NULL;
             session->failed = false;
             pg_retry_reset(session);
@@ -953,9 +995,11 @@ static int pg_handle_txn_control(int fd, const char* sql,
         pg_retry_reset(session);
         if (status != UWP_STS_OK) {
             if (session->txn && retry_bound) {
-                (void)qihse_txn_rollback((qihse_txn_manager_t*)ctx->txn_manager,
-                                         session->txn);
-                session->txn = NULL;
+                qihse_txn_manager_t* manager = ctx->txn_manager;
+                if (qihse_txn_rollback(manager, session->txn) == 0) {
+                    (void)qihse_txn_release(manager, session->txn);
+                    session->txn = NULL;
+                }
                 session->failed = true;
             } else session->failed = session->txn != NULL;
             if (status == UWP_STS_ERR_PERM)
@@ -983,6 +1027,8 @@ static int pg_handle_txn_control(int fd, const char* sql,
             return pg_send_error_ready(fd, session, "25000", "transaction rollback failed",
                                        true);
         }
+        (void)qihse_txn_release((qihse_txn_manager_t*)ctx->txn_manager,
+                              session->txn);
         session->txn = NULL;
         session->failed = false;
         pg_retry_reset(session);
@@ -995,8 +1041,12 @@ static int pg_handle_txn_control(int fd, const char* sql,
 
 static void pg_implicit_rollback(pg_transaction_session_t* session) {
     if (session->txn) {
-        (void)qihse_txn_rollback((qihse_txn_manager_t*)session->uwp->txn_manager,
-                                session->txn);
+        qihse_txn_manager_t* manager = session->uwp->txn_manager;
+        if (qihse_txn_rollback(manager, session->txn) != 0) {
+            session->failed = true;
+            return;
+        }
+        (void)qihse_txn_release(manager, session->txn);
         session->txn = NULL;
     }
     session->failed = false;
@@ -2659,8 +2709,9 @@ static void pg_wire_handle_client_internal(
 done:
     pg_extended_clear(&extended);
     if (session.txn && uwp && uwp->txn_manager) {
-        (void)qihse_txn_rollback((qihse_txn_manager_t*)uwp->txn_manager,
-                                 session.txn);
+        qihse_txn_manager_t* manager = uwp->txn_manager;
+        if (qihse_txn_rollback(manager, session.txn) == 0)
+            (void)qihse_txn_release(manager, session.txn);
         session.txn = NULL;
     }
     pg_retry_reset(&session);

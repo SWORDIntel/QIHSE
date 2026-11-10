@@ -65,7 +65,7 @@ int main(void) {
     qihse_user_t* owner = qihse_auth_create_tenant_user(operator_user, 31u, 3101u,
         QIHSE_ROLE_ANALYST, 0u, 0u, "ProjectionSwapOwner123!", false);
     assert(owner);
-    qihse_kv_store_t* kv = qihse_kv_store_create();
+    qihse_kv_store_t* kv = qihse_kv_store_create_user(operator_user);
     assert(kv);
     qihse_resp_server_config_t config;
     qihse_resp_server_config_init(&config);
@@ -117,8 +117,18 @@ int main(void) {
     assert(qihse_ai_memory_projection_wait_ready(server, owner, 30000u));
     qihse_ai_memory_projection_shutdown(server);
 
+    /* Output dimensions are a distinct part of the persistent identity too. */
+    provider.dim = 8u;
+    assert(qihse_ai_memory_set_embedder(&provider));
+    assert(qihse_ai_memory_set_embedder_fingerprint(model_a));
+    assert(qihse_ai_memory_projection_enable(server, owner, library, data_dir));
+    assert(qihse_ai_memory_projection_wait_ready(server, owner, 30000u));
+    qihse_ai_memory_projection_shutdown(server);
+
     qihse_resp_server_destroy(server);
     qihse_kv_store_destroy(kv);
+    qihse_auth_shutdown_rate_limiter();
+    qihse_auth_shutdown_volume_limiter();
     qihse_audit_shutdown();
     assert(nftw(data_dir, remove_fixture, 16, FTW_DEPTH | FTW_PHYS) == 0);
     puts("PASS mocked KEYSTONE model-bound cache re-enable without KV mutation");
