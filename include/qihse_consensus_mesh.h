@@ -248,6 +248,15 @@ bool qihse_consensus_mesh_range_transition_user(
     qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
     uint64_t decision_index, qihse_consensus_range_request_t* out_request,
     qihse_consensus_range_decision_t* out_decision);
+/* Requires an active system Operator. Return the latest committed, finalized
+ * PROMOTION for a stable group ID.
+ * A successful lookup with out_found=false means no committed promotion is
+ * recorded; callers may then use their common initial group configuration.
+ * Pending or aborted promotions are never exposed. */
+bool qihse_consensus_mesh_range_group_transition_user(
+    qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
+    const char* group_id, qihse_consensus_range_request_t* out_request,
+    qihse_consensus_range_decision_t* out_decision, bool* out_found);
 bool qihse_consensus_mesh_range_lookup_user(
     qihse_consensus_mesh_t* mesh, const qihse_user_t* principal,
     const char* transfer_id,

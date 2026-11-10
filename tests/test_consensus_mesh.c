@@ -109,6 +109,30 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
                                                  genesis, 5000u, &genesis_index,
                                                  genesis_digest));
   assert(genesis_index > 0);
+  qihse_consensus_range_request_t group_transition = {0};
+  qihse_consensus_range_decision_t group_decision = {0};
+  bool group_found = true;
+  assert(qihse_consensus_mesh_range_group_transition_user(
+      meshes[client], operator_user, TEST_GROUP_A, &group_transition,
+      &group_decision, &group_found));
+  assert(!group_found && group_transition.transfer_id[0] == '\0' &&
+         group_decision.decision_index == 0u);
+  memset(&group_transition, 0xa5, sizeof(group_transition));
+  memset(&group_decision, 0xa5, sizeof(group_decision));
+  group_found = true;
+  assert(!qihse_consensus_mesh_range_group_transition_user(
+      meshes[client], analyst, TEST_GROUP_A, &group_transition,
+      &group_decision, &group_found));
+  assert(!group_found && group_transition.transfer_id[0] == '\0' &&
+         group_decision.decision_index == 0u);
+  memset(&group_transition, 0xa5, sizeof(group_transition));
+  memset(&group_decision, 0xa5, sizeof(group_decision));
+  group_found = true;
+  assert(!qihse_consensus_mesh_range_group_transition_user(
+      meshes[client], NULL, TEST_GROUP_A, &group_transition, &group_decision,
+      &group_found));
+  assert(!group_found && group_transition.transfer_id[0] == '\0' &&
+         group_decision.decision_index == 0u);
   qihse_consensus_entry_t genesis_entry;
   size_t genesis_entry_count = 0;
   assert(qihse_consensus_mesh_read_committed(
@@ -364,6 +388,85 @@ static void test_range_arbitration(qihse_consensus_mesh_t *meshes[NODE_COUNT],
       &state_index));
   assert(!strcmp(selected[500].owner_topology_id, "topology-b") &&
          selected[500].epoch == 113u);
+
+  qihse_consensus_range_request_t promotion = {0};
+  promotion.op = QIHSE_RANGE_OP_PROMOTION;
+  snprintf(promotion.transfer_id, sizeof(promotion.transfer_id),
+           "promotion-range-500-b");
+  snprintf(promotion.source_topology_id, sizeof(promotion.source_topology_id),
+           "topology-b");
+  snprintf(promotion.source_qkp_id, sizeof(promotion.source_qkp_id),
+           "mesh-node-2");
+  snprintf(promotion.source_group_id, sizeof(promotion.source_group_id),
+           TEST_GROUP_B);
+  snprintf(promotion.target_topology_id, sizeof(promotion.target_topology_id),
+           "topology-c");
+  snprintf(promotion.target_qkp_id, sizeof(promotion.target_qkp_id),
+           "mesh-node-1");
+  snprintf(promotion.target_group_id, sizeof(promotion.target_group_id),
+           TEST_GROUP_B);
+  snprintf(promotion.successor_topology_id,
+           sizeof(promotion.successor_topology_id), "topology-d");
+  snprintf(promotion.successor_qkp_id, sizeof(promotion.successor_qkp_id),
+           "mesh-node-3");
+  snprintf(promotion.source_generation, sizeof(promotion.source_generation),
+           "00000000000000000000000000000005");
+  snprintf(promotion.target_generation, sizeof(promotion.target_generation),
+           "00000000000000000000000000000006");
+  memcpy(promotion.slots, bitmap, sizeof(bitmap));
+  memcpy(promotion.expected_state_digest, state_digest, sizeof(state_digest));
+  qihse_consensus_range_grant_t promotion_grant;
+  assert(qihse_consensus_mesh_range_reserve_user(
+      meshes[client], operator_user, &promotion, 5000u, &promotion_grant));
+  uint8_t promotion_evidence[32];
+  memset(promotion_evidence, 0x79, sizeof(promotion_evidence));
+  size_t pending_leader = current_test_leader(meshes);
+  assert(pending_leader < NODE_COUNT);
+  assert(qihse_consensus_mesh_test_hold_append_replies(meshes[pending_leader],
+                                                       true));
+  qihse_consensus_range_decision_t promotion_decision;
+  assert(!qihse_consensus_mesh_range_finalize_user(
+      meshes[pending_leader], operator_user, &promotion, &promotion_grant,
+      promotion_evidence, 500u, &promotion_decision));
+  memset(&group_transition, 0xa5, sizeof(group_transition));
+  memset(&group_decision, 0xa5, sizeof(group_decision));
+  group_found = true;
+  assert(qihse_consensus_mesh_range_group_transition_user(
+      meshes[pending_leader], operator_user, TEST_GROUP_B, &group_transition,
+      &group_decision, &group_found));
+  assert(!group_found && group_transition.transfer_id[0] == '\0' &&
+         group_decision.decision_index == 0u);
+  qihse_consensus_mesh_stop(meshes[pending_leader]);
+  qihse_consensus_mesh_destroy(meshes[pending_leader]);
+  meshes[pending_leader] = NULL;
+  size_t promotion_leader = wait_test_leader(meshes);
+  assert(promotion_leader < NODE_COUNT && promotion_leader != pending_leader);
+  assert(qihse_consensus_mesh_range_group_transition_user(
+      meshes[promotion_leader], operator_user, TEST_GROUP_B, &group_transition,
+      &group_decision, &group_found));
+  assert(!group_found && group_transition.transfer_id[0] == '\0' &&
+         group_decision.decision_index == 0u);
+  assert(qihse_consensus_mesh_range_finalize_user(
+      meshes[promotion_leader], operator_user, &promotion, &promotion_grant,
+      promotion_evidence, 5000u, &promotion_decision));
+  assert(promotion_decision.decision_index > promotion_grant.reserve_index);
+  restart_test_voter(meshes, configs, pending_leader,
+                     promotion_decision.decision_index);
+  memset(&group_transition, 0, sizeof(group_transition));
+  memset(&group_decision, 0, sizeof(group_decision));
+  group_found = false;
+  assert(qihse_consensus_mesh_range_group_transition_user(
+      meshes[client], operator_user, TEST_GROUP_B, &group_transition,
+      &group_decision, &group_found));
+  assert(group_found && group_transition.op == QIHSE_RANGE_OP_PROMOTION &&
+         !strcmp(group_transition.transfer_id, promotion.transfer_id) &&
+         !strcmp(group_transition.target_topology_id,
+                 promotion.target_topology_id) &&
+         !strcmp(group_transition.target_generation,
+                 promotion.target_generation) &&
+         !strcmp(group_transition.successor_topology_id,
+                 promotion.successor_topology_id) &&
+         group_decision.decision_index == promotion_decision.decision_index);
   for (unsigned n = 0; n < 12; n += 11) {
     char history_id[65];
     snprintf(history_id, sizeof(history_id), "transfer-history-%u", n);

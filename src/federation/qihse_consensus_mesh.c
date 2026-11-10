@@ -3055,6 +3055,58 @@ bool qihse_consensus_mesh_range_transition_user(
   return ok;
 }
 
+bool qihse_consensus_mesh_range_group_transition_user(
+    qihse_consensus_mesh_t *m, const qihse_user_t *u, const char *group_id,
+    qihse_consensus_range_request_t *request,
+    qihse_consensus_range_decision_t *decision, bool *found) {
+  if (request)
+    memset(request, 0, sizeof(*request));
+  if (decision)
+    memset(decision, 0, sizeof(*decision));
+  if (found)
+    *found = false;
+  if (!qcm_range_mesh_valid(m) || !group_id || !request || !decision ||
+      !found || !qcm_range_lower_hex(group_id, 64) || !qcm_range_operator(u))
+    return false;
+
+  pthread_mutex_lock(&m->state_lock);
+  qcm_range_state_t s;
+  uint64_t commit = 0;
+  bool ok = qcm_range_replay_locked(m, u, &s, &commit) && s.initialized &&
+            s.genesis_index <= commit;
+  qihse_consensus_range_request_t latest_request = {0};
+  qihse_consensus_range_decision_t latest_decision = {0};
+  uint64_t latest_index = 0;
+  if (ok) {
+    for (size_t i = 0; i < s.pending_count; ++i) {
+      const qcm_range_pending_t *p = &s.pending[i];
+      if (!p->committed || !p->terminal || !p->finalized ||
+          p->request.op != QIHSE_RANGE_OP_PROMOTION ||
+          p->decision.decision_index > commit ||
+          p->decision.decision_index <= latest_index ||
+          strcmp(p->request.source_group_id, group_id) ||
+          strcmp(p->request.target_group_id, group_id))
+        continue;
+      latest_request = p->request;
+      latest_decision = p->decision;
+      latest_index = p->decision.decision_index;
+    }
+    if (latest_index) {
+      *request = latest_request;
+      *decision = latest_decision;
+      *found = true;
+    }
+  }
+  qcm_range_state_free(&s);
+  pthread_mutex_unlock(&m->state_lock);
+  if (!ok) {
+    memset(request, 0, sizeof(*request));
+    memset(decision, 0, sizeof(*decision));
+    *found = false;
+  }
+  return ok;
+}
+
 #define QCM_RANGE_FORWARD_HEADER 153u
 #define QCM_RANGE_FORWARD_REPLY 53u
 #define QCM_RANGE_CHUNK_HEADER 16u
