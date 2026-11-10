@@ -568,7 +568,16 @@ static uint64_t wal_append_raw(qihse_wal_t* wal,
 
     /* Durability */
     if (wal->durability == QIHSE_WAL_DURABILITY_FDATASYNC) {
-        if (sync_data_fd(wal->seg_fd) != 0) goto fail;
+        if (sync_data_fd(wal->seg_fd) != 0) {
+            /* The complete record may already be durable despite the failed
+             * acknowledgement. Do not append a COMMIT or reuse this handle;
+             * close and reopen so recovery decides from the valid WAL prefix. */
+            wal->writer_failed = true;
+            int failed_fd = wal->seg_fd;
+            wal->seg_fd = -1;
+            (void)close(failed_fd);
+            goto fail;
+        }
     }
     /* GROUP_COMMIT: caller is responsible for calling qihse_wal_flush() */
 

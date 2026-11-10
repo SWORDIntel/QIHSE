@@ -67,10 +67,12 @@ static void test_lifecycle(void) {
     assert(t1);
     assert(t1->state == QIHSE_TXN_ACTIVE);
     assert(t1->id == QIHSE_TXN_FIRST_ID);
+    assert(qihse_txn_record_write(t1, QIHSE_MVCC_ENGINE_KV, "life", 4) == 0);
     uint64_t id1 = t1->id;
 
     qihse_txn_t* t2 = qihse_txn_begin(mgr, QIHSE_ISO_REPEATABLE_READ);
     assert(t2);
+    assert(qihse_txn_release(mgr, t1) == -1); /* live handles cannot be freed */
     assert(t2->id != id1);
     assert(qihse_txn_active_count(mgr) == 2);
 
@@ -109,6 +111,10 @@ static void test_lifecycle(void) {
     qihse_txn_set_start_lsn(t1, 4242);
     assert(qihse_txn_get_start_lsn(t1) == 4242);
     assert(qihse_txn_get_snapshot(t2) == t2->id - 1);
+
+    /* Terminal handles stay readable until explicitly released. */
+    assert(qihse_txn_release(mgr, t1) == 0);
+    assert(qihse_txn_release(mgr, t2) == 0);
 
     qihse_txn_manager_destroy(mgr);
     printf("PASS txn lifecycle: BEGIN/COMMIT/ROLLBACK, registry, active set, LSN\n");

@@ -108,7 +108,9 @@ typedef struct qihse_txn_manager qihse_txn_manager_t;
 
 /* The manager has no durable 2PC decision journal. Callers must resolve all
  * COMMITTING/ABORTING transactions before destroying it or pending participant
- * work will require external recovery. */
+ * work will require external recovery. Terminal handles are retained so their
+ * state remains readable; call qihse_txn_release() promptly in long-lived
+ * managers, or destruction releases all remaining handles. */
 qihse_txn_manager_t* qihse_txn_manager_create(void);
 void qihse_txn_manager_destroy(qihse_txn_manager_t* mgr);
 
@@ -125,6 +127,12 @@ int qihse_txn_commit(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
 /* ROLLBACK a transaction.  Returns 0 on success. */
 int qihse_txn_rollback(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
+
+/* Release a terminal transaction handle and its read/write set before manager
+ * destruction. The handle remains valid after COMMIT/ROLLBACK until released
+ * or until the manager is destroyed. Active, PREPARED, COMMITTING, and
+ * ABORTING transactions cannot be released. */
+int qihse_txn_release(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
 /* Create a SAVEPOINT with the given name.  Returns 0 on success. */
 int qihse_txn_savepoint(qihse_txn_manager_t* mgr, qihse_txn_t* txn,

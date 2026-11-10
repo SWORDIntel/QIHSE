@@ -267,9 +267,18 @@ int main(void) {
     assert(qihse_wal_last_checkpoint(wal) == 0);
 
     qihse_test_sync_fail = 0;
-    assert(qihse_wal_flush(wal) == 0);
+    /* A complete record with a failed durability ACK is ambiguous. This
+     * handle must not append a COMMIT behind it; reopen and recover first. */
+    assert(qihse_wal_append_commit(wal, 1) == 0);
+    assert(qihse_wal_flush(wal) == -1);
+    assert(qihse_wal_replay(wal, 0, count_record, &replayed) == -1);
+    assert(qihse_wal_destroy_checked(wal) == 0);
+    wal = qihse_wal_create(checked_dir, 64 * 1024,
+                           QIHSE_WAL_DURABILITY_FDATASYNC);
+    assert(wal && qihse_wal_current_lsn(wal) == 2);
     assert(qihse_wal_replay(wal, 0, count_record, &replayed) == 1);
     assert(replayed == 1);
+    assert(qihse_wal_append_commit(wal, 1) == 2);
     assert(qihse_wal_checkpoint(wal, 9) == -1);
     uint64_t checkpoint = qihse_wal_current_lsn(wal);
     assert(qihse_wal_append_checkpoint(wal, checkpoint) != 0);

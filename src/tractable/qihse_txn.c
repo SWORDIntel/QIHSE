@@ -45,6 +45,7 @@ typedef struct qihse_active_node_s {
     qihse_txn_registry_entry_t* commit_registry_entry;
     qihse_txn_registry_entry_t* abort_registry_entry;
     struct qihse_active_node_s* next;
+    struct qihse_active_node_s* finished_next;
 } qihse_active_node_t;
 
 /* A committed transaction's writes remain here while an active SERIALIZABLE
@@ -65,6 +66,10 @@ struct qihse_txn_manager {
     qihse_arena_t*           arena;
     /* Active transactions (linked list) */
     qihse_active_node_t*     active_head;
+    /* Keep terminal handles valid until manager destruction, then release the
+     * handle and its heap-backed read/write set. There is no public per-handle
+     * destroy API, so unlinking a transaction must not orphan its allocation. */
+    qihse_active_node_t*     finished_head;
     /* Committed/aborted registry (hash table for quick lookup) */
     qihse_txn_registry_entry_t** registry_buckets;
     size_t                   registry_n_buckets;
@@ -141,6 +146,7 @@ static bool active_add(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     node->commit_summary = NULL;
     node->commit_registry_entry = NULL;
     node->abort_registry_entry = NULL;
+    node->finished_next = NULL;
     node->next = mgr->active_head;
     mgr->active_head = node;
     mgr->active_count++;
@@ -208,7 +214,11 @@ static void active_remove(qihse_txn_manager_t* mgr, uint64_t txn_id) {
         if ((*pp)->txn->id == txn_id) {
             qihse_active_node_t* dead = *pp;
             *pp = dead->next;
-            /* Don't arena-free the node (arena is bump-allocated); just unlink */
+            /* Keep terminal handles usable by callers until manager destroy,
+             * while retaining a route to their malloc-backed rw_set. */
+            dead->next = NULL;
+            dead->finished_next = mgr->finished_head;
+            mgr->finished_head = dead;
             mgr->active_count--;
             return;
         }
@@ -338,6 +348,7 @@ qihse_txn_manager_t* qihse_txn_manager_create(void) {
     pthread_mutex_init(&mgr->lock, NULL);
     mgr->next_txn_id     = QIHSE_TXN_FIRST_ID;
     mgr->active_head     = NULL;
+    mgr->finished_head   = NULL;
     mgr->active_count    = 0;
     mgr->commit_seq      = 0;
     mgr->participant_count = 0;
@@ -377,7 +388,21 @@ void qihse_txn_manager_destroy(qihse_txn_manager_t* mgr) {
             free(node->txn->rw_set);
             node->txn->rw_set = NULL;
         }
+        if (node->txn) {
+            free(node->txn);
+            node->txn = NULL;
+        }
         node = node->next;
+    }
+    node = mgr->finished_head;
+    while (node) {
+        qihse_active_node_t* next = node->finished_next;
+        if (node->txn) {
+            if (node->txn->rw_set) free(node->txn->rw_set);
+            free(node->txn);
+            node->txn = NULL;
+        }
+        node = next;
     }
     qihse_committed_summary_t* summary = mgr->committed_head;
     while (summary) {
@@ -547,6 +572,29 @@ int qihse_txn_rollback(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
     prune_committed_history_locked(mgr);
     pthread_mutex_unlock(&mgr->lock);
 
+    return 0;
+}
+
+int qihse_txn_release(qihse_txn_manager_t* mgr, qihse_txn_t* txn) {
+    if (!mgr || !txn) return -1;
+    pthread_mutex_lock(&mgr->lock);
+    qihse_active_node_t** link = &mgr->finished_head;
+    while (*link && (*link)->txn != txn) link = &(*link)->finished_next;
+    if (!*link || (txn->state != QIHSE_TXN_COMMITTED &&
+                   txn->state != QIHSE_TXN_ABORTED)) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -1;
+    }
+    qihse_active_node_t* finished = *link;
+    *link = finished->finished_next;
+    finished->finished_next = NULL;
+    free(txn->rw_set);
+    txn->rw_set = NULL;
+    txn->rw_count = 0;
+    txn->rw_capacity = 0;
+    free(txn);
+    finished->txn = NULL;
+    pthread_mutex_unlock(&mgr->lock);
     return 0;
 }
 
