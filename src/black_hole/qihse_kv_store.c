@@ -9868,5 +9868,4 @@ bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
 }
 
 #include "qihse_ct_range_export.inc"
-#include "qihse_ct_lane_transfer.inc"
 
