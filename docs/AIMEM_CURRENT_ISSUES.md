@@ -286,6 +286,7 @@ adapters. These remain local changes; no live service or dataset was changed.
 | KV compaction and exports | Failed input-file cleanup resurrected deleted and expired keys; a forgiving damaged-row scan could publish incomplete full, replica, delta and owner-data exports and then delete compaction inputs. Recovery-producing scans now stop on corruption. Publish and sync the replacement before retiring inputs; retain dead states while older files can survive, check cleanup errors and preserve accurate live-file counts. Failed export leaves an existing destination unchanged. |
 | Degraded KV reads | The metadata-index fallback loaded SSTables into RAM and unlinked their only durable copies. A read/export followed by process exit lost a previously durable key. Materialization now retains original SSTables until a durable replacement retires them. Compaction also retains disk versions shadowed by RAM whose WAL replacement may not yet be fsynced. The restart regression fails before this change and passes afterward. |
 | Expired delta replacements | Legacy delta export skipped an expired replacement, allowing a lagging consumer to keep an older non-expiring value after its cursor advanced. Emit a tombstone at the replacement's original sequence with its classification/SCI and no value. RAM/SST fixtures cover the later cursor and low-clearance/missing-SCI exclusion without relying on a sweeper. This is separate from CT1's grouped replication journal. |
+| Native container WAL | Appending/truncating a V1 WAL rewrote length metadata in place; interruption could make the container unreadable before record-tail recovery ran. V2 keeps WAL as the final EOF extent, with no per-append table/header rewrite. Existing V1 files remain readable and convert atomically on their first WAL mutation, preserving persisted sections without publishing pending caller buffers. Partial append rolls back its tail; failed rollback requires reopen. Explicit sync covers both inode and parent entry, including a retry after uncertain migration rename. Fault tests cover failed append/rollback/rename/directory sync and reopen; vector WAL, read-only, spill and persistence fixtures pass. |
 | Transactions and WAL | Terminal transaction handles/write sets were orphaned; UWP could drop pending COMMITTING/ABORTING handles. Add explicit terminal release, release consumed UWP/PG handles, and keep pending work attached for retry. A complete WAL write followed by failed fdatasync now disables that writer until reopen rather than allowing later records to make an ambiguously acknowledged operation durable. |
 | Vector/HNSW lifecycle | Mutations left graph/INT8/binary candidate indexes valid and sidecar loading ignored post-WAL generations. Invalidate stale accelerators with exact fallback, validate live generations and keep read-only builds ephemeral. Fix over-aligned HNSW allocations and propagate build allocation failures instead of publishing an incomplete index. The existing void insertion API remains as a compatibility wrapper. |
 | Other protocols | BSON builders could dereference failed allocations, miscount serialized terminators or partially replace fields; grouped aggregation array growth was not allocation-atomic. Bolt wrapped chunk lengths above 65535 bytes, and socket/buffer failures could lose framing. PG could emit incomplete messages after allocation failure. Preserve BSON/Bolt public struct layouts, check construction failures, split Bolt chunks, terminate failed writes and protect PG TLS writes from SIGPIPE only in the writing thread. |
@@ -307,7 +308,8 @@ allocation faults, PG/UWP transaction behavior, WAL durability, BSON and adapter
 denials, vector lifecycle, HNSW allocation failures, compaction/recovery/export
 faults, ownership replay and interrupted large transfer. Scoped protocol
 ASan/UBSan passes with leak detection enabled; changed HNSW/vector and BSON
-units also have focused sanitizer evidence, not whole-library coverage.
+units also have focused sanitizer evidence, not whole-library coverage. The
+container WAL fault fixture passes scoped ASan/UBSan with leak detection enabled.
 
 Reproduce the principal focused checks from a built checkout:
 
@@ -318,15 +320,26 @@ make -o lib test-protocol-io-failures test-pg-wire-txn test-sql-dml-exec \
   test-vector-derived-lifecycle test-hnsw-allocation-failures
 make -o lib test-kv-compaction-recovery test-ownership-journal-write-status \
   test-ct-transfer-storage test-cluster-transfer test-ct-transfer-large
+make -o lib test-container-wal-recovery test-container-create-sync \
+  test-container-lifecycle test-container-flush-locking test-vector-wal-admission \
+  test-vector-spill-recovery test-persist
 make test-aimem-projection-model-swap QIHSE_ENABLE_AIMEM_KEYSTONE=1 \
   QIHSE_AIMEM_KEYSTONE_INCLUDE=../KEYSTONE/include
 ```
+
+Container migration is lazy and needs no separate conversion command. Its first
+WAL mutation copies the existing container once; normal appends retain existing
+batching. Explicit sync now also syncs the directory, adding that I/O at the
+existing durability boundary. V1-only binaries cannot read newly written V2
+containers, so a binary downgrade requires a compatible backup. Record checksums
+are not cryptographic authentication; V2 repairs crash recovery, not that
+separate integrity limitation. No latency improvement is claimed.
 
 Still open: authenticated missing-promotion chains; per-range replication roles
 (a daemon still has one CT role/peer and a dedicated slotless successor);
 consensus-backed range arbitration for automatic balancing under divergent
 partition views; durable generic 2PC coordinator decisions and general SQL WAL
-redo; container-v1 crash-atomic section-table/header updates; and real remote
+redo; cryptographic binding of container section metadata and WAL records; and real remote
 KEYSTONE/ONNX readiness. Automatic rebalance is opt-in in the source, not a
 default cluster guarantee. No live partition incident is claimed by this
 source review. The full suite remains paused at the user's request; these

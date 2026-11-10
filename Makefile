@@ -1525,6 +1525,18 @@ test-resp-wire-framing: lib
 
 test-serial: test-container-create-sync test-vector-spill-recovery test-resp-wire-framing
 
+.PHONY: test-container-wal-recovery
+test-container-wal-recovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Dfsync=qihse_test_fsync \
+	    -c persistence/qihse_container.c -o tests/test_container_wal_recovery_impl.o
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -Wl,--wrap=pwrite,--wrap=ftruncate,--wrap=rename \
+	    -o tests/test_container_wal_recovery_v2 tests/test_container_wal_recovery_v2.c \
+	    tests/test_container_wal_recovery_impl.o -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_container_wal_recovery_v2
+
+test-serial: test-container-wal-recovery
+
 .PHONY: test-ownership-journal-write-status
 test-ownership-journal-write-status: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_OWNERSHIP_JOURNAL_TEST_WRAP_FSYNC \

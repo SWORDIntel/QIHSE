@@ -692,7 +692,9 @@ bool qihse_ctr_open_write(const char* path, bool create, qihse_container_t* ctr)
         }
     }
 
-    if (count == 0u) {
+    if (count == 0u ||
+        (count == 1u && ctr->sections[0].section_id == QIHSE_CTR_SEC_WAL &&
+         ctr->sections[0].length == 0u)) {
         uint8_t enc_key[QIHSE_MLKEM_CIPHERTEXT_SIZE];
         qihse_pqc_init(&ctr->pqc_ctx, NULL, enc_key);
         /* The flush operation will write this new SEC_KEY into the database automatically */
@@ -1174,8 +1176,6 @@ bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size)
 
 bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length) {
     int idx;
-    uint8_t len_bytes[8];
-    uint64_t field_off;
 
     if (!ctr || ctr->fd < 0 || !ctr->locked || ctr->read_only) {
         errno = EINVAL;
@@ -1214,12 +1214,8 @@ bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length) {
         return true;
     }
 
-    field_off = QIHSE_CTR_TABLE_OFFSET +
-                (uint64_t)idx * QIHSE_CTR_SECTION_ENTRY_SIZE + 16u;
-    qihse_le_write_u64(len_bytes, new_length);
-    if (!ctr_pwrite(ctr->fd, len_bytes, 8u, field_off)) return false;
-    ctr->sections[idx].length = new_length;
-    return true;
+    errno = EINVAL;
+    return false;
 }
 
 bool qihse_ctr_fsync(qihse_container_t* ctr) {
@@ -1228,7 +1224,11 @@ bool qihse_ctr_fsync(qihse_container_t* ctr) {
 #ifndef _WIN32
     int rc;
     do { rc = fsync(ctr->fd); } while (rc != 0 && errno == EINTR);
-    return rc == 0;
+    if (rc != 0) return false;
+    /* A prior atomic replacement can have returned an uncertain result after
+     * rename. Handles are short-lived, so a reopen cannot remember that error.
+     * Re-establish pathname durability at this explicit sync boundary too. */
+    return ctr->path && ctr_sync_parent_directory(ctr->path);
 #else
     return _commit(ctr->fd) == 0;
 #endif

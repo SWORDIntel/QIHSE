@@ -237,6 +237,14 @@ static void test_v1_conversion(const char* dir, const char* name,
         assert(qihse_ctr_open_write(path, false, &ctr));
     }
     assert(qihse_ctr_wal_append(&ctr, "new", 3u));
+    if (fail_after_rename) {
+        /* Reopen discarded all in-memory knowledge of the uncertain rename.
+         * Its explicit durability boundary must retry the parent sync. */
+        fail_directory_sync = 1;
+        errno = 0;
+        assert(!qihse_ctr_fsync(&ctr));
+        assert(errno == EIO && !fail_directory_sync);
+    }
     assert(qihse_ctr_fsync(&ctr));
     assert(ctr.format_version == QIHSE_CTR_VERSION);
     assert(qihse_ctr_section_length(&ctr, QIHSE_CTR_SEC_WAL) ==

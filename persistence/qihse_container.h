@@ -191,9 +191,8 @@ bool qihse_ctr_wal_append(qihse_container_t* ctr, const void* data, size_t size)
  */
 bool qihse_ctr_wal_truncate(qihse_container_t* ctr, uint64_t new_length);
 
-/*
- * fsync the container fd.
- */
+/* Sync the inode and its parent entry, including a replacement published by a
+ * prior uncertain flush. Append itself remains unsynced. */
 bool qihse_ctr_fsync(qihse_container_t* ctr);
 
 #ifdef __cplusplus
