@@ -13217,11 +13217,12 @@ static bool qihse_resp_ct_group_status(qihse_resp_session_t* s,
         !qihse_resp_ct_group_find(s->server, lane_id)) return false;
     const char* authenticated_peer = qihse_resp_replication_peer_id(s->server, s->qkp);
     if (!authenticated_peer) return false;
-    qihse_user_t* status_principal = mode == QIHSE_KV_CT_LANE_RECEIVER
-        ? s->server->ct_control_principal : s->user;
     pthread_rwlock_rdlock(&s->server->kv_lock);
-    bool ok = status_principal && qihse_kv_ct_lane_status(
-        s->server->store, status_principal, lane_id, out);
+    /* KV admits this metadata-only status read to the configured CT service
+     * principal on either lane mode. Keep the authenticated peer identity at
+     * the lowest KV layer and then require the exact lane pin below; do not
+     * substitute a local Operator for the remote service identity. */
+    bool ok = qihse_kv_ct_lane_status(s->server->store, s->user, lane_id, out);
     pthread_rwlock_unlock(&s->server->kv_lock);
     if (!ok || out->mode != mode) return false;
     if (mode == QIHSE_KV_CT_LANE_SOURCE)
