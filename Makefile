@@ -2094,7 +2094,7 @@ PREFIX ?= /usr/local
 PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_limit.h \
     qihse_hetero.h qihse_math.h qihse_instr.h qihse_search.h \
     qihse_vector_db.h qihse_uwp.h qihse_uwp_tls.h qihse_uwp_metrics.h \
-    qihse_kv_store.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
+    qihse_kv_store.h qihse_backup.h qihse_operations.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
     qihse_timeseries.h qihse_event_stream.h qihse_repl.h qihse_pooler.h \
     qihse_txn.h qihse_platform.h qihse_schema.h qihse_table_store.h \
     qihse_sql_parser.h qihse_sql_extensions.h qihse_sql_fts.h \

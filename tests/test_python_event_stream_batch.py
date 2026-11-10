@@ -33,13 +33,14 @@ def main():
     # Reject narrowing and oversize batches before entering the native ABI.
     for bad_scope in (EventScope("python-firmware", 65536, 0),
                       EventScope("python-firmware", 0, -1),
-                      EventScope("python-firmware", True, 0)):
+                      EventScope("python-firmware", True, 0),
+                      EventScope("python-firmware\0other", 0, 0)):
         try:
             stream.append_batch(bad_scope, [{"schema_id": 1, "payload": b"x"}], user=user)
         except ValueError:
             pass
         else:
-            raise AssertionError("out-of-range EventScope labels were accepted")
+            raise AssertionError("invalid EventScope was accepted")
     for bad_records in ([{"schema_id": 1, "payload": 100_000_000}],
                         [{"schema_id": 1, "payload": b""}] * 1025):
         try:

@@ -190,6 +190,8 @@ def _native_scope(scope: EventScope) -> _Scope:
     """Validate scope values before ctypes narrows them to the C ABI."""
     if not isinstance(scope.topic, str):
         raise TypeError("event scope topic must be a string")
+    if "\0" in scope.topic:
+        raise ValueError("event scope topic must not contain NUL")
     labels = (scope.classification, scope.sci)
     if any(isinstance(value, bool) or not isinstance(value, int) or
            not 0 <= value <= 0xFFFF for value in labels):
