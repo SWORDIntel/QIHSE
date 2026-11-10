@@ -24,8 +24,75 @@ typedef struct qihse_kv_ct_range_snapshot qihse_kv_ct_range_snapshot_t;
 #define QIHSE_KV_CT_ID_MAX 64u
 #define QIHSE_KV_CT_TOKEN_BYTES 32u
 #define QIHSE_KV_CT_MAX_GROUP_RECORDS 4096u
+#define QIHSE_KV_CT_LANE_ID_MAX 64u
+#define QIHSE_KV_CT_SLOT_BITMAP_BYTES 2048u
+#define QIHSE_KV_CT_MAX_LANES 16384u /* one context per possible cluster slot */
+#define QIHSE_KV_CT_CERTIFICATE_MAX_BYTES 8192u
 typedef struct qihse_kv_ct_writer_scope qihse_kv_ct_writer_scope_t;
 typedef struct qihse_kv_ct_proof qihse_kv_ct_proof_t;
+
+typedef enum {
+    QIHSE_KV_CT_LANE_AUTH_TRANSFER = 1,
+    QIHSE_KV_CT_LANE_AUTH_PROMOTION = 2
+} qihse_kv_ct_lane_authority_op_t;
+
+/* Immutable input to the quorum verifier. The reservation fields are required
+ * for every proof; final-decision fields are additionally required by cutover
+ * and membership mutation. */
+typedef struct {
+    qihse_kv_ct_lane_authority_op_t operation;
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char source_group_id[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+    char target_group_id[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+    char source_qkp_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_qkp_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char source_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    char successor_qkp_id[QIHSE_KV_CT_ID_MAX + 1u];
+    uint8_t slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES];
+    uint64_t grant_epoch;
+    uint64_t reserve_index;
+    uint8_t reserve_digest[32];
+    uint64_t final_decision_index;
+    uint8_t final_decision_digest[32];
+    uint64_t source_cut;
+    uint64_t target_cursor;
+    uint8_t range_digest[32];
+    uint8_t image_digest[32];
+    uint8_t certificate_head_digest[32];
+    uint8_t promotion_event_digest[32];
+} qihse_kv_ct_lane_authority_claim_t;
+
+typedef bool (*qihse_kv_ct_lane_authority_verify_fn)(
+    void* context, const qihse_kv_ct_lane_authority_claim_t* claim,
+    bool require_final_decision);
+
+typedef enum {
+    QIHSE_KV_CT_LANE_SOURCE = 1,
+    QIHSE_KV_CT_LANE_RECEIVER = 2
+} qihse_kv_ct_lane_mode_t;
+
+/* Per-range CT1 replication context. The lane ID is stable while slot_bitmap
+ * changes as ownership transfers; generation identifies one stream epoch. */
+typedef struct {
+    char lane_id[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char peer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    qihse_kv_ct_lane_mode_t mode;
+    uint8_t slot_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES];
+    uint64_t baseline_row_seq;
+    uint64_t durable_position;
+    uint64_t acknowledged_position;
+    uint64_t retained_bytes;
+    uint64_t limit_bytes;
+    unsigned char baseline_digest[32];
+    unsigned char slot_bitmap_digest[32];
+    unsigned char certificate_head_digest[32];
+    unsigned char certificate_ack_digest[32];
+    bool baseline_sealed;
+    bool admitted;
+} qihse_kv_ct_lane_status_t;
 
 typedef enum {
     QIHSE_KV_CT_ACTOR_USER = 1,
@@ -100,6 +167,77 @@ bool qihse_kv_ct_writer_scope_finish(qihse_kv_ct_writer_scope_t* scope,
     uint32_t timeout_ms, uint64_t* out_last_seq);
 bool qihse_kv_ct_owner_token_get(qihse_kv_store_t* store,
     qihse_user_t* principal, unsigned char out[QIHSE_KV_CT_TOKEN_BYTES]);
+
+/* Group-scoped CT1 replication. One store may be source for some lanes and
+ * receiver for others. Lane IDs are stable 64-character lowercase hex IDs;
+ * generations are unique per configured lane. Slot membership is exact and
+ * may be updated by a durable range-transfer transition. */
+bool qihse_kv_ct_lane_source_enable(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id,
+    const uint8_t slot_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    const char* source_id, const char* successor_id, const char* generation,
+    unsigned char out_owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t max_retained_bytes);
+bool qihse_kv_ct_lane_receiver_bind(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id,
+    const uint8_t slot_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    const char* source_id, const char* target_id, const char* generation,
+    qihse_kv_ct_tenant_policy_t tenant_policy, uint32_t tenant_id,
+    uint64_t baseline_row_seq,
+    unsigned char out_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_lane_receiver_empty_baseline_seal(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    unsigned char out_digest[32]);
+bool qihse_kv_ct_lane_status(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* lane_id,
+    qihse_kv_ct_lane_status_t* out_status);
+bool qihse_kv_ct_lane_owner_token_get(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id,
+    unsigned char out[QIHSE_KV_CT_TOKEN_BYTES]);
+int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* lane_id,
+    qihse_kv_replica_snapshot_t** out_snapshot,
+    uint64_t* out_baseline_row_seq, unsigned char out_digest[32]);
+bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, qihse_user_t* data_principal,
+    const char* lane_id, const char* snapshot_filepath,
+    uint64_t baseline_row_seq, const unsigned char expected_digest[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_lane_source_reconcile_peer(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, qihse_user_t* replication_principal,
+    const char* lane_id, const char* peer_id, const char* generation,
+    const unsigned char receiver_baseline_digest[32],
+    uint64_t peer_durable_position);
+bool qihse_kv_ct_lane_source_read(qihse_kv_store_t* store,
+    qihse_user_t* replication_principal, const char* lane_id,
+    const char* generation, uint64_t after_position, size_t max_groups,
+    size_t max_bytes, qihse_kv_ct_group_t** out_groups, size_t* out_count,
+    uint64_t* out_resume_position);
+bool qihse_kv_ct_lane_source_ack(qihse_kv_store_t* store,
+    qihse_user_t* replication_principal, const char* lane_id,
+    const char* peer_id, const char* generation, uint64_t durable_position);
+bool qihse_kv_ct_lane_receiver_apply(qihse_kv_store_t* store,
+    qihse_user_t* replication_principal, const char* lane_id,
+    const qihse_kv_ct_group_t* group, uint64_t* out_durable_position);
+bool qihse_kv_ct_lane_certificate_append(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* lane_id, const char* generation,
+    const void* certificate, size_t certificate_len,
+    unsigned char out_digest[32]);
+/* Page contains zero or more records encoded as big-endian uint32 length,
+ * 32-byte SHA-256 digest, then exact certificate bytes. Records are never split. */
+bool qihse_kv_ct_lane_certificate_page(qihse_kv_store_t* store,
+    qihse_user_t* replication_principal, const char* lane_id,
+    const unsigned char after_digest[32], void* buffer, size_t capacity,
+    size_t* out_len, unsigned char out_last_digest[32], bool* out_more);
+bool qihse_kv_ct_lane_certificate_ack(qihse_kv_store_t* store,
+    qihse_user_t* replication_principal, const char* lane_id,
+    const char* peer_id, const char* generation,
+    const unsigned char certificate_digest[32]);
+bool qihse_kv_ct_writer_scope_enter_lane(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* lane_id,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    qihse_kv_ct_writer_scope_t** out_scope);
 
 /* Source capture and exact bounded ordered history. A successful read never
  * coalesces intermediate overwrites. The active principal is checked at the
@@ -294,6 +432,83 @@ bool qihse_kv_ct_proof_fields(qihse_kv_store_t* store,
 bool qihse_kv_ct_proof_validate(qihse_kv_store_t* store,
     qihse_user_t* principal, qihse_user_t* data_principal,
     const qihse_kv_ct_proof_t* proof);
+qihse_kv_ct_proof_t* qihse_kv_ct_lane_authority_proof_create(
+    qihse_kv_store_t* store, qihse_user_t* control_principal,
+    qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context);
+bool qihse_kv_ct_lane_authority_proof_fields(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_proof_t* proof,
+    qihse_kv_ct_lane_authority_claim_t* out_claim);
+bool qihse_kv_ct_lane_authority_proof_validate(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_proof_t* proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    bool require_final_decision);
+bool qihse_kv_ct_lane_promotion_ready(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context);
+bool qihse_kv_ct_lane_transfer_source_fence(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reservation_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    uint64_t* out_source_cut);
+int qihse_kv_ct_lane_transfer_source_export(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reserved_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    qihse_kv_replica_snapshot_t** out_snapshot,
+    unsigned char out_range_digest[32], unsigned char out_image_digest[32]);
+bool qihse_kv_ct_lane_transfer_target_import_begin(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reserved_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* replication_principal,
+    qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reserved_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    qihse_kv_replica_snapshot_t* snapshot,
+    const unsigned char expected_image_digest[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_lane_transfer_target_seal(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reserved_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    unsigned char out_seal_digest[32]);
+bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* final_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    const unsigned char source_owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    const unsigned char target_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+bool qihse_kv_ct_lane_transfer_write_allowed(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* key);
+bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    const qihse_kv_ct_proof_t* reservation_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+qihse_kv_ct_proof_t* qihse_kv_ct_lane_promoted_proof_get(
+    qihse_kv_store_t* store, qihse_user_t* control_principal,
+    qihse_user_t* data_principal, const char* lane_id,
+    const unsigned char promotion_event_digest[32],
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context);
+bool qihse_kv_ct_lane_transfer_checksum(
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    unsigned char out_checksum[32]);
 void qihse_kv_ct_proof_destroy(qihse_kv_ct_proof_t* proof);
 
 /* Context-free open refuses an unfinished full-image publication. Recovery
