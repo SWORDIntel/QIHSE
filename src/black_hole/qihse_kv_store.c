@@ -395,7 +395,6 @@ struct qihse_kv_replica_snapshot {
     uint64_t size;
     uint64_t source_change_seq;
     qihse_user_t* principal;
-    bool owns_principal;
     uint32_t principal_id;
     uint32_t tenant_id;
     uint16_t classification;
@@ -5946,8 +5945,15 @@ static int qihse_kv_save_replica_snapshot_file(qihse_kv_store_t* store,
     return atomic_file_commit(f, tmp, filepath) ? 0 : -1;
 }
 
-int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user) {
+static int qihse_kv_save_user_internal(qihse_kv_store_t* store,
+    const char* filepath, qihse_user_t* user, uint64_t principal_generation,
+    bool generation_bound) {
     if (!store || !store->trie || !filepath) return -1;
+    if (generation_bound &&
+        !qihse_auth_validate_handle_generation(user, principal_generation)) {
+        errno = EACCES;
+        return -2;
+    }
     /* The fast path only reads (trie + index + immutable SSTables), but the
      * !fast path compacts; taking the WRITE side unconditionally keeps the
      * snapshot internally consistent either way. */
@@ -5985,9 +5991,42 @@ int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath, qihse_user
         if (rc < 0) wr.ok = false;
     }
     if (!wr.ok || ferror(f)) { fclose(f); unlink(tmp); kv_store_unlock(store); return -1; }
+    if (generation_bound &&
+        !qihse_auth_validate_handle_generation(user, principal_generation)) {
+        fclose(f); unlink(tmp); kv_store_unlock(store); errno = EACCES; return -2;
+    }
     if (!atomic_file_commit(f, tmp, filepath)) { kv_store_unlock(store); return -1; }
+    /* Publication may include a parent-directory sync. If identity changes
+     * while that sync completes, report the changed authority even though the
+     * now-published candidate cannot safely be rolled back. */
+    if (generation_bound &&
+        !qihse_auth_validate_handle_generation(user, principal_generation)) {
+        kv_store_unlock(store); errno = EACCES; return -2;
+    }
     kv_store_unlock(store);
     return 0;
+}
+
+int qihse_kv_save_user(qihse_kv_store_t* store, const char* filepath,
+                       qihse_user_t* user) {
+    if (!user)
+        return qihse_kv_save_user_internal(store, filepath, NULL, 0u, false);
+    if (!qihse_auth_user_is_active(user)) { errno = EACCES; return -2; }
+    uint64_t generation = 0u;
+    qihse_user_t* principal = qihse_auth_borrow_principal_scoped(
+        qihse_user_get_id(user), &generation);
+    if (!principal || !generation ||
+        qihse_user_get_id(principal) != qihse_user_get_id(user) ||
+        !qihse_auth_validate_handle_generation(user, generation) ||
+        !qihse_auth_validate_handle_generation(principal, generation)) {
+        if (principal) qihse_auth_release_principal_scoped(principal);
+        errno = EACCES;
+        return -2;
+    }
+    int rc = qihse_kv_save_user_internal(store, filepath, principal,
+                                         generation, true);
+    qihse_auth_release_principal_scoped(principal);
+    return rc;
 }
 int qihse_kv_save(qihse_kv_store_t* store, const char* filepath) { return qihse_kv_save_user(store, filepath, NULL); }
 
@@ -6112,7 +6151,6 @@ int qihse_kv_ct_owner_data_snapshot_create(qihse_kv_store_t* store,
     snapshot->size = (uint64_t)st.st_size;
     snapshot->source_change_seq = source_change_seq;
     snapshot->principal = principal;
-    snapshot->owns_principal = false; /* Caller owns this explicit principal. */
     snapshot->principal_id = qihse_user_get_id(principal);
     snapshot->tenant_id = qihse_user_get_tenant_id(principal);
     snapshot->classification = qihse_user_get_classification(principal);
@@ -6182,8 +6220,6 @@ bool qihse_kv_replica_snapshot_read(qihse_kv_replica_snapshot_t* snapshot,
 void qihse_kv_replica_snapshot_destroy(qihse_kv_replica_snapshot_t* snapshot) {
     if (!snapshot) return;
     if (snapshot->fd >= 0) close(snapshot->fd);
-    if (snapshot->owns_principal)
-        qihse_auth_release_principal_scoped(snapshot->principal);
     free(snapshot);
 }
 
