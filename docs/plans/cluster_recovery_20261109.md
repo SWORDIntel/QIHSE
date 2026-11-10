@@ -375,6 +375,13 @@ new backup instead. Do not promise an automatic rollback after cutover.
   COUNT` remains 0, 0, and 309. This confirms service health and preserves the
   known 28-row difference from the 271,434-row union, but it does not explain
   that difference or establish record-level equality.
+- Authenticated `KEYS` checks of the recognized node-local namespaces found
+  no matching rows on T420 or T320. On 730xd they found 309 `aimem:*` rows and
+  323 `aimemv:*` rows; `AIMEM COUNT` reports 309 memories. The other checked
+  local families (`fabric:*`, `fednode:*`, `federation/node/*`, snapshot
+  manifests, and rejoin state) were empty on all three owners. These checks
+  confirm the AIMEM locality but do not explain the 28-row gap, which must be
+  reconciled against record identities rather than inferred from namespaces.
 - Source inspection ruled out using the live replication snapshot as a
   harmless backup shortcut: `REPL.SNAPSHOT.BEGIN` requires a marked namespace
   and advances that peer's durable replication cursor. The underlying full
