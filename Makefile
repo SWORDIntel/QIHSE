@@ -1476,6 +1476,42 @@ test-vector-adapter-concurrency: lib
 
 test-serial: test-vector-adapter-concurrency
 
+.PHONY: test-container-create-sync test-vector-spill-recovery test-resp-wire-framing
+test-container-create-sync: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Dfsync=qihse_test_fsync \
+	    -c persistence/qihse_container.c -o tests/test_container_create_sync_impl.o
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_container_create_sync tests/test_container_create_sync.c \
+	    tests/test_container_create_sync_impl.o -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_container_create_sync
+
+test-vector-spill-recovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -Wl,--wrap=qihse_file_pread_exact,--wrap=qihse_ctr_open_write \
+	    -o tests/test_vector_spill_recovery tests/test_vector_spill_recovery.c \
+	    src/broad_oak/qihse_vector_db.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_spill_recovery
+
+test-resp-wire-framing: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_RESP_WIRE_TESTING -Wl,--export-dynamic \
+	    -Wl,--wrap=qihse_resp_engine_handle_legacy \
+	    -o tests/test_resp_wire_framing tests/test_resp_wire_framing.c \
+	    src/spinnaker/qihse_resp_wire.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_resp_wire_framing
+
+test-serial: test-container-create-sync test-vector-spill-recovery test-resp-wire-framing
+
+.PHONY: test-ownership-journal-write-status
+test-ownership-journal-write-status: lib
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_OWNERSHIP_JOURNAL_TEST_WRAP_FSYNC \
+	    -Wl,--export-dynamic -Wl,--wrap=fsync \
+	    -o tests/test_ownership_journal_write_status tests/test_ownership_journal.c \
+	    src/spinnaker/qihse_cluster_ownership_journal.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ownership_journal_write_status
+
+test-serial: test-ownership-journal-write-status
+
 test-backup-merge-concurrent: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_BACKUP_TEST -Wl,--export-dynamic \
 	    -o tests/test_backup_merge_concurrent tests/test_backup_merge_concurrent.c \

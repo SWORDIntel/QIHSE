@@ -228,6 +228,50 @@ make -o lib test-repl-io-alloc test-vector-wal-admission test-persist \
   test-ownership-abort-replay
 ```
 
+### Spill, creation and request recovery (2026-11-10)
+
+The next review reproduced spill/snapshot data loss and repaired its connected
+failure paths. These are local source changes; no live data was inspected or
+migrated and no service was restarted.
+
+| Area | Confirmed defect | Repair and focused evidence |
+| --- | --- | --- |
+| Spilled vectors | After spill, a subsequent mutation and flush serialized zeroed RAM instead of the spilled payload. `[1,2,3,4]` reopened as `[0,0,0,0]` in the reproducer. Budget disable ignored restore failure and deleted backing; compaction retained old positional tier state. | Materialize the payload before snapshots, compaction and index construction. A failed restore preserves backing, remaining spill markers, the prior budget and pending WAL. Successful compaction resets positional tracking. Flush/compact/reopen, injected read failure and retry tests preserve exact vectors. |
+| Spill ownership and restart | Fixed `<database>.spill` paths could be truncated by another handle; persistent SPILLED hints referenced backing that does not survive restart. Missing tier hints also left tracking arrays uninitialized. | Each handle owns private anonymous temporary backing. Initialize tracking before mapping snapshots, normalize transient SPILLED hints to DRAM, and use exact-I/O helpers. Tests check two handles, an untouched fixed-path sentinel, absent tier hints, read-only mappings and derived-cache construction. |
+| Container creation | Successful initial creation did not sync the inode and parent entry; the VDB constructor ignored create failure. A failed sync followed by retry could skip syncing the leftover valid header. | The explicit create path syncs file and directory, and retries re-sync both. Existing `create=false` WAL opens remain sync-free. Propagate constructor failure. File/directory fault tests cover same-path retry; container lifecycle and replacement-lock tests pass. Per-mutation vector WAL batching was retained; explicit flush remains its durability boundary. |
+| Raw RESP framing | One read was treated as one request, losing fragmented and pipelined input. Length parsing and inline argument overflow could accept malformed/truncated commands; socket write failures were not consistently terminal. | Bounded incremental framing preserves incomplete input and consumes one frame at a time. Reject malformed lengths, NUL fields and excess arguments; retry interrupted receives and drain short writes. Split-array, split-inline, pipeline, bounds, send-pressure and closed-peer tests pass. |
+| Transfer outcome | PREPARE could fail after durable intent/fencing but report REJECTED, which implies no prepared transfer. An errno alone cannot distinguish preflight failure from a sync error after a complete write. | Preserve existing APIs through wrappers and propagate an explicit journal-write uncertainty result to the manager's PENDING result. Keep definite pre-admission failures rejected and retain the original error reason. Fault injection performs a real fsync then returns EINVAL: replay finds the INTENT and the API reports possible writing; duplicate-ID rejection reports no write. Manager tests cover recovered/unreadable PREPARED state and definite rejection. |
+
+Spill is best-effort logical payload residency, not a hard process-RSS cap.
+Snapshot, compaction and derived-index construction can temporarily restore the
+complete payload to RAM. This preserves data at the cost of temporary memory
+residency; no RSS or throughput improvement is claimed. This repair cannot
+reconstruct data already overwritten by an older snapshot.
+
+The standalone spill fixture passes strict compilation and ASan/UBSan with
+leak detection enabled, instrumenting the changed vector unit. The raw framing
+fixture also has focused sanitizer coverage; full-library sanitizer coverage
+and the full suite are separate. The scoped DDL/schema/retry-ledger review
+found no additional confirmed defect and produced no patch.
+
+The combined library and daemon build passes. Integrated spill, persistence,
+creation sync/locking/lifecycle, framing, raw tenant-denial and transfer checks
+pass. Both the spill and raw-framing fixtures pass scoped ASan/UBSan with leak
+detection enabled. The new cases are registered for future full-suite runs.
+The final integrated journal-write-status, transfer-manager and ownership-abort
+replay checks pass, as does the generated API-count check. The complete suite
+remains paused at the user's request; no deployment was performed.
+
+Additional focused targets:
+
+```sh
+make -j8 lib cluster-daemon
+make -o lib test-vector-spill-recovery test-persist test-container-create-sync \
+  test-container-flush-locking test-container-lifecycle test-resp-wire-framing \
+  test-resp-raw-vector-tenant test-cluster-transfer \
+  test-ownership-journal-write-status test-ownership-abort-replay
+```
+
 ## Resolved: expiry sweep and SSTable compaction
 
 The standalone daemon now defaults to a 30-second KV sweep cadence (`--kv-sweep-interval`, with `0` explicitly disabling it). In the earlier 2026-11-05 verification, authenticated QKP `PING` returned `PONG`; INFO reported sweep interval `30`, sweeper running, one live SST file, no degraded SST index, and healthy status. The previous 1,227 live SST files were compacted to one. The suite passed 164 targets at that time. The 2026-11-09 deployment obtained authenticated INFO and verified healthy SST indexing, a 30-second sweep interval and an active sweeper.
