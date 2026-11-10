@@ -42,6 +42,7 @@ struct qihse_cluster_failover {
     qihse_cluster_maintenance_t* maintenance_gate; /* borrowed */
     qihse_kv_store_t* ct_store; /* borrowed */
     qihse_user_t* ct_principal; /* borrowed */
+    char ct_lane_id[65];
     char ct_local_qkp_id[QIHSE_QKP_NODE_ID_LEN + 1u];
     qihse_cluster_topology_qkp_id_fn topology_qkp_id;
     void* topology_qkp_id_context;
@@ -83,6 +84,11 @@ static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t
     if (!config || !config->topology) return NULL;
     if (strnlen(config->ct_local_qkp_id, sizeof(config->ct_local_qkp_id)) >=
         sizeof(config->ct_local_qkp_id)) return NULL;
+    size_t lane_len = strnlen(config->ct_lane_id, sizeof(config->ct_lane_id));
+    if (lane_len >= sizeof(config->ct_lane_id) || (lane_len && lane_len != 64u)) return NULL;
+    for (size_t i = 0; i < lane_len; ++i)
+        if (!((config->ct_lane_id[i] >= '0' && config->ct_lane_id[i] <= '9') ||
+              (config->ct_lane_id[i] >= 'a' && config->ct_lane_id[i] <= 'f'))) return NULL;
     qihse_cluster_failover_t* fo = (qihse_cluster_failover_t*)calloc(1, sizeof(*fo));
     if (!fo) return NULL;
     fo->startup_paused = paused;
@@ -91,6 +97,8 @@ static qihse_cluster_failover_t* fo_create(const qihse_cluster_failover_config_t
     fo->maintenance_gate = config->maintenance_gate;
     fo->ct_store = config->ct_store;
     fo->ct_principal = config->ct_principal;
+    memcpy(fo->ct_lane_id, config->ct_lane_id,
+           strnlen(config->ct_lane_id, sizeof(config->ct_lane_id)) + 1u);
     memcpy(fo->ct_local_qkp_id, config->ct_local_qkp_id,
            strnlen(config->ct_local_qkp_id, sizeof(config->ct_local_qkp_id)) + 1u);
     fo->topology_qkp_id = config->topology_qkp_id;

@@ -64,6 +64,10 @@ typedef struct {
      * health-only promotion remains fail-closed for data-bearing ranges. */
     qihse_kv_store_t* ct_store; /* borrowed */
     qihse_user_t* ct_principal; /* borrowed; never inferred from NULL */
+    /* Optional stable CT lane ID (64 lowercase hex). When supplied, failover
+     * promotes this exact replication group and its exact bitmap; legacy
+     * single-receiver promotion remains selected only when empty. */
+    char ct_lane_id[65];
     char ct_local_qkp_id[QIHSE_QKP_NODE_ID_LEN + 1u];
     qihse_cluster_topology_qkp_id_fn topology_qkp_id;
     void* topology_qkp_id_context;

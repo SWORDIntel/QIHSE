@@ -67,6 +67,8 @@ typedef struct {
     char source_qkp_id[QIHSE_OWNERSHIP_ID_MAX + 1u];
     char target_qkp_id[QIHSE_OWNERSHIP_ID_MAX + 1u];
     char generation[QIHSE_OWNERSHIP_ID_MAX + 1u];
+    /* Stable CT group/lane identity; empty only for legacy/manual records. */
+    char lane_id[QIHSE_OWNERSHIP_ID_MAX + 1u];
     /* CT1 receiver promotion's new local generation; empty for CT2 transfer. */
     char next_generation[QIHSE_OWNERSHIP_ID_MAX + 1u];
     /* CT1 promotion records carry the complete transferred slot set so one

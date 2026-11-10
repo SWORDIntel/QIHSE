@@ -39,6 +39,20 @@ typedef bool (*qihse_cluster_ownership_range_finalize_fn)(
     const qihse_cluster_ownership_txn_t* txn,
     const qihse_cluster_ct_activation_receipt_t* receipt,
     char* err, size_t err_cap);
+typedef bool (*qihse_cluster_ownership_promotion_finalize_fn)(
+    void* context, qihse_user_t* principal,
+    const qihse_cluster_ownership_txn_t* txn,
+    const qihse_kv_ct_proof_t* promoted_proof,
+    const uint8_t promotion_event_digest[32],
+    char* err, size_t err_cap);
+typedef bool (*qihse_cluster_ownership_lane_claim_fn)(
+    void* context, qihse_user_t* principal,
+    const qihse_cluster_ownership_txn_t* txn,
+    qihse_kv_ct_lane_authority_claim_t* out_claim);
+typedef bool (*qihse_cluster_ownership_lane_verify_claim_fn)(
+    void* context, qihse_user_t* principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim,
+    bool require_final_decision);
 
 typedef struct {
     qihse_cluster_topology_t* topology;
@@ -58,6 +72,9 @@ typedef struct {
     qihse_cluster_ownership_range_finalize_fn range_finalize;
     qihse_cluster_ownership_range_check_fn range_check_finalized;
     qihse_cluster_ownership_range_check_fn range_abort;
+    qihse_cluster_ownership_promotion_finalize_fn range_finalize_promotion;
+    qihse_cluster_ownership_lane_claim_fn lane_claim;
+    qihse_cluster_ownership_lane_verify_claim_fn lane_verify_claim;
     void* range_authority_context;
 } qihse_cluster_ownership_context_t;
 
@@ -171,10 +188,39 @@ bool qihse_cluster_ownership_receive_ct1_promotion(
     qihse_cluster_ownership_context_t* context,
     const qihse_cluster_bus_ct1_promotion_update_t* update,
     char* err, size_t err_cap);
+bool qihse_cluster_ownership_receive_ct1_promotion_v2(
+    qihse_cluster_ownership_context_t* context,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer,
+    char* err, size_t err_cap);
 void qihse_cluster_ownership_ct1_promotion_bus_callback(
     qihse_cluster_bus_t* bus,
     const qihse_cluster_bus_ct1_promotion_update_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer,
     void* ownership_context);
+void qihse_cluster_ownership_ct1_promotion_v2_bus_callback(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer, void* ownership_context);
+bool qihse_cluster_ownership_promotion_event_digest(
+    qihse_cluster_ownership_context_t* context,
+    const qihse_cluster_ownership_txn_t* transaction,
+    uint8_t out_digest[32]);
+bool qihse_cluster_ownership_promotion_reserve(
+    qihse_cluster_ownership_context_t* context,
+    qihse_cluster_ownership_txn_t* transaction,
+    qihse_kv_ct_lane_authority_claim_t* out_claim,
+    qihse_kv_ct_proof_t** out_reservation_proof,
+    char* error, size_t error_cap);
+bool qihse_cluster_ownership_promotion_finalize(
+    qihse_cluster_ownership_context_t* context,
+    const qihse_cluster_ownership_txn_t* transaction,
+    const qihse_kv_ct_proof_t* promoted_proof,
+    const uint8_t promotion_event_digest[32],
+    char* error, size_t error_cap);
 
 /* Handler for ACTIVATE requests created only by the RESP QKP replication
  * endpoint after authenticating the configured source pin. It validates the

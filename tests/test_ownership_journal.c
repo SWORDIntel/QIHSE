@@ -137,7 +137,8 @@ static void promotion_seal_fields(qihse_cluster_bus_ct1_promotion_update_t* u) {
 }
 
 static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
-                                                    qihse_user_t* op) {
+                                                    qihse_user_t* op,
+                                                    qihse_user_t* guest) {
     qihse_cluster_topology_t* topo = qihse_cluster_topology_create();
     assert(topo);
     promotion_pin_map_t pins;
@@ -186,6 +187,44 @@ static void test_signed_ct1_promotion_supersession(qihse_kv_store_t* store,
         .peer_id = promotion_peer_id, .peer_id_context = &pins
     };
     char err[256];
+    qihse_cluster_ownership_txn_t canonical_txn;
+    memset(&canonical_txn, 0, sizeof(canonical_txn));
+    canonical_txn.start = event.start;
+    canonical_txn.end = event.end;
+    canonical_txn.config_epoch = event.config_epoch;
+    canonical_txn.source_lsn = event.durable_cursor;
+    snprintf(canonical_txn.transfer_id, sizeof(canonical_txn.transfer_id), "%s", event.transfer_id);
+    snprintf(canonical_txn.source_id, sizeof(canonical_txn.source_id), "%s", event.source_id);
+    snprintf(canonical_txn.target_id, sizeof(canonical_txn.target_id), "%s", event.target_id);
+    snprintf(canonical_txn.source_qkp_id, sizeof(canonical_txn.source_qkp_id), "%s", event.source_qkp_id);
+    snprintf(canonical_txn.target_qkp_id, sizeof(canonical_txn.target_qkp_id), "%s", event.target_qkp_id);
+    snprintf(canonical_txn.owner_id, sizeof(canonical_txn.owner_id), "%s", event.successor_id);
+    snprintf(canonical_txn.generation, sizeof(canonical_txn.generation), "%s", event.generation);
+    snprintf(canonical_txn.next_generation, sizeof(canonical_txn.next_generation), "%s", event.next_generation);
+    snprintf(canonical_txn.lane_id, sizeof(canonical_txn.lane_id),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    memcpy(canonical_txn.slot_bitmap, event.slot_bitmap, sizeof(canonical_txn.slot_bitmap));
+    memcpy(canonical_txn.proof_digest, event.promotion_digest, sizeof(canonical_txn.proof_digest));
+    qihse_cluster_bus_ct1_promotion_update_v2_t canonical_event;
+    memset(&canonical_event, 0, sizeof(canonical_event));
+    canonical_event.magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC;
+    canonical_event.base = event;
+    snprintf(canonical_event.lane_id, sizeof(canonical_event.lane_id), "%s", canonical_txn.lane_id);
+    assert(qihse_cluster_bus_ct1_promotion_v2_seal(&canonical_event));
+    uint8_t canonical_digest[32];
+    assert(qihse_cluster_ownership_promotion_event_digest(&ownership,
+        &canonical_txn, canonical_digest));
+    assert(memcmp(canonical_digest, canonical_event.event_digest, sizeof(canonical_digest)) == 0);
+    OPENSSL_cleanse(canonical_digest, sizeof(canonical_digest));
+    OPENSSL_cleanse(&canonical_event, sizeof(canonical_event));
+    qihse_cluster_ownership_context_t low_context = ownership;
+    low_context.principal = guest;
+    assert(!qihse_cluster_ownership_receive_ct1_promotion(&low_context,
+        &event, err, sizeof(err)));
+    assert(strstr(err, "active System Operator") != NULL);
+    uint16_t denied_owner = QIHSE_CLUSTER_NODE_NONE;
+    assert(qihse_cluster_topology_get_slot(topo, 100, &denied_owner, NULL, NULL));
+    assert(denied_owner == ix[0]);
     qihse_cluster_bus_ct1_promotion_update_t forged = event;
     forged.target_id[0] = forged.target_id[0] == 'a' ? 'b' : 'a';
     assert(!qihse_cluster_ownership_receive_ct1_promotion(&ownership,
@@ -786,7 +825,7 @@ int main(void) {
     const char* store_dir = qihse_kv_store_data_directory(store);
     assert(store_dir && *store_dir);
     test_range_authority_reserve_precedes_intent(op);
-    test_signed_ct1_promotion_supersession(store, op);
+    test_signed_ct1_promotion_supersession(store, op, guest);
     qihse_cluster_ownership_context_t ownership = {.store = store, .principal = op};
 
     qihse_cluster_ownership_txn_t old_final = finalized_ct2(
@@ -964,6 +1003,29 @@ int main(void) {
         !strcmp(got.transfer_id, getter_abort_final.transfer_id));
     OPENSSL_cleanse(&getter_abort_prepare, sizeof(getter_abort_prepare));
     OPENSSL_cleanse(&getter_abort_final, sizeof(getter_abort_final));
+
+    qihse_cluster_ownership_txn_t lane_prepare = txn(QIHSE_OWNERSHIP_PREPARED);
+    snprintf(lane_prepare.transfer_id, sizeof(lane_prepare.transfer_id),
+             "ct1-lane-journal-v3");
+    memset(lane_prepare.lane_id, 'a', 64u);
+    lane_prepare.lane_id[64] = '\0';
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &lane_prepare) == 0);
+    qihse_cluster_ownership_txn_t lane_commit = lane_prepare;
+    lane_commit.phase = QIHSE_OWNERSHIP_COMMITTED;
+    lane_commit.target_lsn = lane_commit.source_lsn;
+    snprintf(lane_commit.owner_id, sizeof(lane_commit.owner_id), "%s", lane_commit.target_id);
+    memset(lane_commit.proof_digest, 0x45, sizeof(lane_commit.proof_digest));
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &lane_commit) == 0);
+    qihse_cluster_ownership_txn_t lane_final = lane_commit;
+    lane_final.phase = QIHSE_OWNERSHIP_FINALIZED;
+    assert(qihse_cluster_ownership_journal_append_txn(store_dir, &lane_final) == 0);
+    memset(&got, 0, sizeof(got));
+    assert(qihse_cluster_ownership_transfer_get_finalized(&ownership,
+        "ct1-lane-journal-v3", &got, NULL, 0));
+    assert(!strcmp(got.lane_id, lane_prepare.lane_id));
+    OPENSSL_cleanse(&lane_prepare, sizeof(lane_prepare));
+    OPENSSL_cleanse(&lane_commit, sizeof(lane_commit));
+    OPENSSL_cleanse(&lane_final, sizeof(lane_final));
 
     assert(qihse_auth_destroy_user(op, 991u));
     memset(&got, 0xa5, sizeof(got));

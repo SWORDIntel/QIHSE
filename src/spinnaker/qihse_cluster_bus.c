@@ -103,6 +103,8 @@ struct qihse_cluster_bus {
     void* on_ct_slot_update_user_data;
     qihse_cluster_bus_on_ct1_promotion_update_cb on_ct1_promotion_update;
     void* on_ct1_promotion_update_user_data;
+    qihse_cluster_bus_on_ct1_promotion_v2_update_cb on_ct1_promotion_v2_update;
+    void* on_ct1_promotion_v2_update_user_data;
     pthread_mutex_t ct_queue_lock;
     pthread_cond_t ct_queue_cond;
     pthread_t ct_worker;
@@ -177,6 +179,7 @@ struct qihse_cluster_bus {
     /* Veiled framing state (owned copy of the config key; NULL = passthrough) */
     char* veil_key;
     size_t veil_key_len;
+    uint8_t* veil_plain; /* reusable receive scratch; never place this on bus thread stack */
 };
 
 typedef struct ct1_announcement {
@@ -225,9 +228,21 @@ static bool qihse_bus_ct1_first_run(
     qihse_cluster_bus_ct1_promotion_update_t* run);
 static bool qihse_bus_ct1_promotion_digest(
     const qihse_cluster_bus_ct1_promotion_update_t* update, uint8_t out[32]);
+static bool qihse_bus_ct1_promotion_v2_valid(
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update);
+static bool qihse_bus_ct1_promotion_v2_digest(
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update, uint8_t out[32]);
 static void qihse_bus_handle_ct1_promotion_update(qihse_cluster_bus_t* bus,
     uint16_t sender, const uint8_t* payload, size_t payload_len,
-    bool signature_verified, const qihse_uuid_t* signer);
+    bool signature_verified, const qihse_uuid_t* signer,
+    const uint8_t* signed_envelope, size_t envelope_len);
+static void qihse_bus_handle_ct1_promotion_v2_update(qihse_cluster_bus_t* bus,
+    uint16_t sender, const uint8_t* payload, size_t payload_len,
+    bool signature_verified, const qihse_uuid_t* signer,
+    const uint8_t* signed_envelope, size_t envelope_len);
+static void qihse_bus_handle_ct1_certificate(qihse_cluster_bus_t* bus,
+    uint16_t relay_sender, const uint8_t* payload, size_t payload_len,
+    bool relay_signature_verified);
 
 static uint64_t qihse_bus_now_ms(void) {
 #ifdef _WIN32
@@ -938,9 +953,60 @@ bool qihse_cluster_bus_ct1_promotion_seal(
     return qihse_bus_ct1_promotion_digest(update, update->event_digest);
 }
 
+static bool qihse_bus_ct1_promotion_v2_digest(
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update, uint8_t out[32]) {
+    if (!update || !out) return false;
+    static const unsigned char domain[] = "QIHSE-CT1-PROMOTION-QCP2-v1";
+    unsigned char base_digest[32];
+    unsigned char target_cursor[8];
+    for (size_t i = 0; i < sizeof(target_cursor); ++i)
+        target_cursor[i] = (unsigned char)(update->target_cursor >> (56u - i * 8u));
+    if (!qihse_bus_ct1_promotion_digest(&update->base, base_digest)) return false;
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    unsigned int n = 0;
+    bool ok = md && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(md, domain, sizeof(domain)) == 1 &&
+        EVP_DigestUpdate(md, base_digest, sizeof(base_digest)) == 1 &&
+        EVP_DigestUpdate(md, target_cursor, sizeof(target_cursor)) == 1 &&
+        EVP_DigestUpdate(md, update->lane_id, sizeof(update->lane_id)) == 1 &&
+        EVP_DigestFinal_ex(md, out, &n) == 1 && n == 32;
+    EVP_MD_CTX_free(md);
+    OPENSSL_cleanse(base_digest, sizeof(base_digest));
+    OPENSSL_cleanse(target_cursor, sizeof(target_cursor));
+    return ok;
+}
+
+static bool qihse_bus_ct1_promotion_v2_valid(
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update) {
+    if (!update || update->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC ||
+        update->reserved || update->base.magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC ||
+        !qihse_bus_valid_ct1_promotion(&update->base)) return false;
+    if (strnlen(update->lane_id, sizeof(update->lane_id)) != 64u) return false;
+    for (size_t i = 0; i < 64u; ++i)
+        if (!((update->lane_id[i] >= '0' && update->lane_id[i] <= '9') ||
+              (update->lane_id[i] >= 'a' && update->lane_id[i] <= 'f'))) return false;
+    uint8_t digest[32];
+    bool ok = qihse_bus_ct1_promotion_v2_digest(update, digest) &&
+        CRYPTO_memcmp(digest, update->event_digest, sizeof(digest)) == 0;
+    OPENSSL_cleanse(digest, sizeof(digest));
+    return ok;
+}
+
+bool qihse_cluster_bus_ct1_promotion_v2_seal(
+    qihse_cluster_bus_ct1_promotion_update_v2_t* update) {
+    if (!update || update->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC ||
+        update->base.magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC ||
+        strnlen(update->lane_id, sizeof(update->lane_id)) != 64u) return false;
+    for (size_t i = 0; i < 64u; ++i)
+        if (!((update->lane_id[i] >= '0' && update->lane_id[i] <= '9') ||
+              (update->lane_id[i] >= 'a' && update->lane_id[i] <= 'f'))) return false;
+    return qihse_bus_ct1_promotion_v2_digest(update, update->event_digest);
+}
+
 static void qihse_bus_handle_ct1_promotion_update(qihse_cluster_bus_t* bus,
     uint16_t sender, const uint8_t* payload, size_t payload_len,
-    bool signature_verified, const qihse_uuid_t* signer) {
+    bool signature_verified, const qihse_uuid_t* signer,
+    const uint8_t* signed_envelope, size_t envelope_len) {
     if (!bus || !bus->on_ct1_promotion_update || !signature_verified || !signer ||
         payload_len != sizeof(qihse_cluster_bus_ct1_promotion_update_t)) return;
     qihse_cluster_bus_ct1_promotion_update_t update;
@@ -954,8 +1020,98 @@ static void qihse_bus_handle_ct1_promotion_update(qihse_cluster_bus_t* bus,
         target.has_uuid && CRYPTO_memcmp(target.node_uuid, signer->bytes, 16u) == 0;
     if (authorized && (!bus->maintenance_gate || qihse_cluster_maintenance_enter(
             bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT))) {
-        bus->on_ct1_promotion_update(bus, &update,
+        bus->on_ct1_promotion_update(bus, &update, signed_envelope, envelope_len, signer,
                                      bus->on_ct1_promotion_update_user_data);
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT);
+    }
+    OPENSSL_cleanse(&update, sizeof(update));
+}
+
+static bool qihse_bus_verify_nested_qbs(qihse_cluster_bus_t* bus,
+    const uint8_t* envelope, size_t envelope_len, qihse_uuid_t* signer,
+    const uint8_t** payload, size_t* payload_len) {
+    if (!bus || !envelope || !signer || !payload || !payload_len ||
+        envelope_len < QIHSE_CLUSTER_BUS_HEADER_SIZE + 27u || envelope_len > 8192u ||
+        envelope[envelope_len - 3u] != 'Q' || envelope[envelope_len - 2u] != 'B' ||
+        envelope[envelope_len - 1u] != 'S') return false;
+    uint16_t sig_len = (uint16_t)(envelope[envelope_len - 5u] |
+        ((uint16_t)envelope[envelope_len - 4u] << 8));
+    size_t trailer_len = 3u + 16u + (size_t)sig_len + 6u;
+    if (!sig_len || sig_len > 4627u || trailer_len > envelope_len) return false;
+    size_t signed_len = envelope_len - trailer_len;
+    size_t trailer = signed_len;
+    if (envelope[trailer] != envelope[envelope_len - 6u] ||
+        envelope[trailer + 1u] != envelope[envelope_len - 5u] ||
+        envelope[trailer + 2u] != envelope[envelope_len - 4u]) return false;
+    uint32_t magic = 0, type = 0, sender = 0, body_len = 0;
+    if (!qihse_bus_parse_header(envelope, signed_len, &magic, &type, &sender,
+            &body_len) || magic != QIHSE_CLUSTER_BUS_MAGIC ||
+        type != QIHSE_BUS_MSG_SLOT_UPDATE ||
+        signed_len != QIHSE_CLUSTER_BUS_HEADER_SIZE + (size_t)body_len ||
+        body_len != sizeof(qihse_cluster_bus_ct1_promotion_update_v2_t)) return false;
+    memcpy(signer->bytes, envelope + trailer + 3u, sizeof(signer->bytes));
+    if (!bus->federation_store || !bus->federation_user) return false;
+    qihse_federation_node_identity_t ident;
+    if (!qihse_federation_node_identity_read(bus->federation_store,
+            bus->federation_user, signer, &ident) || ident.trust != QIHSE_TRUST_APPROVED ||
+        !qihse_federation_verify(ident.sig_alg, ident.public_key, ident.public_key_len,
+            envelope, signed_len, envelope + trailer + 3u + 16u, sig_len)) return false;
+    *payload = envelope + QIHSE_CLUSTER_BUS_HEADER_SIZE;
+    *payload_len = body_len;
+    (void)sender;
+    return true;
+}
+
+static void qihse_bus_handle_ct1_certificate(qihse_cluster_bus_t* bus,
+    uint16_t relay_sender, const uint8_t* payload, size_t payload_len,
+    bool relay_signature_verified) {
+    (void)relay_sender;
+    if (!bus || !relay_signature_verified || !bus->on_ct1_promotion_v2_update ||
+        !payload || payload_len > 8192u) return;
+    qihse_uuid_t original_signer;
+    const uint8_t* inner_payload = NULL;
+    size_t inner_payload_len = 0;
+    if (!qihse_bus_verify_nested_qbs(bus, payload, payload_len, &original_signer,
+            &inner_payload, &inner_payload_len)) return;
+    qihse_cluster_bus_ct1_promotion_update_v2_t update;
+    memcpy(&update, inner_payload, sizeof(update));
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t target;
+    bool authorized = qihse_bus_ct1_promotion_v2_valid(&update) &&
+        qihse_cluster_topology_find_node(bus->topology, update.base.target_id,
+            &target_index) &&
+        qihse_cluster_topology_get_node(bus->topology, target_index, &target) &&
+        target.has_uuid && CRYPTO_memcmp(target.node_uuid, original_signer.bytes, 16u) == 0;
+    if (authorized && (!bus->maintenance_gate || qihse_cluster_maintenance_enter(
+            bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT))) {
+        bus->on_ct1_promotion_v2_update(bus, &update, payload, payload_len,
+            &original_signer, bus->on_ct1_promotion_v2_update_user_data);
+        if (bus->maintenance_gate)
+            qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT);
+    }
+    OPENSSL_cleanse(&update, sizeof(update));
+}
+
+static void qihse_bus_handle_ct1_promotion_v2_update(qihse_cluster_bus_t* bus,
+    uint16_t sender, const uint8_t* payload, size_t payload_len,
+    bool signature_verified, const qihse_uuid_t* signer,
+    const uint8_t* signed_envelope, size_t envelope_len) {
+    if (!bus || !bus->on_ct1_promotion_v2_update || !signature_verified || !signer ||
+        payload_len != sizeof(qihse_cluster_bus_ct1_promotion_update_v2_t)) return;
+    qihse_cluster_bus_ct1_promotion_update_v2_t update;
+    memcpy(&update, payload, sizeof(update));
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t target;
+    bool authorized = qihse_bus_ct1_promotion_v2_valid(&update) &&
+        qihse_cluster_topology_find_node(bus->topology, update.base.target_id, &target_index) &&
+        sender == target_index &&
+        qihse_cluster_topology_get_node(bus->topology, target_index, &target) &&
+        target.has_uuid && CRYPTO_memcmp(target.node_uuid, signer->bytes, 16u) == 0;
+    if (authorized && (!bus->maintenance_gate || qihse_cluster_maintenance_enter(
+            bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT))) {
+        bus->on_ct1_promotion_v2_update(bus, &update, signed_envelope, envelope_len,
+            signer, bus->on_ct1_promotion_v2_update_user_data);
         if (bus->maintenance_gate)
             qihse_cluster_maintenance_leave(bus->maintenance_gate, QIHSE_MAINT_WRITER_BUS_SLOT);
     }
@@ -1207,14 +1363,16 @@ static void qihse_bus_handle_fed_heartbeat(qihse_cluster_bus_t* bus,
 
 static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
                                        const uint8_t* data, size_t len) {
-    uint8_t plain[QIHSE_CLUSTER_BUS_MAX_DATAGRAM];
+    const uint8_t* plain = bus ? bus->veil_plain : NULL;
     qihse_uuid_t signer_uuid;
     memset(&signer_uuid, 0, sizeof(signer_uuid));
     bool signature_verified = false;
     if (bus->veil_key) {
         /* Veiled receive path: peel nonce/padding, de-XOR, then parse the
          * inner frame. Malformed wrappers are dropped silently (UDP). */
-        size_t inner_len = qihse_bus_veil_decode(bus, data, len, plain, sizeof(plain));
+        if (!plain) return;
+        size_t inner_len = qihse_bus_veil_decode(bus, data, len,
+            (uint8_t*)plain, QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
         if (inner_len == 0) return;
         data = plain;
         len = inner_len;
@@ -1244,22 +1402,26 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
          * trailer byte (advisory only) — the signature must verify under
          * exactly the key material the enrollment recorded. */
         if (bus->federation_store && bus->federation_user) {
-            qihse_federation_node_identity_t ident;
-            bool have = qihse_federation_node_identity_read(
-                bus->federation_store, bus->federation_user, &signer_uuid, &ident);
-            if (have && ident.trust == QIHSE_TRUST_APPROVED) {
+            qihse_federation_node_identity_t* ident = calloc(1, sizeof(*ident));
+            bool have = ident && qihse_federation_node_identity_read(
+                bus->federation_store, bus->federation_user, &signer_uuid, ident);
+            if (have && ident->trust == QIHSE_TRUST_APPROVED) {
                 verified = qihse_federation_verify(
-                    ident.sig_alg, ident.public_key, ident.public_key_len,
+                    ident->sig_alg, ident->public_key, ident->public_key_len,
                     data, tr, data + tr + 3u + 16u, sig_len);
                 if (getenv("QBS_DBG"))
                     fprintf(stderr, "[qbs] verify=%d alg=%d pk=%zu tr=%zu sig=%u\n",
-                            (int)verified, (int)ident.sig_alg,
-                            (size_t)ident.public_key_len, tr, sig_len);
+                            (int)verified, (int)ident->sig_alg,
+                            (size_t)ident->public_key_len, tr, sig_len);
             } else if (getenv("QBS_DBG")) {
                 fprintf(stderr,
                         "[qbs] have=0 signer=%02x%02x%02x%02x\n",
                         signer_uuid.bytes[0], signer_uuid.bytes[1], signer_uuid.bytes[2],
                         signer_uuid.bytes[3]);
+            }
+            if (ident) {
+                OPENSSL_cleanse(ident, sizeof(*ident));
+                free(ident);
             }
         }
         if (!verified) {
@@ -1293,10 +1455,18 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
         case QIHSE_BUS_MSG_MEET:        qihse_bus_handle_meet(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_FAIL:        qihse_bus_handle_fail(bus, sender, payload, payload_len); break;
         case QIHSE_BUS_MSG_SLOT_UPDATE:
-            if (payload_len == sizeof(qihse_cluster_bus_ct1_promotion_update_t))
+            if (payload_len == sizeof(qihse_cluster_bus_ct1_promotion_update_v2_t))
+                qihse_bus_handle_ct1_promotion_v2_update(bus, sender, payload, payload_len,
+                    signature_verified, &signer_uuid, data, len);
+            else if (payload_len == sizeof(qihse_cluster_bus_ct1_promotion_update_t))
                 qihse_bus_handle_ct1_promotion_update(bus, sender, payload, payload_len,
-                                                       signature_verified, &signer_uuid);
+                                                       signature_verified, &signer_uuid,
+                                                       data, len);
             else qihse_bus_handle_slot_update(bus, payload, payload_len);
+            break;
+        case QIHSE_BUS_MSG_CT1_CERTIFICATE:
+            qihse_bus_handle_ct1_certificate(bus, sender, payload, payload_len,
+                                              signature_verified);
             break;
         case QIHSE_BUS_MSG_NODE_UPDATE: qihse_bus_handle_node_update(bus, payload, payload_len); break;
         case QIHSE_BUS_MSG_NODE_OBS:    qihse_bus_handle_node_obs(bus, payload, payload_len); break;
@@ -1323,6 +1493,7 @@ static void qihse_bus_process_datagram(qihse_cluster_bus_t* bus,
 bool qihse_bus_msg_signed_class(uint32_t message_type) {
     switch ((qihse_cluster_bus_msg_type_t)message_type) {
         case QIHSE_BUS_MSG_SLOT_UPDATE:
+        case QIHSE_BUS_MSG_CT1_CERTIFICATE:
         case QIHSE_BUS_MSG_NODE_UPDATE:
         case QIHSE_BUS_MSG_GROUP_UPDATE:
         case QIHSE_BUS_MSG_GROUP_ACK:
@@ -1337,6 +1508,7 @@ bool qihse_bus_msg_carries_authority(uint32_t message_type) {
         /* Verified, post-quantum signed: may carry authority. */
         case QIHSE_BUS_MSG_FED_STATEMENT:
         case QIHSE_BUS_MSG_FED_HEARTBEAT:
+        case QIHSE_BUS_MSG_CT1_CERTIFICATE:
             return true;
         /* Bootstrap, liveness and discovery only.  MEET and PING must work
          * before a peer is enrolled, which is exactly why they must not confer
@@ -1709,6 +1881,8 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
     bus->on_ct_slot_update_user_data = config->on_ct_slot_update_user_data;
     bus->on_ct1_promotion_update = config->on_ct1_promotion_update;
     bus->on_ct1_promotion_update_user_data = config->on_ct1_promotion_update_user_data;
+    bus->on_ct1_promotion_v2_update = config->on_ct1_promotion_v2_update;
+    bus->on_ct1_promotion_v2_update_user_data = config->on_ct1_promotion_v2_update_user_data;
     bus->on_group_update = config->on_group_update;
     bus->on_group_update_user_data = config->on_group_update_user_data;
     bus->on_group_ack = config->on_group_ack;
@@ -1761,15 +1935,23 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
             return NULL;
         }
         memcpy(bus->veil_key, config->veil_key, bus->veil_key_len + 1u);
+        bus->veil_plain = OPENSSL_malloc(QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
+        if (!bus->veil_plain) {
+            OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+            free(bus);
+            return NULL;
+        }
     }
     if (pthread_mutex_init(&bus->lock, NULL) != 0) {
         OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        OPENSSL_clear_free(bus->veil_plain, QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
         free(bus);
         return NULL;
     }
     if (pthread_mutex_init(&bus->ct_queue_lock, NULL) != 0) {
         pthread_mutex_destroy(&bus->lock);
         OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        OPENSSL_clear_free(bus->veil_plain, QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
         free(bus);
         return NULL;
     }
@@ -1777,6 +1959,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         pthread_mutex_destroy(&bus->ct_queue_lock);
         pthread_mutex_destroy(&bus->lock);
         OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        OPENSSL_clear_free(bus->veil_plain, QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
         free(bus);
         return NULL;
     }
@@ -1791,6 +1974,7 @@ qihse_cluster_bus_t* qihse_cluster_bus_create(const qihse_cluster_bus_config_t* 
         pthread_mutex_destroy(&bus->ct_queue_lock);
         pthread_mutex_destroy(&bus->lock);
         OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+        OPENSSL_clear_free(bus->veil_plain, QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
         free(bus);
         return NULL;
     }
@@ -1914,6 +2098,7 @@ void qihse_cluster_bus_destroy(qihse_cluster_bus_t* bus) {
     free(bus->ct1_announcements);
     free(bus->ct1_slot_announcement);
     OPENSSL_clear_free(bus->veil_key, bus->veil_key_len + 1u);
+    OPENSSL_clear_free(bus->veil_plain, QIHSE_CLUSTER_BUS_MAX_DATAGRAM);
     free(bus);
 }
 
@@ -2081,6 +2266,39 @@ bool qihse_cluster_bus_broadcast_ct1_promotion(
     return ok;
 }
 
+bool qihse_cluster_bus_broadcast_ct1_promotion_v2(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update) {
+    if (!bus || !update || !bus->running || !bus->federation_sign_key ||
+        !bus->has_local_node_uuid || !qihse_bus_ct1_promotion_v2_valid(update)) return false;
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    if (!qihse_cluster_topology_find_node(bus->topology, update->base.target_id,
+            &target_index) || target_index != bus->local_node_index) return false;
+    /* The QCP2 payload carries the complete immutable slot bitmap and its
+     * lane identity. Do not slice the signed proof to a transient run. */
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_SLOT_UPDATE,
+        (const uint8_t*)update, sizeof(*update));
+}
+
+bool qihse_cluster_bus_relay_ct1_certificate(qihse_cluster_bus_t* bus,
+    const void* signed_envelope, size_t envelope_len) {
+    if (!bus || !bus->running || !bus->federation_sign_key || !signed_envelope ||
+        envelope_len > QIHSE_CLUSTER_BUS_CT1_CERTIFICATE_MAX) return false;
+    qihse_uuid_t original_signer;
+    const uint8_t* payload = NULL;
+    size_t payload_len = 0;
+    if (!qihse_bus_verify_nested_qbs(bus, signed_envelope, envelope_len,
+            &original_signer, &payload, &payload_len)) return false;
+    qihse_cluster_bus_ct1_promotion_update_v2_t update;
+    memcpy(&update, payload, sizeof(update));
+    bool valid = qihse_bus_ct1_promotion_v2_valid(&update);
+    OPENSSL_cleanse(&update, sizeof(update));
+    OPENSSL_cleanse(&original_signer, sizeof(original_signer));
+    if (!valid) return false;
+    return qihse_bus_send_to_all_peers(bus, QIHSE_BUS_MSG_CT1_CERTIFICATE,
+        (const uint8_t*)signed_envelope, envelope_len);
+}
+
 void qihse_cluster_bus_set_federation(qihse_cluster_bus_t* bus,
                                       void* store, void* user,
                                       const qihse_uuid_t* node_uuid,
@@ -2138,6 +2356,14 @@ void qihse_cluster_bus_set_ct1_promotion_update_callback(
     if (!bus) return;
     bus->on_ct1_promotion_update = cb;
     bus->on_ct1_promotion_update_user_data = user_data;
+}
+
+void qihse_cluster_bus_set_ct1_promotion_v2_update_callback(
+    qihse_cluster_bus_t* bus,
+    qihse_cluster_bus_on_ct1_promotion_v2_update_cb cb, void* user_data) {
+    if (!bus) return;
+    bus->on_ct1_promotion_v2_update = cb;
+    bus->on_ct1_promotion_v2_update_user_data = user_data;
 }
 
 void qihse_cluster_bus_set_fail_callback(qihse_cluster_bus_t* bus,

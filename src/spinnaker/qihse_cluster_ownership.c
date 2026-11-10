@@ -206,12 +206,20 @@ static void set_error(char* err, size_t cap, const char* message) {
     if (err && cap) snprintf(err, cap, "%s", message ? message : "ownership transfer failed");
 }
 
+static bool ownership_system_operator_active(const qihse_user_t* user);
+static bool resolve_qkp_id(const qihse_cluster_ownership_context_t* c,
+                           const char* topology_id,
+                           char out[QIHSE_KV_CT_ID_MAX + 1u]);
+
 static bool range_authority_hooks_valid(
     const qihse_cluster_ownership_context_t* c) {
     if (!c) return false;
     unsigned configured = (c->range_reserve != NULL) +
         (c->range_check_reserved != NULL) + (c->range_finalize != NULL) +
         (c->range_check_finalized != NULL) + (c->range_abort != NULL);
+    if (c->range_finalize_promotion && configured != 5) return false;
+    if ((c->lane_claim != NULL) != (c->lane_verify_claim != NULL)) return false;
+    if (c->range_finalize_promotion && (!c->lane_claim || !c->lane_verify_claim)) return false;
     return configured == 0 || configured == 5;
 }
 
@@ -233,6 +241,120 @@ static bool range_check_finalized(qihse_cluster_ownership_context_t* c,
     }
     return !c->range_check_finalized || c->range_check_finalized(
         c->range_authority_context, c->principal, txn, err, err_cap);
+}
+
+typedef struct {
+    qihse_cluster_ownership_context_t* context;
+    qihse_user_t* principal;
+} lane_verify_ctx_t;
+
+static bool lane_authority_verify_adapter(
+    void* opaque, const qihse_kv_ct_lane_authority_claim_t* claim,
+    bool require_final) {
+    lane_verify_ctx_t* v = opaque;
+    return v && v->context && v->context->lane_verify_claim &&
+        v->context->lane_verify_claim(v->context->range_authority_context,
+            v->principal, claim, require_final);
+}
+
+bool qihse_cluster_ownership_promotion_reserve(
+    qihse_cluster_ownership_context_t* c,
+    qihse_cluster_ownership_txn_t* txn,
+    qihse_kv_ct_lane_authority_claim_t* out_claim,
+    qihse_kv_ct_proof_t** out_reservation_proof,
+    char* err, size_t err_cap) {
+    if (out_claim) memset(out_claim, 0, sizeof(*out_claim));
+    if (out_reservation_proof) *out_reservation_proof = NULL;
+    if (!c || !ownership_system_operator_active(c->principal) || !txn ||
+        !txn->lane_id[0] || !txn->next_generation[0] ||
+        !out_claim || !out_reservation_proof || !range_authority_hooks_valid(c) ||
+        !c->range_reserve || !c->lane_claim || !c->lane_verify_claim ||
+        !c->store || !c->data_principal) {
+        set_error(err, err_cap, "active System Operator, lane-bound promotion, and complete range authority are required");
+        return false;
+    }
+    if (!c->range_reserve(c->range_authority_context, c->principal,
+            txn, err, err_cap) ||
+        !c->lane_claim(c->range_authority_context, c->principal, txn,
+            out_claim)) {
+        if (!err || !err_cap || !err[0])
+            set_error(err, err_cap, "could not read committed lane promotion reservation");
+        return false;
+    }
+    char successor_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    bool successor_resolved = resolve_qkp_id(c, txn->owner_id, successor_qkp);
+    bool claim_matches = successor_resolved &&
+        out_claim->operation == QIHSE_KV_CT_LANE_AUTH_PROMOTION &&
+        !strcmp(out_claim->transfer_id, txn->transfer_id) &&
+        !strcmp(out_claim->source_group_id, txn->lane_id) &&
+        !strcmp(out_claim->target_group_id, txn->lane_id) &&
+        !strcmp(out_claim->source_generation, txn->generation) &&
+        !strcmp(out_claim->target_generation, txn->next_generation) &&
+        out_claim->grant_epoch == txn->config_epoch &&
+        out_claim->source_cut == txn->source_lsn &&
+        !strcmp(out_claim->source_qkp_id, txn->source_qkp_id) &&
+        !strcmp(out_claim->target_qkp_id, txn->target_qkp_id) &&
+        !strcmp(out_claim->successor_qkp_id, successor_qkp) &&
+        out_claim->target_cursor == txn->target_lsn &&
+        CRYPTO_memcmp(out_claim->slots, txn->slot_bitmap, sizeof(txn->slot_bitmap)) == 0;
+    OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+    if (!claim_matches) {
+        memset(out_claim, 0, sizeof(*out_claim));
+        set_error(err, err_cap, "range authority returned a promotion claim that differs from the immutable lane tuple");
+        return false;
+    }
+    lane_verify_ctx_t verify_ctx = {.context = c, .principal = c->principal};
+    *out_reservation_proof = qihse_kv_ct_lane_authority_proof_create(
+        c->store, c->principal, c->data_principal, out_claim,
+        lane_authority_verify_adapter, &verify_ctx);
+    if (!*out_reservation_proof) {
+        memset(out_claim, 0, sizeof(*out_claim));
+        set_error(err, err_cap, "could not mint verified immutable promotion reservation proof");
+        return false;
+    }
+    return true;
+}
+
+bool qihse_cluster_ownership_promotion_finalize(
+    qihse_cluster_ownership_context_t* c,
+    const qihse_cluster_ownership_txn_t* txn,
+    const qihse_kv_ct_proof_t* promoted_proof,
+    const uint8_t promotion_event_digest[32], char* err, size_t err_cap) {
+    if (!c || !ownership_system_operator_active(c->principal) || !txn ||
+        !txn->lane_id[0] || !txn->next_generation[0] || !promoted_proof ||
+        !promotion_event_digest || !range_authority_hooks_valid(c) ||
+        !c->range_finalize_promotion) {
+        set_error(err, err_cap, "active System Operator, ready lane promotion proof, and promotion finalizer are required");
+        return false;
+    }
+    qihse_kv_ct_lane_authority_claim_t claim;
+    memset(&claim, 0, sizeof(claim));
+    uint8_t canonical_digest[32] = {0};
+    bool evidence_ok = qihse_cluster_ownership_promotion_event_digest(
+            c, txn, canonical_digest) &&
+        CRYPTO_memcmp(canonical_digest, promotion_event_digest, 32u) == 0 &&
+        qihse_kv_ct_lane_authority_proof_fields(c->store, c->principal,
+            c->data_principal, promoted_proof, &claim) &&
+        claim.operation == QIHSE_KV_CT_LANE_AUTH_PROMOTION &&
+        !strcmp(claim.transfer_id, txn->transfer_id) &&
+        !strcmp(claim.source_group_id, txn->lane_id) &&
+        !strcmp(claim.target_group_id, txn->lane_id) &&
+        !strcmp(claim.source_generation, txn->generation) &&
+        !strcmp(claim.target_generation, txn->next_generation) &&
+        claim.grant_epoch == txn->config_epoch &&
+        claim.source_cut == txn->source_lsn &&
+        claim.target_cursor == txn->target_lsn &&
+        CRYPTO_memcmp(claim.slots, txn->slot_bitmap, sizeof(txn->slot_bitmap)) == 0 &&
+        CRYPTO_memcmp(claim.promotion_event_digest, promotion_event_digest, 32u) == 0 &&
+        !claim.final_decision_index;
+    OPENSSL_cleanse(canonical_digest, sizeof(canonical_digest));
+    OPENSSL_cleanse(&claim, sizeof(claim));
+    if (!evidence_ok) {
+        set_error(err, err_cap, "durable lane marker does not match the exact reserved promotion event");
+        return false;
+    }
+    return c->range_finalize_promotion(c->range_authority_context, c->principal,
+        txn, promoted_proof, promotion_event_digest, err, err_cap);
 }
 
 static bool ownership_system_operator_active(const qihse_user_t* user) {
@@ -782,8 +904,9 @@ bool qihse_cluster_ownership_activate_target(
     qihse_cluster_ownership_context_t* c,
     const qihse_resp_ct_activation_request_t* request,
     char* err, size_t err_cap) {
-    if (!c || !c->topology || !c->store || !c->principal || !c->data_principal || !request) {
-        set_error(err, err_cap, "authenticated target context and source activation request are required");
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) ||
+        !c->data_principal || !request) {
+        set_error(err, err_cap, "active System Operator target context and source activation request are required");
         return false;
     }
     qihse_user_t* request_data_principal =
@@ -1073,15 +1196,15 @@ bool qihse_cluster_ownership_prepare_target_handler(
     unsigned char range_checksum[32] = {0}, image_sha256[32] = {0};
     if (out_target_cut) *out_target_cut = 0;
     if (!c || !request || !out_target_cut || !c->resp_server || !c->store ||
-        !c->principal || !qihse_resp_ct_begin_request_fields(request,
+        !ownership_system_operator_active(c->principal) || !qihse_resp_ct_begin_request_fields(request,
             &transfer_id, &topology_source_id, &topology_target_id,
             &source_qkp_id, &target_qkp_id, &generation, &first_slot,
             &last_slot, &source_lsn, &config_epoch, range_checksum,
             image_sha256, &total_bytes) || !transfer_id || !topology_source_id ||
         !topology_target_id || !source_qkp_id || !target_qkp_id || !generation ||
-        !source_lsn || !config_epoch || !total_bytes || first_slot > last_slot ||
+        (!source_lsn && !c->range_reserve) || !config_epoch || !total_bytes || first_slot > last_slot ||
         last_slot >= QIHSE_CLUSTER_SLOT_COUNT || total_bytes > INT64_MAX) {
-        set_error(err, err_cap, "authenticated CT2 BEGIN request is malformed");
+        set_error(err, err_cap, "active System Operator context and valid authenticated CT2 BEGIN request are required");
         goto done;
     }
     qihse_user_t* request_data_principal = qihse_resp_ct_begin_request_principal(request);
@@ -1215,7 +1338,7 @@ bool qihse_cluster_ownership_abort_target_handler(
             &target_qkp_id, &generation, &first_slot, &last_slot,
             &source_lsn, &config_epoch, checksum) || !transfer_id ||
         !topology_source_id || !topology_target_id || !source_qkp_id ||
-        !target_qkp_id || !generation || !source_lsn || !config_epoch ||
+        !target_qkp_id || !generation || (!source_lsn && !c->range_reserve) || !config_epoch ||
         first_slot > last_slot || last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
         !target_request_topology(c, topology_source_id, topology_target_id,
             source_qkp_id, target_qkp_id, first_slot, last_slot,
@@ -1304,8 +1427,8 @@ bool qihse_cluster_ownership_transfer_abort(
     qihse_cluster_ownership_context_t* c, const char* transfer_id,
     uint16_t source_index, uint16_t target_index,
     char* err, size_t err_cap) {
-    if (!c || !c->topology || !c->store || !c->principal || !transfer_id) {
-        set_error(err, err_cap, "authenticated context and transfer ID are required for abort");
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) || !transfer_id) {
+        set_error(err, err_cap, "active System Operator context and transfer ID are required for abort");
         return false;
     }
     if (!range_authority_hooks_valid(c)) {
@@ -1555,8 +1678,9 @@ bool qihse_cluster_ownership_transfer_publish(
     qihse_cluster_ownership_context_t* c, const char* transfer_id,
     const qihse_cluster_ct_activation_receipt_t* activation,
     char* err, size_t err_cap) {
-    if (!c || !c->topology || !c->store || !c->principal || !transfer_id || !activation) {
-        set_error(err, err_cap, "durable source context and target activation receipt are required");
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) ||
+        !transfer_id || !activation) {
+        set_error(err, err_cap, "active System Operator source context and target activation receipt are required");
         return false;
     }
     const char* data_dir = qihse_kv_store_data_directory(c->store);
@@ -1666,12 +1790,12 @@ bool qihse_cluster_ownership_receive_ct_update(
     const qihse_cluster_bus_ct_slot_update_t* u,
     const qihse_cluster_ct_activation_receipt_t* receipt,
     char* err, size_t err_cap) {
-    if (!c || !c->topology || !c->store || !c->principal || !u || !receipt ||
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) || !u || !receipt ||
         u->magic != QIHSE_CLUSTER_BUS_CT_UPDATE_MAGIC || u->reserved ||
         u->start > u->end || u->end >= QIHSE_CLUSTER_SLOT_COUNT ||
         !u->transfer_id[0] || !u->source_id[0] || !u->target_id[0] ||
         !u->generation[0] || strcmp(u->owner_id, u->target_id)) {
-        set_error(err, err_cap, "authenticated context, valid CT update, and pinned receipt are required");
+        set_error(err, err_cap, "active System Operator context, valid CT update, and pinned receipt are required");
         return false;
     }
     uint16_t source_index, target_index;
@@ -2018,6 +2142,34 @@ static bool ct1_update_from_txn(const qihse_cluster_ownership_txn_t* txn,
     return qihse_cluster_bus_ct1_promotion_seal(update);
 }
 
+bool qihse_cluster_ownership_promotion_event_digest(
+    qihse_cluster_ownership_context_t* c,
+    const qihse_cluster_ownership_txn_t* txn, uint8_t out_digest[32]) {
+    if (!c || !txn || !out_digest || !txn->lane_id[0] || !txn->next_generation[0])
+        return false;
+    uint16_t successor_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t successor;
+    char successor_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    qihse_cluster_bus_ct1_promotion_update_v2_t update;
+    memset(&update, 0, sizeof(update));
+    bool ok = qihse_cluster_topology_find_node(c->topology, txn->owner_id,
+            &successor_index) &&
+        qihse_cluster_topology_get_node(c->topology, successor_index, &successor) &&
+        resolve_qkp_id(c, successor.id, successor_qkp) &&
+        ct1_update_from_txn(txn, successor_qkp, &update.base);
+    if (ok) {
+        update.magic = QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC;
+        update.target_cursor = txn->target_lsn;
+        snprintf(update.lane_id, sizeof(update.lane_id), "%s", txn->lane_id);
+        ok = qihse_cluster_bus_ct1_promotion_v2_seal(&update);
+    }
+    if (ok) memcpy(out_digest, update.event_digest, sizeof(update.event_digest));
+    else OPENSSL_cleanse(out_digest, 32u);
+    OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+    OPENSSL_cleanse(&update, sizeof(update));
+    return ok;
+}
+
 static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) {
     replay_context_t* r = opaque;
     qihse_cluster_ownership_context_t* c = r->context;
@@ -2092,6 +2244,16 @@ static bool recover_txn(const qihse_cluster_ownership_txn_t* txn, void* opaque) 
     if (txn->phase != QIHSE_OWNERSHIP_FINALIZED &&
         txn->phase != QIHSE_OWNERSHIP_ADOPTED) return false;
     if (txn->next_generation[0]) {
+        /* Older QOS1/QOS2 terminal records have no lane ID or quorum grant.
+         * They are accepted only while replaying the validated local journal,
+         * before group-mode common genesis is installed. All live bus,
+         * target, and manager entry points still require range authority. */
+        if (txn->lane_id[0] && !range_check_finalized(c, txn, r->err, r->err_cap)) {
+            set_error(r->err, r->err_cap,
+                "lane CT1 promotion lacks a committed range authority decision");
+            r->failed = true;
+            return false;
+        }
         if (txn->phase == QIHSE_OWNERSHIP_FINALIZED && local_index != target_index) {
             set_error(r->err, r->err_cap, "finalized CT1 promotion journal is not on its promoted target");
             r->failed = true; return false;
@@ -2224,12 +2386,13 @@ bool qihse_cluster_ownership_receive_ct1_promotion(
     qihse_cluster_ownership_context_t* c,
     const qihse_cluster_bus_ct1_promotion_update_t* u,
     char* err, size_t err_cap) {
-    if (!c || !u || u->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC ||
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) || !u ||
+        u->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_MAGIC ||
         u->reserved || !u->config_epoch || u->start > u->end ||
         u->end >= QIHSE_CLUSTER_SLOT_COUNT || !u->transfer_id[0] ||
         !u->source_id[0] || !u->target_id[0] || !u->successor_id[0] ||
         !u->generation[0] || !u->next_generation[0]) {
-        set_error(err, err_cap, "signed CT1 promotion tuple is malformed");
+        set_error(err, err_cap, "active System Operator context and valid signed CT1 promotion tuple are required");
         return false;
     }
     qihse_cluster_bus_ct1_promotion_update_t sealed = *u;
@@ -2368,12 +2531,238 @@ bool qihse_cluster_ownership_receive_ct1_promotion(
     return true;
 }
 
+bool qihse_cluster_ownership_receive_ct1_promotion_v2(
+    qihse_cluster_ownership_context_t* c,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* u,
+    const uint8_t* envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer, char* err, size_t err_cap) {
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) ||
+        !c->range_finalize_promotion || !c->lane_claim || !c->lane_verify_claim ||
+        !u || !envelope || !envelope_len ||
+        envelope_len > QIHSE_KV_CT_CERTIFICATE_MAX_BYTES || !original_signer ||
+        u->magic != QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC || u->reserved ||
+        !u->base.config_epoch || u->base.start > u->base.end ||
+        u->base.end >= QIHSE_CLUSTER_SLOT_COUNT || !u->base.transfer_id[0] ||
+        !u->base.source_id[0] || !u->base.target_id[0] || !u->base.successor_id[0] ||
+        !u->base.generation[0] || !u->base.next_generation[0] ||
+        strnlen(u->lane_id, sizeof(u->lane_id)) != 64u) {
+        set_error(err, err_cap, "active System Operator, lane-authority hooks, and valid signed QCP2 certificate are required");
+        return false;
+    }
+    for (size_t i = 0; i < 64u; ++i) {
+        if (!((u->lane_id[i] >= '0' && u->lane_id[i] <= '9') ||
+              (u->lane_id[i] >= 'a' && u->lane_id[i] <= 'f'))) {
+            set_error(err, err_cap, "QCP2 lane ID is not canonical lowercase hex");
+            return false;
+        }
+    }
+    qihse_cluster_bus_ct1_promotion_update_v2_t sealed = *u;
+    qihse_cluster_bus_ct1_promotion_update_t base_sealed = u->base;
+    bool digest_ok = qihse_cluster_bus_ct1_promotion_seal(&base_sealed) &&
+        CRYPTO_memcmp(base_sealed.event_digest, u->base.event_digest, 32u) == 0 &&
+        qihse_cluster_bus_ct1_promotion_v2_seal(&sealed) &&
+        CRYPTO_memcmp(sealed.event_digest, u->event_digest, 32u) == 0;
+    OPENSSL_cleanse(&base_sealed, sizeof(base_sealed));
+    OPENSSL_cleanse(&sealed, sizeof(sealed));
+    if (!digest_ok) {
+        set_error(err, err_cap, "QCP2 digest does not bind the base event, lane and target cursor");
+        return false;
+    }
+    if (envelope_len < QIHSE_CLUSTER_BUS_HEADER_SIZE +
+            sizeof(qihse_cluster_bus_ct1_promotion_update_v2_t) + 25u ||
+        memcmp(envelope + QIHSE_CLUSTER_BUS_HEADER_SIZE, u, sizeof(*u)) != 0) {
+        set_error(err, err_cap, "original signed envelope does not contain this exact QCP2 event");
+        return false;
+    }
+
+    uint16_t source_index = QIHSE_CLUSTER_NODE_NONE;
+    uint16_t target_index = QIHSE_CLUSTER_NODE_NONE;
+    uint16_t successor_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_t source, target, successor;
+    char source_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    char target_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    char successor_qkp[QIHSE_KV_CT_ID_MAX + 1u] = {0};
+    bool identities_ok = qihse_cluster_topology_find_node(c->topology,
+            u->base.source_id, &source_index) &&
+        qihse_cluster_topology_find_node(c->topology, u->base.target_id, &target_index) &&
+        qihse_cluster_topology_find_node(c->topology, u->base.successor_id, &successor_index) &&
+        qihse_cluster_topology_get_node(c->topology, source_index, &source) &&
+        qihse_cluster_topology_get_node(c->topology, target_index, &target) &&
+        qihse_cluster_topology_get_node(c->topology, successor_index, &successor) &&
+        resolve_qkp_id(c, source.id, source_qkp) &&
+        resolve_qkp_id(c, target.id, target_qkp) &&
+        resolve_qkp_id(c, successor.id, successor_qkp) &&
+        !strcmp(source_qkp, u->base.source_qkp_id) &&
+        !strcmp(target_qkp, u->base.target_qkp_id) &&
+        !strcmp(successor_qkp, u->base.successor_qkp_id) &&
+        source_index != target_index && source_index != successor_index &&
+        target_index != successor_index && target.has_uuid &&
+        CRYPTO_memcmp(target.node_uuid, original_signer->bytes, sizeof(original_signer->bytes)) == 0;
+    if (!identities_ok) {
+        set_error(err, err_cap, "QCP2 source, target signer, successor, or QKP pin does not match trusted topology");
+        goto fail;
+    }
+
+    qihse_cluster_ownership_txn_t txn;
+    memset(&txn, 0, sizeof(txn));
+    txn.phase = QIHSE_OWNERSHIP_ADOPTED;
+    txn.start = u->base.start;
+    txn.end = u->base.end;
+    txn.config_epoch = u->base.config_epoch;
+    txn.source_lsn = u->base.durable_cursor;
+    txn.target_lsn = u->target_cursor;
+    snprintf(txn.transfer_id, sizeof(txn.transfer_id), "%s", u->base.transfer_id);
+    snprintf(txn.source_id, sizeof(txn.source_id), "%s", u->base.source_id);
+    snprintf(txn.target_id, sizeof(txn.target_id), "%s", u->base.target_id);
+    snprintf(txn.source_qkp_id, sizeof(txn.source_qkp_id), "%s", u->base.source_qkp_id);
+    snprintf(txn.target_qkp_id, sizeof(txn.target_qkp_id), "%s", u->base.target_qkp_id);
+    snprintf(txn.owner_id, sizeof(txn.owner_id), "%s", u->base.successor_id);
+    snprintf(txn.generation, sizeof(txn.generation), "%s", u->base.generation);
+    snprintf(txn.next_generation, sizeof(txn.next_generation), "%s", u->base.next_generation);
+    snprintf(txn.lane_id, sizeof(txn.lane_id), "%s", u->lane_id);
+    memcpy(txn.slot_bitmap, u->base.slot_bitmap, sizeof(txn.slot_bitmap));
+    uint32_t min_slot = QIHSE_CLUSTER_SLOT_COUNT, max_slot = 0;
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(txn.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        if (slot < min_slot) min_slot = slot;
+        max_slot = slot;
+    }
+    if (min_slot >= QIHSE_CLUSTER_SLOT_COUNT || min_slot != txn.start || max_slot != txn.end) {
+        set_error(err, err_cap, "QCP2 interval does not exactly bound its immutable lane bitmap");
+        goto txn_fail;
+    }
+    uint8_t audit_digest[32] = {0};
+    if (!ct1_recovery_digest(&txn, txn.owner_id, u->base.successor_qkp_id, audit_digest) ||
+        CRYPTO_memcmp(audit_digest, u->base.promotion_digest, sizeof(audit_digest)) != 0) {
+        OPENSSL_cleanse(audit_digest, sizeof(audit_digest));
+        set_error(err, err_cap, "QCP2 audit fingerprint does not match its durable promotion tuple");
+        goto txn_fail;
+    }
+    memcpy(txn.proof_digest, audit_digest, sizeof(txn.proof_digest));
+    OPENSSL_cleanse(audit_digest, sizeof(audit_digest));
+    if (!range_check_finalized(c, &txn, err, err_cap)) goto txn_fail;
+
+    qihse_kv_ct_lane_authority_claim_t claim;
+    memset(&claim, 0, sizeof(claim));
+    if (!c->lane_claim(c->range_authority_context, c->principal, &txn, &claim) ||
+        claim.operation != QIHSE_KV_CT_LANE_AUTH_PROMOTION ||
+        strcmp(claim.source_group_id, txn.lane_id) ||
+        strcmp(claim.target_group_id, txn.lane_id) ||
+        strcmp(claim.target_generation, txn.next_generation) ||
+        claim.grant_epoch != txn.config_epoch || claim.source_cut != txn.source_lsn ||
+        claim.target_cursor != txn.target_lsn ||
+        CRYPTO_memcmp(claim.slots, txn.slot_bitmap, sizeof(txn.slot_bitmap)) != 0 ||
+        CRYPTO_memcmp(claim.promotion_event_digest, u->event_digest, 32u) != 0 ||
+        !c->lane_verify_claim(c->range_authority_context, c->principal, &claim, true)) {
+        OPENSSL_cleanse(&claim, sizeof(claim));
+        set_error(err, err_cap, "QCP2 is not covered by the committed lane promotion decision");
+        goto txn_fail;
+    }
+    OPENSSL_cleanse(&claim, sizeof(claim));
+
+    bool needs_apply = false;
+    for (uint32_t slot = 0; slot < QIHSE_CLUSTER_SLOT_COUNT; ++slot) {
+        if (!(txn.slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u)))) continue;
+        uint16_t owner = QIHSE_CLUSTER_NODE_NONE;
+        uint64_t epoch = 0;
+        if (!qihse_cluster_topology_get_slot(c->topology, (uint16_t)slot,
+                &owner, NULL, NULL) ||
+            !qihse_cluster_topology_get_slot_epoch(c->topology, (uint16_t)slot, &epoch)) {
+            set_error(err, err_cap, "could not read local lane slot epoch");
+            goto txn_fail;
+        }
+        if (epoch > txn.config_epoch || (epoch == txn.config_epoch && owner == target_index)) continue;
+        if (epoch == txn.config_epoch || owner != source_index) {
+            set_error(err, err_cap, "QCP2 range conflicts with a same-epoch or unrelated current owner");
+            goto txn_fail;
+        }
+        needs_apply = true;
+    }
+    if (!needs_apply) {
+        OPENSSL_cleanse(&txn, sizeof(txn));
+        set_error(err, err_cap, "");
+        OPENSSL_cleanse(source_qkp, sizeof(source_qkp));
+        OPENSSL_cleanse(target_qkp, sizeof(target_qkp));
+        OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+        return true;
+    }
+
+    /* Persist the original target-signed QBS envelope before the local
+     * ownership journal/routing change whenever this store holds the lane. */
+    qihse_kv_ct_lane_status_t lane_status;
+    memset(&lane_status, 0, sizeof(lane_status));
+    errno = 0;
+    if (!qihse_kv_ct_lane_status(c->store, c->principal, txn.lane_id, &lane_status)) {
+        OPENSSL_cleanse(&lane_status, sizeof(lane_status));
+        set_error(err, err_cap, "local promoted CT lane is unavailable for the signed QCP2 certificate");
+        goto txn_fail;
+    }
+    if (strcmp(lane_status.generation, txn.next_generation) ||
+        strcmp(lane_status.source_id, txn.target_qkp_id) ||
+        CRYPTO_memcmp(lane_status.slot_bitmap, txn.slot_bitmap, sizeof(txn.slot_bitmap))) {
+        OPENSSL_cleanse(&lane_status, sizeof(lane_status));
+        set_error(err, err_cap, "local CT lane does not match the promoted generation/bitmap");
+        goto txn_fail;
+    }
+    qihse_user_t* certificate_principal =
+        lane_status.mode == QIHSE_KV_CT_LANE_SOURCE ? c->principal : c->data_principal;
+    unsigned char cert_digest[32] = {0};
+    bool appended = certificate_principal &&
+        qihse_kv_ct_lane_certificate_append(c->store, certificate_principal,
+            txn.lane_id, txn.next_generation, envelope, envelope_len, cert_digest);
+    OPENSSL_cleanse(cert_digest, sizeof(cert_digest));
+    OPENSSL_cleanse(&lane_status, sizeof(lane_status));
+    if (!appended) {
+        set_error(err, err_cap, "could not durably append the exact signed QCP2 certificate to its lane");
+        goto txn_fail;
+    }
+    const char* data_dir = qihse_kv_store_data_directory(c->store);
+    if (!data_dir || qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+        set_error(err, err_cap, "could not persist signed QCP2 adoption before routing slots");
+        goto txn_fail;
+    }
+    if (!adopt_txn_ranges(c->topology, NULL, &txn, target_index)) {
+        set_error(err, err_cap, "signed QCP2 adoption is durable but topology replay is required");
+        goto txn_fail;
+    }
+    OPENSSL_cleanse(&txn, sizeof(txn));
+    OPENSSL_cleanse(source_qkp, sizeof(source_qkp));
+    OPENSSL_cleanse(target_qkp, sizeof(target_qkp));
+    OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+    set_error(err, err_cap, "");
+    return true;
+
+txn_fail:
+    OPENSSL_cleanse(&txn, sizeof(txn));
+fail:
+    OPENSSL_cleanse(source_qkp, sizeof(source_qkp));
+    OPENSSL_cleanse(target_qkp, sizeof(target_qkp));
+    OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
+    return false;
+}
+
 void qihse_cluster_ownership_ct1_promotion_bus_callback(
     qihse_cluster_bus_t* bus,
-    const qihse_cluster_bus_ct1_promotion_update_t* update, void* opaque) {
+    const qihse_cluster_bus_ct1_promotion_update_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer, void* opaque) {
     (void)bus;
+    (void)verified_signed_envelope;
+    (void)envelope_len;
+    (void)original_signer;
     char err[192];
     (void)qihse_cluster_ownership_receive_ct1_promotion(opaque, update, err, sizeof(err));
+}
+
+void qihse_cluster_ownership_ct1_promotion_v2_bus_callback(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer, void* opaque) {
+    (void)bus;
+    char err[192];
+    (void)qihse_cluster_ownership_receive_ct1_promotion_v2(opaque, update,
+        verified_signed_envelope, envelope_len, original_signer, err, sizeof(err));
 }
 
 static bool topology_node_owns_slots(qihse_cluster_topology_t* topology,
@@ -2670,8 +3059,8 @@ static bool ownership_replay_impl(
     qihse_cluster_ownership_context_t* c, bool* out_unresolved,
     bool allow_pending, char* err, size_t err_cap) {
     if (out_unresolved) *out_unresolved = false;
-    if (!c || !c->topology || !c->store || !c->principal || !out_unresolved) {
-        set_error(err, err_cap, "authenticated topology/store context is required for ownership recovery");
+    if (!c || !c->topology || !c->store || !ownership_system_operator_active(c->principal) || !out_unresolved) {
+        set_error(err, err_cap, "active System Operator topology/store context is required for ownership recovery");
         return false;
     }
     if (!range_authority_hooks_valid(c)) {

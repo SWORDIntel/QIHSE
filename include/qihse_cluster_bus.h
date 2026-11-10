@@ -113,7 +113,8 @@ typedef enum {
      * overlay and are dropped when the DHT hint table is not enabled, which is
      * the fail-closed default. */
     QIHSE_BUS_MSG_DHT_FIND  = 13u, /* "peers near this node id?" */
-    QIHSE_BUS_MSG_DHT_NODES = 14u  /* up to k peers, nearest first */
+    QIHSE_BUS_MSG_DHT_NODES = 14u, /* up to k peers, nearest first */
+    QIHSE_BUS_MSG_CT1_CERTIFICATE = 15u /* relayed original signed QCP2 envelope */
 } qihse_cluster_bus_msg_type_t;
 
 /*
@@ -221,6 +222,20 @@ typedef struct {
     uint8_t event_digest[32];
 } qihse_cluster_bus_ct1_promotion_update_t;
 
+/* QCP2 wraps the unchanged, signed QCP1 promotion tuple with a stable CT lane
+ * identity. Its independent digest binds the exact QCP1 event and lane ID;
+ * legacy QCP1 encoding and digest remain byte-for-byte unchanged. */
+#define QIHSE_CLUSTER_BUS_CT1_PROMOTION_V2_MAGIC 0x32504351u /* "QCP2" */
+#define QIHSE_CLUSTER_BUS_CT1_CERTIFICATE_MAX 8192u
+typedef struct {
+    uint32_t magic;
+    uint32_t reserved;
+    uint64_t target_cursor; /* promoted lane's sealed baseline row sequence */
+    qihse_cluster_bus_ct1_promotion_update_t base;
+    char lane_id[65];
+    uint8_t event_digest[32];
+} qihse_cluster_bus_ct1_promotion_update_v2_t;
+
 typedef struct qihse_cluster_bus qihse_cluster_bus_t;
 
 typedef void (*qihse_cluster_bus_on_fail_cb)(qihse_cluster_topology_t* topology,
@@ -241,7 +256,14 @@ typedef void (*qihse_cluster_bus_on_ct_slot_update_cb)(
     const qihse_cluster_bus_ct_slot_update_t* update, void* user_data);
 typedef void (*qihse_cluster_bus_on_ct1_promotion_update_cb)(
     qihse_cluster_bus_t* bus,
-    const qihse_cluster_bus_ct1_promotion_update_t* update, void* user_data);
+    const qihse_cluster_bus_ct1_promotion_update_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer, void* user_data);
+typedef void (*qihse_cluster_bus_on_ct1_promotion_v2_update_cb)(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update,
+    const uint8_t* verified_signed_envelope, size_t envelope_len,
+    const qihse_uuid_t* original_signer, void* user_data);
 
 typedef struct {
     qihse_cluster_topology_t* topology;
@@ -263,6 +285,8 @@ typedef struct {
     void* on_ct_slot_update_user_data;
     qihse_cluster_bus_on_ct1_promotion_update_cb on_ct1_promotion_update;
     void* on_ct1_promotion_update_user_data;
+    qihse_cluster_bus_on_ct1_promotion_v2_update_cb on_ct1_promotion_v2_update;
+    void* on_ct1_promotion_v2_update_user_data;
     /* Group update push. on_group_update fires on every member when an update
      * frame arrives; on_group_ack fires on the pusher when a member reports
      * applied/rejected. Both run on the bus thread: keep them short. */
@@ -408,6 +432,9 @@ void qihse_cluster_bus_set_ct_slot_update_callback(
 void qihse_cluster_bus_set_ct1_promotion_update_callback(
     qihse_cluster_bus_t* bus,
     qihse_cluster_bus_on_ct1_promotion_update_cb cb, void* user_data);
+void qihse_cluster_bus_set_ct1_promotion_v2_update_callback(
+    qihse_cluster_bus_t* bus,
+    qihse_cluster_bus_on_ct1_promotion_v2_update_cb cb, void* user_data);
 
 /* Install the group callbacks after creation (the bus struct is opaque, so
  * consumers that wire themselves up post-create use this instead of touching
@@ -437,8 +464,18 @@ bool qihse_cluster_bus_broadcast_ct_slot_update(
 bool qihse_cluster_bus_broadcast_ct1_promotion(
     qihse_cluster_bus_t* bus,
     const qihse_cluster_bus_ct1_promotion_update_t* update);
+bool qihse_cluster_bus_broadcast_ct1_promotion_v2(
+    qihse_cluster_bus_t* bus,
+    const qihse_cluster_bus_ct1_promotion_update_v2_t* update);
+/* Relay the exact original signed QCP2 datagram as an opaque certificate.
+ * The outer bus sender is authenticated independently from the original
+ * target signer embedded in the certificate. */
+bool qihse_cluster_bus_relay_ct1_certificate(qihse_cluster_bus_t* bus,
+    const void* signed_envelope, size_t envelope_len);
 bool qihse_cluster_bus_ct1_promotion_seal(
     qihse_cluster_bus_ct1_promotion_update_t* update);
+bool qihse_cluster_bus_ct1_promotion_v2_seal(
+    qihse_cluster_bus_ct1_promotion_update_v2_t* update);
 
 /* Broadcast a node metadata update (role change, health change). */
 bool qihse_cluster_bus_broadcast_node_update(qihse_cluster_bus_t* bus,

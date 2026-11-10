@@ -16,6 +16,9 @@
 #define QIHSE_OWNERSHIP_JOURNAL_FRAME 65u            /* see wire layout below */
 #define QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC 0x32534F51u /* "QOS2" */
 #define QIHSE_OWNERSHIP_JOURNAL_V2_FRAME 2596u
+#define QIHSE_OWNERSHIP_JOURNAL_V3_MAGIC 0x33534F51u /* "QOS3" */
+#define QIHSE_OWNERSHIP_JOURNAL_V3_FRAME 2661u
+#define QIHSE_OWNERSHIP_JOURNAL_TXN_FRAME_MAX QIHSE_OWNERSHIP_JOURNAL_V3_FRAME
 #define QIHSE_OWNERSHIP_JOURNAL_LOCK_NAME "slot-ownership.journal.lock"
 
 /* Serialize journal state transitions across both threads and processes.
@@ -101,6 +104,14 @@ static bool digest_nonzero(const uint8_t digest[32]) {
     for (size_t i = 0; i < 32; ++i) v |= digest[i];
     return v != 0;
 }
+static bool valid_lane_id(const char* lane_id) {
+    if (!lane_id || !*lane_id) return lane_id != NULL;
+    if (strnlen(lane_id, QIHSE_OWNERSHIP_ID_MAX + 1u) != 64u) return false;
+    for (size_t i = 0; i < 64u; ++i)
+        if (!((lane_id[i] >= '0' && lane_id[i] <= '9') ||
+              (lane_id[i] >= 'a' && lane_id[i] <= 'f'))) return false;
+    return true;
+}
 static bool txn_shape_valid(const qihse_cluster_ownership_txn_t* t) {
     if (!t || t->start > t->end || t->end >= QIHSE_CLUSTER_SLOT_COUNT ||
         !fixed_string(t->transfer_id, sizeof(t->transfer_id), false) ||
@@ -109,6 +120,8 @@ static bool txn_shape_valid(const qihse_cluster_ownership_txn_t* t) {
         !fixed_string(t->source_qkp_id, sizeof(t->source_qkp_id), false) ||
         !fixed_string(t->target_qkp_id, sizeof(t->target_qkp_id), false) ||
         !fixed_string(t->generation, sizeof(t->generation), false) ||
+        !fixed_string(t->lane_id, sizeof(t->lane_id), true) ||
+        !valid_lane_id(t->lane_id) ||
         !fixed_string(t->next_generation, sizeof(t->next_generation), true) ||
         !fixed_string(t->owner_id, sizeof(t->owner_id), false) ||
         !strcmp(t->source_id, t->target_id) ||
@@ -141,14 +154,15 @@ static bool txn_shape_valid(const qihse_cluster_ownership_txn_t* t) {
     return false;
 }
 
-/* V2 frame layout: fixed-width, little-endian, checksum is SHA-256 over the
- * first 2564 bytes. The receipt digest is an audit binding; peer identity and
- * remote durable copy must be verified before a COMMITTED frame is appended. */
-static bool txn_encode(const qihse_cluster_ownership_txn_t* t, uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V2_FRAME]) {
+/* V3 adds the stable lane ID after the V2 payload. The receipt digest is an
+ * audit binding; peer identity and remote copy still require independent
+ * verification before COMMITTED. */
+static bool txn_encode(const qihse_cluster_ownership_txn_t* t,
+                       uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V3_FRAME]) {
     if (!txn_shape_valid(t)) { errno = EINVAL; return false; }
-    memset(frame, 0, QIHSE_OWNERSHIP_JOURNAL_V2_FRAME);
-    put_u32(frame, QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC);
-    frame[4] = 2;
+    memset(frame, 0, QIHSE_OWNERSHIP_JOURNAL_V3_FRAME);
+    put_u32(frame, QIHSE_OWNERSHIP_JOURNAL_V3_MAGIC);
+    frame[4] = 3;
     frame[5] = (uint8_t)t->phase;
     put_u16(frame + 8, t->start); put_u16(frame + 10, t->end);
     put_u64(frame + 12, t->config_epoch);
@@ -163,8 +177,9 @@ static bool txn_encode(const qihse_cluster_ownership_txn_t* t, uint8_t frame[QIH
     put_bytes(frame + 419, t->next_generation, strlen(t->next_generation));
     put_bytes(frame + 484, t->proof_digest, sizeof(t->proof_digest));
     put_bytes(frame + 516, t->slot_bitmap, sizeof(t->slot_bitmap));
+    put_bytes(frame + 2564, t->lane_id, strlen(t->lane_id));
     unsigned int n = 0;
-    if (!EVP_Digest(frame, 2564, frame + 2564, &n, EVP_sha256(), NULL) || n != 32) {
+    if (!EVP_Digest(frame, 2629, frame + 2629, &n, EVP_sha256(), NULL) || n != 32) {
         errno = EIO; return false;
     }
     return true;
@@ -180,11 +195,16 @@ static bool field_string(const uint8_t* p, size_t cap, char* out, size_t out_cap
     return true;
 }
 
-static bool txn_decode(const uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V2_FRAME], qihse_cluster_ownership_txn_t* t) {
+static bool txn_decode(const uint8_t* frame, size_t frame_len,
+                       qihse_cluster_ownership_txn_t* t) {
     uint8_t digest[32]; unsigned int n = 0;
-    if (get_u32(frame) != QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC || frame[4] != 2 || frame[6] || frame[7] ||
-        !EVP_Digest(frame, 2564, digest, &n, EVP_sha256(), NULL) || n != 32 ||
-        memcmp(digest, frame + 2564, 32)) return false;
+    bool v3 = get_u32(frame) == QIHSE_OWNERSHIP_JOURNAL_V3_MAGIC;
+    if ((!v3 && get_u32(frame) != QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC) ||
+        frame_len != (v3 ? QIHSE_OWNERSHIP_JOURNAL_V3_FRAME : QIHSE_OWNERSHIP_JOURNAL_V2_FRAME) ||
+        frame[4] != (v3 ? 3 : 2) || frame[6] || frame[7]) return false;
+    size_t body_len = v3 ? 2629u : 2564u;
+    if (!EVP_Digest(frame, body_len, digest, &n, EVP_sha256(), NULL) || n != 32 ||
+        memcmp(digest, frame + body_len, 32)) return false;
     memset(t, 0, sizeof(*t));
     t->phase = (qihse_cluster_ownership_phase_t)frame[5];
     t->start = get_u16(frame + 8); t->end = get_u16(frame + 10);
@@ -200,6 +220,7 @@ static bool txn_decode(const uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V2_FRAME], qi
     if (!field_string(frame + 419, 65, t->next_generation, sizeof(t->next_generation))) return false;
     memcpy(t->proof_digest, frame + 484, sizeof(t->proof_digest));
     memcpy(t->slot_bitmap, frame + 516, sizeof(t->slot_bitmap));
+    if (v3 && !field_string(frame + 2564, 65, t->lane_id, sizeof(t->lane_id))) return false;
     return txn_shape_valid(t);
 }
 
@@ -242,7 +263,8 @@ static int read_exact_frame(int fd, uint8_t* frame, size_t cap, size_t* out_len)
     }
     uint32_t m = get_u32(magic);
     size_t need = m == QIHSE_OWNERSHIP_JOURNAL_MAGIC ? QIHSE_OWNERSHIP_JOURNAL_FRAME :
-                  m == QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC ? QIHSE_OWNERSHIP_JOURNAL_V2_FRAME : 0;
+                  m == QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC ? QIHSE_OWNERSHIP_JOURNAL_V2_FRAME :
+                  m == QIHSE_OWNERSHIP_JOURNAL_V3_MAGIC ? QIHSE_OWNERSHIP_JOURNAL_V3_FRAME : 0;
     if (!need || need > cap) { *out_len = 4; return -1; }
     memcpy(frame, magic, 4); got = 4;
     while (got < need) {
@@ -253,7 +275,8 @@ static int read_exact_frame(int fd, uint8_t* frame, size_t cap, size_t* out_len)
         got += (size_t)n;
     }
     *out_len = need;
-    return m == QIHSE_OWNERSHIP_JOURNAL_MAGIC ? 1 : 2;
+    return m == QIHSE_OWNERSHIP_JOURNAL_MAGIC ? 1 :
+        m == QIHSE_OWNERSHIP_JOURNAL_V2_MAGIC ? 2 : 3;
 }
 
 static int journal_append_legacy_unlocked(const char* data_dir,
@@ -331,6 +354,7 @@ static bool same_txn(const qihse_cluster_ownership_txn_t* a,
            !strcmp(a->source_qkp_id, b->source_qkp_id) &&
            !strcmp(a->target_qkp_id, b->target_qkp_id) &&
            !strcmp(a->generation, b->generation) &&
+           !strcmp(a->lane_id, b->lane_id) &&
            !strcmp(a->next_generation, b->next_generation) &&
            (!a->next_generation[0] || !strcmp(a->owner_id, b->owner_id)) &&
            a->start == b->start && a->end == b->end &&
@@ -384,7 +408,7 @@ static int journal_append_txn_unlocked(
     if (!transition_ok) {
         errno = EPROTO; return -1;
     }
-    uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V2_FRAME];
+    uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V3_FRAME];
     if (!txn_encode(txn, frame)) return -1;
     char path[4096];
     if (journal_path(data_dir, path, sizeof(path)) != 0) { errno = ENAMETOOLONG; return -1; }
@@ -438,14 +462,14 @@ int qihse_cluster_ownership_journal_replay_txn(
     if (journal_path(data_dir, path, sizeof(path)) != 0) { errno = ENAMETOOLONG; return -1; }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return errno == ENOENT ? 0 : -1;
-    uint8_t* frame = malloc(QIHSE_OWNERSHIP_JOURNAL_V2_FRAME);
+    uint8_t* frame = malloc(QIHSE_OWNERSHIP_JOURNAL_TXN_FRAME_MAX);
     if (!frame) { close(fd); errno = ENOMEM; return -1; }
     int replayed = 0; bool pending = false;
     qihse_cluster_ownership_phase_t active_phase = 0;
     qihse_cluster_ownership_txn_t active;
     for (;;) {
         size_t length = 0;
-        int kind = read_exact_frame(fd, frame, QIHSE_OWNERSHIP_JOURNAL_V2_FRAME, &length);
+        int kind = read_exact_frame(fd, frame, QIHSE_OWNERSHIP_JOURNAL_TXN_FRAME_MAX, &length);
         if (kind == 0) break;
         if (kind < 0) { *out_unresolved = true; free(frame); close(fd); errno = EILSEQ; return -1; }
         if (kind == 1) {
@@ -454,7 +478,7 @@ int qihse_cluster_ownership_journal_replay_txn(
             continue;
         }
         qihse_cluster_ownership_txn_t t;
-        if (!txn_decode(frame, &t)) { *out_unresolved = true; free(frame); close(fd); errno = EILSEQ; return -1; }
+        if (!txn_decode(frame, length, &t)) { *out_unresolved = true; free(frame); close(fd); errno = EILSEQ; return -1; }
         if (t.phase == QIHSE_OWNERSHIP_INTENT) {
             if (pending) { *out_unresolved = true; free(frame); close(fd); errno = EPROTO; return -1; }
             active = t; pending = true; active_phase = QIHSE_OWNERSHIP_INTENT;
@@ -515,13 +539,13 @@ int qihse_cluster_ownership_journal_replay(const char* data_dir,
     if (fd < 0) return (errno == ENOENT) ? 0 : -1; /* no journal yet = nothing to replay */
 
     int replayed = 0;
-    uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V2_FRAME];
+    uint8_t frame[QIHSE_OWNERSHIP_JOURNAL_V3_FRAME];
     for (;;) {
         size_t length = 0;
         int kind = read_exact_frame(fd, frame, sizeof(frame), &length);
         if (kind == 0) break;
         if (kind < 0) break; /* corrupt/torn tail: preserve earlier records */
-        if (kind == 2) continue; /* v2 is replayed only by the fenced runtime */
+        if (kind == 2 || kind == 3) continue; /* transfer journals replay only in fenced runtime */
         uint64_t stored = get_u64(frame + 57);
         if (stored != fnv1a64(frame, 57u)) {
             break; /* corrupt/torn entry — stop, preserve earlier valid entries */
