@@ -9,7 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CT_TRANSFER_MAX_IMAGE ((uint64_t)64u << 20)
 #define CT_TRANSFER_DEFAULT_CHUNK (12u << 10)
 #define CT_TRANSFER_MAX_CHUNK (12u << 10)
 #define CT_TRANSFER_MAX_RESUMES 3u
@@ -533,11 +532,11 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
     }
     uint64_t total = 0;
     if (!qihse_kv_ct_range_snapshot_size(snapshot, c->ownership->data_principal, &total)) total = 0;
-    if (!total || total > CT_TRANSFER_MAX_IMAGE) {
+    if (!total || total > (uint64_t)INT64_MAX) {
         qihse_kv_ct_range_snapshot_destroy(snapshot);
         qihse_cluster_transfer_result_t failed = prewire_failure(c, transfer_id, source_index, target_index,
-            newly_prepared, "CT2 range snapshot is empty or exceeds 64 MiB", err, err_cap);
-        return total > CT_TRANSFER_MAX_IMAGE && failed == QIHSE_CLUSTER_TRANSFER_REJECTED
+            newly_prepared, "CT2 range snapshot is empty or exceeds supported file offsets", err, err_cap);
+        return total > (uint64_t)INT64_MAX && failed == QIHSE_CLUSTER_TRANSFER_REJECTED
             ? QIHSE_CLUSTER_TRANSFER_TOO_LARGE : failed;
     }
     progress(c, QIHSE_CLUSTER_TRANSFER_SNAPSHOTTED, 0, total);

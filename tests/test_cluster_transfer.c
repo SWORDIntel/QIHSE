@@ -487,18 +487,10 @@ static void test_pre_wire_failures_abort_only_new_prepare(void) {
     ownership.topology = (qihse_cluster_topology_t *)(uintptr_t)4;
     ownership.peer_id = peer_id;
     qihse_cluster_transfer_context_t context = {.ownership = &ownership};
+    int abort_before;
     event_count = 0; read_calls = 0; fail_owner_token = 0;
     force_export_failure = false;
-    snapshot_size_override = (64u << 20) + 1u;
-    int abort_before = abort_calls;
-    assert(qihse_cluster_transfer_range(&context, "transfer-oversize", 1, 2,
-        10, 12, NULL, 0) == QIHSE_CLUSTER_TRANSFER_TOO_LARGE);
-    assert(abort_calls == abort_before + 1 && event_count == 4);
-    assert(!strcmp(events[0], "prepare") && !strcmp(events[1], "export") &&
-           !strcmp(events[2], "destroy") && !strcmp(events[3], "abort"));
-    assert(read_calls == 0);
-
-    /* A size refusal is splittable only after a proven source abort. */
+    /* An export-layer failure is splittable only after a proven source abort. */
     force_export_failure = true;
     export_failure_errno = E2BIG;
     snapshot_size_override = 0;

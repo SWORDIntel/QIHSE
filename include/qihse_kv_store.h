@@ -232,8 +232,9 @@ bool qihse_kv_ct_target_activate(qihse_kv_store_t* store,
     const qihse_kv_ct_target_receipt_claim_t* source_commit_claim,
     qihse_kv_ct_receipt_verify_fn verify_source_commit, void* verify_context,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
-/* Bounded CT2 transfer image: at most 4096 live rows and 64 MiB. The source
- * must already hold the matching durable range fence. */
+/* CT2 range snapshot is file-backed and not capped by the per-frame group
+ * limits. Its practical bounds are addressable file size and available disk.
+ * The source must already hold the matching durable range fence. */
 int qihse_kv_ct_range_export(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_user_t* data_principal,
     const char* transfer_id, const char* target_id, const char* generation,
@@ -248,7 +249,9 @@ bool qihse_kv_ct_range_snapshot_read(qihse_kv_ct_range_snapshot_t* snapshot,
     size_t* out_read);
 void qihse_kv_ct_range_snapshot_destroy(qihse_kv_ct_range_snapshot_t* snapshot);
 /* Target remains a CT1 source for its own successor. Import merges the
- * source range in one QKV6 group, including tombstones for target-only keys.
+ * source range into bounded, ordered QKV6 groups, including tombstones for
+ * target-only keys. The durable transfer phase hides ownership until every
+ * group is applied and the final receipt is published.
  * Source change_seq in the image is transfer provenance; imported mutations
  * receive target-local change_seq and ACTOR_REPLICA with the authenticated
  * transfer principal. Original historical actor identity is unavailable in

@@ -19,7 +19,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define CT_TARGET_MAX_IMAGE ((uint64_t)64u << 20)
 #define CT_TARGET_MAX_CHUNK (12u << 10)
 #define CT_TARGET_META_VERSION 1u
 #define CT_TARGET_STATE_PREPARING 0u
@@ -168,7 +167,7 @@ static bool manifest_valid(ct_target_manifest_t *manifest) {
     if (memcmp(manifest->magic, manifest_magic, sizeof(manifest_magic)) != 0 ||
         manifest->version != CT_TARGET_META_VERSION ||
         manifest->state > CT_TARGET_STATE_FINALIZED ||
-        !manifest->total_bytes || manifest->total_bytes > CT_TARGET_MAX_IMAGE ||
+        !manifest->total_bytes || manifest->total_bytes > (uint64_t)INT64_MAX ||
         manifest->offset > manifest->total_bytes ||
         manifest->first_slot > manifest->last_slot ||
         manifest->last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
@@ -497,7 +496,7 @@ bool qihse_ct_target_begin(qihse_ct_target_t *target,
     if (err && err_cap) err[0] = '\0';
     if (out_resume_offset) *out_resume_offset = 0;
     if (!out_resume_offset || !image_sha256 || !canonical_range_sha256 ||
-        !total_bytes || total_bytes > CT_TARGET_MAX_IMAGE ||
+        !total_bytes || total_bytes > (uint64_t)INT64_MAX ||
         !validate_peer_and_txn(target, data_principal, authenticated_source_qkp_id, source_txn)) {
         set_error(err, err_cap, "CT2 BEGIN authorization or bounds check failed"); errno = EACCES; return false;
     }
@@ -612,7 +611,8 @@ bool qihse_ct_target_chunk(qihse_ct_target_t *target,
     if (!target || !data_authority(data_principal) || !authenticated_source_qkp_id ||
         !valid_id(transfer_id, QIHSE_OWNERSHIP_ID_MAX + 1u) || !image_sha256 ||
         !bytes || !length || length > CT_TARGET_MAX_CHUNK || !out_next_offset ||
-        offset > total_bytes || length > total_bytes - offset || total_bytes > CT_TARGET_MAX_IMAGE) {
+        offset > total_bytes || length > total_bytes - offset ||
+        total_bytes > (uint64_t)INT64_MAX) {
         set_error(err, err_cap, "CT2 CHUNK authorization or bounds check failed"); errno = EACCES; return false;
     }
     char meta_name[80], image_name[80];

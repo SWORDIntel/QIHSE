@@ -357,6 +357,9 @@ struct qihse_kv_store {
     char ct_transfer_source_generation[QIHSE_KV_CT_ID_MAX + 1u];
     uint64_t ct_transfer_source_cut;
     uint64_t ct_transfer_target_position;
+    uint64_t ct_transfer_base_change_seq;
+    uint64_t ct_transfer_applied_records;
+    bool ct_transfer_chunked;
     unsigned char ct_transfer_image_digest[32];
     unsigned char ct_transfer_group_digest[32];
     unsigned char ct_transfer_range_digest[32];
@@ -693,8 +696,43 @@ typedef struct {
     unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES];
     unsigned char last_group_digest[32];
     unsigned char moved_slots[QIHSE_CLUSTER_SLOT_COUNT / 8u];
+    uint64_t transfer_base_change_seq;
+    uint64_t transfer_applied_records;
+    uint8_t transfer_chunked;
     uint64_t checksum;
 } kv_ct_disk_t;
+
+/* QCTST002 was the durable layout before chunked CT2 imports. Keep its exact
+ * definition so existing stores can upgrade without losing active CT state. */
+typedef struct {
+    char magic[8];
+    uint8_t mode;
+    uint8_t fence_state;
+    uint16_t fence_first, fence_last;
+    uint32_t tenant_id;
+    uint32_t tenant_policy;
+    uint64_t baseline_lsn, durable_lsn, ack_lsn, retained_bytes, limit_bytes;
+    unsigned char baseline_digest[32];
+    uint8_t baseline_sealed;
+    uint64_t fence_cut_position;
+    char source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char target_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char successor_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    uint8_t transfer_phase;
+    char transfer_source_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char transfer_source_generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t transfer_source_cut;
+    uint64_t transfer_target_position;
+    unsigned char transfer_image_digest[32];
+    unsigned char transfer_group_digest[32];
+    unsigned char transfer_range_digest[32];
+    unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES];
+    unsigned char last_group_digest[32];
+    unsigned char moved_slots[QIHSE_CLUSTER_SLOT_COUNT / 8u];
+    uint64_t checksum;
+} kv_ct_disk_v2_t;
 
 struct qihse_kv_ct_writer_scope {
     qihse_kv_store_t* store;
@@ -756,7 +794,7 @@ static bool ct_state_write(qihse_kv_store_t* store) {
     }
     kv_ct_disk_t disk;
     memset(&disk, 0, sizeof(disk));
-    memcpy(disk.magic, "QCTST002", 8u);
+    memcpy(disk.magic, "QCTST003", 8u);
     disk.mode = store->ct_mode;
     disk.fence_state = store->ct_fence_state;
     disk.fence_first = store->ct_fence_first;
@@ -792,6 +830,9 @@ static bool ct_state_write(qihse_kv_store_t* store) {
     memcpy(disk.last_group_digest, store->ct_last_group_digest,
            sizeof(disk.last_group_digest));
     memcpy(disk.moved_slots, store->ct_moved_slots, sizeof(disk.moved_slots));
+    disk.transfer_base_change_seq = store->ct_transfer_base_change_seq;
+    disk.transfer_applied_records = store->ct_transfer_applied_records;
+    disk.transfer_chunked = store->ct_transfer_chunked ? 1u : 0u;
     disk.checksum = fnv1a64_update(14695981039346656037ULL, &disk,
                                   offsetof(kv_ct_disk_t, checksum));
     char path[4096], temp[8192]; FILE* f = NULL;
@@ -814,11 +855,31 @@ static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
     if (fstat(fd, &st) != 0 || st.st_uid != geteuid() ||
         (st.st_mode & 077) || st.st_nlink != 1) { close(fd); errno = EACCES; return false; }
     kv_ct_disk_t disk;
-    bool ok = read(fd, &disk, sizeof(disk)) == (ssize_t)sizeof(disk);
+    memset(&disk, 0, sizeof(disk));
+    bool legacy_v2 = st.st_size == (off_t)sizeof(kv_ct_disk_v2_t);
+    bool current_v3 = st.st_size == (off_t)sizeof(kv_ct_disk_t);
+    bool ok = false;
+    if (legacy_v2) {
+        kv_ct_disk_v2_t old;
+        memset(&old, 0, sizeof(old));
+        ok = read(fd, &old, sizeof(old)) == (ssize_t)sizeof(old) &&
+            memcmp(old.magic, "QCTST002", 8u) == 0 &&
+            old.checksum == fnv1a64_update(14695981039346656037ULL, &old,
+                offsetof(kv_ct_disk_v2_t, checksum));
+        if (ok) {
+            memcpy(&disk, &old, offsetof(kv_ct_disk_v2_t, checksum));
+            memcpy(disk.magic, "QCTST003", 8u);
+            disk.checksum = fnv1a64_update(14695981039346656037ULL, &disk,
+                offsetof(kv_ct_disk_t, checksum));
+        }
+        OPENSSL_cleanse(&old, sizeof(old));
+    } else if (current_v3) {
+        ok = read(fd, &disk, sizeof(disk)) == (ssize_t)sizeof(disk);
+    }
     char extra;
     if (ok) ok = read(fd, &extra, 1u) == 0;
     close(fd);
-    ok = ok && memcmp(disk.magic, "QCTST002", 8u) == 0 &&
+    ok = ok && memcmp(disk.magic, "QCTST003", 8u) == 0 &&
         (disk.mode == 1u || disk.mode == 2u) &&
         disk.fence_state <= 4u && disk.fence_first <= disk.fence_last &&
         disk.baseline_sealed <= 1u &&
@@ -831,6 +892,7 @@ static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
         disk.transfer_source_id[QIHSE_KV_CT_ID_MAX] == '\0' &&
         disk.transfer_source_generation[QIHSE_KV_CT_ID_MAX] == '\0' &&
         disk.transfer_phase <= 2u &&
+        disk.transfer_chunked <= 1u &&
         ct_id_valid(disk.source_id) && ct_id_valid(disk.generation) &&
         (disk.mode != 1u || ct_id_valid(disk.successor_id)) &&
         (disk.mode != 2u || ct_id_valid(disk.target_id)) &&
@@ -874,6 +936,9 @@ static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
            sizeof(disk.transfer_source_generation));
     store->ct_transfer_source_cut = disk.transfer_source_cut;
     store->ct_transfer_target_position = disk.transfer_target_position;
+    store->ct_transfer_base_change_seq = disk.transfer_base_change_seq;
+    store->ct_transfer_applied_records = disk.transfer_applied_records;
+    store->ct_transfer_chunked = disk.transfer_chunked != 0u;
     memcpy(store->ct_transfer_image_digest, disk.transfer_image_digest, 32u);
     memcpy(store->ct_transfer_group_digest, disk.transfer_group_digest, 32u);
     memcpy(store->ct_transfer_range_digest, disk.transfer_range_digest, 32u);
@@ -3404,16 +3469,25 @@ static bool ct_range_image_read(FILE* input, qihse_user_t* principal,
             if (exact_range) { ok = false; break; }
             continue;
         }
-        size_t bytes = strlen(row.key) + strlen(row.val) + 64u;
+        size_t key_len = strlen(row.key), value_len = strlen(row.val);
+        if (key_len > SIZE_MAX - value_len - 64u) {
+            disk_record_free(&row); ok = false; errno = EOVERFLOW; break;
+        }
+        size_t bytes = key_len + value_len + 64u;
         if ((row.flags & ~KV_FLAG_TOMBSTONE) != 0u ||
             ((row.flags & KV_FLAG_TOMBSTONE) != 0u &&
              (row.val[0] != '\0' || row.expire_time_ms != 0u)) ||
-            out->count >= QIHSE_KV_CT_MAX_GROUP_RECORDS ||
-            bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES - out->bytes) {
-            disk_record_free(&row); ok = false; errno = E2BIG; break;
+            bytes > SIZE_MAX - out->bytes || out->count == SIZE_MAX) {
+            disk_record_free(&row); ok = false; errno = EOVERFLOW; break;
         }
         if (out->count == out->capacity) {
+            if (out->capacity > SIZE_MAX / 2u) {
+                disk_record_free(&row); ok = false; errno = EOVERFLOW; break;
+            }
             size_t next = out->capacity ? out->capacity * 2u : 128u;
+            if (next > SIZE_MAX / sizeof(*out->rows)) {
+                disk_record_free(&row); ok = false; errno = EOVERFLOW; break;
+            }
             kv_disk_record_t* grown = realloc(out->rows, next * sizeof(*grown));
             if (!grown) { disk_record_free(&row); ok = false; break; }
             out->rows = grown; out->capacity = next;
@@ -3440,7 +3514,7 @@ static bool ct_range_stage_copy(const char* source_path,
     if (source_fd < 0) return false;
     struct stat st;
     bool ok = fstat(source_fd, &st) == 0 && st.st_size >= 0 &&
-        (uint64_t)st.st_size <= QIHSE_KV_DURABLE_BATCH_MAX_BYTES;
+        (uint64_t)st.st_size <= (uint64_t)INT64_MAX;
     char* temp = malloc(8192u);
     FILE* output = NULL;
     if (ok) ok = temp && atomic_file_begin(stage_path, temp, 8192u, &output);
@@ -3484,7 +3558,167 @@ static bool ct_range_image_from_path(const char* path, qihse_user_t* principal,
     return ok;
 }
 
-static bool ct_range_merge_group(qihse_kv_store_t* store,
+static bool ct_range_merge_batch(qihse_kv_store_t* store,
+    qihse_user_t* principal, const ct_range_image_t* incoming,
+    const ct_range_image_t* existing, size_t* in_pos, size_t* old_pos,
+    uint64_t base_seq, uint64_t records_before, uint64_t stream_position,
+    qihse_kv_ct_group_t* group, size_t* out_encoded_bytes) {
+    if (out_encoded_bytes) *out_encoded_bytes = 0u;
+    if (!store || !principal || !incoming || !existing || !in_pos ||
+        !old_pos || !group || !out_encoded_bytes ||
+        *in_pos > incoming->count || *old_pos > existing->count ||
+        !stream_position) return false;
+    memset(group, 0, sizeof(*group));
+    qihse_kv_ct_record_t* rows = calloc(QIHSE_KV_CT_MAX_GROUP_RECORDS,
+                                        sizeof(*rows));
+    if (!rows) return false;
+    snprintf(group->source_id, sizeof(group->source_id), "%s", store->ct_source_id);
+    snprintf(group->generation, sizeof(group->generation), "%s", store->ct_generation);
+    group->stream_position = stream_position;
+    group->records = rows;
+    const size_t start_i = *in_pos, start_j = *old_pos;
+    size_t i = start_i, j = start_j;
+    while (i < incoming->count || j < existing->count) {
+        if (group->count == QIHSE_KV_CT_MAX_GROUP_RECORDS) break;
+        const kv_disk_record_t* source = i < incoming->count ? &incoming->rows[i] : NULL;
+        const kv_disk_record_t* target = j < existing->count ? &existing->rows[j] : NULL;
+        int order = source && target ? strcmp(source->key, target->key) :
+                    source ? -1 : 1;
+        const char* key = source && order <= 0 ? source->key : target->key;
+        uint32_t resource_tenant = 0u;
+        if (!ct_resource_tenant(key, 0u, &resource_tenant)) goto failed;
+        bool source_tombstone = source && (source->flags & KV_FLAG_TOMBSTONE);
+        qihse_kv_ct_record_t candidate = {
+            .key = (char*)key,
+            .value = source && order <= 0 && !source_tombstone ? source->val : NULL,
+            .classification = source && order <= 0 ? source->classification : target->classification,
+            .sci_compartment = source && order <= 0 ? source->sci_compartment : target->sci_compartment,
+            .expire_time_ms = source && order <= 0 && !source_tombstone ? source->expire_time_ms : 0u,
+            .actor_id = qihse_user_get_id(principal), .actor_tenant_id = 0u,
+            .resource_tenant_id = resource_tenant,
+            .actor_kind = QIHSE_KV_CT_ACTOR_REPLICA,
+            .tombstone = !source || order > 0 || source_tombstone
+        };
+        if (records_before > UINT64_MAX - (uint64_t)group->count - 1u ||
+            base_seq > UINT64_MAX - records_before - (uint64_t)group->count - 1u)
+            goto failed;
+        candidate.change_seq = base_seq + records_before + (uint64_t)group->count + 1u;
+        if (!qihse_auth_can_access(principal, candidate.classification,
+                                   candidate.sci_compartment)) goto failed;
+        if (source && target && order == 0 &&
+            (source->classification < target->classification ||
+             (source->sci_compartment & target->sci_compartment) != target->sci_compartment)) goto failed;
+        rows[group->count] = candidate;
+        group->count++;
+        if (group->count == 1u) group->first_seq = candidate.change_seq;
+        group->last_seq = candidate.change_seq;
+        if (source && order <= 0) i++;
+        if (target && order >= 0) j++;
+    }
+    if (!group->count) {
+        free(rows);
+        memset(group, 0, sizeof(*group));
+        return true;
+    }
+
+    /* Size each bounded frame once. Rechecking the whole growing prefix after
+     * every row made large values quadratic in total bytes. If the maximum
+     * row-count prefix exceeds the codec's per-frame bound, binary-search the
+     * largest valid prefix; frame size is monotone in its row prefix. */
+    size_t encoded = 0u;
+    size_t max_bytes = store->ct_limit_bytes > SIZE_MAX ? SIZE_MAX :
+        (size_t)store->ct_limit_bytes;
+    if (!qihse_ct_codec_encoded_size(store->ct_system_principal,
+            QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, QIHSE_CT_CODEC_MODE_SOURCE,
+            group, max_bytes, &encoded)) {
+        size_t low = 0u, high = group->count;
+        size_t best_encoded = 0u;
+        while (low < high) {
+            size_t mid = low + (high - low + 1u) / 2u;
+            size_t candidate_bytes = 0u;
+            size_t saved_count = group->count;
+            uint64_t saved_last = group->last_seq;
+            group->count = mid;
+            group->last_seq = rows[mid - 1u].change_seq;
+            bool fits = qihse_ct_codec_encoded_size(store->ct_system_principal,
+                QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+                QIHSE_CT_CODEC_MODE_SOURCE, group, max_bytes,
+                &candidate_bytes);
+            group->count = saved_count;
+            group->last_seq = saved_last;
+            if (fits) {
+                low = mid;
+                best_encoded = candidate_bytes;
+            } else {
+                high = mid - 1u;
+            }
+        }
+        if (!low) goto failed;
+        group->count = low;
+        group->last_seq = rows[low - 1u].change_seq;
+        encoded = best_encoded;
+
+        /* Rewind the merge cursors to the end of the retained prefix. */
+        i = start_i;
+        j = start_j;
+        for (size_t k = 0u; k < low; k++) {
+            const kv_disk_record_t* source = i < incoming->count ?
+                &incoming->rows[i] : NULL;
+            const kv_disk_record_t* target = j < existing->count ?
+                &existing->rows[j] : NULL;
+            int order = source && target ? strcmp(source->key, target->key) :
+                        source ? -1 : 1;
+            if (source && order <= 0) i++;
+            if (target && order >= 0) j++;
+        }
+    }
+    *out_encoded_bytes = encoded;
+    *in_pos = i;
+    *old_pos = j;
+    return true;
+failed:
+    free(rows);
+    memset(group, 0, sizeof(*group));
+    return false;
+}
+
+static bool ct_range_measure_batches(qihse_kv_store_t* store,
+    qihse_user_t* principal, const ct_range_image_t* incoming,
+    const ct_range_image_t* existing, uint64_t base_seq, uint64_t base_lsn,
+    uint64_t* out_records, uint64_t* out_groups, uint64_t* out_bytes) {
+    if (out_records) *out_records = 0u;
+    if (out_groups) *out_groups = 0u;
+    if (out_bytes) *out_bytes = 0u;
+    if (!out_records || !out_groups || !out_bytes) return false;
+    size_t i = 0u, j = 0u;
+    uint64_t records = 0u, groups = 0u, bytes = 0u;
+    while (i < incoming->count || j < existing->count) {
+        if (groups >= UINT64_MAX - base_lsn) return false;
+        qihse_kv_ct_group_t group = {0};
+        size_t frame_bytes = 0u;
+        bool ok = ct_range_merge_batch(store, principal, incoming, existing,
+            &i, &j, base_seq, records, base_lsn + groups + 1u,
+            &group, &frame_bytes);
+        if (!ok || group.count == 0u ||
+            group.count > UINT64_MAX - records ||
+            frame_bytes > UINT64_MAX - bytes) {
+            free(group.records);
+            return false;
+        }
+        records += (uint64_t)group.count;
+        groups++;
+        bytes += (uint64_t)frame_bytes;
+        free(group.records);
+    }
+    *out_records = records;
+    *out_groups = groups;
+    *out_bytes = bytes;
+    return true;
+}
+
+/* QCTST002 could be left in phase 1 by an older one-frame importer. Preserve
+ * its exact replay path; new imports always use the chunked state below. */
+static bool ct_range_merge_legacy_group(qihse_kv_store_t* store,
     qihse_user_t* principal, const ct_range_image_t* incoming,
     const ct_range_image_t* existing, qihse_kv_ct_group_t* group) {
     if (!store || !principal || !incoming || !existing || !group) return false;
@@ -3519,7 +3753,8 @@ static bool ct_range_merge_group(qihse_kv_store_t* store,
         row->actor_kind = QIHSE_KV_CT_ACTOR_REPLICA;
         row->tombstone = !source || order > 0 || source_tombstone;
         row->change_seq = group->count;
-        if (!qihse_auth_can_access(principal, row->classification, row->sci_compartment)) goto failed;
+        if (!qihse_auth_can_access(principal, row->classification,
+                                   row->sci_compartment)) goto failed;
         if (source && target && order == 0 &&
             (source->classification < target->classification ||
              (source->sci_compartment & target->sci_compartment) != target->sci_compartment)) goto failed;
@@ -3922,6 +4157,9 @@ bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
         unsigned char prior_image[32], prior_group[32], prior_range[32];
         uint64_t prior_source_cut = store->ct_transfer_source_cut;
         uint64_t prior_target_position = store->ct_transfer_target_position;
+        uint64_t prior_base_seq = store->ct_transfer_base_change_seq;
+        uint64_t prior_applied_records = store->ct_transfer_applied_records;
+        bool prior_chunked = store->ct_transfer_chunked;
         memcpy(prior_id, store->ct_transfer_id, sizeof(prior_id));
         memcpy(prior_target, store->ct_target_id, sizeof(prior_target));
         memcpy(prior_source, store->ct_transfer_source_id, sizeof(prior_source));
@@ -3935,6 +4173,9 @@ bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
         store->ct_transfer_source_generation[0] = '\0';
         store->ct_transfer_source_cut = 0u;
         store->ct_transfer_target_position = 0u;
+        store->ct_transfer_base_change_seq = 0u;
+        store->ct_transfer_applied_records = 0u;
+        store->ct_transfer_chunked = false;
         store->ct_transfer_phase = 0u;
         memset(store->ct_transfer_image_digest, 0, 32u);
         memset(store->ct_transfer_group_digest, 0, 32u);
@@ -3957,6 +4198,9 @@ bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
                    sizeof(prior_generation));
             store->ct_transfer_source_cut = prior_source_cut;
             store->ct_transfer_target_position = prior_target_position;
+            store->ct_transfer_base_change_seq = prior_base_seq;
+            store->ct_transfer_applied_records = prior_applied_records;
+            store->ct_transfer_chunked = prior_chunked;
             memcpy(store->ct_transfer_image_digest, prior_image, 32u);
             memcpy(store->ct_transfer_group_digest, prior_group, 32u);
             memcpy(store->ct_transfer_range_digest, prior_range, 32u);
@@ -4000,9 +4244,12 @@ bool qihse_kv_ct_target_prepare(qihse_kv_store_t* store,
         kv_store_unlock(store);
         return ok;
     }
-    ok = ok && store->ct_admitted &&
-         store->ct_ack_lsn == store->ct_durable_lsn;
-    if (ok && store->ct_fence_state == 1u) {
+    /* An exact persisted target fence is the resume authority for a staged
+     * import. Its first QKV6 groups may be durable but not yet ACKed by the
+     * destination's successor; requiring ACK == durable here would strand a
+     * crash-interrupted multi-frame import before it can resume. */
+    if (ok && store->ct_fence_state == 1u &&
+        store->ct_transfer_source_id[0] != '\0') {
         ok = strcmp(store->ct_transfer_id, claim.transfer_id) == 0 &&
             store->ct_fence_first == claim.first_slot &&
             store->ct_fence_last == claim.last_slot &&
@@ -4015,6 +4262,8 @@ bool qihse_kv_ct_target_prepare(qihse_kv_store_t* store,
         kv_store_unlock(store);
         return ok;
     }
+    ok = ok && store->ct_admitted &&
+         store->ct_ack_lsn == store->ct_durable_lsn;
     ok = ok && store->ct_transfer_phase == 0u;
     if (ok) {
         store->ct_fence_state = 1u;
@@ -4030,6 +4279,9 @@ bool qihse_kv_ct_target_prepare(qihse_kv_store_t* store,
                  claim.generation);
         store->ct_transfer_source_cut = claim.source_cut;
         store->ct_transfer_target_position = 0u;
+        store->ct_transfer_base_change_seq = 0u;
+        store->ct_transfer_applied_records = 0u;
+        store->ct_transfer_chunked = false;
         memcpy(store->ct_transfer_range_digest,
                claim.range_checksum, 32u);
         memset(store->ct_transfer_image_digest, 0, 32u);

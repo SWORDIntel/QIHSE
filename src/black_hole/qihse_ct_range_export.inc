@@ -38,12 +38,17 @@ struct qihse_kv_ct_range_snapshot {
 static bool ct_range_export_add(ct_range_export_collect_t* c, const char* key,
     kv_payload_t* memory, const sst_meta_entry_t* disk) {
     size_t key_len = strlen(key);
-    if (c->count >= QIHSE_KV_CT_MAX_GROUP_RECORDS ||
-        key_len > QIHSE_KV_DURABLE_BATCH_MAX_BYTES - c->key_bytes) {
-        errno = E2BIG; c->ok = false; return false;
+    if (key_len > SIZE_MAX - c->key_bytes || c->count == SIZE_MAX) {
+        errno = EOVERFLOW; c->ok = false; return false;
     }
     if (c->count == c->capacity) {
+        if (c->capacity > SIZE_MAX / 2u) {
+            errno = EOVERFLOW; c->ok = false; return false;
+        }
         size_t capacity = c->capacity ? c->capacity * 2u : 128u;
+        if (capacity > SIZE_MAX / sizeof(*c->rows)) {
+            errno = EOVERFLOW; c->ok = false; return false;
+        }
         ct_range_export_entry_t* rows = realloc(c->rows, capacity * sizeof(*rows));
         if (!rows) { c->ok = false; return false; }
         c->rows = rows; c->capacity = capacity;
@@ -181,10 +186,12 @@ static bool ct_range_import_existing_locked(qihse_kv_store_t* store,
                 disk_record_free(&row); goto failed;
             }
         }
-        size_t bytes = strlen(row.key) + strlen(row.val) + 64u;
-        if (bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES - out->bytes) {
-            disk_record_free(&row); errno = EFBIG; goto failed;
+        size_t key_len = strlen(row.key), value_len = strlen(row.val);
+        if (key_len > SIZE_MAX - value_len - 64u ||
+            key_len + value_len + 64u > SIZE_MAX - out->bytes) {
+            disk_record_free(&row); errno = EOVERFLOW; goto failed;
         }
+        size_t bytes = key_len + value_len + 64u;
         out->rows[out->count++] = row;
         out->bytes += bytes;
     }
@@ -332,10 +339,7 @@ int qihse_kv_ct_range_export(qihse_kv_store_t* store,
             disk_record_free(&r);
             if (!valid) goto unlock;
         }
-        off_t size = ftello(image);
-        if (size < 0 || (uint64_t)size > QIHSE_KV_DURABLE_BATCH_MAX_BYTES) {
-            errno = EFBIG; goto unlock;
-        }
+        if (ftello(image) < 0) goto unlock;
     }
     if (fflush(image) != 0 || fdatasync(fileno(image)) != 0) goto unlock;
     if (!ct_range_export_fence_matches(store, transfer_id, target_id,
@@ -348,7 +352,7 @@ int qihse_kv_ct_range_export(qihse_kv_store_t* store,
         c.authorized = false; errno = EACCES; goto unlock;
     }
     off_t end = ftello(image);
-    if (end < 0 || (uint64_t)end > QIHSE_KV_DURABLE_BATCH_MAX_BYTES) goto unlock;
+    if (end < 0 || (uint64_t)end > (uint64_t)INT64_MAX) goto unlock;
     qihse_kv_ct_range_snapshot_t* snapshot = calloc(1u, sizeof(*snapshot));
     qihse_kv_replica_snapshot_t* raw = calloc(1u, sizeof(*raw));
     if (!snapshot || !raw) { free(snapshot); free(raw); goto unlock; }
@@ -485,9 +489,12 @@ bool qihse_kv_ct_range_import(qihse_kv_store_t* store, qihse_user_t* principal,
     /* Check the pinned fence before any classified file materialization.
      * In particular, a caller cannot use the importer as a generic QFS read. */
     kv_store_rdlock(store);
+    bool resume_transfer = store->ct_transfer_phase != 0u &&
+        ct_range_import_identity_matches(store, source_id, source_generation,
+                                          source_cut, expected_sha256);
     bool allowed = ct_range_import_fence_matches(store, transfer_id,
         first_slot, last_slot, owner_token) &&
-        store->ct_admitted &&
+        (store->ct_admitted || resume_transfer) &&
         ct_id_valid(store->ct_transfer_source_id) &&
         strcmp(store->ct_transfer_source_id, source_id) == 0 &&
         strcmp(store->ct_transfer_source_generation,
@@ -518,7 +525,11 @@ bool qihse_kv_ct_range_import(qihse_kv_store_t* store, qihse_user_t* principal,
 
     kv_store_wrlock(store);
     if (!ct_range_import_fence_matches(store, transfer_id,
-            first_slot, last_slot, owner_token) || !store->ct_admitted ||
+            first_slot, last_slot, owner_token) ||
+        (!store->ct_admitted &&
+         !(store->ct_transfer_phase != 0u &&
+           ct_range_import_identity_matches(store, source_id,
+               source_generation, source_cut, expected_sha256))) ||
         !ct_id_valid(store->ct_transfer_source_id) ||
         strcmp(store->ct_transfer_source_id, source_id) != 0 ||
         strcmp(store->ct_transfer_source_generation,
@@ -547,78 +558,200 @@ bool qihse_kv_ct_range_import(qihse_kv_store_t* store, qihse_user_t* principal,
     if (!stage_ok || !ct_range_image_from_path(stage_path, data_principal,
             first_slot, last_slot, true, &incoming)) goto unlock;
 
-    /* The complete QKV6 frame may have replayed after a crash while the
-     * separate phase-2 state publication did not. The phase-1 digest pins
-     * that exact frame; do not rebuild it from already changed target rows. */
-    if (store->ct_transfer_phase == 1u &&
-        store->ct_durable_lsn == store->ct_transfer_target_position) {
-        unsigned char zero[32] = {0};
-        ok = memcmp(store->ct_transfer_group_digest, zero, 32u) == 0 ||
-             memcmp(store->ct_last_group_digest,
-                    store->ct_transfer_group_digest, 32u) == 0;
-        if (ok) ok = ct_range_import_publish_applied(store);
-        if (ok) *out_target_position = store->ct_transfer_target_position;
-        goto unlock;
-    }
     if (!ct_range_import_existing_locked(store, data_principal,
             first_slot, last_slot, &existing)) goto unlock;
+    if (store->ct_transfer_phase == 1u && !store->ct_transfer_chunked) {
+        /* QCTST002 in-flight import: preserve its single-frame recovery rule. */
+        if (store->ct_durable_lsn == store->ct_transfer_target_position) {
+            ok = CRYPTO_memcmp(store->ct_last_group_digest,
+                               store->ct_transfer_group_digest, 32u) == 0;
+            if (ok) {
+                store->ct_transfer_target_position = store->ct_durable_lsn;
+                ok = ct_range_import_publish_applied(store);
+            }
+            if (ok) *out_target_position = store->ct_transfer_target_position;
+            goto unlock;
+        }
+        if (store->ct_durable_lsn == UINT64_MAX) goto unlock;
+        uint64_t next_seq = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
+        if (!ct_range_merge_legacy_group(store, data_principal,
+                &incoming, &existing, &group) ||
+            group.count > UINT64_MAX - next_seq) goto unlock;
+        group.stream_position = store->ct_durable_lsn + 1u;
+        for (size_t i = 0u; i < group.count; i++)
+            group.records[i].change_seq = next_seq + i + 1u;
+        group.first_seq = group.count ? next_seq + 1u : 0u;
+        group.last_seq = next_seq + group.count;
+        unsigned char digest[32] = {0};
+        ok = group.count && qihse_ct_codec_group_digest(store->ct_system_principal,
+            QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, &group, digest) &&
+            CRYPTO_memcmp(digest, store->ct_transfer_group_digest, 32u) == 0 &&
+            store->ct_transfer_target_position == store->ct_durable_lsn + 1u &&
+            ct_append_group_locked(store, data_principal, &group);
+        OPENSSL_cleanse(digest, sizeof(digest));
+        for (size_t i = 0u; ok && i < group.count; i++) {
+            qihse_kv_ct_record_t* row = &group.records[i];
+            if (!insert_internal(store, row->key, row->tombstone ? "" : row->value,
+                    row->expire_time_ms, row->classification,
+                    row->sci_compartment,
+                    row->tombstone ? KV_FLAG_TOMBSTONE : 0u,
+                    row->change_seq)) {
+                store->recovery_pending = true;
+                ok = false;
+                break;
+            }
+            kv_change_seq_floor(store, row->change_seq);
+        }
+        if (ok) {
+            store->ct_transfer_target_position = store->ct_durable_lsn;
+            ok = ct_range_import_publish_applied(store);
+        }
+        if (ok) *out_target_position = store->ct_transfer_target_position;
+        OPENSSL_cleanse(group.records, group.count * sizeof(*group.records));
+        free(group.records);
+        memset(&group, 0, sizeof(group));
+        goto unlock;
+    }
 
-    /* The range was frozen throughout the target snapshot, so these exact
-     * rows remain the merge preimage. Unrelated CT1 writes may have advanced
-     * the global sequence before this lock; assign target-local IDs now. */
-    if (!ct_range_merge_group(store, data_principal,
-                              &incoming, &existing, &group)) goto unlock;
-    uint64_t next_seq = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
-    if (group.count > UINT64_MAX - next_seq) goto unlock;
-    for (size_t i = 0u; i < group.count; i++)
-        group.records[i].change_seq = next_seq + i + 1u;
-    group.first_seq = group.count ? next_seq + 1u : 0u;
-    group.last_seq = next_seq + group.count;
-
-    unsigned char group_digest[32] = {0};
-    if (group.count && !qihse_ct_codec_group_digest(store->ct_system_principal,
-            QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
-            &group, group_digest)) goto unlock;
+    uint64_t base_lsn = 0u, base_seq = 0u;
     if (store->ct_transfer_phase == 0u) {
+        base_lsn = store->ct_durable_lsn;
+        base_seq = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
+    } else {
+        if (!store->ct_transfer_chunked) goto unlock;
+        base_lsn = store->ct_transfer_target_position;
+        base_seq = store->ct_transfer_base_change_seq;
+        if (store->ct_durable_lsn < base_lsn) goto unlock;
+    }
+    uint64_t total_records = 0u, total_groups = 0u, total_frame_bytes = 0u;
+    if (!ct_range_measure_batches(store, data_principal, &incoming, &existing,
+            base_seq, base_lsn, &total_records, &total_groups,
+            &total_frame_bytes)) goto unlock;
+    if (total_groups > UINT64_MAX - base_lsn) goto unlock;
+
+    if (store->ct_transfer_phase == 0u) {
+        if (store->ct_ack_lsn != store->ct_durable_lsn ||
+            total_frame_bytes > store->ct_limit_bytes ||
+            store->ct_retained_bytes > store->ct_limit_bytes - total_frame_bytes)
+            goto unlock;
         snprintf(store->ct_transfer_source_id,
                  sizeof(store->ct_transfer_source_id), "%s", source_id);
         snprintf(store->ct_transfer_source_generation,
                  sizeof(store->ct_transfer_source_generation), "%s",
                  source_generation);
         store->ct_transfer_source_cut = source_cut;
-        store->ct_transfer_target_position = store->ct_durable_lsn +
-            (group.count != 0u);
+        store->ct_transfer_target_position = base_lsn;
+        store->ct_transfer_base_change_seq = base_seq;
+        store->ct_transfer_applied_records = 0u;
+        store->ct_transfer_chunked = true;
+        memset(store->ct_transfer_group_digest, 0, 32u);
         memcpy(store->ct_transfer_image_digest, expected_sha256, 32u);
-        memcpy(store->ct_transfer_group_digest, group_digest, 32u);
         store->ct_transfer_phase = 1u;
         if (!ct_state_write(store)) {
             store->recovery_pending = true;
             goto unlock;
         }
-    } else {
-        if (store->ct_transfer_target_position != group.stream_position ||
-            memcmp(store->ct_transfer_group_digest,
-                   group_digest, 32u) != 0) goto unlock;
     }
-    if (group.count == 0u) {
-        ok = ct_range_import_publish_applied(store);
-        if (ok) *out_target_position = store->ct_transfer_target_position;
+
+    uint64_t committed_groups = store->ct_durable_lsn - base_lsn;
+    size_t in_pos = 0u, old_pos = 0u;
+    uint64_t processed_records = 0u, group_index = 0u;
+    uint64_t saved_records = store->ct_transfer_applied_records;
+    if (saved_records > total_records || committed_groups > total_groups)
         goto unlock;
-    }
-    if (store->ct_durable_lsn + 1u != store->ct_transfer_target_position ||
-        !ct_append_group_locked(store, data_principal, &group)) goto unlock;
-    for (size_t i = 0u; i < group.count; i++) {
-        qihse_kv_ct_record_t* row = &group.records[i];
-        if (!insert_internal(store, row->key, row->tombstone ? "" : row->value,
-                row->expire_time_ms, row->classification,
-                row->sci_compartment,
-                row->tombstone ? KV_FLAG_TOMBSTONE : 0u,
-                row->change_seq)) {
-            store->recovery_pending = true;
+    bool saved_digest_seen = saved_records == 0u;
+    while (in_pos < incoming.count || old_pos < existing.count) {
+        if (group_index >= total_groups || group_index >= UINT64_MAX - base_lsn)
+            goto unlock;
+        size_t frame_bytes = 0u;
+        if (!ct_range_merge_batch(store, data_principal, &incoming, &existing,
+                &in_pos, &old_pos, base_seq, processed_records,
+                base_lsn + group_index + 1u, &group, &frame_bytes) ||
+            !group.count) goto unlock;
+        unsigned char digest[32] = {0};
+        if (!qihse_ct_codec_group_digest(store->ct_system_principal,
+                QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, &group, digest)) {
+            OPENSSL_cleanse(digest, sizeof(digest));
             goto unlock;
         }
-        kv_change_seq_floor(store, row->change_seq);
+        uint64_t after_records = processed_records + (uint64_t)group.count;
+        if (after_records < processed_records) {
+            OPENSSL_cleanse(digest, sizeof(digest));
+            goto unlock;
+        }
+        if (processed_records < saved_records) {
+            if (after_records > saved_records) {
+                OPENSSL_cleanse(digest, sizeof(digest));
+                goto unlock;
+            }
+            if (after_records == saved_records) {
+                if (CRYPTO_memcmp(digest, store->ct_transfer_group_digest, 32u) != 0) {
+                    OPENSSL_cleanse(digest, sizeof(digest));
+                    goto unlock;
+                }
+                saved_digest_seen = true;
+            }
+        } else if (group_index < committed_groups) {
+            /* WAL fsync succeeded but progress-state publication did not. */
+            if (group_index != committed_groups - 1u ||
+                CRYPTO_memcmp(digest, store->ct_last_group_digest, 32u) != 0) {
+                OPENSSL_cleanse(digest, sizeof(digest));
+                goto unlock;
+            }
+            store->ct_transfer_applied_records = after_records;
+            memcpy(store->ct_transfer_group_digest, digest, 32u);
+            if (!ct_state_write(store)) {
+                store->recovery_pending = true;
+                OPENSSL_cleanse(digest, sizeof(digest));
+                goto unlock;
+            }
+            saved_records = after_records;
+            saved_digest_seen = true;
+        } else {
+            if (group_index != committed_groups ||
+                store->ct_durable_lsn == UINT64_MAX ||
+                group.stream_position != store->ct_durable_lsn + 1u ||
+                !ct_append_group_locked(store, data_principal, &group)) {
+                OPENSSL_cleanse(digest, sizeof(digest));
+                goto unlock;
+            }
+            for (size_t r = 0u; r < group.count; r++) {
+                qihse_kv_ct_record_t* row = &group.records[r];
+                if (!insert_internal(store, row->key,
+                        row->tombstone ? "" : row->value,
+                        row->expire_time_ms, row->classification,
+                        row->sci_compartment,
+                        row->tombstone ? KV_FLAG_TOMBSTONE : 0u,
+                        row->change_seq)) {
+                    store->recovery_pending = true;
+                    OPENSSL_cleanse(digest, sizeof(digest));
+                    goto unlock;
+                }
+                kv_change_seq_floor(store, row->change_seq);
+            }
+            store->ct_transfer_applied_records = after_records;
+            memcpy(store->ct_transfer_group_digest, digest, 32u);
+            if (!ct_state_write(store)) {
+                store->recovery_pending = true;
+                OPENSSL_cleanse(digest, sizeof(digest));
+                goto unlock;
+            }
+            saved_records = after_records;
+            saved_digest_seen = true;
+            committed_groups++;
+        }
+        processed_records = after_records;
+        group_index++;
+        OPENSSL_cleanse(digest, sizeof(digest));
+        OPENSSL_cleanse(group.records, group.count * sizeof(*group.records));
+        free(group.records);
+        memset(&group, 0, sizeof(group));
     }
+    if (processed_records != total_records || saved_records != total_records ||
+        !saved_digest_seen || group_index != total_groups ||
+        committed_groups != total_groups ||
+        store->ct_durable_lsn != base_lsn + total_groups) goto unlock;
+    store->ct_transfer_target_position = store->ct_durable_lsn;
     ok = ct_range_import_publish_applied(store);
     if (ok) *out_target_position = store->ct_transfer_target_position;
 unlock:

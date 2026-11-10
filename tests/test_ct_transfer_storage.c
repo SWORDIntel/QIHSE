@@ -50,7 +50,10 @@ static bool verify_committed(const qihse_kv_ct_target_receipt_claim_t* claim,
 
 static const char* source_key = "commons/ct2-source-high";
 static char stale_key[96], outside_key[96], local_key[96];
-static uint16_t slot;
+static uint16_t slot, transfer_first, transfer_last;
+static bool large_transfer_mode;
+
+enum { LARGE_TRANSFER_ROWS = 4097, LARGE_TRANSFER_VALUE_BYTES = 16380 };
 
 static bool count_key(const char* key, const char* value, void* user_data) {
     (void)value;
@@ -58,8 +61,17 @@ static bool count_key(const char* key, const char* value, void* user_data) {
     return true;
 }
 
+static bool count_large_keys(const char* key, const char* value, void* user_data) {
+    (void)value;
+    if (strncmp(key, "commons/ctlarge-", 16u) == 0) (*(size_t*)user_data)++;
+    return true;
+}
+
 static void select_keys(void) {
+    large_transfer_mode = getenv("QIHSE_CT_LARGE_TRANSFER") != NULL;
     slot = qihse_cluster_key_slot(source_key, strlen(source_key));
+    transfer_first = large_transfer_mode ? 0u : slot;
+    transfer_last = large_transfer_mode ? (QIHSE_CLUSTER_SLOT_COUNT - 1u) : slot;
     bool same = false, different = false;
     for (unsigned i = 0u; i < 100000u && (!same || !different); i++) {
         char candidate[96];
@@ -80,6 +92,37 @@ static void select_keys(void) {
         found_local = qihse_cluster_key_slot(local_key, strlen(local_key)) == slot;
     }
     assert(found_local);
+}
+
+static void seed_large_rows(qihse_kv_store_t* store, qihse_user_t* op) {
+    char* value = malloc(LARGE_TRANSFER_VALUE_BYTES + 1u);
+    assert(value);
+    memset(value, 'L', LARGE_TRANSFER_VALUE_BYTES);
+    value[LARGE_TRANSFER_VALUE_BYTES] = '\0';
+    const size_t batch_sizes[] = {4000u, LARGE_TRANSFER_ROWS - 4000u};
+    size_t ordinal = 0u;
+    for (size_t b = 0u; b < sizeof(batch_sizes) / sizeof(batch_sizes[0]); b++) {
+        size_t count = batch_sizes[b];
+        qihse_kv_batch_set_record_t* records = calloc(count, sizeof(*records));
+        char** keys = calloc(count, sizeof(*keys));
+        assert(records && keys);
+        for (size_t i = 0u; i < count; i++, ordinal++) {
+            char key[64];
+            int n = snprintf(key, sizeof(key), "commons/ctlarge-%04zu", ordinal);
+            assert(n > 0 && (size_t)n < sizeof(key));
+            keys[i] = strdup(key);
+            assert(keys[i]);
+            records[i] = (qihse_kv_batch_set_record_t){
+                .key = keys[i], .value = value,
+                .classification = 4u, .sci_compartment = 2u
+            };
+        }
+        assert(qihse_kv_set_batch_durable_user(store, records, count, op));
+        for (size_t i = 0u; i < count; i++) free(keys[i]);
+        free(keys);
+        free(records);
+    }
+    free(value);
 }
 
 static void path_join(char out[4096], const char* dir, const char* leaf) {
@@ -191,6 +234,7 @@ static void child_phase(const char* phase, const char* data_dir,
         if (source) {
             assert(qihse_kv_set_user(store, source_key, "source-secret",
                                      4u, 2u, op));
+            if (large_transfer_mode) seed_large_rows(store, op);
             check_value(store, low, source_key, NULL);
         } else {
             assert(qihse_kv_set_user(store, stale_key, "stale-secret",
@@ -230,28 +274,33 @@ static void child_phase(const char* phase, const char* data_dir,
             assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
         }
         uint64_t cut = UINT64_MAX;
-        assert(qihse_kv_ct_fence_range(store, op, transfer_id, slot, slot,
+        assert(qihse_kv_ct_fence_range(store, op, transfer_id, transfer_first, transfer_last,
                                         token, &cut));
         qihse_kv_ct_range_snapshot_t* denied = NULL;
         uint64_t denied_cut = 0u;
         unsigned char denied_digest[32];
         assert(qihse_kv_ct_range_export(store, low, op, transfer_id,
-            target_id, source_generation, slot, slot, token, &denied,
+            target_id, source_generation, transfer_first, transfer_last, token, &denied,
             &denied_cut, denied_digest) != 0);
         assert(!denied && denied_cut == 0u);
         assert(qihse_kv_ct_range_export(store, op, low, transfer_id,
-            target_id, source_generation, slot, slot, token, &denied,
+            target_id, source_generation, transfer_first, transfer_last, token, &denied,
             &denied_cut, denied_digest) == -2);
         assert(!denied && denied_cut == 0u);
         qihse_kv_ct_range_snapshot_t* range = NULL;
         unsigned char image_digest[32];
         assert(qihse_kv_ct_range_export(store, op, op, transfer_id,
-            target_id, source_generation, slot, slot, token, &range,
+            target_id, source_generation, transfer_first, transfer_last, token, &range,
             &cut, image_digest) == 0);
         assert(range);
         uint64_t bytes = 0u;
         assert(!qihse_kv_ct_range_snapshot_size(range, low, &bytes));
         assert(qihse_kv_ct_range_snapshot_size(range, op, &bytes) && bytes);
+        if (large_transfer_mode) {
+            assert(bytes > QIHSE_KV_DURABLE_BATCH_MAX_BYTES);
+            fprintf(stderr, "large CT2 source image: %llu bytes\n",
+                    (unsigned long long)bytes);
+        }
         int fd = open(image_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC |
                     O_NOFOLLOW, 0600);
         assert(fd >= 0);
@@ -276,7 +325,7 @@ static void child_phase(const char* phase, const char* data_dir,
         qihse_kv_ct_proof_t* proof =
             qihse_kv_ct_source_transfer_proof_create(store, op, op,
                 transfer_id, source_id, target_id, source_generation,
-                slot, slot, cut);
+                transfer_first, transfer_last, cut);
         assert(proof && qihse_kv_ct_proof_validate(store, op, op, proof));
         qihse_kv_ct_target_receipt_claim_t prepared =
             claim_from_proof(store, op, proof);
@@ -292,7 +341,7 @@ static void child_phase(const char* phase, const char* data_dir,
         uint64_t retry_cut = UINT64_MAX, retry_bytes = 0u;
         unsigned char retry_sha[32], first_sha[32];
         assert(qihse_kv_ct_range_export(store, op, op, transfer_id,
-            target_id, source_generation, slot, slot, token, &retry,
+            target_id, source_generation, transfer_first, transfer_last, token, &retry,
             &retry_cut, retry_sha) == 0);
         assert(retry && retry_cut == prepared.source_cut);
         assert(qihse_kv_ct_range_snapshot_size(retry, op, &retry_bytes));
@@ -320,15 +369,22 @@ static void child_phase(const char* phase, const char* data_dir,
         qihse_kv_ct_proof_t* proof =
             qihse_kv_ct_source_transfer_proof_create(store, op, op,
                 transfer_id, source_id, target_id, source_generation,
-                slot, slot, retry_cut);
+                transfer_first, transfer_last, retry_cut);
         assert(proof);
         qihse_kv_ct_target_receipt_claim_t again =
             claim_from_proof(store, op, proof);
         assert(memcmp(again.range_checksum, prepared.range_checksum, 32u) == 0);
         qihse_kv_ct_proof_destroy(proof);
         qihse_kv_ct_range_snapshot_destroy(retry);
-    } else if (strcmp(step, "target-import") == 0) {
-        admitted_source(store, op, target_peer, target_generation);
+    } else if (strcmp(step, "target-import") == 0 ||
+               strcmp(step, "target-import-crash") == 0) {
+        qihse_kv_ct_transfer_status_detail_t transfer_status = {0};
+        assert(qihse_kv_ct_transfer_status_detail(store, op, &transfer_status));
+        /* Once a target fence is durable, its normal CT1 admission reconcile
+         * is intentionally held until import completes; resume the exact
+         * transfer without trying to clear that recovery barrier. */
+        if (transfer_status.base.transfer_phase == 0u)
+            admitted_source(store, op, target_peer, target_generation);
         assert(qihse_kv_ct_owner_token_get(store, op, token));
         qihse_kv_ct_target_receipt_claim_t prepared = read_claim(prepared_path);
         receipt_fixture_t source_receipt = {PREPARED, prepared};
@@ -338,9 +394,18 @@ static void child_phase(const char* phase, const char* data_dir,
             verify_prepared, &refused, token, &local_cut));
         assert(qihse_kv_ct_target_prepare(store, op, &prepared,
             verify_prepared, &source_receipt, token, &local_cut));
+        if (large_transfer_mode) {
+            /* Preparation fences the whole destination range. Neither point
+             * reads nor enumeration/replica readers may observe staged data. */
+            check_value(store, op, "commons/ctlarge-0000", NULL);
+            size_t staged_visible = 0u;
+            (void)qihse_kv_foreach_user(store, op, count_large_keys,
+                                        &staged_visible);
+            assert(staged_visible == 0u);
+        }
         uint64_t target_position = 0u;
         assert(!qihse_kv_ct_range_import(store, low, op, transfer_id,
-            source_id, source_generation, slot, slot, prepared.source_cut,
+            source_id, source_generation, transfer_first, transfer_last, prepared.source_cut,
             image_path, prepared.range_checksum, token, &target_position));
         /* The QFS byte hash is distinct from the canonical range seal. */
         unsigned char image_sha[32];
@@ -351,22 +416,49 @@ static void child_phase(const char* phase, const char* data_dir,
         assert(digest_fd >= 0);
         assert(read(digest_fd, image_sha, 32u) == 32);
         assert(close(digest_fd) == 0);
+        if (strcmp(step, "target-import-crash") == 0) {
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+            /* Fail after the first complete QKV6 group reached the WAL, but
+             * before its progress tuple is published. The next process must
+             * recover that group and resume at the next frame exactly once. */
+            assert(setenv("QIHSE_AIMEM_FAIL_AT", "ct-after-group-fsync", 1) == 0);
+            assert(!qihse_kv_ct_range_import(store, op, op, transfer_id,
+                source_id, source_generation, transfer_first, transfer_last,
+                prepared.source_cut, image_path, image_sha, token,
+                &target_position));
+            _exit(0);
+#else
+            assert(!"target-import-crash needs QIHSE_AIMEM_DURABILITY_TEST");
+#endif
+        }
         assert(!qihse_kv_ct_range_import(store, op, low, transfer_id,
-            source_id, source_generation, slot, slot, prepared.source_cut,
+            source_id, source_generation, transfer_first, transfer_last, prepared.source_cut,
             image_path, image_sha, token, &target_position));
         assert(qihse_kv_ct_range_import(store, op, op, transfer_id,
-            source_id, source_generation, slot, slot, prepared.source_cut,
+            source_id, source_generation, transfer_first, transfer_last, prepared.source_cut,
             image_path, image_sha, token, &target_position));
         assert(target_position > local_cut);
+        if (large_transfer_mode) {
+            assert(target_position - local_cut == 2u);
+            fprintf(stderr, "large CT2 target durable groups: %llu\n",
+                    (unsigned long long)(target_position - local_cut));
+        }
         assert(qihse_kv_ct_range_import(store, op, op, transfer_id,
-            source_id, source_generation, slot, slot, prepared.source_cut,
+            source_id, source_generation, transfer_first, transfer_last, prepared.source_cut,
             image_path, image_sha, token, &target_position));
         assert(qihse_kv_ct_source_ack(store, op, target_peer,
                                        target_generation, target_position));
+        if (large_transfer_mode) {
+            check_value(store, op, "commons/ctlarge-0000", NULL);
+            size_t staged_visible = 0u;
+            (void)qihse_kv_foreach_user(store, op, count_large_keys,
+                                        &staged_visible);
+            assert(staged_visible == 0u);
+        }
         qihse_kv_sweep_expired(store);
         qihse_kv_ct_proof_t* seal = qihse_kv_ct_target_seal_create(store,
             op, op, transfer_id, source_id, target_id, source_generation,
-            slot, slot, prepared.source_cut);
+            transfer_first, transfer_last, prepared.source_cut);
         assert(seal && qihse_kv_ct_proof_validate(store, op, op, seal));
         qihse_kv_ct_target_receipt_claim_t sealed =
             claim_from_proof(store, op, seal);
@@ -383,7 +475,7 @@ static void child_phase(const char* phase, const char* data_dir,
         qihse_kv_ct_proof_t* proof =
             qihse_kv_ct_source_transfer_proof_create(store, op, op,
                 transfer_id, source_id, target_id, source_generation,
-                slot, slot, sealed.source_cut);
+                transfer_first, transfer_last, sealed.source_cut);
         assert(proof);
         assert(qihse_kv_ct_source_fence_commit(store, op, proof, &sealed,
             verify_sealed, &peer_receipt, token));
@@ -406,18 +498,28 @@ static void child_phase(const char* phase, const char* data_dir,
         if (strcmp(step, "target-activate") == 0) {
             seal = qihse_kv_ct_target_seal_create(store, op, op,
                 transfer_id, source_id, target_id, source_generation,
-                slot, slot, committed.source_cut);
+                transfer_first, transfer_last, committed.source_cut);
             assert(seal);
         }
         assert(qihse_kv_ct_target_activate(store, op, seal, &committed,
             verify_committed, &source_receipt, token));
         qihse_kv_ct_proof_destroy(seal);
+        admitted_source(store, op, target_peer, target_generation);
         check_value(store, op, source_key,
                     reverse && strcmp(step, "target-reopen") == 0 ?
                     "returned-write" : "source-secret");
         check_value(store, low, source_key, NULL);
         check_value(store, op, stale_key, NULL);
-        if (!reverse) check_value(store, op, outside_key, "keep-outside");
+        if (!reverse)
+            check_value(store, op, outside_key,
+                        large_transfer_mode ? NULL : "keep-outside");
+        if (large_transfer_mode) {
+            size_t visible_large = 0u;
+            assert(qihse_kv_foreach_user(store, op, count_large_keys,
+                                         &visible_large));
+            assert(visible_large == LARGE_TRANSFER_ROWS);
+            fprintf(stderr, "large CT2 activated rows: %zu\n", visible_large);
+        }
         if (reverse && strcmp(step, "target-activate") == 0) {
             qihse_kv_ct_writer_scope_t* scope = NULL;
             assert(qihse_kv_ct_writer_scope_enter(store, op, token, &scope));
@@ -462,8 +564,9 @@ static void child_phase(const char* phase, const char* data_dir,
      * Checks run in each process after re-opening durable state. */
     const char* leaf = strrchr(data_dir, '/');
     assert(leaf);
-    check_value(store, op, local_key, !strcmp(leaf + 1, "source") ?
-        "source-local-memory" : "target-local-memory");
+    if (!(large_transfer_mode && strcmp(step, "target-import") == 0))
+        check_value(store, op, local_key, !strcmp(leaf + 1, "source") ?
+            "source-local-memory" : "target-local-memory");
     check_value(store, low, local_key, NULL);
     qihse_kv_store_destroy(store);
 }
@@ -488,7 +591,9 @@ int main(int argc, char** argv) {
         child_phase(argv[1], argv[2], argv[3]);
         return 0;
     }
-    assert(argc == 1);
+    bool large = argc == 2 && strcmp(argv[1], "--large") == 0;
+    assert(argc == 1 || large);
+    if (large) assert(setenv("QIHSE_CT_LARGE_TRANSFER", "1", 1) == 0);
     umask(0077);
     char base[] = "./ct_transfer_XXXXXX";
     assert(mkdtemp(base));
@@ -501,19 +606,27 @@ int main(int argc, char** argv) {
     run_child(argv[0], "target-setup", target_dir, base);
     run_child(argv[0], "source-export", source_dir, base);
     usleep(1600000u); /* The physical TTL passes before the restarted retry. */
-    run_child(argv[0], "source-export-retry", source_dir, base);
+    if (!large) run_child(argv[0], "source-export-retry", source_dir, base);
+    if (large) {
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+        run_child(argv[0], "target-import-crash", target_dir, base);
+#endif
+    }
     run_child(argv[0], "target-import", target_dir, base);
     run_child(argv[0], "source-commit", source_dir, base);
     run_child(argv[0], "target-activate", target_dir, base);
     run_child(argv[0], "source-reopen", source_dir, base);
     run_child(argv[0], "target-reopen", target_dir, base);
-    run_child(argv[0], "reverse-source-export", target_dir, base);
-    run_child(argv[0], "reverse-target-import", source_dir, base);
-    run_child(argv[0], "reverse-source-commit", target_dir, base);
-    run_child(argv[0], "reverse-target-activate", source_dir, base);
-    run_child(argv[0], "reverse-source-reopen", target_dir, base);
-    run_child(argv[0], "reverse-target-reopen", source_dir, base);
+    if (!large) {
+        run_child(argv[0], "reverse-source-export", target_dir, base);
+        run_child(argv[0], "reverse-target-import", source_dir, base);
+        run_child(argv[0], "reverse-source-commit", target_dir, base);
+        run_child(argv[0], "reverse-target-activate", source_dir, base);
+        run_child(argv[0], "reverse-source-reopen", target_dir, base);
+        run_child(argv[0], "reverse-target-reopen", source_dir, base);
+    }
     aimem_fixture_cleanup(base);
-    puts("ct transfer storage: ok");
+    puts(large ? "ct transfer storage (>64 MiB): ok" :
+                 "ct transfer storage: ok");
     return 0;
 }
