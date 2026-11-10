@@ -123,6 +123,12 @@ int main(void) {
     assert(memcmp(status_a.slot_bitmap, slots_a, sizeof(slots_a)) == 0);
     assert(memcmp(status_b.slot_bitmap, slots_b, sizeof(slots_b)) == 0);
     assert(!qihse_kv_ct_lane_status(store, low, LANE_A, &status_a));
+    assert(!qihse_kv_ct_lane_status(store, low, LANE_B, &status_b));
+    /* The configured active system replication service may inspect lane
+     * metadata on either role; RESP additionally pins each request to the
+     * exact configured peer/lane before calling this metadata API. */
+    assert(qihse_kv_ct_lane_status(store, peer, LANE_B, &status_b));
+    assert(status_b.mode == QIHSE_KV_CT_LANE_RECEIVER);
     assert(!qihse_kv_ct_lane_status(store, peer, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", &status_a));
 
     /* Lane B starts from a real canonical empty baseline, not cursor zero by
@@ -143,6 +149,19 @@ int main(void) {
         "peer-a", GEN_A, baseline_digest, 0u));
     assert(qihse_kv_ct_lane_source_reconcile_peer(store, op, peer, LANE_A,
         "peer-a", GEN_A, baseline_digest, 0u));
+    qihse_kv_ct_lane_status_t resolved = {0};
+    assert(qihse_kv_ct_lane_source_for_slots(store, op, slots_a, &resolved));
+    assert(strcmp(resolved.lane_id, LANE_A) == 0 && resolved.admitted);
+    uint8_t empty_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    assert(!qihse_kv_ct_lane_source_for_slots(store, op, empty_slots, &resolved));
+    assert(resolved.lane_id[0] == '\0');
+    uint8_t cross_lane_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES];
+    for (size_t i = 0; i < sizeof(cross_lane_slots); ++i)
+        cross_lane_slots[i] = (uint8_t)(slots_a[i] | slots_b[i]);
+    assert(!qihse_kv_ct_lane_source_for_slots(store, op, cross_lane_slots, &resolved));
+    assert(resolved.lane_id[0] == '\0');
+    assert(!qihse_kv_ct_lane_source_for_slots(store, low, slots_a, &resolved));
+    assert(resolved.lane_id[0] == '\0');
     qihse_kv_replica_snapshot_destroy(baseline);
 
     /* Exact original certificate bytes have their own durable, bounded page
@@ -379,8 +398,76 @@ int main(void) {
     qihse_kv_ct_proof_destroy(promoted_proof);
     assert(qihse_kv_ct_lane_source_reconcile_peer(store, op, peer, LANE_B,
         "peer-a", GEN_C, promotion_baseline_digest, 0u));
+    assert(qihse_kv_ct_lane_status(store, op, LANE_B, &status_b) &&
+           status_b.admitted && status_b.promotion_pending);
+    assert(!qihse_kv_ct_lane_source_for_slots(store, op, slots_b, &resolved));
+    assert(resolved.lane_id[0] == '\0');
+    assert(qihse_kv_ct_lane_source_for_slots(store, op, slots_a, &resolved));
+    assert(strcmp(resolved.lane_id, LANE_A) == 0);
+    assert_value(store, op, key_a, "lane-a-v2"); /* unrelated source lane stays live */
+    assert_value(store, op, key_b, NULL); /* common FINAL has not been committed */
+    qihse_kv_ct_writer_scope_t* pending_scope = NULL;
+    assert(!qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_B, token_b,
+        &pending_scope));
+
+    promotion.final_decision_index = 12u;
+    memset(promotion.final_decision_digest, 0x44,
+        sizeof(promotion.final_decision_digest));
+    bool promotion_final_available = false;
+    qihse_kv_ct_proof_t* promotion_final_proof =
+        qihse_kv_ct_lane_authority_proof_create(store, op, op, &promotion,
+            verify_lane_claim, &promotion_final_available);
+    assert(promotion_final_proof);
+    assert(!qihse_kv_ct_lane_promotion_finalize(store, op, op, &promotion,
+        promotion_final_proof, verify_lane_claim, &promotion_final_available));
+    promotion_final_available = true;
+    assert(qihse_kv_ct_lane_promotion_finalize(store, op, op, &promotion,
+        promotion_final_proof, verify_lane_claim, &promotion_final_available));
+    qihse_kv_ct_proof_destroy(promotion_final_proof);
+    assert(qihse_kv_ct_lane_source_for_slots(store, op, slots_b, &resolved));
+    assert(strcmp(resolved.lane_id, LANE_B) == 0 && resolved.admitted &&
+           !resolved.promotion_pending && strcmp(resolved.generation, GEN_C) == 0);
     assert_value(store, op, key_b, "lane-b-v1");
     assert_value(store, op, key_a, "lane-a-v2");
+
+    /* A promoted lane must preserve deterministic source row versions through
+     * replay. Commit one post-promotion write, ACK it, and reopen twice; the
+     * value and allocator high-water must remain unchanged on both replays. */
+    assert(qihse_kv_ct_writer_scope_enter_lane(store, op, LANE_B, token_b, &scope));
+    assert(qihse_kv_set_user(store, key_b, "lane-b-v2", 4u, 1u, op));
+    uint64_t promoted_resume = 0u;
+    assert(qihse_kv_ct_lane_source_read(store, peer, LANE_B, GEN_C,
+        0u, 8u, 65536u, &groups, &group_count, &promoted_resume));
+    assert(group_count == 1u && promoted_resume == 1u && groups[0].count == 1u &&
+           strcmp(groups[0].records[0].value, "lane-b-v2") == 0);
+    assert(qihse_kv_ct_lane_source_ack(store, peer, LANE_B,
+        "peer-a", GEN_C, promoted_resume));
+    assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+    scope = NULL;
+    qihse_kv_ct_groups_free(groups, group_count);
+    groups = NULL;
+    uint64_t promoted_highwater = qihse_kv_change_seq(store);
+    qihse_kv_ct_lane_status_t promoted_status = {0};
+    assert(qihse_kv_ct_lane_status(store, op, LANE_B, &promoted_status));
+
+    for (unsigned reopen = 0u; reopen < 2u; ++reopen) {
+        qihse_kv_store_destroy(store);
+        store = qihse_kv_store_create_user(op);
+        assert(store);
+        qihse_kv_store_set_replication_principal_id(store, qihse_user_get_id(peer));
+        assert(qihse_kv_ct_lane_status(store, op, LANE_B, &promoted_status));
+        assert(promoted_status.durable_position == 1u &&
+               promoted_status.acknowledged_position == 1u &&
+               !promoted_status.promotion_pending);
+        assert(qihse_kv_ct_lane_source_reconcile_peer(store, op, peer, LANE_B,
+            "peer-a", GEN_C, promoted_status.baseline_digest, 1u));
+        assert(qihse_kv_ct_lane_status(store, op, LANE_A, &status_a));
+        assert(qihse_kv_ct_lane_source_reconcile_peer(store, op, peer, LANE_A,
+            "peer-a", GEN_A, status_a.baseline_digest, 2u));
+        assert_value(store, op, key_b, "lane-b-v2");
+        assert_value(store, op, key_a, "lane-a-v2");
+        assert(qihse_kv_change_seq(store) == promoted_highwater);
+    }
 
     /* A verified reservation fences only its selected slots and persists a
      * recoverable transfer state before source export begins. */

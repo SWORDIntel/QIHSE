@@ -76,7 +76,6 @@ static bool ct_lane_baseline_frame_validate(
         return false;
     const size_t lane_len = frame[5];
     const size_t generation_len = frame[6];
-    const uint8_t* bitmap = frame + 76u;
     const uint8_t* lane = frame + 2124u;
     const uint8_t* generation = frame + 2188u;
     uint64_t seq_base = ct_lane_baseline_get64(frame + 24u);
