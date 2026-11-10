@@ -310,7 +310,7 @@ int qihse_repl_apply_wal(qihse_repl_context_t* ctx, const uint8_t* wal_data, siz
                                                QIHSE_WAL_DURABILITY_NONE);
         if (staged) {
             replayed = qihse_wal_replay(staged, QIHSE_WAL_INVALID_LSN, repl_apply_cb, &seen);
-            qihse_wal_destroy(staged);
+            if (qihse_wal_destroy_checked(staged) != 0) replayed = -1;
         }
     }
     unlink(ctx->stage_seg);   /* the staging area holds one record at a time */

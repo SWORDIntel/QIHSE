@@ -72,6 +72,11 @@ typedef struct qihse_wal qihse_wal_t;
 qihse_wal_t* qihse_wal_create(const char* directory,
                               size_t segment_size,
                               qihse_wal_durability_t durability);
+/* Flushes durable WALs and closes their descriptors before freeing the handle.
+ * Returns 0 on success, -1 on sync/close failure (errno preserved). The handle
+ * is consumed either way. */
+int qihse_wal_destroy_checked(qihse_wal_t* wal);
+/* Compatibility wrapper. Reports a checked-destroy failure to stderr. */
 void qihse_wal_destroy(qihse_wal_t* wal);
 
 /* ── Append operations ──────────────────────────────────────────────────── */

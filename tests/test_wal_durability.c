@@ -17,6 +17,19 @@
 
 int qihse_test_sync_fail;
 int qihse_test_fsync_fail;
+int qihse_test_close_fail_once;
+int qihse_test_close_failures;
+
+int qihse_test_close(int fd) {
+    int rc = (int)syscall(SYS_close, fd);
+    if (qihse_test_close_fail_once) {
+        qihse_test_close_fail_once = 0;
+        qihse_test_close_failures++;
+        errno = EINTR;
+        return -1;
+    }
+    return rc;
+}
 
 int qihse_test_fdatasync(int fd) {
     if (qihse_test_sync_fail) {
@@ -207,11 +220,35 @@ int main(void) {
     qihse_wal_t* wal = qihse_wal_create(
         dir, 64 * 1024, QIHSE_WAL_DURABILITY_FDATASYNC);
     assert(wal != NULL);
+    qihse_test_sync_fail = 1;
+    errno = 0;
+    assert(qihse_wal_destroy_checked(wal) == -1);
+    assert(errno == EIO);
+    qihse_test_sync_fail = 0;
+    remove_single_segment(dir);
+
+    char close_dir[] = "tests/wal_close_failure_XXXXXX";
+    assert(mkdtemp(close_dir) != NULL);
+    wal = qihse_wal_create(close_dir, 64 * 1024,
+                           QIHSE_WAL_DURABILITY_NONE);
+    assert(wal != NULL);
+    qihse_test_close_fail_once = 1;
+    qihse_test_close_failures = 0;
+    errno = 0;
+    assert(qihse_wal_destroy_checked(wal) == -1);
+    assert(errno == EINTR && qihse_test_close_failures == 1);
+    remove_single_segment(close_dir);
+
+    char checked_dir[] = "tests/wal_checked_destroy_XXXXXX";
+    assert(mkdtemp(checked_dir) != NULL);
+    wal = qihse_wal_create(checked_dir, 64 * 1024,
+                           QIHSE_WAL_DURABILITY_FDATASYNC);
+    assert(wal != NULL);
     pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
         qihse_wal_t* second = qihse_wal_create(
-            dir, 64 * 1024, QIHSE_WAL_DURABILITY_FDATASYNC);
+            checked_dir, 64 * 1024, QIHSE_WAL_DURABILITY_FDATASYNC);
         _exit(second == NULL ? 0 : 1);
     }
     int status;
@@ -238,8 +275,8 @@ int main(void) {
     assert(qihse_wal_append_checkpoint(wal, checkpoint) != 0);
     assert(qihse_wal_checkpoint(wal, checkpoint) == 0);
     assert(qihse_wal_last_checkpoint(wal) == checkpoint);
-    qihse_wal_destroy(wal);
-    remove_single_segment(dir);
+    assert(qihse_wal_destroy_checked(wal) == 0);
+    remove_single_segment(checked_dir);
 
     char rotate_dir[] = "tests/wal_rotate_sync_failure_XXXXXX";
     assert(mkdtemp(rotate_dir) != NULL);

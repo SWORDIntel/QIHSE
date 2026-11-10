@@ -406,19 +406,44 @@ qihse_wal_t* qihse_wal_create(const char* directory,
     return wal;
 }
 
-void qihse_wal_destroy(qihse_wal_t* wal) {
-    if (!wal) return;
+int qihse_wal_destroy_checked(qihse_wal_t* wal) {
+    if (!wal) return 0;
+    int failed = 0;
+    int saved_errno = 0;
     pthread_mutex_lock(&wal->lock);
     if (wal->seg_fd >= 0) {
         if (wal->durability != QIHSE_WAL_DURABILITY_NONE) {
-            (void)sync_data_fd(wal->seg_fd);
+            if (sync_data_fd(wal->seg_fd) != 0) {
+                failed = 1;
+                saved_errno = errno ? errno : EIO;
+            }
         }
-        close(wal->seg_fd);
+        if (close(wal->seg_fd) != 0 && !failed) {
+            failed = 1;
+            saved_errno = errno ? errno : EIO;
+        }
     }
-    if (wal->dir_fd >= 0) close(wal->dir_fd);
+    if (wal->dir_fd >= 0 && close(wal->dir_fd) != 0 && !failed) {
+        failed = 1;
+        saved_errno = errno ? errno : EIO;
+    }
     pthread_mutex_unlock(&wal->lock);
     pthread_mutex_destroy(&wal->lock);
     free(wal);
+    if (failed) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+void qihse_wal_destroy(qihse_wal_t* wal) {
+    if (qihse_wal_destroy_checked(wal) != 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "qihse_wal_destroy: final sync/close failed: %s\n",
+                strerror(saved_errno));
+        errno = saved_errno;
+    }
 }
 
 /* ── Append ─────────────────────────────────────────────────────────────── */

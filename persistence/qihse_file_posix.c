@@ -50,6 +50,15 @@ static bool qihse_file_offset_ok(uint64_t offset, off_t* out) {
     return true;
 }
 
+static bool qihse_file_range_ok(uint64_t offset, size_t size) {
+    uint64_t max_off = (((uint64_t)1u) << ((sizeof(off_t) * CHAR_BIT) - 1u)) - 1u;
+    if (offset > max_off || (uint64_t)size > max_off - offset) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    return true;
+}
+
 bool qihse_path_join(const char* dir, const char* name, char* out, size_t out_size) {
     size_t dir_len;
     size_t name_len;
@@ -152,10 +161,7 @@ bool qihse_file_close(qihse_file_t* file) {
         return true;
     }
 
-    do {
-        rc = close(file->fd);
-    } while (rc != 0 && errno == EINTR);
-
+    rc = close(file->fd);
     file->fd = QIHSE_FILE_INVALID_FD;
     return rc == 0;
 }
@@ -168,6 +174,7 @@ bool qihse_file_pread_exact(qihse_file_t* file, void* buf, size_t size, uint64_t
         errno = EINVAL;
         return false;
     }
+    if (!qihse_file_range_ok(offset, size)) return false;
 
     while (done < size) {
         off_t off;
@@ -181,7 +188,12 @@ bool qihse_file_pread_exact(qihse_file_t* file, void* buf, size_t size, uint64_t
         }
 #ifdef _WIN32
         lock_io();
-        lseek(file->fd, off, SEEK_SET);
+        if (lseek(file->fd, off, SEEK_SET) != off) {
+            int seek_errno = errno ? errno : EIO;
+            unlock_io();
+            errno = seek_errno;
+            return false;
+        }
         n = read(file->fd, p + done, (unsigned int)(size - done));
         unlock_io();
 #else
@@ -211,6 +223,7 @@ bool qihse_file_pwrite_exact(qihse_file_t* file, const void* buf, size_t size, u
         errno = EINVAL;
         return false;
     }
+    if (!qihse_file_range_ok(offset, size)) return false;
 
     while (done < size) {
         off_t off;
@@ -224,7 +237,12 @@ bool qihse_file_pwrite_exact(qihse_file_t* file, const void* buf, size_t size, u
         }
 #ifdef _WIN32
         lock_io();
-        lseek(file->fd, off, SEEK_SET);
+        if (lseek(file->fd, off, SEEK_SET) != off) {
+            int seek_errno = errno ? errno : EIO;
+            unlock_io();
+            errno = seek_errno;
+            return false;
+        }
         n = write(file->fd, p + done, (unsigned int)(size - done));
         unlock_io();
 #else
