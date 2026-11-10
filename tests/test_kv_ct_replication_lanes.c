@@ -21,6 +21,7 @@ static const char LANE_B[QIHSE_KV_CT_LANE_ID_MAX + 1u] =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 static const char GEN_A[33] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static const char GEN_B[33] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+static const char GEN_C[33] = "cccccccccccccccccccccccccccccccc";
 
 static void bitmap_set(uint8_t bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES], uint16_t slot) {
     bitmap[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
@@ -282,11 +283,81 @@ int main(void) {
     assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
     qihse_kv_ct_groups_free(groups, group_count);
 
+    /* Promote receiver B independently while source A remains admitted. The
+     * new generation must discard B's old baseline and seal a fresh one. */
+    assert(qihse_kv_ct_lane_status(store, op, LANE_B, &status_b));
+    qihse_kv_ct_lane_authority_claim_t promotion = {0};
+    promotion.operation = QIHSE_KV_CT_LANE_AUTH_PROMOTION;
+    snprintf(promotion.transfer_id, sizeof(promotion.transfer_id), "promote-b-1");
+    snprintf(promotion.source_group_id, sizeof(promotion.source_group_id), "%s", LANE_B);
+    snprintf(promotion.target_group_id, sizeof(promotion.target_group_id), "%s", LANE_B);
+    snprintf(promotion.source_qkp_id, sizeof(promotion.source_qkp_id), "peer-b");
+    snprintf(promotion.target_qkp_id, sizeof(promotion.target_qkp_id), "node-a");
+    snprintf(promotion.source_generation, sizeof(promotion.source_generation), "%s", GEN_B);
+    snprintf(promotion.target_generation, sizeof(promotion.target_generation), "%s", GEN_C);
+    snprintf(promotion.successor_qkp_id, sizeof(promotion.successor_qkp_id), "peer-a");
+    memcpy(promotion.slots, slots_b, sizeof(slots_b));
+    promotion.grant_epoch = 2u;
+    promotion.reserve_index = 11u;
+    memset(promotion.reserve_digest, 0x21, sizeof(promotion.reserve_digest));
+    promotion.source_cut = status_b.durable_position;
+    memcpy(promotion.range_digest, status_b.slot_bitmap_digest, 32u);
+    memset(promotion.promotion_event_digest, 0x44,
+        sizeof(promotion.promotion_event_digest));
+    qihse_kv_ct_proof_t *promotion_proof =
+        qihse_kv_ct_lane_authority_proof_create(store, op, op, &promotion,
+            verify_lane_claim, &no_final_decision);
+    assert(promotion_proof);
+    assert(qihse_kv_ct_lane_receiver_promote(store, op, op, &promotion,
+        promotion_proof, verify_lane_claim, &no_final_decision, token_b));
+    qihse_kv_ct_proof_destroy(promotion_proof);
+    assert(qihse_kv_ct_lane_status(store, op, LANE_B, &status_b) &&
+           status_b.mode == QIHSE_KV_CT_LANE_SOURCE && !status_b.admitted &&
+           !status_b.baseline_sealed && status_b.durable_position == 0u);
+    qihse_kv_replica_snapshot_t *promotion_baseline = NULL;
+    uint64_t promotion_baseline_seq = 0u;
+    unsigned char promotion_baseline_digest[32];
+    assert(qihse_kv_ct_lane_source_baseline_snapshot_create(store, op, LANE_B,
+        &promotion_baseline, &promotion_baseline_seq, promotion_baseline_digest) == 0);
+    qihse_kv_replica_snapshot_destroy(promotion_baseline);
+    promotion.target_cursor = promotion_baseline_seq;
+    memcpy(promotion.image_digest, promotion_baseline_digest, 32u);
+    static const unsigned char promotion_cert[] = {0x51, 0x43, 0x50, 0x32, 0x44};
+    unsigned char promotion_cert_digest[32];
+    assert(qihse_kv_ct_lane_certificate_append(store, op, LANE_B, GEN_C,
+        promotion_cert, sizeof(promotion_cert), promotion_cert_digest));
+    memcpy(promotion.certificate_head_digest, promotion_cert_digest, 32u);
+    unsigned char promotion_page[128], promotion_page_digest[32];
+    size_t promotion_page_len = 0u; bool promotion_more = false;
+    assert(qihse_kv_ct_lane_certificate_page(store, peer, LANE_B, zero_digest,
+        promotion_page, sizeof(promotion_page), &promotion_page_len,
+        promotion_page_digest, &promotion_more));
+    assert(promotion_page_len == 36u + sizeof(promotion_cert) && !promotion_more);
+    assert(qihse_kv_ct_lane_certificate_ack(store, peer, LANE_B, "peer-a",
+        GEN_C, promotion_cert_digest));
+    assert(qihse_kv_ct_lane_promotion_ready(store, op, op, &promotion,
+        verify_lane_claim, &no_final_decision));
+    qihse_kv_ct_proof_t *promoted_proof = qihse_kv_ct_lane_promoted_proof_get(
+        store, op, op, LANE_B, promotion.promotion_event_digest,
+        verify_lane_claim, &no_final_decision);
+    assert(promoted_proof);
+    qihse_kv_ct_lane_authority_claim_t promoted_claim;
+    assert(qihse_kv_ct_lane_authority_proof_fields(store, op, op,
+        promoted_proof, &promoted_claim));
+    assert(memcmp(promoted_claim.promotion_event_digest,
+        promotion.promotion_event_digest, 32u) == 0);
+    qihse_kv_ct_proof_destroy(promoted_proof);
+    assert(qihse_kv_ct_lane_source_reconcile_peer(store, op, peer, LANE_B,
+        "peer-a", GEN_C, promotion_baseline_digest, 0u));
+    assert_value(store, op, key_b, "lane-b-v1");
+    assert_value(store, op, key_a, "lane-a-v2");
+
     /* A verified reservation fences only its selected slots and persists a
      * recoverable transfer state before source export begins. */
     authority.final_decision_index = 0u;
     memset(authority.final_decision_digest, 0,
         sizeof(authority.final_decision_digest));
+    snprintf(authority.target_generation, sizeof(authority.target_generation), "%s", GEN_C);
     authority.source_cut = resume;
     qihse_kv_ct_proof_t *transfer_proof =
         qihse_kv_ct_lane_authority_proof_create(store, op, op, &authority,
