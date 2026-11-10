@@ -251,7 +251,7 @@ static bool valid_finalized_txn(const qihse_cluster_ownership_txn_t *t,
         t->config_epoch != 0 && proof_or != 0;
 }
 
-static bool finalized_topology_matches(qihse_cluster_transfer_context_t *c,
+static bool trusted_topology_mapping_matches(qihse_cluster_transfer_context_t *c,
                                        const qihse_cluster_ownership_txn_t *txn,
                                        uint16_t source, uint16_t target) {
     qihse_cluster_node_t source_node, target_node;
@@ -421,7 +421,7 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
             &finalized, NULL, 0)) {
         bool exact = valid_finalized_txn(&finalized, transfer_id, source_index,
                 target_index, first_slot, last_slot) &&
-            finalized_topology_matches(c, &finalized, source_index, target_index);
+            trusted_topology_mapping_matches(c, &finalized, source_index, target_index);
         if (!exact) {
             OPENSSL_cleanse(&finalized, sizeof(finalized));
             set_error(err, err_cap, "finalized CT2 retry tuple or trusted topology mapping differs");
@@ -452,9 +452,8 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
             &txn, NULL, 0)) {
         if (!valid_committed_txn(&txn, transfer_id, source_index, target_index,
                                  first_slot, last_slot) ||
-            !topology_matches(c, &txn, source_index, target_index,
-                              first_slot, last_slot)) {
-            set_error(err, err_cap, "committed CT2 tuple does not match requested retry");
+            !trusted_topology_mapping_matches(c, &txn, source_index, target_index)) {
+            set_error(err, err_cap, "committed CT2 retry tuple or trusted topology mapping differs");
             return QIHSE_CLUSTER_TRANSFER_PENDING;
         }
         progress(c, QIHSE_CLUSTER_TRANSFER_COMMITTING, 0, 0);

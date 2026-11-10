@@ -48,6 +48,8 @@ static uint32_t mock_tenant = QIHSE_TENANT_SYSTEM;
 static bool mock_active = true;
 static bool mock_data_access = true;
 static uint16_t test_first = 10, test_last = 12;
+static uint16_t test_current_owner = 1;
+static bool test_topology_advanced;
 
 struct qihse_cluster_topology { int marker; };
 
@@ -57,7 +59,8 @@ bool qihse_cluster_topology_get_node(const qihse_cluster_topology_t *topology,
     memset(out, 0, sizeof(*out));
     out->index = index;
     snprintf(out->id, sizeof(out->id), "node-%c", index == 1 ? 'a' : 'b');
-    out->role = QIHSE_CLUSTER_NODE_PRIMARY;
+    out->role = test_topology_advanced ? QIHSE_CLUSTER_NODE_REPLICA :
+        QIHSE_CLUSTER_NODE_PRIMARY;
     out->healthy = true;
     return true;
 }
@@ -68,7 +71,7 @@ bool qihse_cluster_topology_get_slot(const qihse_cluster_topology_t *topology,
     uint16_t slot, uint16_t *owner, qihse_cluster_slot_state_t *state, uint16_t *peer) {
     (void)peer;
     if (!topology || slot < test_first || slot > test_last) return false;
-    if (owner) *owner = 1;
+    if (owner) *owner = test_current_owner;
     if (state) *state = QIHSE_CLUSTER_SLOT_STABLE;
     return true;
 }
@@ -633,6 +636,23 @@ static void test_pinned_qkp_transfer_resumes_and_activates_before_publish(void) 
     }
     assert(commit < activation && activation < publish);
     assert(memcmp(received, image, sizeof(image)) == 0);
+    /* Simulate the target topology having advanced after the durable source
+     * COMMITTED record, before this process has observed FINALIZED. The source
+     * no longer owns these slots and neither node is a fresh-transfer PRIMARY;
+     * exact retry must reconcile the persisted transaction without replaying
+     * fresh-transfer admission or rolling the current owner back. */
+    test_topology_advanced = true;
+    test_current_owner = 2;
+    size_t events_before_committed_retry = event_count;
+    int publishes_before_committed_retry = publish_calls;
+    assert(qihse_cluster_transfer_range(&context, "transfer-1", 1, 2, 10, 12,
+        NULL, 0) == QIHSE_CLUSTER_TRANSFER_COMMITTED);
+    assert(event_count == events_before_committed_retry + 3 &&
+           !strcmp(events[events_before_committed_retry], "activate") &&
+           !strcmp(events[events_before_committed_retry + 1], "activation-receipt") &&
+           !strcmp(events[events_before_committed_retry + 2], "publish") &&
+           publish_calls == publishes_before_committed_retry + 1 &&
+           test_current_owner == 2);
     /* A finalized retry repairs a lost one-shot publication by repeating the
      * idempotent pinned activation and refreshing proof-bearing publication. */
     finalized = committed;
@@ -686,6 +706,7 @@ int main(void) {
     durable_offset = 0; dropped_first_chunk_ack = 0;
     durable_sealed = false; durable_activated = false;
     forge_activation_receipt = false;
+    test_current_owner = 1; test_topology_advanced = false;
     memset(received, 0, sizeof(received));
     test_pinned_qkp_transfer_resumes_and_activates_before_publish();
     return 0;
