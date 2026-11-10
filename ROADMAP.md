@@ -615,6 +615,8 @@ Integration and focused evidence are tracked in the
 The group storage and quorum foundations are integrated; daemon, transfer and
 promotion-chain acceptance remain in progress. These foundations do not close
 CT.1 or CT.2 on their own.
+The shared [range-group contract](docs/plans/ct_range_group_contract.md) defines
+the operation ordering, cursor domains and component boundaries.
 
 1. Repair the current path first: automatic CT2 balancing under `--brain-act`,
    durable retry independent of the observation journal, and local completion

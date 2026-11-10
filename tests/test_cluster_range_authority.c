@@ -323,6 +323,11 @@ int main(void) {
     assert(finalize_calls == completed + 1);
     assert(qihse_cluster_range_authority_check_finalized(&a, op, &transaction, NULL, 0));
     assert(qihse_cluster_range_authority_claim(&a, op, &transaction, &claim));
+    /* An observer verifies the committed event without reading the promoted
+     * node's private baseline/certificate marker. This cannot create the
+     * producer's durable-readiness proof, tested separately above. */
+    assert(!memcmp(claim.promotion_event_digest, event, 32));
+    assert(qihse_cluster_range_authority_verify_claim(&verifier, &claim, true));
     memcpy(claim.image_digest, ready_claim.image_digest, 32);
     memcpy(claim.certificate_head_digest, ready_claim.certificate_head_digest, 32);
     memcpy(claim.promotion_event_digest, event, 32);

@@ -15,6 +15,7 @@ CT.1 and CT.2 remain partial until the complete runtime path passes.
 | Quorum range history | Consensus mesh fixture covers follower submission, committed genesis/reserve/finalize, low-clearance denial, inherited uncommitted terminal entries, lost reply, leader loss, restart, exact retry and conflicting operations. RESERVED lookup does not disclose an uncommitted terminal decision. |
 | Independent replication groups | Storage fixture has one store own A and receive B, restart both, and promote B while A remains usable. Context state uses field-wise persistent encoding and an explicit old-reader format fence. |
 | Authority adapter | Focused adapter fixture and scoped ASan/UBSan run passed for principal propagation, immutable grants, typed activation binding, sparse/empty-stream promotion and persisted readiness-marker binding. This fixture uses a mesh boundary double; it does not substitute for runtime integration. |
+| Promotion lineage | Real signed A-to-B-to-C chain receiver tests passed, including reversed and conflicting chains, non-Operator denial and journal replay with role preservation. The paginated client separately passed framing, pin/auth, invalid signature/digest, no-progress and uncommitted-event filtering checks plus scoped ASan/UBSan. Automatic daemon recovery still needs the transport/callback wiring. |
 
 The integrated library and legacy daemon build succeeded. Focused legacy CT
 storage and codec authorization checks also passed after the group foundation.
@@ -37,9 +38,9 @@ The complete suite remains stopped at the user's request.
 - Keep legacy local journal replay separate from new live quorum admission.
   An empty historical lane identifier must not bypass quorum checks on a new
   peer message.
-- Remove quadratic history scans without imposing another aggregate transfer
-  count cap. Historical replay still requires work proportional to retained
-  history unless a separate checkpoint implementation is added.
+- Quorum replay now indexes transfer IDs, reserve indexes and active slots;
+  sequential-history tests passed. Historical replay still requires work
+  proportional to retained history unless a separate checkpoint is added.
 
 Slot distribution is not a measurement of balanced record counts, stored
 bytes or CPU load. No performance improvement is claimed without a workload
