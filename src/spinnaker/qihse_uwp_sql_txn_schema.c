@@ -1164,6 +1164,20 @@ static void uwp_ps_clear_bindings(uwp_ps_slot_t* s) {
  * ------------------------------------------------------------------------- */
 
 static qihse_ts_type_t uwp_sql_type_to_ts_type(qihse_sql_type_t t);
+/* Clear a connection's generic transaction pointer only after reaching a
+ * terminal state and releasing the retained handle. COMMITTING/ABORTING must
+ * stay reachable so callers can retry their participant callbacks. */
+static bool uwp_sql_txn_release_terminal(qihse_txn_manager_t* manager,
+                                         qihse_txn_t** slot) {
+    if (!manager || !slot || !*slot) return false;
+    qihse_txn_t* txn = *slot;
+    if (txn->state != QIHSE_TXN_COMMITTED && txn->state != QIHSE_TXN_ABORTED)
+        return false;
+    if (qihse_txn_release(manager, txn) != 0) return false;
+    *slot = NULL;
+    return true;
+}
+
 static uwp_sts_result_t uwp_dispatch_txn_locked(qihse_uwp_context_t* ctx,
     uint8_t command_opcode, const uint8_t* payload, size_t payload_len,
     qihse_txn_t** current_txn, qihse_user_t* user, int client_fd,
@@ -5858,8 +5872,10 @@ static uwp_sts_result_t uwp_dispatch_sql_locked(qihse_uwp_context_t* ctx,
             qihse_txn_t* failing = *current_txn;
             int rollback_rc = qihse_txn_rollback(
                 (qihse_txn_manager_t*)ctx->txn_manager, failing);
-            if (rollback_rc == 0 || failing->state != QIHSE_TXN_ACTIVE)
-                *current_txn = NULL;
+            if (rollback_rc == 0 || failing->state == QIHSE_TXN_COMMITTED ||
+                failing->state == QIHSE_TXN_ABORTED)
+                (void)uwp_sql_txn_release_terminal(
+                    (qihse_txn_manager_t*)ctx->txn_manager, current_txn);
         }
         if (result == UWP_STS_OK && ast->stmt_type == QIHSE_SQL_SELECT) {
             if (uwp_sql_execute_select(ctx, ast, current_txn, user,
@@ -5904,8 +5920,10 @@ static uwp_sts_result_t uwp_dispatch_sql_locked(qihse_uwp_context_t* ctx,
                         qihse_txn_t* failing = *current_txn;
                         int rollback_rc = qihse_txn_rollback(
                             (qihse_txn_manager_t*)ctx->txn_manager, failing);
-                        if (rollback_rc == 0 || failing->state != QIHSE_TXN_ACTIVE)
-                            *current_txn = NULL;
+                        if (rollback_rc == 0 || failing->state == QIHSE_TXN_COMMITTED ||
+                            failing->state == QIHSE_TXN_ABORTED)
+                            (void)uwp_sql_txn_release_terminal(
+                                (qihse_txn_manager_t*)ctx->txn_manager, current_txn);
                         if (result != UWP_STS_ERR_PERM)
                             result = UWP_STS_ERR_FAILED;
                     }
@@ -5953,8 +5971,10 @@ static uwp_sts_result_t uwp_dispatch_sql_locked(qihse_uwp_context_t* ctx,
                         qihse_txn_t* failing = *current_txn;
                         int rollback_rc = qihse_txn_rollback(
                             (qihse_txn_manager_t*)ctx->txn_manager, failing);
-                        if (rollback_rc == 0 || failing->state != QIHSE_TXN_ACTIVE)
-                            *current_txn = NULL;
+                        if (rollback_rc == 0 || failing->state == QIHSE_TXN_COMMITTED ||
+                            failing->state == QIHSE_TXN_ABORTED)
+                            (void)uwp_sql_txn_release_terminal(
+                                (qihse_txn_manager_t*)ctx->txn_manager, current_txn);
                     }
                     result = UWP_STS_ERR_FAILED;
                 } else {
@@ -6789,11 +6809,11 @@ static uwp_sts_result_t uwp_dispatch_txn_locked(qihse_uwp_context_t* ctx,
             rc = command_opcode == 0x02
                      ? qihse_txn_commit(manager, finishing)
                      : qihse_txn_rollback(manager, finishing);
-            /* Allocation failure can leave a rollbackable transaction active;
-             * retain the handle in that case.  Successful completion and
-             * conflict aborts clear it. */
-            if (rc == 0 || finishing->state != QIHSE_TXN_ACTIVE)
-                (*current_txn) = NULL;
+            /* Preserve ACTIVE (retryable local failure), COMMITTING, and
+             * ABORTING handles. Only terminal work can be released. */
+            if (rc == 0 || finishing->state == QIHSE_TXN_COMMITTED ||
+                finishing->state == QIHSE_TXN_ABORTED)
+                (void)uwp_sql_txn_release_terminal(manager, current_txn);
             uwp_reply_cb(write_fn, write_ctx, rc == 0 ? "OK\n" : "ERR\n");
             return rc == 0 ? UWP_STS_OK : UWP_STS_ERR_FAILED;
         case 0x04:

@@ -1160,7 +1160,15 @@ static void uwp_conn_destroy(uwp_conn_t* conn) {
         }
     }
     if (conn->current_txn && conn->ctx->txn_manager) {
-        qihse_txn_rollback((qihse_txn_manager_t*)conn->ctx->txn_manager, conn->current_txn);
+        qihse_txn_manager_t* manager =
+            (qihse_txn_manager_t*)conn->ctx->txn_manager;
+        qihse_txn_rollback(manager, conn->current_txn);
+        /* A failed rollback may leave ACTIVE or ABORTING work in the manager;
+         * do not release it as though recovery had completed. Terminal state
+         * is safe to retire now that the connection no longer owns it. */
+        if (conn->current_txn->state == QIHSE_TXN_COMMITTED ||
+            conn->current_txn->state == QIHSE_TXN_ABORTED)
+            (void)qihse_txn_release(manager, conn->current_txn);
         conn->current_txn = NULL;
     }
     if (conn->tls_session) {

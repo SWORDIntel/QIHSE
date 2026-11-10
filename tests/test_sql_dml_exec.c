@@ -116,6 +116,24 @@ static void expect_reply(const uwp_reply_buf_t* out, const char* needle) {
     }
 }
 
+static int test_txn_prepare_ok(void* ctx, uint64_t txn_id) {
+    (void)ctx;
+    (void)txn_id;
+    return 0;
+}
+
+static int test_txn_commit_retry(void* ctx, uint64_t txn_id) {
+    int* attempts = (int*)ctx;
+    (void)txn_id;
+    return (*attempts)++ == 0 ? -1 : 0;
+}
+
+static int test_txn_abort_ok(void* ctx, uint64_t txn_id) {
+    (void)ctx;
+    (void)txn_id;
+    return 0;
+}
+
 static void expect_reply_absent(const uwp_reply_buf_t* out, const char* needle) {
     if (strstr(out->data, needle)) {
         fprintf(stderr, "FAIL: reply disclosed forbidden marker '%s': %s\n",
@@ -1016,6 +1034,30 @@ static void test_durable_keys(qihse_user_t* user) {
     assert(run_sql_txn(&ctx, user, "INSERT INTO dkeys VALUES (4, 'b')", &txn, &out) == UWP_STS_OK);
     assert(run_sql_txn(&ctx, user, "COMMIT", &txn, &out) != UWP_STS_OK);
     assert(qihse_table_row_count(qihse_table_store_find_table(qihse_uwp_sql_table_store(), "dkeys")) == 2);
+
+    /* A pending 2PC decision must remain attached to the UWP transaction
+     * handle when ordinary COMMIT cannot finish it. The caller can then retry
+     * the committed decision and release the completed handle. */
+    int commit_attempts = 0;
+    qihse_txn_participant_t participant = {
+        .engine_id = 61,
+        .engine_ctx = &commit_attempts,
+        .prepare = test_txn_prepare_ok,
+        .commit = test_txn_commit_retry,
+        .abort = test_txn_abort_ok,
+    };
+    assert(qihse_txn_register_participant(ctx.txn_manager, participant) == 0);
+    assert(run_txn_command(&ctx, user, 0x01, "\0", &txn, &out) == UWP_STS_OK);
+    assert(txn && qihse_txn_prepare(ctx.txn_manager, txn) == 0);
+    assert(qihse_txn_commit_prepared(ctx.txn_manager, txn) == -1);
+    assert(txn->state == QIHSE_TXN_COMMITTING && commit_attempts == 1);
+    assert(run_txn_command(&ctx, user, 0x02, NULL, &txn, &out) != UWP_STS_OK);
+    assert(txn && txn->state == QIHSE_TXN_COMMITTING);
+    assert(qihse_txn_commit_prepared(ctx.txn_manager, txn) == 0);
+    assert(txn->state == QIHSE_TXN_COMMITTED && commit_attempts == 2);
+    assert(qihse_txn_release(ctx.txn_manager, txn) == 0);
+    txn = NULL;
+
     qihse_uwp_sql_close_durable(&ctx);
     qihse_schema_registry_destroy(ctx.schema);
     qihse_txn_manager_destroy(ctx.txn_manager);
