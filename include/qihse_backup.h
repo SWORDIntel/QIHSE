@@ -107,8 +107,10 @@ int qihse_backup_full_user(qihse_kv_store_t* kv, qihse_user_t* user,
  * data-only image. Retained tombstones and expiry metadata are included for
  * conservative union/recovery; CT identity, owner token, cursors and journal
  * are deliberately not included. A persisted-but-disarmed CT store is not
- * exportable through this operation. Restore into a fresh CT-disabled store,
- * then initialize a new CT source generation and successor baseline. */
+ * exportable through this operation. Restore into a CT-disabled store; the
+ * restore atomically replaces its current KV image, so a nonempty target is
+ * supported when the restoring principal may read all data being replaced.
+ * Then initialize a new CT source generation and successor baseline. */
 int qihse_backup_owner_data_user(qihse_kv_store_t* kv, qihse_user_t* user,
                                  const char* output_path,
                                  qihse_backup_info_t* info);

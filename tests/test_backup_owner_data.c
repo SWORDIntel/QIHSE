@@ -24,7 +24,21 @@ static void restore_owner_data_child(const char* backup_path, const char* data_d
     assert(op);
     qihse_kv_store_t* restored = qihse_kv_store_create_user(op);
     assert(restored);
+    char archive_dir[4096];
+    assert(strlen(backup_path) < sizeof(archive_dir));
+    memcpy(archive_dir, backup_path, strlen(backup_path) + 1u);
+    char* archive_slash = strrchr(archive_dir, '/');
+    assert(archive_slash);
+    *archive_slash = '\0';
+    /* Restore stages under the target data directory, so the source archive
+     * need only be readable; its directory need not be writable. */
+    assert(chmod(archive_dir, 0500) == 0);
+    /* A CT-disabled target may contain an older image. Restore is an atomic
+     * replacement, so callers need not manually empty/recreate the store. */
+    assert(qihse_kv_set_user(restored, "stale/target", "discarded", 0u, 0u, op));
     assert(qihse_restore_user(restored, op, backup_path) == QIHSE_BACKUP_EXPORT_OK);
+    assert(chmod(archive_dir, 0700) == 0);
+    assert(qihse_kv_get_user(restored, "stale/target", op) == NULL);
     char* value = qihse_kv_get_user(restored, "aimem/current", op);
     assert(value && strcmp(value, "retained") == 0);
     free(value);

@@ -218,33 +218,35 @@ static int backup_container_gate(const qihse_user_t* user, const backup_header_t
 
 /* ── Filesystem helpers ────────────────────────────────────────────────── */
 
-static bool backup_sibling_path(const char* path, const char* suffix,
-                                char* out, size_t cap) {
-    struct timespec ts;
-    unsigned long long ms = 0u;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-        ms = (unsigned long long)ts.tv_sec * 1000u +
-             (unsigned long long)(ts.tv_nsec / 1000000);
-    }
-    int n = snprintf(out, cap, "%s%s.%ld.%llu", path, suffix, (long)getpid(), ms);
-    return n >= 0 && (size_t)n < cap;
-}
-
-/* Reserve a private, collision-free scratch pathname. The producer atomically
- * replaces this owned placeholder; cleanup must never target a path that was
- * merely guessed from pid and wall-clock time. */
-static bool backup_sibling_reserve_path(const char* path, const char* suffix,
-                                        char* out, size_t cap) {
+/* Reserve a private, collision-free sibling file. Returning its descriptor
+ * keeps writers attached to the inode they created; callers that need a path
+ * for a producer's atomic replace may close it and retain the unique name. */
+static int backup_sibling_reserve(const char* path, const char* suffix,
+                                  char* out, size_t cap) {
     int n = snprintf(out, cap, "%s%s.XXXXXX", path, suffix);
-    if (n < 0 || (size_t)n >= cap) return false;
+    if (n < 0 || (size_t)n >= cap) return -1;
     int fd = mkstemp(out);
-    if (fd < 0) return false;
-    bool ok = fchmod(fd, 0600) == 0;
+    if (fd < 0) return -1;
+    bool ok = fchmod(fd, 0600) == 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
     int saved_errno = ok ? 0 : errno;
-    if (close(fd) != 0 && ok) { ok = false; saved_errno = errno; }
     if (!ok) {
+        close(fd);
         (void)unlink(out);
         errno = saved_errno ? saved_errno : EIO;
+        return -1;
+    }
+    return fd;
+}
+
+/* Reserve a pathname which a KV producer will atomically replace. */
+static bool backup_sibling_reserve_path(const char* path, const char* suffix,
+                                        char* out, size_t cap) {
+    int fd = backup_sibling_reserve(path, suffix, out, cap);
+    if (fd < 0) return false;
+    if (close(fd) != 0) {
+        int saved_errno = errno;
+        (void)unlink(out);
+        errno = saved_errno;
         return false;
     }
     return true;
@@ -269,11 +271,9 @@ static FILE* backup_open_read(const char* path) {
 
 /* 0600: a backup of a classified dataset is not world-readable, and the mode
  * is set at creation rather than left to the umask. */
-static FILE* backup_create_exclusive(const char* path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0) return NULL;
+static FILE* backup_create_reserved(int fd) {
     FILE* f = fdopen(fd, "wb");
-    if (!f) { close(fd); unlink(path); return NULL; }
+    if (!f) close(fd);
     return f;
 }
 
@@ -417,9 +417,11 @@ static int backup_seal_container(const char* output_path, backup_type_t type,
     chunk = (uint8_t*)malloc(BACKUP_COPY_CHUNK);
     if (!chunk) goto done;
 
-    if (!backup_sibling_path(output_path, ".tmp", tmp_path, sizeof(tmp_path))) goto done;
-    out_f = backup_create_exclusive(tmp_path);
-    if (!out_f) goto done;
+    int tmp_fd = backup_sibling_reserve(output_path, ".tmp", tmp_path,
+                                        sizeof(tmp_path));
+    if (tmp_fd < 0) goto done;
+    out_f = backup_create_reserved(tmp_fd);
+    if (!out_f) { unlink(tmp_path); goto done; }
     tmp_pending = true;
 
     uint8_t header[BACKUP_HEADER_BYTES];
@@ -440,9 +442,10 @@ static int backup_seal_container(const char* output_path, backup_type_t type,
     if (fseeko(out_f, (off_t)BACKUP_OFF_CHECKSUM, SEEK_SET) != 0) goto done;
     if (fwrite(ck, 1u, sizeof(ck), out_f) != sizeof(ck)) goto done;
 
-    /* Renamed into place only once every byte is down and flushed, so a
-     * failed export never leaves a container at `output_path` — and never
-     * damages the previous backup that was there. */
+    /* Renamed into place only once every byte is down and flushed. Before
+     * rename, failures leave the previous output alone. After rename, a
+     * directory-sync failure is ambiguous: retain the candidate at the
+     * published path and report the error rather than implying rollback. */
     if (!backup_finish_file(out_f)) { out_f = NULL; goto done; }
     out_f = NULL;
     if (!qihse_auth_validate_handle_generation(user, principal_generation)) {
@@ -783,11 +786,11 @@ int qihse_backup_owner_data_user(qihse_kv_store_t* kv, qihse_user_t* user,
         rc = QIHSE_BACKUP_EXPORT_DENIED; goto done;
     }
     char tmp_path[BACKUP_PATH_MAX];
-    if (!backup_sibling_path(output_path, ".owner", tmp_path, sizeof(tmp_path))) {
-        rc = QIHSE_BACKUP_EXPORT_ERR; goto done;
-    }
-    FILE* out = backup_create_exclusive(tmp_path);
-    if (!out) { rc = QIHSE_BACKUP_EXPORT_ERR; goto done; }
+    int tmp_fd = backup_sibling_reserve(output_path, ".owner", tmp_path,
+                                        sizeof(tmp_path));
+    if (tmp_fd < 0) { rc = QIHSE_BACKUP_EXPORT_ERR; goto done; }
+    FILE* out = backup_create_reserved(tmp_fd);
+    if (!out) { unlink(tmp_path); rc = QIHSE_BACKUP_EXPORT_ERR; goto done; }
     bool ok = true;
     uint8_t* buf = malloc(BACKUP_COPY_CHUNK);
     if (!buf) ok = false;
@@ -907,11 +910,17 @@ int qihse_restore_user(qihse_kv_store_t* kv, qihse_user_t* user, const char* bac
     chunk = (uint8_t*)malloc(BACKUP_COPY_CHUNK);
     if (!chunk) goto done;
 
-    if (!backup_sibling_path(backup_path, ".restore", scratch_path, sizeof(scratch_path))) {
-        goto done;
-    }
-    scratch_f = backup_create_exclusive(scratch_path);
-    if (!scratch_f) goto done;
+    const char* data_dir = qihse_kv_store_data_directory(kv);
+    int prefix_n = data_dir ? snprintf(scratch_path, sizeof(scratch_path),
+                                       "%sqihse-backup-restore", data_dir) : -1;
+    if (prefix_n < 0 || (size_t)prefix_n >= sizeof(scratch_path)) goto done;
+    char restore_prefix[BACKUP_PATH_MAX];
+    memcpy(restore_prefix, scratch_path, (size_t)prefix_n + 1u);
+    int scratch_fd = backup_sibling_reserve(restore_prefix, "",
+                                            scratch_path, sizeof(scratch_path));
+    if (scratch_fd < 0) goto done;
+    scratch_f = backup_create_reserved(scratch_fd);
+    if (!scratch_f) { unlink(scratch_path); goto done; }
     scratch_pending = true;
 
     /* Verify-then-apply in a single pass: the section is copied to a scratch
