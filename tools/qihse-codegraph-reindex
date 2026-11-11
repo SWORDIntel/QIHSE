@@ -363,6 +363,9 @@ def preflight(repo, root, migrate_only, source_provider='git', explicit_python=N
                          'build it with make qihse-codegraph')
     if migrate_only:
         return repo, cli, None
+    bundled = root / 'libexec' / 'code-review-graph' / 'bin' / 'python'
+    if explicit_python is None and bundled.is_file() and os.access(bundled, os.X_OK):
+        explicit_python = bundled
     crg = shutil.which('code-review-graph')
     if not crg and explicit_python is None:
         raise ValueError('code-review-graph is not executable on PATH; set --producer-python')
@@ -492,7 +495,14 @@ def main():
         return 2
     env = os.environ.copy()
     previous = env.get('LD_LIBRARY_PATH', '')
-    env['LD_LIBRARY_PATH'] = str(root) + (os.pathsep + previous if previous else '')
+    library_paths = [str(root / 'lib'), str(root)]
+    env['LD_LIBRARY_PATH'] = os.pathsep.join(library_paths + ([previous] if previous else []))
+    if not env.get('QIHSE_CODEGRAPH_XXH3_LIBRARY'):
+        for candidate in (root / 'lib' / 'libqihse_xxh3.so',
+                          root / 'tools' / 'codegraph_xxh3' / 'build' / 'libqihse_xxh3.so'):
+            if candidate.is_file():
+                env['QIHSE_CODEGRAPH_XXH3_LIBRARY'] = str(candidate)
+                break
     storage_args = ['--storage-format', args.storage_format] if args.storage_format else []
     stages = 1 if args.migrate_only else (3 if args.query_index else 2)
     encoding = args.storage_format or 'auto'

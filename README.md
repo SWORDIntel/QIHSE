@@ -323,6 +323,9 @@ recall and KEYSTONE/tgrep text search. Uncertain graph edges are retained
 without being treated as verified relationships; stale indexes fail closed.
 
 Build/test: `make qihse-codegraph && make test-codegraph`.
+The full host installer includes a pinned Code Review Graph producer and its
+Python dependencies in a private environment; reindexing needs no separate
+pipx installation.
 Details: [Native CodeGraph architecture](docs/architecture/codegraph_native.md).
 
 ## Agent quickstart

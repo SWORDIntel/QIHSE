@@ -209,6 +209,14 @@ if [ "$(realpath -m -- "$PREFIX")" = "$(realpath -- "$ROOT_DIR")" ]; then
     echo "[ERROR] Installation prefix is the source checkout; use a separate staged/versioned prefix." >&2
     exit 1
 fi
+if [ "$DRY_RUN" -eq 0 ] && [ ! -f "${ROOT_DIR}/vendor/code-review-graph/pyproject.toml" ]; then
+    echo "  • Fetching pinned Code Review Graph producer..."
+    git -C "${ROOT_DIR}" submodule update --init vendor/code-review-graph
+    if [ ! -f "${ROOT_DIR}/vendor/code-review-graph/pyproject.toml" ]; then
+        echo "[ERROR] Code Review Graph submodule checkout did not complete." >&2
+        exit 1
+    fi
+fi
 
 # Operator password resolution:
 # 1. Use user-supplied QIHSE_OPERATOR_PASSWORD or --operator-password if provided
@@ -706,10 +714,10 @@ make -j "${JOBS}" \
     QIHSE_ENABLE_RTM="${QIHSE_ENABLE_RTM}" \
     QIHSE_ENABLE_ABM="${QIHSE_ENABLE_ABM}" \
     QIHSE_ARCH_FLAGS="${QIHSE_ARCH_FLAGS}" \
-    all
+    all qihse-codegraph
 
 # Verify artifacts
-for req_art in libqihse.so qihse-cluster-daemon qihse_keygen qihse-machine-token; do
+for req_art in libqihse.so qihse-cluster-daemon qihse_keygen qihse-machine-token qihse-codegraph; do
     if [ ! -f "${ROOT_DIR}/${req_art}" ]; then
         echo "[ERROR] Expected build output '${req_art}' was not created!" >&2
         exit 1
@@ -756,6 +764,7 @@ $SUDO install -m 755 "${ROOT_DIR}/qihse_keygen" "${PREFIX}/bin/qihse_keygen"
 $SUDO install -m 755 "${ROOT_DIR}/qihse-machine-token" "${PREFIX}/bin/qihse-machine-token"
 $SUDO install -d -m 755 "${PREFIX}/libexec"
 $SUDO install -m 755 "${ROOT_DIR}/tools/fleet/refresh-machine-token.sh" "${PREFIX}/libexec/refresh-machine-token.sh"
+$SUDO "${ROOT_DIR}/scripts/install_codegraph.sh" "${PREFIX}"
 
 if [ -f "${ROOT_DIR}/qihse-federation-ca" ]; then
     $SUDO install -m 755 "${ROOT_DIR}/qihse-federation-ca" "${PREFIX}/bin/qihse-federation-ca"

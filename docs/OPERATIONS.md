@@ -149,7 +149,7 @@ not with a fallback tokenizer. It is not full PostgreSQL text-search parity.
 | `make federation-ca` | Build `qihse-federation-ca` | Verified |
 | `make xdp-kern` | Compile the eBPF XDP object with `clang` | *Not verified here* |
 | `make install` | Install library, `qihse-backup` and public/transitive headers under `$(DESTDIR)$(PREFIX)` | Defaults to a live prefix when `DESTDIR` is empty; stage first (§1.6). Not executed in this documentation update. |
-| `make install-host` | Automated hardware ISA detection, build, `/opt/QIHSE` install, PQC keygen & systemd launch (`scripts/install_qihse.sh`) | Verified |
+| `make install-host` | Automated hardware ISA detection, build, host install including pinned Code Review Graph producer, PQC keygen & systemd launch (`scripts/install_qihse.sh`) | CodeGraph producer staged and tested separately; full host install not rerun. |
 
 ### 1.3 CPU ISA selection & Automated Host Installer
 

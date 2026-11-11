@@ -27,6 +27,16 @@ This optional target needs libqihse.so, OpenSSL, json-c and Zstandard developmen
 It does not add a new mandatory dependency to the main QIHSE library or to HAX.
 On Debian: install libjson-c-dev, libssl-dev and libzstd-dev if not present.
 
+The host installer initializes the pinned `vendor/code-review-graph` submodule,
+builds this native target, and installs the producer into a private Python
+environment under the selected prefix. Its dependencies include igraph. Use
+`git clone --recurse-submodules` for a new checkout, or run
+`git submodule update --init vendor/code-review-graph` before installing an
+existing checkout. The installed `bin/qihse-codegraph-reindex` uses the private
+producer automatically; a separate pipx installation is unnecessary.
+`make install` remains the relocatable public C API install; use
+`make install-host` for the complete host installation.
+
 Run with the QIHSE repo's libqihse.so on the loader path, or install that
 library through the normal QIHSE procedure.
 

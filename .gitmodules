@@ -9,3 +9,6 @@
 	path = vendor/oqs-provider
 	url = https://github.com/open-quantum-safe/oqs-provider.git
 	ignore = dirty
+[submodule "vendor/code-review-graph"]
+	path = vendor/code-review-graph
+	url = https://github.com/SWORDIntel/code-review-graph.git

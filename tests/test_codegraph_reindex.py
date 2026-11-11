@@ -155,6 +155,27 @@ class ReindexTests(unittest.TestCase):
         self.crg.unlink(); result=self.run_wrapper()
         self.assertEqual(result.returncode,2); self.assertEqual(self.events(),[])
 
+    def test_bundled_producer_is_used_without_path_launcher(self):
+        self.crg.unlink()
+        private = self.root/'libexec'/'code-review-graph'/'bin'/'python'
+        private.parent.mkdir(parents=True)
+        marker = self.root/'bundled-used'
+        private.write_text(
+            f'#!{sys.executable}\nimport os,sys\n'
+            f'open({str(marker)!r}, "w").close()\n'
+            f'os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n'
+        )
+        private.chmod(0o700)
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
+        self.assertEqual([e['stage'] for e in self.events()], ['prepare-source', 'import'])
+
+        marker.unlink()
+        result = self.run_wrapper('--producer-python', sys.executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+
     def test_invalid_repository(self):
         (self.repo/'.git').rmdir(); result=self.run_wrapper()
         self.assertEqual(result.returncode,2); self.assertEqual(self.events(),[])
