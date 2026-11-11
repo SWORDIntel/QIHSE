@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include "qihse_container_keys_fixture.h"
 #include "qihse_resp_wire.h"
 #include "qihse_auth.h"
 #include "qihse_audit.h"
@@ -58,6 +59,7 @@ int main(void) {
     char root[] = "tests/resp-raw-vector-XXXXXX"; assert(mkdtemp(root));
     assert(setenv("QIHSE_DATA_DIR",root,1) == 0);
     assert(setenv("QIHSE_FIPS_MODE","disabled",1) == 0);
+    qihse_test_container_keys(root);
     assert(qihse_auth_init());
     const char* op_password = "RawVectorOperator123!";
     const char* tenant_password = "RawVectorTenant123!";

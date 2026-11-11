@@ -50,7 +50,10 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range(
     char *err, size_t err_cap);
 
 /* New group transfer path. The stable source/destination groups are resolved
- * by quorum before bytes move; the legacy interval transfer stays unchanged. */
+ * by quorum before bytes move; the legacy interval transfer stays unchanged.
+ * NULL expected_source_generation derives the original durable operation's
+ * generation on retry, or the current source group's generation for a new
+ * manual request. Brain requests supply their already pinned generation. */
 qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     qihse_cluster_transfer_context_t *context, const char *transfer_id,
     uint16_t source_index, uint16_t target_index,
@@ -61,7 +64,11 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
 /* Canonical binary claim payload for the binary-safe REPL.CT2 GROUP-* wire
  * commands. Fixed-width fields are encoded individually; native struct layout
  * is never sent or persisted. The caller owns `out`. */
-#define QIHSE_CT_GROUP_CLAIM_WIRE_BYTES 2737u
+/* Magic + operation + six identity/generation fields + two lane IDs +
+ * bitmap + fixed counters/digests. Keep the wire size derived from fields. */
+#define QIHSE_CT_GROUP_CLAIM_WIRE_BYTES (9u + \
+    6u * QIHSE_KV_CT_ID_MAX + 2u * QIHSE_KV_CT_LANE_ID_MAX + \
+    QIHSE_KV_CT_SLOT_BITMAP_BYTES + 232u)
 bool qihse_cluster_transfer_claim_encode(
     const qihse_kv_ct_lane_authority_claim_t *claim,
     unsigned char out[QIHSE_CT_GROUP_CLAIM_WIRE_BYTES]);

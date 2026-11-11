@@ -231,7 +231,8 @@ static bool ct_lane_baseline_collect_existing_locked(
         out->bytes += key_len + value_len + 64u;
         out->rows[out->count++] = row;
     }
-    qsort(out->rows, out->count, sizeof(*out->rows), ct_image_row_cmp);
+    if (out->count > 1u)
+        qsort(out->rows, out->count, sizeof(*out->rows), ct_image_row_cmp);
     for (size_t i = 0u; i < collected.count; ++i)
         free(collected.rows[i].key);
     free(collected.rows);
@@ -318,6 +319,7 @@ static bool ct_lane_baseline_image_read(const char* path,
     }
     if (fclose(input) != 0) ok = false;
     if (ok) {
+        if (out->count > 1u)
         qsort(out->rows, out->count, sizeof(*out->rows), ct_image_row_cmp);
         for (size_t i = 1u; i < out->count; ++i)
             if (strcmp(out->rows[i - 1u].key, out->rows[i].key) == 0)
@@ -522,7 +524,7 @@ static bool ct_lane_baseline_frame_build(uint8_t frame[CT_LANE_BASELINE_FRAME_BY
 static bool ct_lane_baseline_apply_frame(
     qihse_kv_store_t* store,
     const uint8_t frame[CT_LANE_BASELINE_FRAME_BYTES],
-    const kv_read_context_t* read_context) {
+    const kv_read_context_t* read_context, bool replay) {
     if (!store || !ct_lane_baseline_frame_validate(frame)) {
         errno = EINVAL;
         return false;
@@ -574,14 +576,17 @@ static bool ct_lane_baseline_apply_frame(
     unsigned token_nonzero = 0u;
     if (lane) for (size_t i = 0u; i < QIHSE_KV_CT_TOKEN_BYTES; ++i)
         token_nonzero |= lane->owner_token[i];
+    /* WAL replay restores the frame's historical row image even after a
+     * committed transfer shrank this lane. Current membership authorizes new
+     * installs and cursor/admission updates, not historical durable rows. */
     bool bitmap_nonempty = ct_lane_baseline_bitmap_nonempty(bitmap);
     bool selected_subset = lane && bitmap_nonempty &&
         ct_lane_baseline_bitmap_subset(bitmap, lane->status.slot_bitmap);
+    /* Moving the final slot away does not reset this stream's history. */
     bool empty_lane_baseline = lane && !bitmap_nonempty &&
-        !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap) &&
-        source_cut == 0u;
+        !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap);
     ok = lane && token_nonzero != 0u && store->ct_enabled &&
-        (selected_subset || empty_lane_baseline) &&
+        (replay || selected_subset || empty_lane_baseline) &&
         !store->recovery_pending &&
         __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE) >= target_seq_base;
     kv_store_unlock(store);
@@ -595,8 +600,7 @@ static bool ct_lane_baseline_apply_frame(
         actual_max_classification == max_classification &&
         actual_required_sci == required_sci;
     if (!ok) goto done;
-    if (!ct_lane_baseline_bitmap_nonempty(bitmap) &&
-        (incoming.count != 0u || source_cut != 0u)) {
+    if (!ct_lane_baseline_bitmap_nonempty(bitmap) && incoming.count != 0u) {
         errno = EINVAL;
         ok = false;
         goto done;
@@ -613,8 +617,8 @@ static bool ct_lane_baseline_apply_frame(
         ct_lane_baseline_bitmap_subset(bitmap, lane->status.slot_bitmap);
     empty_lane_baseline = lane && !bitmap_nonempty &&
         !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap) &&
-        source_cut == 0u && incoming.count == 0u;
-    ok = lane && (selected_subset || empty_lane_baseline) &&
+        incoming.count == 0u;
+    ok = lane && (replay || selected_subset || empty_lane_baseline) &&
         !store->recovery_pending &&
         __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE) >= target_seq_base;
     if (ok) ok = ct_lane_baseline_apply_rows_locked(store, read_context->user,
@@ -690,7 +694,7 @@ bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     bool allowed = lane && lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
         ((selected_nonempty && ct_lane_baseline_bitmap_subset(
             selected_bitmap, lane->status.slot_bitmap)) ||
-         (!selected_nonempty && source_cut == 0u &&
+         (!selected_nonempty &&
           !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap))) &&
         mismatch == 0u && !store->recovery_pending && store->wal_fd;
     if (allowed) {
@@ -720,7 +724,7 @@ bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
             lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
             ((ct_lane_baseline_bitmap_nonempty(bitmap) &&
               ct_lane_baseline_bitmap_subset(bitmap, lane->status.slot_bitmap)) ||
-             (!ct_lane_baseline_bitmap_nonempty(bitmap) && source_cut == 0u &&
+             (!ct_lane_baseline_bitmap_nonempty(bitmap) &&
               !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap))) &&
             strcmp(lane->status.generation, lane_generation) == 0 &&
             __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE) == target_seq_base;
@@ -749,7 +753,7 @@ bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
         lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
         ((ct_lane_baseline_bitmap_nonempty(bitmap) &&
           ct_lane_baseline_bitmap_subset(bitmap, lane->status.slot_bitmap)) ||
-         (!ct_lane_baseline_bitmap_nonempty(bitmap) && source_cut == 0u &&
+         (!ct_lane_baseline_bitmap_nonempty(bitmap) &&
           !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap))) &&
         strcmp(lane->status.generation, lane_generation) == 0 &&
         __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE) == target_seq_base;
@@ -763,7 +767,7 @@ bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     kv_store_unlock(store);
     if (ok) {
         const kv_read_context_t read_context = {.user = data_principal};
-        ok = ct_lane_baseline_apply_frame(store, frame, &read_context);
+        ok = ct_lane_baseline_apply_frame(store, frame, &read_context, false);
     }
     if (!ok) {
         kv_store_wrlock(store);

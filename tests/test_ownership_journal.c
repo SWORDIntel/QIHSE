@@ -751,8 +751,18 @@ static void test_signed_ct1_missing_predecessor_chain(qihse_kv_store_t* store,
         uint16_t owner = QIHSE_CLUSTER_NODE_NONE; uint64_t epoch = 0;
         assert(qihse_cluster_topology_get_slot(topology, slot, &owner, NULL, NULL));
         assert(qihse_cluster_topology_get_slot_epoch(topology, slot, &epoch));
-        assert(owner == indices[2] && epoch == 6u);
+        /* Rejection preserves the newer common map, including the CT2
+         * transition interleaved with this historical promotion chain. */
+        assert(owner == authority.final_owner[slot] && epoch == authority.final_epoch[slot]);
     }
+    assert(qihse_cluster_ownership_receive_ct1_promotion_chain(&ownership,
+        ordered, lengths, 2u, err, sizeof(err)));
+    txn_replay_t adopted_count = {0};
+    bool adopted_pending = false;
+    assert(qihse_cluster_ownership_journal_replay_txn(
+        qihse_kv_store_data_directory(chain_store), on_txn, &adopted_count,
+        &adopted_pending) == 2);
+    assert(adopted_count.count == 2u && !adopted_pending);
     free(forged_envelope);
     free(envelopes[0]); free(envelopes[1]);
     for (size_t i = 0; i < 2; ++i) qihse_federation_node_key_free(private_keys[i]);
@@ -1006,6 +1016,36 @@ int main(void) {
     assert(qihse_cluster_ownership_journal_append_txn(dir_cross_domain,
         &cross_domain_commit) == 0);
     puts("[PASS] CT2 source/target cursors are independent domains");
+
+    /* Promotion INTENT predates its quorum-assigned epoch. Bind it once,
+     * while preserving every known field and rejecting later epoch changes. */
+    char dir_promotion_intent[] = "./tests/.qihse_journal_promotion_intent_XXXXXX";
+    assert(mkdtemp(dir_promotion_intent));
+    qihse_cluster_ownership_txn_t promotion_intent = txn(QIHSE_OWNERSHIP_INTENT);
+    strcpy(promotion_intent.transfer_id, "ct1-unassigned-epoch");
+    memset(promotion_intent.lane_id, 'a', 64u); promotion_intent.lane_id[64] = 0;
+    strcpy(promotion_intent.next_generation, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    for (uint32_t slot = promotion_intent.start; slot <= promotion_intent.end; ++slot)
+        promotion_intent.slot_bitmap[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+    promotion_intent.config_epoch = 0u;
+    assert(qihse_cluster_ownership_journal_append_txn(dir_promotion_intent, &promotion_intent) == 0);
+    qihse_cluster_ownership_txn_t promotion_prepared = promotion_intent;
+    promotion_prepared.phase = QIHSE_OWNERSHIP_PREPARED;
+    promotion_prepared.config_epoch = 7u;
+    qihse_cluster_ownership_txn_t changed_identity = promotion_prepared;
+    changed_identity.target_id[0] ^= 1;
+    assert(qihse_cluster_ownership_journal_append_txn(dir_promotion_intent, &changed_identity) != 0);
+    assert(qihse_cluster_ownership_journal_append_txn(dir_promotion_intent, &promotion_prepared) == 0);
+    qihse_cluster_ownership_txn_t changed_epoch = promotion_prepared;
+    changed_epoch.phase = QIHSE_OWNERSHIP_COMMITTED;
+    changed_epoch.config_epoch++;
+    memset(changed_epoch.proof_digest, 0x71, sizeof(changed_epoch.proof_digest));
+    assert(qihse_cluster_ownership_journal_append_txn(dir_promotion_intent, &changed_epoch) != 0);
+    memset(&tr, 0, sizeof(tr)); unresolved = false;
+    assert(qihse_cluster_ownership_journal_replay_txn(dir_promotion_intent, on_txn, &tr,
+        &unresolved) == 2);
+    assert(unresolved && tr.last == QIHSE_OWNERSHIP_PREPARED);
+    puts("[PASS] promotion INTENT binds the assigned epoch once");
 
     /* A durable INTENT must survive the crash window before the backing CT
      * fence is installed. A matching PREPARED frame may then bind the exact
@@ -1405,6 +1445,8 @@ int main(void) {
              "ct1-lane-journal-v3");
     memset(lane_prepare.lane_id, 'a', 64u);
     lane_prepare.lane_id[64] = '\0';
+    for (uint32_t slot = lane_prepare.start; slot <= lane_prepare.end; ++slot)
+        lane_prepare.slot_bitmap[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
     assert(qihse_cluster_ownership_journal_append_txn(store_dir, &lane_prepare) == 0);
     qihse_cluster_ownership_txn_t lane_commit = lane_prepare;
     lane_commit.phase = QIHSE_OWNERSHIP_COMMITTED;

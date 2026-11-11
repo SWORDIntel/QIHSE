@@ -553,7 +553,11 @@ test-ct-replication-lanes: lib
 
 test-serial: test-ct-replication-lanes
 
-.PHONY: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer
+.PHONY: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer test-ct-lane-lifecycle
+test-ct-lane-lifecycle: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_lifecycle tests/test_ct_lane_lifecycle.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_lane_lifecycle
+
 test-ct-lane-baseline: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_baseline tests/test_ct_lane_baseline.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_baseline
@@ -570,7 +574,7 @@ test-ct-lane-transfer: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_transfer tests/test_ct_lane_transfer.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_transfer
 
-test-serial: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer
+test-serial: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer test-ct-lane-lifecycle
 
 .PHONY: test-cluster-range-authority
 test-cluster-range-authority: lib
@@ -644,6 +648,37 @@ test-ct-brain-balance: cluster-daemon keygen
 	LD_LIBRARY_PATH=. python3 tests/ct_brain_drill.py
 
 test-serial: test-ct-brain-balance
+
+.PHONY: test-ct-group-claim
+test-ct-group-claim: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_group_claim tests/test_ct_group_claim.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_group_claim
+
+test-serial: test-ct-group-claim
+
+.PHONY: test-ownership-lane-transfer
+test-ownership-lane-transfer: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ownership_lane_transfer tests/test_ownership_lane_transfer.c src/spinnaker/qihse_cluster_ownership.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ownership_lane_transfer
+
+test-serial: test-ownership-lane-transfer
+
+.PHONY: test-ownership-lane-abort
+test-ownership-lane-abort: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ownership_lane_abort tests/test_ownership_lane_abort.c src/spinnaker/qihse_cluster_ownership.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ownership_lane_abort
+
+test-serial: test-ownership-lane-abort
+
+.PHONY: test-ct-lane-promotion-recovery test-ct-multigroup-promotion
+test-ct-lane-promotion-recovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ct_lane_promotion_recovery tests/test_ct_lane_promotion_recovery.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_lane_promotion_recovery
+
+test-ct-multigroup-promotion: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/ct_multigroup_promotion_drill.py
+
+test-serial: test-ct-lane-promotion-recovery test-ct-multigroup-promotion
 
 .PHONY: test-ct-group-config test-ct-lane-commands test-ct-multigroup
 test-ct-group-config:
@@ -2428,7 +2463,7 @@ PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_l
     qihse_clickhouse_sql.h qihse_http_api.h \
     qihse_resp_engine.h qihse_resp_wire.h qihse_resp_fts_namespace.h qihse_qkp.h qihse_resp_cluster.h \
     qihse_cluster_bus.h qihse_cluster_maintenance.h qihse_cluster_failover.h qihse_cluster_scatter.h \
-    qihse_ct_codec.h qihse_cluster_ownership.h qihse_cluster_ownership_journal.h qihse_cluster_transfer.h qihse_ct_target.h \
+    qihse_ct_codec.h qihse_ct_group_config.h qihse_cluster_ownership.h qihse_cluster_ownership_journal.h qihse_cluster_transfer.h qihse_ct_target.h \
     qihse_system_guard.h qihse_quota.h qihse_blob.h qihse_bundle.h \
     qihse_consensus.h qihse_consensus_blob.h qihse_consensus_blob_channel.h \
     qihse_consensus_channel.h qihse_consensus_mesh.h qihse_consensus_wire.h \

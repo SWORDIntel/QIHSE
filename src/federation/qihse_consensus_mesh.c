@@ -54,22 +54,34 @@ typedef struct {
     int tx_fd;
     int rx_fd;
     int authority_rx_fd;
+    unsigned consensus_burst;
 } qcm_peer_t;
 
-/* Select the oldest queued consensus item when present. Removing an interior
- * item shifts only the logical queue suffix, preserving FIFO within each kind. */
+/* Prefer election/heartbeat traffic, but give staged payloads bounded
+ * service. A lagging peer can otherwise reject APPEND for missing payloads,
+ * trigger another APPEND, and starve the very stage that permits progress.
+ * FIFO is preserved within each kind; at most eight control sends precede
+ * an already-queued payload stage. */
+#define QCM_CONSENSUS_BURST 8u
 static qcm_tx_item_t* qcm_tx_dequeue(qcm_peer_t* peer) {
     if (!peer || !peer->tx_count) return NULL;
-    size_t selected = 0u;
+    size_t control = SIZE_MAX, stage = SIZE_MAX;
     for (size_t i = 0; i < peer->tx_count; ++i) {
         size_t slot = (peer->tx_head + i) % QCM_QUEUE_PER_PEER;
-        if (peer->tx[slot] && peer->tx[slot]->kind == QCM_TX_CONSENSUS) {
-            selected = i;
-            break;
-        }
+        if (!peer->tx[slot]) continue;
+        if (peer->tx[slot]->kind == QCM_TX_CONSENSUS) {
+            if (control == SIZE_MAX) control = i;
+        } else if (stage == SIZE_MAX) stage = i;
     }
+    size_t selected = control != SIZE_MAX &&
+        (stage == SIZE_MAX || peer->consensus_burst < QCM_CONSENSUS_BURST)
+        ? control : stage;
+    if (selected == SIZE_MAX) return NULL;
     size_t slot = (peer->tx_head + selected) % QCM_QUEUE_PER_PEER;
     qcm_tx_item_t* item = peer->tx[slot];
+    if (item->kind == QCM_TX_CONSENSUS) {
+        if (peer->consensus_burst < QCM_CONSENSUS_BURST) peer->consensus_burst++;
+    } else peer->consensus_burst = 0u;
     for (size_t i = selected; i + 1u < peer->tx_count; ++i) {
         size_t dst = (peer->tx_head + i) % QCM_QUEUE_PER_PEER;
         size_t src = (peer->tx_head + i + 1u) % QCM_QUEUE_PER_PEER;
@@ -96,6 +108,17 @@ bool qihse_consensus_mesh_test_tx_priority(void) {
     const size_t expected[] = {1u, 3u, 0u, 2u, 4u};
     for (size_t i = 0; i < 5u; ++i)
         if (qcm_tx_dequeue(&peer) != &items[expected[i]]) return false;
+    if (peer.tx_count) return false;
+    memset(&peer, 0, sizeof(peer));
+    qcm_tx_item_t flood[12] = {{.kind = QCM_TX_STAGE_BLOB}};
+    for (size_t i = 1u; i < 12u; ++i) flood[i].kind = QCM_TX_CONSENSUS;
+    for (size_t i = 0u; i < 12u; ++i) peer.tx[i] = &flood[i];
+    peer.tx_count = 12u;
+    for (size_t i = 1u; i <= QCM_CONSENSUS_BURST; ++i)
+        if (qcm_tx_dequeue(&peer) != &flood[i]) return false;
+    if (qcm_tx_dequeue(&peer) != &flood[0]) return false;
+    for (size_t i = QCM_CONSENSUS_BURST + 1u; i < 12u; ++i)
+        if (qcm_tx_dequeue(&peer) != &flood[i]) return false;
     return peer.tx_count == 0u;
 }
 #endif
@@ -630,6 +653,30 @@ static void* qcm_accept_main(void* opaque) {
     return NULL;
 }
 
+/* A stream can outlive an election. Reassert current leadership before
+ * staging data, not just when connecting while already leader. */
+static bool qcm_tx_leader_contact(qihse_consensus_mesh_t* mesh,
+    size_t peer_index, qihse_qkp_session_t* session, int fd,
+    const qihse_consensus_channel_config_t* channel, uint64_t* out_term) {
+    if (out_term) *out_term = 0u;
+    qihse_consensus_msg_t probe = {0};
+    pthread_mutex_lock(&mesh->state_lock);
+    bool leader = qihse_consensus_role(mesh->consensus) == QIHSE_CONSENSUS_LEADER;
+    if (leader) {
+        probe.type = QIHSE_CONSENSUS_MSG_APPEND;
+        snprintf(probe.group_id, sizeof(probe.group_id), "%s", mesh->consensus_config.group_id);
+        probe.from = mesh->consensus_config.self;
+        probe.to = mesh->peers[peer_index].uuid;
+        probe.term = qihse_consensus_term(mesh->consensus);
+        probe.fencing_epoch = qihse_consensus_fencing_epoch(mesh->consensus);
+        probe.u.append.leader_commit = qihse_consensus_commit_index(mesh->consensus);
+        if (out_term) *out_term = probe.term;
+    }
+    pthread_mutex_unlock(&mesh->state_lock);
+    return !leader || qihse_consensus_channel_send(session, fd, channel,
+        mesh->principal, &probe);
+}
+
 static void* qcm_tx_main(void* opaque) {
     qcm_tx_arg_t* arg = opaque;
     size_t peer_index = arg->peer_index;
@@ -674,30 +721,7 @@ static void* qcm_tx_main(void* opaque) {
             continue;
         }
         qcm_debug("connected to peer %s", mesh->peers[peer_index].node_id);
-        /* A restarted receiver has forgotten its volatile leader identity.
-         * Reassert the current leader on every authenticated stream before
-         * queued snapshot chunks can arrive; this empty prefix probe is also
-         * understood by legacy QCS1 peers. */
-        qihse_consensus_msg_t leader_probe;
-        memset(&leader_probe, 0, sizeof(leader_probe));
-        pthread_mutex_lock(&mesh->state_lock);
-        bool probe_is_leader = qihse_consensus_role(mesh->consensus) ==
-                               QIHSE_CONSENSUS_LEADER;
-        if (probe_is_leader) {
-            leader_probe.type = QIHSE_CONSENSUS_MSG_APPEND;
-            snprintf(leader_probe.group_id, sizeof(leader_probe.group_id),
-                     "%s", mesh->consensus_config.group_id);
-            leader_probe.from = mesh->consensus_config.self;
-            leader_probe.to = mesh->peers[peer_index].uuid;
-            leader_probe.term = qihse_consensus_term(mesh->consensus);
-            leader_probe.fencing_epoch =
-                qihse_consensus_fencing_epoch(mesh->consensus);
-            leader_probe.u.append.leader_commit =
-                qihse_consensus_commit_index(mesh->consensus);
-        }
-        pthread_mutex_unlock(&mesh->state_lock);
-        if (probe_is_leader && !qihse_consensus_channel_send(session, fd,
-                &channel, mesh->principal, &leader_probe)) {
+        if (!qcm_tx_leader_contact(mesh, peer_index, session, fd, &channel, NULL)) {
             qcm_debug("leader-contact probe to %s failed",
                       mesh->peers[peer_index].node_id);
             qihse_qkp_session_free(session);
@@ -727,15 +751,38 @@ static void* qcm_tx_main(void* opaque) {
             bool sent = false;
             if (item->kind == QCM_TX_CONSENSUS && item->value.consensus) {
                 qihse_consensus_msg_t* message = item->value.consensus;
-                sent = qihse_consensus_channel_send(session, fd, &channel,
-                                                     mesh->principal, message);
+                sent = true;
+                if (message->type == QIHSE_CONSENSUS_MSG_APPEND &&
+                    message->u.append.entry_count) {
+                    uint64_t leader_term = 0u;
+                    sent = qcm_tx_leader_contact(mesh, peer_index, session, fd,
+                        &channel, &leader_term);
+                    /* An offline follower may lack blobs for historical
+                     * committed entries, not merely the newest proposal.
+                     * Stage each referenced payload before its APPEND. The
+                     * content-addressed channel answers HAVE on retries. */
+                    for (size_t e = 0u; sent && leader_term == message->term &&
+                         e < message->u.append.entry_count; ++e) {
+                        const qihse_consensus_entry_t* entry = &message->u.append.entries[e];
+                        if (entry->type != QIHSE_CONSENSUS_ENTRY_DATA ||
+                            entry->payload_len != QIHSE_CONSENSUS_BLOB_REF_BYTES ||
+                            memcmp(entry->payload, "QBR1", 4u)) continue;
+                        sent = qihse_consensus_blob_channel_send(mesh->blob_context,
+                            session, fd, &channel, mesh->principal, entry);
+                    }
+                }
+                if (sent) sent = qihse_consensus_channel_send(session, fd, &channel,
+                    mesh->principal, message);
                 if (!sent) qcm_debug("send to %s failed for msg type %d term %llu",
                     mesh->peers[peer_index].node_id, (int)message->type,
                     (unsigned long long)message->term);
             } else if (item->kind == QCM_TX_STAGE_BLOB && item->value.stage) {
-                sent = qihse_consensus_blob_channel_send(mesh->blob_context,
-                    session, fd, &channel, mesh->principal,
-                    &item->value.stage->entry);
+                uint64_t leader_term = 0u;
+                sent = qcm_tx_leader_contact(mesh, peer_index, session, fd,
+                    &channel, &leader_term) && leader_term &&
+                    qihse_consensus_blob_channel_send(mesh->blob_context,
+                        session, fd, &channel, mesh->principal,
+                        &item->value.stage->entry);
 #ifdef QIHSE_CONSENSUS_MESH_TESTING
                 /* The receive side has durably imported the blob before the
                  * channel returns success. Treating that ACK as lost forces

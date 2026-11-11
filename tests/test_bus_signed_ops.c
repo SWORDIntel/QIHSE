@@ -346,10 +346,14 @@ static void test_real_sender_wire_and_max_payload(void) {
      * the ordinary datagram sender below. */
     qihse_cluster_node_t local_node;
     assert(qihse_cluster_topology_get_node(f.topology, 0, &local_node));
-    local_node.has_uuid = true;
-    memcpy(local_node.node_uuid, f.peer.node_id.bytes,
-           sizeof(local_node.node_uuid));
-    assert(qihse_cluster_topology_upsert_node(f.topology, &local_node, NULL));
+    /* Upsert derives a UUID from the cluster node ID; it does not accept an
+     * arbitrary UUID in the supplied node. Explicitly bind this fixture's
+     * enrolled signing identity through the identity-binding API. */
+    assert(qihse_cluster_topology_set_node_uuid(f.topology, 0,
+        f.peer.node_id.bytes));
+    assert(qihse_cluster_topology_get_node(f.topology, 0, &local_node));
+    assert(local_node.has_uuid && memcmp(local_node.node_uuid,
+        f.peer.node_id.bytes, sizeof(local_node.node_uuid)) == 0);
     f.bus = qihse_cluster_bus_create(&cfg);
     assert(f.bus && qihse_cluster_bus_start(f.bus));
 
@@ -381,6 +385,22 @@ static void test_real_sender_wire_and_max_payload(void) {
     assert(qihse_cluster_bus_ct1_promotion_v2_seal(&promotion));
     uint8_t* certificate = NULL;
     size_t certificate_len = 0;
+    /* QCP2 binds the base digest, but sealing its outer digest does not
+     * populate base.event_digest. An incompletely sealed producer record
+     * must not become a signed authority certificate. Match the actual
+     * failover producer's base-then-QCP2 sequence below. */
+    assert(!qihse_cluster_bus_ct1_promotion_certificate_create(f.bus,
+        &promotion, &certificate, &certificate_len));
+    assert(!certificate && certificate_len == 0u);
+    assert(qihse_cluster_bus_ct1_promotion_seal(&promotion.base));
+    assert(qihse_cluster_bus_ct1_promotion_v2_seal(&promotion));
+
+    /* A field changed after sealing must also be rejected before signing. */
+    promotion.base.durable_cursor++;
+    assert(!qihse_cluster_bus_ct1_promotion_certificate_create(f.bus,
+        &promotion, &certificate, &certificate_len));
+    assert(!certificate && certificate_len == 0u);
+    promotion.base.durable_cursor--;
     assert(qihse_cluster_bus_ct1_promotion_certificate_create(f.bus,
         &promotion, &certificate, &certificate_len));
     assert(certificate && certificate_len <= QIHSE_CLUSTER_BUS_CT1_CERTIFICATE_MAX);
@@ -394,6 +414,18 @@ static void test_real_sender_wire_and_max_payload(void) {
         sizeof(promotion.event_digest)) == 0);
     assert(memcmp(verified_signer.bytes, f.peer.node_id.bytes,
         sizeof(verified_signer.bytes)) == 0);
+    certificate[QIHSE_CLUSTER_BUS_HEADER_SIZE] ^= 1u;
+    assert(!qihse_cluster_bus_ct1_certificate_verify(f.bus, certificate,
+        certificate_len, &verified_promotion, &verified_signer));
+    qihse_cluster_bus_ct1_promotion_update_v2_t empty_promotion = {0};
+    qihse_uuid_t empty_signer = {0};
+    assert(memcmp(&verified_promotion, &empty_promotion,
+        sizeof(verified_promotion)) == 0);
+    assert(memcmp(&verified_signer, &empty_signer,
+        sizeof(verified_signer)) == 0);
+    certificate[QIHSE_CLUSTER_BUS_HEADER_SIZE] ^= 1u;
+    assert(qihse_cluster_bus_ct1_certificate_verify(f.bus, certificate,
+        certificate_len, &verified_promotion, &verified_signer));
     qihse_cluster_bus_ct1_certificate_free(certificate, certificate_len);
 
     uint8_t payload[QIHSE_CLUSTER_BUS_MAX_PAYLOAD];

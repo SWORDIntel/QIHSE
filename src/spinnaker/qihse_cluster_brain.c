@@ -254,6 +254,7 @@ static bool brain_node_caps(brain_t* brain, uint16_t index,
 
 static brain_t* g_brain = NULL;
 static pthread_mutex_t g_brain_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_brain_wake = PTHREAD_COND_INITIALIZER;
 
 static uint64_t brain_now_ms(void) {
     struct timespec ts;
@@ -2095,9 +2096,13 @@ static void* brain_main(void* argument) {
         if (brain->maintenance_gate) qihse_cluster_maintenance_leave(
             brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN);
         }
-        uint32_t ms = brain->interval_seconds * 1000u;
-        struct timespec ts = { (time_t)(ms / 1000u), (long)((ms % 1000u) * 1000000L) };
-        nanosleep(&ts, NULL);
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += (time_t)brain->interval_seconds;
+        pthread_mutex_lock(&g_brain_lock);
+        while (__atomic_load_n(&brain->running, __ATOMIC_ACQUIRE) &&
+               pthread_cond_timedwait(&g_brain_wake, &g_brain_lock, &deadline) == 0) {}
+        pthread_mutex_unlock(&g_brain_lock);
     }
     if (started && (!brain->maintenance_gate || qihse_cluster_maintenance_enter(
             brain->maintenance_gate, QIHSE_MAINT_WRITER_BRAIN))) {
@@ -2280,9 +2285,12 @@ void qihse_cluster_brain_stop(void) {
     pthread_mutex_lock(&g_brain_lock);
     brain_t* brain = g_brain;
     g_brain = NULL;
+    if (brain) {
+        __atomic_store_n(&brain->running, false, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_brain_wake);
+    }
     pthread_mutex_unlock(&g_brain_lock);
     if (!brain) return;
-    __atomic_store_n(&brain->running, false, __ATOMIC_RELEASE);
     pthread_join(brain->thread, NULL); /* thread finishes its cycle on its own struct */
     /* The brain thread is joined, so no round is in flight: this parks the
      * idle workers and joins them before the brain struct goes away. */

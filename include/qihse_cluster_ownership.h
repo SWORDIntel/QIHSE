@@ -53,6 +53,9 @@ typedef bool (*qihse_cluster_ownership_lane_verify_claim_fn)(
     void* context, qihse_user_t* principal,
     const qihse_kv_ct_lane_authority_claim_t* claim,
     bool require_final_decision);
+typedef bool (*qihse_cluster_ownership_lane_verify_aborted_fn)(
+    void* context, qihse_user_t* principal,
+    const qihse_kv_ct_lane_authority_claim_t* claim);
 typedef bool (*qihse_cluster_ownership_range_refresh_fn)(
     void* context, qihse_user_t* principal,
     const uint8_t slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
@@ -83,6 +86,9 @@ typedef struct qihse_cluster_ownership_context {
     qihse_cluster_ownership_promotion_finalize_fn range_finalize_promotion;
     qihse_cluster_ownership_lane_claim_fn lane_claim;
     qihse_cluster_ownership_lane_verify_claim_fn lane_verify_claim;
+    /* A committed cancellation is a different decision from FINAL. This
+     * verifier must consult the actual common ABORT, never a caller flag. */
+    qihse_cluster_ownership_lane_verify_aborted_fn lane_verify_aborted;
     /* Refresh routing from committed common ownership after a lane proof is
      * verified. The adapter derives owner IDs/epochs itself; no caller map is
      * accepted. */
@@ -272,16 +278,23 @@ void qihse_cluster_ownership_bus_update_callback(
  * revalidate the checksum, finish the persistent source fence, and only then
  * adopt the owner map. An unfinished PREPARED phase returns false and sets
  * out_unresolved so the embedding can keep listeners/writers paused. */
+/* Finish locally staged range membership from the actual committed common
+ * decision. Safe for source, destination and destination successor, including
+ * restart or missed bus delivery; RESERVED never admits data. */
+bool qihse_cluster_ownership_reconcile_lane_transfer(
+    qihse_cluster_ownership_context_t* context, char* err, size_t err_cap);
+
 bool qihse_cluster_ownership_replay(
     qihse_cluster_ownership_context_t* context, bool* out_unresolved,
     char* err, size_t err_cap);
 
 /* Control-plane startup variant: returns true when the journal is valid even
  * if the final CT2 transaction still needs its peer. In that case
- * out_unresolved remains true and callers MUST keep ordinary data listeners
- * closed while allowing only pinned CT recovery commands. Reinvoke after a
- * peer ACTIVATE/receipt exchange; it returns unresolved=false only after the
- * durable FINALIZED phase has been locally replayed. */
+ * out_unresolved remains true. Legacy singleton recovery keeps ordinary
+ * listeners closed. A verified group transfer retains its KV range fence,
+ * allowing unrelated groups to serve while the exact operation is retried.
+ * Reinvoke after a peer ACTIVATE/receipt exchange; unresolved becomes false
+ * only after the durable FINALIZED phase has been locally replayed. */
 bool qihse_cluster_ownership_replay_control(
     qihse_cluster_ownership_context_t* context, bool* out_unresolved,
     char* err, size_t err_cap);

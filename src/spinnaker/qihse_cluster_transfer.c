@@ -23,9 +23,15 @@ static bool group_claim_text_valid(const char* text, size_t width,
     if (!text) return false;
     size_t len = strnlen(text, width + 1u);
     if (!len || len > width || (exact_length && len != exact_length)) return false;
-    if (hex_only) for (size_t i = 0; i < len; ++i)
-        if (!((text[i] >= '0' && text[i] <= '9') ||
-              (text[i] >= 'a' && text[i] <= 'f'))) return false;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (hex_only) {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                return false;
+        } else if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                     c == '.' || c == ':')) return false;
+    }
     return true;
 }
 
@@ -79,15 +85,15 @@ bool qihse_cluster_transfer_claim_encode(
         !group_claim_encode_text(&p, claim->target_group_id,
             QIHSE_KV_CT_LANE_ID_MAX, QIHSE_KV_CT_LANE_ID_MAX, true) ||
         !group_claim_encode_text(&p, claim->source_qkp_id,
-            QIHSE_KV_CT_ID_MAX, 64u, true) ||
+            QIHSE_KV_CT_ID_MAX, 0u, false) ||
         !group_claim_encode_text(&p, claim->target_qkp_id,
-            QIHSE_KV_CT_ID_MAX, 64u, true) ||
+            QIHSE_KV_CT_ID_MAX, 0u, false) ||
         !group_claim_encode_text(&p, claim->source_generation,
             QIHSE_KV_CT_ID_MAX, 32u, true) ||
         !group_claim_encode_text(&p, claim->target_generation,
             QIHSE_KV_CT_ID_MAX, 32u, true) ||
         !group_claim_encode_text(&p, claim->successor_qkp_id,
-            QIHSE_KV_CT_ID_MAX, 64u, true)) {
+            QIHSE_KV_CT_ID_MAX, 0u, false)) {
         OPENSSL_cleanse(out, QIHSE_CT_GROUP_CLAIM_WIRE_BYTES);
         return false;
     }
@@ -130,15 +136,15 @@ bool qihse_cluster_transfer_claim_decode(const void* wire, size_t wire_len,
         !group_claim_decode_text(&p, out_claim->target_group_id,
             QIHSE_KV_CT_LANE_ID_MAX, QIHSE_KV_CT_LANE_ID_MAX, true) ||
         !group_claim_decode_text(&p, out_claim->source_qkp_id,
-            QIHSE_KV_CT_ID_MAX, 64u, true) ||
+            QIHSE_KV_CT_ID_MAX, 0u, false) ||
         !group_claim_decode_text(&p, out_claim->target_qkp_id,
-            QIHSE_KV_CT_ID_MAX, 64u, true) ||
+            QIHSE_KV_CT_ID_MAX, 0u, false) ||
         !group_claim_decode_text(&p, out_claim->source_generation,
             QIHSE_KV_CT_ID_MAX, 32u, true) ||
         !group_claim_decode_text(&p, out_claim->target_generation,
             QIHSE_KV_CT_ID_MAX, 32u, true) ||
         !group_claim_decode_text(&p, out_claim->successor_qkp_id,
-            QIHSE_KV_CT_ID_MAX, 64u, true)) goto invalid;
+            QIHSE_KV_CT_ID_MAX, 0u, false)) goto invalid;
     if ((size_t)(end - p) < sizeof(out_claim->slots)) goto invalid;
     memcpy(out_claim->slots, p, sizeof(out_claim->slots)); p += sizeof(out_claim->slots);
     if ((size_t)(end - p) != 232u) goto invalid;
@@ -1008,7 +1014,6 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
     if (!c || !ownership || !ownership->store || !ownership->principal ||
         !ownership->data_principal || !ownership->resp_server || !transfer_id ||
         !*transfer_id || strlen(transfer_id) > QIHSE_OWNERSHIP_ID_MAX ||
-        !expected_source_generation || strlen(expected_source_generation) != 32u ||
         first_slot > last_slot || last_slot >= QIHSE_CLUSTER_SLOT_COUNT ||
         source_index == target_index || !ownership->range_authority_context ||
         !ownership->lane_claim || !ownership->lane_verify_claim) {
@@ -1023,6 +1028,35 @@ qihse_cluster_transfer_result_t qihse_cluster_transfer_range_group(
         qihse_user_get_tenant_id(ownership->data_principal) != QIHSE_TENANT_SYSTEM) {
         set_error(err, err_cap, "group transfer requires an active system Operator and system data principal");
         errno = EACCES;
+        return QIHSE_CLUSTER_TRANSFER_REJECTED;
+    }
+    /* Manual callers omit the generation. Pin it to the original local
+     * operation when retrying, or to the actual SOURCE group for a new move. */
+    char resolved_generation[33] = {0};
+    if (!expected_source_generation) {
+        qihse_cluster_ownership_txn_t previous = {0};
+        if (qihse_cluster_ownership_transfer_get_finalized(ownership, transfer_id,
+                &previous, NULL, 0) ||
+            qihse_cluster_ownership_transfer_get_committed(ownership, transfer_id,
+                &previous, NULL, 0) ||
+            qihse_cluster_ownership_transfer_get_prepared(ownership, transfer_id,
+                &previous, NULL, 0)) {
+            if (strlen(previous.generation) == 32u)
+                memcpy(resolved_generation, previous.generation, 33u);
+        } else {
+            uint8_t slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+            for (uint32_t slot = first_slot; slot <= last_slot; ++slot)
+                slots[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+            qihse_kv_ct_lane_status_t source = {0};
+            if (qihse_kv_ct_lane_source_for_slots(ownership->store,
+                    ownership->principal, slots, &source) &&
+                strlen(source.generation) == 32u)
+                memcpy(resolved_generation, source.generation, 33u);
+        }
+        expected_source_generation = resolved_generation;
+    }
+    if (strlen(expected_source_generation) != 32u) {
+        set_error(err, err_cap, "source group generation is unavailable");
         return QIHSE_CLUSTER_TRANSFER_REJECTED;
     }
     /* Resolve durable group history against the common FINAL decision before

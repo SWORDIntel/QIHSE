@@ -15,6 +15,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import pathlib
 import time
 import uuid
 
@@ -34,12 +35,27 @@ OWNER = {"group-a": "lead", "group-b": "successor", "group-c": "joiner"}
 SUCCESSOR = {"group-a": "joiner", "group-b": "lead", "group-c": "successor"}
 
 
+class GroupCluster(IsolatedCluster):
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is not None:
+            # Preserve the actual unmet runtime condition before temporary
+            # daemon logs are removed by the shared harness cleanup.
+            for name, log in self.logs.items():
+                log.flush()
+                detail = "\n".join(line for line in
+                    pathlib.Path(log.name).read_text(errors="replace").splitlines()
+                    if "sealed session ended" not in line)[-20000:]
+                print(f"--- CT group {name} daemon ---\n{detail}", file=sys.stderr)
+        return super().__exit__(exc_type, exc, traceback)
+
+
 def command(session, *args):
     return parse_resp_frame(session.execute_resp(*args))
 
 
 def write_when_ready(session, key, value, operation, timeout=45):
     deadline = time.monotonic() + timeout
+    reply = None
     while time.monotonic() < deadline:
         reply = command(session, "SET", key, value)
         if isinstance(reply, tuple) and reply[0] == "status":
@@ -50,7 +66,7 @@ def write_when_ready(session, key, value, operation, timeout=45):
             time.sleep(0.1)
             continue
         raise AssertionError(f"{operation}: {reply!r}")
-    raise AssertionError(f"{operation}: owner lane never became writable")
+    raise AssertionError(f"{operation}: owner lane never became writable: {reply!r}")
 
 
 def tag_for(first, last, label):
@@ -91,12 +107,12 @@ def wait_value(session, key, expected, timeout=45):
             time.sleep(0.1)
             continue
         time.sleep(0.1)
-    raise AssertionError(f"value did not converge for {key}")
+    raise AssertionError(f"value did not converge for {key}; last reply: {reply!r}")
 
 
 def group_source_status(peer, lane_id):
     reply = command(peer, "REPL.CT1", "STATUS", lane_id)
-    if not isinstance(reply, list) or len(reply) != 13 or reply[0] != lane_id.encode():
+    if not isinstance(reply, list) or len(reply) != 14 or reply[0] != lane_id.encode():
         raise AssertionError(f"unexpected CT1 source lane status: {reply!r}")
     return {
         "source_id": reply[1].decode(), "generation": reply[2].decode(),
@@ -104,6 +120,7 @@ def group_source_status(peer, lane_id):
         "acknowledged_position": int(reply[5]), "baseline_row_seq": int(reply[8]),
         "baseline_stream_cut": int(reply[9]), "baseline_digest": reply[10].decode(),
         "certificate_head": reply[11].decode(), "certificate_ack": reply[12].decode(),
+        "scope_digest": reply[13].decode(),
     }
 
 
@@ -196,7 +213,7 @@ finally:
 def main():
     if not (ROOT / "qihse-cluster-daemon").is_file():
         raise AssertionError("build the integrated daemon before running this drill")
-    with IsolatedCluster(prefix="ct-multigroup-") as cluster:
+    with GroupCluster(prefix="ct-multigroup-") as cluster:
         for name in NODES:
             cluster.reserve_endpoint(name)
         topology = {name: topology_id_for(*cluster.endpoints[name]) for name in NODES}
@@ -236,6 +253,8 @@ def main():
 
         def start(name, *, brain=False, target_clearance=65535, target_sci=65535):
             extra = list(group_args)
+            if name == "successor":
+                extra.append("--failover-start-paused")
             extra.extend(["--consensus-group", "ct-multigroup-ring",
                           "--consensus-self", mesh_members[name],
                           "--consensus-listen-ip", "127.0.0.1",
@@ -258,9 +277,8 @@ def main():
                                   str(cluster.identity_file(candidate, "qihse_dsa_pub.pem"))])
             # Existing service-principal knobs provide the authorization
             # negative path without adding a test-only daemon account.
-            if name == "joiner":
-                extra.extend(["--replication-principal-clearance", str(target_clearance),
-                              "--replication-principal-sci", str(target_sci)])
+            extra.extend(["--replication-principal-clearance", str(target_clearance),
+                          "--replication-principal-sci", str(target_sci)])
             if not brain:
                 # Group mode defaults every daemon to an acting brain. Keep
                 # this setup phase observation-only so no range moves before
@@ -284,6 +302,8 @@ def main():
             futures = {pool.submit(start, name): name for name in NODES}
             for future in as_completed(futures, timeout=90):
                 admins[futures[future]] = future.result()
+
+        print(f"CT group fixture: {cluster.root}", flush=True)
 
         # Build the three authenticated CT1 pairs in the configured ring.
         # Each client authenticates as the source or receiver identity pinned
@@ -326,6 +346,9 @@ def main():
                 sum(owner == topology["joiner"] for owner in initial.values()) != 3192):
             raise AssertionError("initial ring ownership counts differ from the configured lane runs")
 
+        wait_value(admins["lead"], protected_key, protected_value.encode())
+        print("PASS initial writes and three independent replication pairs", flush=True)
+
         # Restart B with the same full ring map. It must retain its own B group
         # and its receiver state for C's group before A starts balancing.
         admins["successor"].close()
@@ -342,12 +365,13 @@ def main():
         # presence is established by CT1 durable-cursor progress, not GET.
         if command(admins["lead"], "GET", protected_key) != protected_value.encode():
             raise AssertionError("generic classified source row is missing on A")
-        # Reopen C with low clearance and SCI so CT2 target authorization must
-        # refuse the protected group and preserve A's durable pending tuple.
-        admins["joiner"].close()
-        cluster.processes["joiner"].terminate()
-        cluster.processes["joiner"].wait(timeout=15)
-        admins["joiner"] = start("joiner", target_clearance=0, target_sci=0)
+        # D=B is the destination C's successor. Its low-clearance principal
+        # must refuse protected incoming A rows without disrupting A's existing
+        # full-clearance replica C (which must ACK A's restart baseline).
+        admins["successor"].close()
+        cluster.processes["successor"].terminate()
+        cluster.processes["successor"].wait(timeout=15)
+        admins["successor"] = start("successor", target_clearance=0, target_sci=0)
 
         # Enable brain actuation only after all three groups have data and receiver
         # cursors. A->C is the only expected transfer; the lane selector clamps
@@ -358,7 +382,20 @@ def main():
         admins["lead"] = start("lead", brain=True)
         # A denied target keeps the source fenced and the same durable tuple;
         # do not use an unavailable source read as evidence of data loss.
-        time.sleep(8)
+        durable_pending_path = cluster.root / "brain-a" / "ct2-pending"
+        deadline = time.monotonic() + 40
+        while not durable_pending_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        # Establish that this is the data-bearing successor denial, rather
+        # than an unrelated setup failure that merely left ownership on A.
+        deadline = time.monotonic() + 35
+        while time.monotonic() < deadline:
+            diagnostic = (cluster.root / "lead.log").read_text(errors="replace")
+            if "C or D did not persist the identical composite image seal" in diagnostic:
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("protected successor import did not reach the seal-denial leg")
         denied_view = owner_map(admins["successor"])
         if denied_view is None or denied_view.get(protected_slot) != topology["lead"]:
             raise AssertionError("clearance/SCI denial changed A ownership before authorization")
@@ -369,14 +406,23 @@ def main():
                 not (denied_pending[1] <= protected_slot <= denied_pending[2] <= planned_last)):
             raise AssertionError(f"low-clearance target did not retain the exact A->C fenced tuple: {denied_pending!r}")
 
-        # Raise C's data principal through the existing startup configuration.
-        # The source brain retries the same fenced operation and the local
-        # finalized receipt path must be stable if C had already completed it.
+        print(f"PASS protected range stayed on A; retry tuple {denied_pending[5]}", flush=True)
+
+        # Reopen C's prepared journal while D still refuses the protected
+        # range; C's own group must remain available during scoped recovery.
+        # Then restore D's data clearance through the existing configuration.
+        # A retries the same operation, including its already staged C image.
         admins["joiner"].close()
         cluster.processes["joiner"].terminate()
         cluster.processes["joiner"].wait(timeout=15)
         admins["joiner"] = start("joiner")
+        wait_value(admins["joiner"], keys["joiner"], values["joiner"])
+        admins["successor"].close()
+        cluster.processes["successor"].terminate()
+        cluster.processes["successor"].wait(timeout=15)
+        admins["successor"] = start("successor")
         lane_clients = open_lane_clients()
+        print("CHECK resuming the staged range with restored successor clearance", flush=True)
         deadline = time.monotonic() + 90
         final = {}
         while time.monotonic() < deadline:
@@ -392,17 +438,34 @@ def main():
                     break
             time.sleep(0.2)
         else:
-            raise AssertionError(f"CT2 multi-group transfer did not converge: {final!r}")
+            summary = {name: None if mapping is None else {
+                "owner_counts": {node: sum(owner == topology[node] for owner in mapping.values())
+                                 for node in NODES},
+                "protected_owner": mapping.get(protected_slot)}
+                for name, mapping in final.items()}
+            raise AssertionError(f"CT2 multi-group transfer did not converge: {summary!r}")
         completed_pending = pending_tuple(durable_pending_path)
-        if completed_pending != (0, *denied_pending[1:]):
+        if completed_pending[5] == denied_pending[5] and completed_pending != (0, *denied_pending[1:]):
             raise AssertionError(f"CT2 retry changed its durable tuple: {completed_pending!r} != {denied_pending!r}")
+        # A may already be balancing a second range. Prove the original
+        # operation's immutable completion through the authenticated manual
+        # retry API, independently of the brain's current pending slot.
+        original_retry = command(admins["lead"], "CLUSTER", "CT2", "TRANSFER",
+            denied_pending[4], f"{denied_pending[1]}-{denied_pending[2]}", denied_pending[5])
+        if original_retry != ("status", b"COMMITTED"):
+            raise AssertionError(f"original CT2 completion was not recoverable: {original_retry!r}")
 
         # C now owns migrated group-A slots and continues owning group C, while
         # its source replica C->B and its pre-existing A receiver both remain.
         wait_value(admins["lead"], keys["lead"], values["lead"])
         wait_value(admins["successor"], keys["successor"], values["successor"])
         wait_value(admins["joiner"], keys["joiner"], values["joiner"])
-        wait_value(admins["joiner"], protected_key, protected_value.encode())
+        try:
+            wait_value(admins["joiner"], protected_key, protected_value.encode())
+        except AssertionError:
+            for label, (outbound, inbound) in lane_clients.items():
+                print(f"CT1 diagnostic {label}: source={group_source_status(inbound, group_ids[label])!r} receiver={group_receiver_status(outbound, group_ids[label])!r}", flush=True)
+            raise
         post_transfer_key = f"{{{tags['joiner']}}}:post-transfer-write"
         write_when_ready(admins["joiner"], post_transfer_key,
                          "C remains a live owner", "write C-owned group after CT2")

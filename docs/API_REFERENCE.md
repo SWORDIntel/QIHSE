@@ -41,7 +41,7 @@ nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
 ```
 
 The nine headers of [§1](#1-federation-core--includeqihse_federationh)–[§7](#7-security-and-authentication--includeqihse_authh)
-declare 315 `qihse_*` functions between them, and 312 of those resolve to a
+declare 406 `qihse_*` functions between them, and 403 of those resolve to a
 symbol in `libqihse.so`. The three that do not are the expected exception:
 `qihse_kv_get()`, `qihse_kv_del()` and `qihse_kv_exists()` are `static inline`
 wrappers in `include/qihse_kv_store.h`, so they compile into the caller rather
@@ -69,10 +69,19 @@ above):
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 17 | 17 |
-| `include/qihse_kv_store.h` | 104 | 101 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 144 | 141 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
+
+**Installed headers.** `make install-headers PREFIX=... DESTDIR=...` installs
+public roots under `include/qihse/`, including `qihse_ct_group_config.h` required
+by the RESP interfaces. Transitive `memory/`, `orchestration/` and `core/`
+headers remain relative to the SDK's `include/` root so existing relative
+includes resolve. Add that root to the compiler include path; for example,
+use `<qihse/qihse_resp_engine.h>` and
+`<orchestration/include/qihse_hetero.h>`. The staged-install test compiles each
+public header independently and links C and C++ consumers outside the checkout.
 
 - **Security context.** Federation entry points take `void* store_void` (a
   `qihse_kv_store_t*`) and `void* user_void` (a `qihse_user_t*`). The `void*`
@@ -685,6 +694,17 @@ intentionally restricted to unclassified data.
 | `int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq)` | In-memory delta: exactly the mutations strictly greater than `since_seq`, in ascending sequence order, tombstones included, authorization-filtered at the KV layer. The resume point is the highest sequence the principal may see — never the global high-water, so hidden mutations cannot be counted from it. | non-zero |
 | `int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user, uint64_t since_seq, uint64_t* out_resume_seq)` | File form of the same delta stream; `qihse_backup_incremental_user()` ([§2.3](#23-snapshot-backup--includeqihse_backuph)) seals it into a `BACKUP_INCREMENTAL` container. | non-zero |
 | `void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)` | Release a delta record array. | n/a |
+
+**Group baseline scope.**
+`qihse_kv_ct_lane_baseline_scope_digest(snapshot, principal, out_digest)` returns
+the immutable 32-byte membership digest captured by
+`qihse_kv_ct_lane_source_baseline_snapshot_create()`. It requires the snapshot's
+authenticated principal and rejects ordinary unscoped snapshots; failure zeros
+the output. A receiver checks this digest and the source's current membership
+against its own group before replacing data. A source membership change does
+not change the scope of an existing snapshot handle. Group STATUS appends the
+current scope digest (14 fields total), and group BASELINE STATUS appends the
+snapshot scope digest (8 fields total).
 
 ### Durable batch SET contract
 
@@ -2118,7 +2138,7 @@ below) and is wired into the `make test` aggregate.
 Protocol changes in the same round:
 
 - **Joint consensus** in the scoped consensus module: `qihse_consensus_propose_joint()` — two-phase C_old,new bulk membership transitions with a dual-majority quorum (majority of C_old AND of the current fold) and a survivor rule against mid-joint stranding. Tests j1–j4 in `tests/test_consensus.c`.
-- **Signed bus ops frames**: SLOT/NODE/GROUP updates carry an ML-DSA-87 trailer verified against the signer's ENROLLED identity (algorithm of record from the enrollment, never a wire-claimed byte). Daemon flags: `--node-key PATH`, `--require-signed-ops`.
+- **Signed bus ops frames**: SLOT/NODE/GROUP updates carry an ML-DSA-87 trailer verified against the signer's ENROLLED identity (algorithm of record from the enrollment, never a wire-claimed byte). Daemon flags: `--node-key PATH`, `--require-signed-ops`. Ordinary signed datagrams allow the full 8,192-byte payload plus header and signature trailer (12,860 bytes total); persisted CT1 promotion certificates retain their separate 8,192-byte envelope limit.
 - **Lease wire TTL contract**: FEDERATION LEASE.ACQUIRE/RENEW take a TTL in ms from the server's now (default `QIHSE_FEDERATION_LEASE_DEFAULT_TTL_MS`, 60s); the server stores the absolute expiry. The core APIs remain absolute.
 - **Audit fork safety**: `pthread_atfork` handlers fence the audit signer around fork and restart it in the child — a forked process no longer inherits frozen audit mutexes.
 

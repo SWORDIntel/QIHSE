@@ -47,14 +47,6 @@ static char *key_for_slot(const char *prefix, uint16_t wanted_slot) {
     return NULL;
 }
 
-static void assert_value(qihse_kv_store_t *store, qihse_user_t *user,
-                         const char *key, const char *expected) {
-    char *value = qihse_kv_get_user(store, key, user);
-    if (expected) assert(value && strcmp(value, expected) == 0);
-    else assert(value == NULL);
-    free(value);
-}
-
 static void copy_snapshot(qihse_kv_replica_snapshot_t *snapshot,
                           qihse_user_t *principal, const char *path) {
     uint64_t size = 0u;
@@ -294,6 +286,28 @@ static int empty_lane_process(const char *data_dir, const char *image_path) {
     /* Other local data may advance the row watermark before this group joins. */
     assert(qihse_kv_set_user(store, "node-local", "outside-group", 0u, 0u,
                              operator_user));
+    qihse_kv_replica_snapshot_t *nonempty_snapshot = NULL;
+    assert(qihse_kv_replica_snapshot_create(store, operator_user, "*",
+        &nonempty_snapshot) == 0);
+    uint64_t nonempty_size = 0u;
+    assert(qihse_kv_replica_snapshot_size(nonempty_snapshot, operator_user,
+        &nonempty_size));
+    unsigned char snapshot_bytes[4096], nonempty_digest[32];
+    size_t snapshot_read = 0u;
+    assert(nonempty_size > 0u && nonempty_size <= sizeof(snapshot_bytes));
+    assert(qihse_kv_replica_snapshot_read(nonempty_snapshot, operator_user,
+        0u, snapshot_bytes, sizeof(snapshot_bytes), &snapshot_read));
+    assert(snapshot_read == nonempty_size);
+    unsigned int nonempty_digest_len = 0u;
+    assert(EVP_Digest(snapshot_bytes, snapshot_read, nonempty_digest,
+        &nonempty_digest_len, EVP_sha256(), NULL) == 1);
+    assert(nonempty_digest_len == sizeof(nonempty_digest));
+    char nonempty_path[4096];
+    int path_len = snprintf(nonempty_path, sizeof(nonempty_path),
+        "%s.nonempty", image_path);
+    assert(path_len > 0 && (size_t)path_len < sizeof(nonempty_path));
+    copy_snapshot(nonempty_snapshot, operator_user, nonempty_path);
+    qihse_kv_replica_snapshot_destroy(nonempty_snapshot);
     FILE *empty = fopen(image_path, "wb");
     assert(empty && fclose(empty) == 0);
     unsigned char digest[32];
@@ -306,11 +320,16 @@ static int empty_lane_process(const char *data_dir, const char *image_path) {
     assert(qihse_kv_ct_lane_receiver_bind(store, operator_user, TARGET_LANE,
         empty_slots, "source-node", "joining-node", GEN_SOURCE,
         QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 0u, token));
+    assert(!qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
+        operator_user, TARGET_LANE, empty_slots, nonempty_path,
+        7u, 5u, nonempty_digest, token));
+    qihse_kv_ct_lane_status_t status = {0};
+    assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
+    assert(!status.baseline_sealed && status.durable_position == 0u &&
+        status.acknowledged_position == 0u);
     assert(qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
         operator_user, TARGET_LANE, empty_slots, image_path,
         7u, 0u, digest, token));
-
-    qihse_kv_ct_lane_status_t status = {0};
     assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
     assert(status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
            status.baseline_sealed && !status.admitted &&
@@ -319,6 +338,16 @@ static int empty_lane_process(const char *data_dir, const char *image_path) {
            status.durable_position == 0u &&
            status.acknowledged_position == 0u);
 
+    /* A previously active lane can lose its final slot while retaining a
+     * nonzero stream position. Its fresh empty baseline keeps that cut. */
+    assert(qihse_kv_ct_lane_receiver_baseline_install(store, operator_user,
+        operator_user, TARGET_LANE, empty_slots, image_path,
+        7u, 5u, digest, token));
+    assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
+    assert(status.baseline_sealed && !status.admitted &&
+        status.baseline_row_seq == 7u && status.baseline_stream_cut == 5u &&
+        status.durable_position == 5u && status.acknowledged_position == 5u);
+
     qihse_kv_store_destroy(store);
     store = qihse_kv_store_create_user(operator_user);
     assert(store);
@@ -326,7 +355,8 @@ static int empty_lane_process(const char *data_dir, const char *image_path) {
     assert(qihse_kv_ct_lane_status(store, operator_user, TARGET_LANE, &status));
     assert(status.baseline_sealed && !status.admitted &&
            status.baseline_row_seq == 7u &&
-           status.baseline_stream_cut == 0u);
+           status.baseline_stream_cut == 5u &&
+           status.durable_position == 5u && status.acknowledged_position == 5u);
     qihse_kv_store_destroy(store);
     qihse_auth_release_principal_scoped(operator_user);
     return 0;

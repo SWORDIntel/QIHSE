@@ -109,9 +109,11 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
         return false;
     }
 
-    /* Promotion only, source_group == target_group, final_decision_index == 0 */
-    if (reserved_claim->operation != QIHSE_KV_CT_LANE_AUTH_PROMOTION ||
-        strcmp(reserved_claim->source_group_id, reserved_claim->target_group_id) != 0 ||
+    bool promotion = reserved_claim->operation == QIHSE_KV_CT_LANE_AUTH_PROMOTION;
+    bool transfer = reserved_claim->operation == QIHSE_KV_CT_LANE_AUTH_TRANSFER;
+    if ((!promotion && !transfer) ||
+        (promotion && strcmp(reserved_claim->source_group_id,
+                             reserved_claim->target_group_id) != 0) ||
         reserved_claim->final_decision_index != 0u ||
         !ct_digest_zero(reserved_claim->final_decision_digest) ||
         !ct_lane_claim_valid(reserved_claim, false) ||
@@ -142,15 +144,22 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
         return false;
     }
 
-    const char* lane_id = reserved_claim->target_group_id;
+    const char* lane_id = promotion ? reserved_claim->target_group_id
+                                    : reserved_claim->source_group_id;
+    const char* source_id = promotion ? reserved_claim->target_qkp_id
+                                      : reserved_claim->source_qkp_id;
+    const char* peer_id = promotion ? reserved_claim->successor_qkp_id
+                                    : reserved_claim->target_qkp_id;
+    const char* generation = promotion ? reserved_claim->target_generation
+                                       : reserved_claim->source_generation;
     qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
     bool is_new = (lane == NULL);
 
     /* Existing exact new tuple is idempotent and preserves baseline/cursors. */
     if (lane && lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
-        strcmp(lane->status.source_id, reserved_claim->target_qkp_id) == 0 &&
-        strcmp(lane->status.peer_id, reserved_claim->successor_qkp_id) == 0 &&
-        strcmp(lane->status.generation, reserved_claim->target_generation) == 0 &&
+        strcmp(lane->status.source_id, source_id) == 0 &&
+        strcmp(lane->status.peer_id, peer_id) == 0 &&
+        strcmp(lane->status.generation, generation) == 0 &&
         lane->tenant_policy == QIHSE_KV_CT_TENANT_SYSTEM_ALL &&
         lane->tenant_id == 0u &&
         memcmp(lane->status.slot_bitmap, reserved_claim->slots,
@@ -158,6 +167,22 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
         memcpy(out_owner_token, lane->owner_token, QIHSE_KV_CT_TOKEN_BYTES);
         kv_store_unlock(store);
         return true;
+    }
+
+    /* A later transfer can reuse its completed, empty staging context. It
+     * must never reset an active replica or any SOURCE group. Promotion uses
+     * its distinct quorum-authorized role transition above. */
+    bool occupied = false;
+    if (lane) for (size_t i = 0; i < sizeof(lane->status.slot_bitmap); ++i)
+        occupied |= lane->status.slot_bitmap[i] != 0;
+    if (transfer && ((lane && (lane->status.mode != QIHSE_KV_CT_LANE_RECEIVER ||
+                              lane->status.admitted || occupied)) ||
+        (store->lane_transfer && store->lane_transfer->active &&
+         store->lane_transfer->phase < 4u &&
+         strcmp(store->lane_transfer->claim.transfer_id, reserved_claim->transfer_id)))) {
+        kv_store_unlock(store);
+        errno = EBUSY;
+        return false;
     }
 
     /* Allocate slot if new lane */
@@ -175,7 +200,7 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
     for (size_t i = 0; valid && i < store->ct_lane_capacity; ++i) {
         qihse_kv_ct_lane_t* other = &store->lanes[i];
         if (!other->used || other == lane) continue;
-        if (strcmp(other->status.generation, reserved_claim->target_generation) == 0) {
+        if (strcmp(other->status.generation, generation) == 0) {
             valid = false;
         }
     }
@@ -193,15 +218,24 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
         return false;
     }
 
+    /* Old same-generation receiver frames must be checkpointed before a
+     * new bitmap/cursor context becomes durable. Otherwise restart would
+     * replay a historical frame against the replacement membership. Source
+     * retained logs are independent of this shared WAL checkpoint. */
+    if (!is_new && !kv_sync_store_locked(store)) {
+        kv_store_unlock(store);
+        return false;
+    }
+
     /* Rotate lane token on new tuple; reset baseline, stream positions,
      * admission, retained bytes and last-group digest. */
     qihse_kv_ct_lane_t old = *lane;
     memset(lane, 0, sizeof(*lane));
     lane->used = true;
-    snprintf(lane->status.lane_id, sizeof(lane->status.lane_id), "%s", reserved_claim->target_group_id);
-    snprintf(lane->status.source_id, sizeof(lane->status.source_id), "%s", reserved_claim->target_qkp_id);
-    snprintf(lane->status.peer_id, sizeof(lane->status.peer_id), "%s", reserved_claim->successor_qkp_id);
-    snprintf(lane->status.generation, sizeof(lane->status.generation), "%s", reserved_claim->target_generation);
+    snprintf(lane->status.lane_id, sizeof(lane->status.lane_id), "%s", lane_id);
+    snprintf(lane->status.source_id, sizeof(lane->status.source_id), "%s", source_id);
+    snprintf(lane->status.peer_id, sizeof(lane->status.peer_id), "%s", peer_id);
+    snprintf(lane->status.generation, sizeof(lane->status.generation), "%s", generation);
     lane->status.mode = QIHSE_KV_CT_LANE_RECEIVER;
     memcpy(lane->status.slot_bitmap, reserved_claim->slots, QIHSE_KV_CT_SLOT_BITMAP_BYTES);
     lane->status.baseline_row_seq = 0u;
@@ -313,6 +347,13 @@ bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
         return true;
     }
 
+    /* Publish the old row image and rotate historical receiver frames before
+     * narrowing the membership used by subsequent WAL replay. */
+    if (!kv_sync_store_locked(store)) {
+        kv_store_unlock(store);
+        return false;
+    }
+
     /* Persist reduced bitmap and digest; invalidate cached baseline and set
      * baseline_sealed=false without changing existing durable cursor. */
     qihse_kv_ct_lane_status_t old_status = lane->status;
@@ -342,6 +383,31 @@ bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
 
     kv_store_unlock(store);
     return true;
+}
+
+bool qihse_kv_ct_lane_source_disable(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id, const char* generation,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    if (!store || !ct_admin(operator_principal) || !ct_lane_id_valid(lane_id) ||
+        !ct_id_valid(generation) || !owner_token) { errno = EACCES; return false; }
+    kv_store_wrlock(store);
+    qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
+    bool ok = lane && !store->recovery_pending &&
+        !strcmp(lane->status.generation, generation) &&
+        CRYPTO_memcmp(lane->owner_token, owner_token, QIHSE_KV_CT_TOKEN_BYTES) == 0;
+    if (!ok) { kv_store_unlock(store); errno = EACCES; return false; }
+    if (lane->status.mode == QIHSE_KV_CT_LANE_SOURCE) {
+        qihse_kv_ct_lane_status_t previous = lane->status;
+        lane->status.mode = QIHSE_KV_CT_LANE_RECEIVER;
+        lane->status.admitted = false;
+        lane->status.baseline_sealed = false;
+        lane->status.baseline_refresh_needed = false;
+        lane->status.promotion_pending = false;
+        ok = ct_lanes_state_write(store) && ct_lane_marker_write(store);
+        if (!ok) { lane->status = previous; store->recovery_pending = true; }
+    }
+    kv_store_unlock(store);
+    return ok;
 }
 
 #endif /* QIHSE_CT_LANE_LIFECYCLE_INC */

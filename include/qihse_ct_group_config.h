@@ -8,6 +8,10 @@
 
 #include "qihse_cluster_slot.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define QIHSE_CT_LANE_ID_HEX_LEN 64u
 #define QIHSE_CT_GENERATION_HEX_LEN 32u
 #define QIHSE_CT_GROUP_SLOT_BITMAP_BYTES (QIHSE_CLUSTER_SLOT_COUNT / 8u)
@@ -22,7 +26,8 @@ typedef struct {
 
 /* Parse one repeatable --ct-group tuple:
  * LANE_ID,OWNER_TOPOLOGY_ID,SUCCESSOR_TOPOLOGY_ID,GENERATION,SLOTS
- * SLOTS is one or more inclusive ranges joined with ';', e.g. 0-4095;8192-16383.
+ * SLOTS is one or more inclusive ranges joined with ';', e.g. 0-4095;8192-16383,
+ * or '-' for an empty joining group.
  */
 bool qihse_ct_group_config_parse(const char* spec,
                                  qihse_ct_group_config_t* out);
@@ -31,5 +36,9 @@ bool qihse_ct_group_config_parse(const char* spec,
  * Empty slot sets are accepted for a joiner lane awaiting its first range. */
 bool qihse_ct_group_configs_validate(
     const qihse_ct_group_config_t* groups, size_t count);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

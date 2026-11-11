@@ -516,6 +516,14 @@ def main() -> int:
             identity_name="lead", node_id=NODE_IDS["lead"], target_name="joiner")
         resumed = transfer_until_committed(source_admin, transfer_id, joiner_topology_id, 0, 8191)
         expect_ok(resumed, "resume same CT2 transfer after target restart")
+        # COMMITTED permits source MOVED immediately. It must therefore imply
+        # destination admission, even if ACTIVATE persisted its journal before
+        # a transient CT1 ACK/replay check and the source recovered via RECEIPT.
+        # Do not poll or wait for background recovery before checking this.
+        immediate_value = command(target_admin, "GET", payload_keys[0])
+        if immediate_value != payload.encode():
+            raise AssertionError(
+                f"CT2 published ownership before destination admission: {immediate_value!r}")
         wait_for_ct1_drain(target_to_successor, successor_to_target, "target-after-CT2-import")
         finalized_status = command(source_peer_to_target,
                                    "REPL.CT2", "STATUS", transfer_id)

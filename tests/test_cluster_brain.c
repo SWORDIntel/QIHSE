@@ -116,13 +116,15 @@ int main(void) {
     assert(mkdtemp(root));
     /* Isolate the audit chain/log per test so parallel aggregates never share root state. */
     setenv("QIHSE_DATA_DIR", root, 1);
-    char dir_a[600], dir_b[600], dir_c[600];
+    char dir_a[600], dir_b[600], dir_c[600], dir_stop[600];
     snprintf(dir_a, sizeof(dir_a), "%s/run_a", root);
     snprintf(dir_b, sizeof(dir_b), "%s/run_b", root);
     snprintf(dir_c, sizeof(dir_c), "%s/run_c", root);
+    snprintf(dir_stop, sizeof(dir_stop), "%s/run_stop", root);
     assert(mkdir(dir_a, 0700) == 0);
     assert(mkdir(dir_b, 0700) == 0);
     assert(mkdir(dir_c, 0700) == 0);
+    assert(mkdir(dir_stop, 0700) == 0);
 
     qihse_resp_server_config_t scfg;
     qihse_resp_server_config_init(&scfg);
@@ -181,6 +183,20 @@ int main(void) {
     assert(!kinds.asymmetry);
     printf("PASS recovered peer journals RECONNECTED\n");
 
+    /* A large observation interval must not hold a node's rolling restart
+     * open until its next cycle. This used to wait nearly thirty seconds. */
+    qihse_brain_config_t stop_cfg = {.server = server,
+        .journal_dir = dir_stop, .interval_seconds = 30u, .act = false};
+    assert(qihse_cluster_brain_start(&stop_cfg));
+    sleep_ms(300u);
+    struct timespec before, after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    qihse_cluster_brain_stop();
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    double stop_ms = (after.tv_sec - before.tv_sec) * 1000.0 +
+        (after.tv_nsec - before.tv_nsec) / 1000000.0;
+    assert(stop_ms < 2000.0);
+    printf("PASS long-interval brain stops promptly\n");
     qihse_resp_server_destroy(server);
     printf("cluster brain tests passed\n");
     return 0;

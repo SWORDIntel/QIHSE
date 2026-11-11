@@ -139,6 +139,17 @@ int main(void) {
     create_admitted_source_lane(store, operator_user, replication_user,
         LANE_C, target_bitmap, "target-c", "target-c-successor", GEN_C,
         target_token);
+    qihse_kv_replica_snapshot_t* pinned_scope = NULL;
+    uint64_t pinned_row_seq = 0u;
+    unsigned char pinned_image_digest[32], pinned_scope_digest[32];
+    assert(qihse_kv_ct_lane_source_baseline_snapshot_create(store, operator_user,
+        LANE_C, &pinned_scope, &pinned_row_seq, pinned_image_digest) == 0);
+    assert(qihse_kv_ct_lane_baseline_scope_digest(pinned_scope, operator_user,
+        pinned_scope_digest));
+    unsigned char denied_scope[32]; memset(denied_scope, 0xff, sizeof(denied_scope));
+    assert(!qihse_kv_ct_lane_baseline_scope_digest(pinned_scope, low_user, denied_scope));
+    assert(memcmp(denied_scope, (unsigned char[32]){0}, 32u) == 0);
+    assert(!qihse_kv_ct_lane_baseline_scope_digest(pinned_scope, NULL, denied_scope));
     unsigned char receiver_token[QIHSE_KV_CT_TOKEN_BYTES];
     assert(qihse_kv_ct_lane_receiver_bind(store, operator_user, LANE_A,
         moved_bitmap, "source-a", "target-c", GEN_A,
@@ -272,6 +283,12 @@ int main(void) {
     qihse_kv_ct_lane_status_t finalized_a = {0}, finalized_c = {0};
     assert(qihse_kv_ct_lane_status(store, operator_user, LANE_A, &finalized_a));
     assert(qihse_kv_ct_lane_status(store, operator_user, LANE_C, &finalized_c));
+    unsigned char retained_scope_digest[32];
+    assert(qihse_kv_ct_lane_baseline_scope_digest(pinned_scope, operator_user,
+        retained_scope_digest));
+    assert(memcmp(retained_scope_digest, pinned_scope_digest, 32u) == 0);
+    assert(memcmp(retained_scope_digest, finalized_c.slot_bitmap_digest, 32u) != 0);
+    qihse_kv_replica_snapshot_destroy(pinned_scope);
     assert(finalized_a.mode == QIHSE_KV_CT_LANE_RECEIVER &&
         !finalized_a.admitted && !memcmp(finalized_a.slot_bitmap,
             (uint8_t[QIHSE_KV_CT_SLOT_BITMAP_BYTES]){0}, sizeof(moved_bitmap)));
@@ -371,6 +388,16 @@ int main(void) {
     assert(finalized_d.mode == QIHSE_KV_CT_LANE_SOURCE && finalized_d.admitted &&
         finalized_d.baseline_sealed && finalized_d.baseline_refresh_needed);
 
+    char* export_key = key_for_slot("commons/export-cut-", target_slot_2);
+    qihse_kv_ct_writer_scope_t* write_scope = NULL;
+    assert(qihse_kv_ct_writer_scope_enter_lane(store, operator_user, LANE_D,
+        target_token_2, &write_scope));
+    assert(qihse_kv_set_user(store, export_key, "source cut is nonzero", 0u, 0u,
+        operator_user));
+    qihse_kv_ct_writer_scope_leave(write_scope);
+    assert(qihse_kv_ct_lane_source_ack(store, replication_user, LANE_D,
+        "target-d-successor", GEN_D, 1u));
+
     /* The source-side fence may replace a completed phase-4 receipt, but an
      * unfinished phase-3 intent is never replaceable. */
     qihse_kv_ct_lane_authority_claim_t claim_3 = {0};
@@ -395,11 +422,41 @@ int main(void) {
     assert(qihse_kv_ct_lane_transfer_source_fence(store, operator_user,
         operator_user, &claim_3, proof_3, verify_reserved, NULL,
         target_token_2, &source_cut_3));
-    assert(source_cut_3 == 0u);
+    assert(source_cut_3 == 1u);
     qihse_kv_ct_lane_transfer_status_t transfer_3 = {0};
     assert(qihse_kv_ct_lane_transfer_status(store, operator_user, &transfer_3));
     assert(transfer_3.active && transfer_3.phase == 1u &&
-        strcmp(transfer_3.claim.transfer_id, "move-next-3") == 0);
+        strcmp(transfer_3.claim.transfer_id, "move-next-3") == 0 &&
+        transfer_3.claim.source_cut == source_cut_3);
+
+    /* The chosen target cut is a different stream domain from the source.
+     * A source-only export must persist it and both seals for exact retry. */
+    qihse_kv_ct_lane_authority_claim_t export_claim = claim_3;
+    export_claim.source_cut = source_cut_3;
+    export_claim.target_cursor = 7u;
+    qihse_kv_ct_proof_t* export_proof = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &export_claim, verify_reserved, NULL);
+    assert(export_proof);
+    qihse_kv_replica_snapshot_t* exported = NULL;
+    unsigned char export_range[32], export_image[32];
+    assert(qihse_kv_ct_lane_transfer_source_export(store, operator_user,
+        operator_user, &export_claim, export_proof, verify_reserved, NULL,
+        &exported, export_range, export_image) == 0);
+    qihse_kv_replica_snapshot_destroy(exported);
+    assert(qihse_kv_ct_lane_transfer_status(store, operator_user, &transfer_3));
+    assert(transfer_3.target_cursor == 7u && transfer_3.claim.target_cursor == 7u);
+    assert(memcmp(transfer_3.claim.range_digest, export_range, 32u) == 0);
+    assert(memcmp(transfer_3.claim.image_digest, export_image, 32u) == 0);
+    export_claim.target_cursor = 8u;
+    qihse_kv_ct_proof_t* changed_cut = qihse_kv_ct_lane_authority_proof_create(
+        store, operator_user, operator_user, &export_claim, verify_reserved, NULL);
+    assert(changed_cut);
+    exported = NULL;
+    assert(qihse_kv_ct_lane_transfer_source_export(store, operator_user,
+        operator_user, &export_claim, changed_cut, verify_reserved, NULL,
+        &exported, export_range, export_image) != 0 && !exported);
+    qihse_kv_ct_proof_destroy(changed_cut);
+    qihse_kv_ct_proof_destroy(export_proof);
 
     qihse_kv_ct_proof_destroy(proof_3);
     qihse_kv_ct_proof_destroy(final_proof_2);
@@ -409,9 +466,28 @@ int main(void) {
     qihse_kv_ct_proof_destroy(image_proof);
     qihse_kv_ct_proof_destroy(proof);
     qihse_kv_store_destroy(store);
+    store = qihse_kv_store_create_user(operator_user);
+    assert(store);
+    qihse_kv_ct_lane_transfer_status_t reopened_export = {0};
+    assert(qihse_kv_ct_lane_transfer_status(store, operator_user, &reopened_export));
+    assert(reopened_export.phase == 1u && reopened_export.source_cut == source_cut_3 &&
+        reopened_export.target_cursor == 7u && reopened_export.claim.target_cursor == 7u);
+    assert(memcmp(reopened_export.range_digest, transfer_3.claim.range_digest, 32u) == 0);
+    assert(memcmp(reopened_export.image_digest, transfer_3.claim.image_digest, 32u) == 0);
+    qihse_kv_store_set_replication_principal_id(store,
+        qihse_user_get_id(replication_user));
+    qihse_kv_ct_lane_status_t reopened_c = {0};
+    assert(qihse_kv_ct_lane_status(store, operator_user, LANE_C, &reopened_c));
+    assert(qihse_kv_ct_lane_source_reconcile_peer(store, operator_user,
+        replication_user, LANE_C, "target-c-successor", GEN_C,
+        reopened_c.baseline_digest, reopened_c.durable_position));
+    assert_value(store, operator_user, preserved_key, "keep");
+    assert_value(store, operator_user, stale_key, NULL);
+    qihse_kv_store_destroy(store);
     qihse_auth_release_principal_scoped(low_user);
     qihse_auth_release_principal_scoped(replication_user);
     qihse_auth_release_principal_scoped(operator_user);
+    free(export_key);
     free(stale_key);
     free(preserved_key);
     aimem_fixture_cleanup(data_dir);

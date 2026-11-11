@@ -423,7 +423,6 @@ int main(void) {
     promotion_final_available = true;
     assert(qihse_kv_ct_lane_promotion_finalize(store, op, op, &promotion,
         promotion_final_proof, verify_lane_claim, &promotion_final_available));
-    qihse_kv_ct_proof_destroy(promotion_final_proof);
     assert(qihse_kv_ct_lane_source_for_slots(store, op, slots_b, &resolved));
     assert(strcmp(resolved.lane_id, LANE_B) == 0 && resolved.admitted &&
            !resolved.promotion_pending && strcmp(resolved.generation, GEN_C) == 0);
@@ -446,6 +445,20 @@ int main(void) {
     scope = NULL;
     qihse_kv_ct_groups_free(groups, group_count);
     groups = NULL;
+    /* A retry after admission and a newer source baseline must complete
+     * from the original event, without reverting data or stream cursors. */
+    qihse_kv_replica_snapshot_t* newer_baseline = NULL;
+    uint64_t newer_row_seq = 0u; unsigned char newer_digest[32];
+    assert(qihse_kv_ct_lane_source_baseline_snapshot_create(store, op, LANE_B,
+        &newer_baseline, &newer_row_seq, newer_digest) == 0);
+    qihse_kv_replica_snapshot_destroy(newer_baseline);
+    assert(memcmp(newer_digest, promotion.image_digest, 32u) != 0);
+    assert(!qihse_kv_ct_lane_promotion_finalize(store, NULL, op, &promotion,
+        promotion_final_proof, verify_lane_claim, &promotion_final_available));
+    assert(qihse_kv_ct_lane_promotion_finalize(store, op, op, &promotion,
+        promotion_final_proof, verify_lane_claim, &promotion_final_available));
+    qihse_kv_ct_proof_destroy(promotion_final_proof);
+    assert_value(store, op, key_b, "lane-b-v2");
     uint64_t promoted_highwater = qihse_kv_change_seq(store);
     qihse_kv_ct_lane_status_t promoted_status = {0};
     assert(qihse_kv_ct_lane_status(store, op, LANE_B, &promoted_status));

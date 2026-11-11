@@ -5,6 +5,7 @@
 #undef NDEBUG
 #endif
 #include <assert.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -426,6 +427,7 @@ static void held_wire_manual_failover(const qihse_resp_server_config_t *base,
     cfg.local_node_index = local;
     qihse_resp_server_t *server = qihse_resp_server_create(&cfg);
     assert(server && qihse_resp_server_start_failover_paused(server, op));
+    assert(qihse_cluster_failover_is_paused(qihse_resp_server_failover(server)));
     real_client_t *wire = connect_peer(server, client, source, "unknown");
     auth_root(wire);
     const char *failover[] = {"CLUSTER", "FAILOVER", "TAKEOVER"};
@@ -461,6 +463,7 @@ static void held_wire_manual_failover(const qihse_resp_server_config_t *base,
     const char *resume[] = {"CLUSTER", "FAILOVER.RESUME"};
     reply = command(wire, 2u, resume, NULL);
     assert(strcmp(reply, "+RESUMED\r\n") == 0);
+    assert(!qihse_cluster_failover_is_paused(qihse_resp_server_failover(server)));
     free(reply);
     reply = command(wire, 3u, failover, NULL);
     assert(strcmp(reply, "-ERR ownership transition requires fenced migration\r\n") == 0);
@@ -543,6 +546,104 @@ static void embedded_execute_closes_startup(const qihse_resp_server_config_t *ba
     qihse_resp_server_destroy(server);
 }
 
+typedef struct {
+    int listener;
+    qihse_qkp_config_t config;
+    qihse_qkp_replication_peer_t source_pin;
+    const char* reply;
+} promotion_reply_peer_t;
+
+static void* promotion_reply_peer(void* opaque) {
+    promotion_reply_peer_t* peer = opaque;
+    int fd = accept(peer->listener, NULL, NULL);
+    assert(fd >= 0);
+    struct timeval timeout = {10, 0};
+    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    assert(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0);
+    qihse_qkp_session_t* session = NULL;
+    assert(qihse_qkp_server_negotiate_with_replication_peers(fd, &peer->config,
+        &peer->source_pin, 1u, &session) == QIHSE_QKP_SECURE);
+    assert(session && qihse_qkp_session_is_replication_peer_any(session,
+        &peer->source_pin, 1u));
+    unsigned char request[4096];
+    ssize_t got = qihse_qkp_recv_sealed(session, fd, request, sizeof(request));
+    assert(got > 0 && memmem(request, (size_t)got,
+        "PROMOTION-PREPARE", sizeof("PROMOTION-PREPARE") - 1u));
+    assert(qihse_qkp_send_sealed(session, fd, peer->reply, strlen(peer->reply)));
+    qihse_qkp_session_free(session);
+    close(fd);
+    return NULL;
+}
+
+/* The real peer-command transport returns the complete RESP frame, including
+ * CRLF. A successful pinned receiver bind must not be mistaken for refusal. */
+static void promotion_prepare_reply_framing(const qihse_resp_server_config_t* base,
+    qihse_user_t* op, const identity_t* source, const identity_t* first) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    struct sockaddr_in address = {.sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = 0};
+    assert(bind(listener, (const struct sockaddr*)&address, sizeof(address)) == 0);
+    assert(listen(listener, 1) == 0);
+    socklen_t length = sizeof(address);
+    assert(getsockname(listener, (struct sockaddr*)&address, &length) == 0);
+    qihse_cluster_topology_t* topology = qihse_cluster_topology_create();
+    assert(topology);
+    qihse_cluster_node_t local = {0}, remote = {0};
+    qihse_cluster_node_id_from_seed("promotion-source", 16u, local.id);
+    strcpy(local.host, "127.0.0.1");
+    local.role = QIHSE_CLUSTER_NODE_PRIMARY; local.healthy = true;
+    local.primary_index = QIHSE_CLUSTER_NODE_NONE;
+    qihse_cluster_node_id_from_seed("promotion-successor", 19u, remote.id);
+    strcpy(remote.host, "127.0.0.1");
+    remote.role = QIHSE_CLUSTER_NODE_PRIMARY; remote.healthy = true;
+    remote.primary_index = QIHSE_CLUSTER_NODE_NONE;
+    remote.port = ntohs(address.sin_port);
+    local.port = remote.port > 1u ? remote.port - 1u : remote.port + 1u;
+    local.bus_port = 17100u; remote.bus_port = 17101u;
+    uint16_t local_index = 0, remote_index = 0;
+    assert(qihse_cluster_topology_upsert_node(topology, &local, &local_index));
+    assert(qihse_cluster_topology_upsert_node(topology, &remote, &remote_index));
+    qihse_resp_server_config_t config = *base;
+    config.topology = topology; config.local_node_index = local_index;
+    qihse_resp_server_t* server = qihse_resp_server_create(&config);
+    assert(server && qihse_resp_server_add_replication_peer(server,
+        "first", first->pub, op));
+    qihse_kv_ct_lane_authority_claim_t claim = {0};
+    claim.operation = QIHSE_KV_CT_LANE_AUTH_PROMOTION;
+    strcpy(claim.transfer_id, "promotion-wire-frame");
+    memset(claim.source_group_id, 'a', 64u);
+    memset(claim.target_group_id, 'a', 64u);
+    strcpy(claim.source_qkp_id, "old-source");
+    strcpy(claim.target_qkp_id, "source");
+    strcpy(claim.successor_qkp_id, "first");
+    memset(claim.source_generation, 'a', 32u);
+    memset(claim.target_generation, 'b', 32u);
+    claim.slots[0] = 1u;
+    claim.grant_epoch = 1u; claim.reserve_index = 1u;
+    claim.reserve_digest[0] = 1u;
+    const char* anchors[] = {source->pub};
+    promotion_reply_peer_t peer = {.listener = listener,
+        .source_pin = {"source", source->pub},
+        .config = {.dsa_key_path = first->dsa, .kem_key_path = first->kem,
+            .kem_pub_path = first->kem_pub, .node_id = "first", .require = true,
+            .trusted_pubs = anchors, .trusted_count = 1u}};
+    const char* replies[] = {"+OK\r\n", "+OKAY\r\n", "+OK"};
+    for (size_t i = 0; i < sizeof(replies) / sizeof(replies[0]); ++i) {
+        peer.reply = replies[i];
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, promotion_reply_peer, &peer) == 0);
+        char error[160] = {0};
+        bool accepted = qihse_resp_ct_promotion_successor_prepare(server,
+            remote_index, &claim, error, sizeof(error));
+        assert(pthread_join(thread, NULL) == 0);
+        assert(accepted == (i == 0u));
+    }
+    close(listener);
+    qihse_resp_server_destroy(server);
+    qihse_cluster_topology_destroy(topology);
+}
+
 int main(void) {
     startup_coordinator_hold();
     char root[] = "build/replication-multi-peer-XXXXXX";
@@ -621,6 +722,7 @@ int main(void) {
     cfg.replication_service_principal = service;
     cfg.replicate_globs = globs;
     cfg.replicate_glob_count = 1u;
+    promotion_prepare_reply_framing(&cfg, op, &source, &first);
     held_wire_manual_failover(&cfg, op, &source, &second);
     embedded_execute_closes_startup(&cfg, op);
     const qihse_qkp_replication_peer_t peers[] = {

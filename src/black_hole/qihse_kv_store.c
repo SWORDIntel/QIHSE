@@ -446,6 +446,8 @@ struct qihse_kv_replica_snapshot {
     uint32_t tenant_id;
     uint16_t classification;
     uint16_t sci;
+    bool has_lane_scope;
+    unsigned char lane_scope_digest[32];
 };
 
 typedef struct kv_replica_cursor {
@@ -2571,7 +2573,7 @@ static bool ct_lane_baseline_frame_validate(
     const uint8_t frame[KV_WAL_CT_LANE_BASELINE_FRAME_BYTES]);
 static bool ct_lane_baseline_apply_frame(qihse_kv_store_t* store,
     const uint8_t frame[KV_WAL_CT_LANE_BASELINE_FRAME_BYTES],
-    const kv_read_context_t* context);
+    const kv_read_context_t* context, bool replay);
 static bool ct_lane_log_append_fd(qihse_kv_store_t* store, const char* lane_id,
     const char* source_id, const char* generation, uint64_t ack_position,
     uint64_t position,
@@ -4103,7 +4105,7 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
                 if (fread(frame, 1u, sizeof(frame), f) != sizeof(frame)) break;
                 errno = 0;
                 if (!ct_lane_baseline_frame_validate(frame) ||
-                    !ct_lane_baseline_apply_frame(store, frame, context)) {
+                    !ct_lane_baseline_apply_frame(store, frame, context, true)) {
                     if (errno == EACCES) goto denied;
                     fclose(f); return false;
                 }
@@ -6206,6 +6208,7 @@ bool qihse_kv_ct_lane_transfer_source_fence(qihse_kv_store_t* store,
         state->phase = 1u;
         state->claim = claim;
         state->source_cut = lane->status.durable_position;
+        state->claim.source_cut = state->source_cut;
         state->source_fenced = true;
         memcpy(state->pending_slot_bitmap, claim.slots, sizeof(claim.slots));
         store->lane_transfer = state;
@@ -6725,7 +6728,8 @@ static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_us
 char* qihse_kv_get_user(qihse_kv_store_t* store, const char* key, qihse_user_t* user) {
     if (!store) return NULL;
     kv_store_rdlock(store);
-    if (store->recovery_pending || !ct_key_read_ready(store, key)) { kv_store_unlock(store); return NULL; }
+    if (store->recovery_pending) { kv_store_unlock(store); errno = EIO; return NULL; }
+    if (!ct_key_read_ready(store, key)) { kv_store_unlock(store); return NULL; }
     char* value = kv_get_user_impl(store, key, user);
     kv_store_unlock(store);
     return value;
@@ -8088,6 +8092,8 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
         snapshot->tenant_id = qihse_user_get_tenant_id(principal);
         snapshot->classification = qihse_user_get_classification(principal);
         snapshot->sci = qihse_user_get_sci(principal);
+        snapshot->has_lane_scope = true;
+        memcpy(snapshot->lane_scope_digest, lane->status.slot_bitmap_digest, 32u);
         memcpy(lane->status.baseline_digest, digest, 32u);
         lane->status.baseline_row_seq = snapshot_row_seq;
         lane->status.baseline_stream_cut = lane->status.durable_position;
@@ -8124,6 +8130,8 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
     snapshot->tenant_id = qihse_user_get_tenant_id(principal);
     snapshot->classification = qihse_user_get_classification(principal);
     snapshot->sci = qihse_user_get_sci(principal);
+    snapshot->has_lane_scope = true;
+    memcpy(snapshot->lane_scope_digest, lane->status.slot_bitmap_digest, 32u);
     *out_snapshot = snapshot;
     *out_baseline_row_seq = lane->status.baseline_row_seq;
     memcpy(out_digest, digest, 32u);
@@ -9067,6 +9075,20 @@ bool qihse_kv_ct_lane_promotion_finalize(qihse_kv_store_t* store,
 
     kv_store_wrlock(store);
     qihse_kv_ct_lane_t* lane = ct_lane_find(store, final_claim->target_group_id);
+    /* Once the exact common FINAL has admitted this generation, a lost
+     * FINALIZED journal write may be retried after normal source writes and
+     * baseline refresh. The original immutable readiness marker still binds
+     * the event above; do not compare it with today's newer image or reset it. */
+    if (!store->recovery_pending && lane &&
+        lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+        lane->status.admitted && !lane->status.promotion_pending &&
+        !strcmp(lane->status.source_id, final_claim->target_qkp_id) &&
+        !strcmp(lane->status.generation, final_claim->target_generation) &&
+        !strcmp(lane->status.peer_id, final_claim->successor_qkp_id) &&
+        !memcmp(lane->status.slot_bitmap, final_claim->slots, sizeof(final_claim->slots))) {
+        kv_store_unlock(store);
+        return true;
+    }
     bool ok = !store->recovery_pending && lane &&
         lane->status.admitted &&
         ct_lane_promotion_claim_matches(store, lane, &marker_claim);
@@ -9207,6 +9229,21 @@ static bool replica_snapshot_authorized(const qihse_kv_replica_snapshot_t* snaps
         qihse_user_get_id(principal) == snapshot->principal_id &&
         qihse_user_get_tenant_id(principal) == snapshot->tenant_id &&
         qihse_auth_can_access(principal, snapshot->classification, snapshot->sci);
+}
+
+/* Scope is captured with the immutable bytes while the lane lock is held.
+ * A later source membership change cannot relabel an older image. */
+bool qihse_kv_ct_lane_baseline_scope_digest(
+    const qihse_kv_replica_snapshot_t* snapshot, qihse_user_t* principal,
+    unsigned char out_digest[32]) {
+    if (out_digest) memset(out_digest, 0, 32u);
+    if (!out_digest || !replica_snapshot_authorized(snapshot, principal) ||
+        !snapshot->has_lane_scope) {
+        errno = EACCES;
+        return false;
+    }
+    memcpy(out_digest, snapshot->lane_scope_digest, 32u);
+    return true;
 }
 
 bool qihse_kv_replica_snapshot_size(const qihse_kv_replica_snapshot_t* snapshot,
@@ -10138,4 +10175,5 @@ bool qihse_kv_store_is_under_attack(qihse_kv_store_t* store) {
 #include "qihse_ct_lane_baseline.inc"
 #include "qihse_ct_lane_log.inc"
 #include "qihse_ct_lane_transfer.inc"
+#include "qihse_ct_lane_lifecycle.inc"
 

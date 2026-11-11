@@ -62,9 +62,14 @@ class PublicAPIInstall(unittest.TestCase):
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
                         "qihse_cluster_slot.h", "qihse_cluster_maintenance.h", "qihse_crc16.h",
                         "qihse_kv_store.h", "qihse_resp_engine.h",
-                        "qihse_resp_wire.h", "qihse_qkp.h"}
+                        "qihse_resp_wire.h", "qihse_qkp.h", "qihse_ct_group_config.h"}
             installed = {header.name for header in (headers / "qihse").glob("*.h")}
             self.assertTrue(required <= installed, f"Missing headers: {required - installed}")
+            # Relative includes from the public roots resolve these at the SDK
+            # include root, alongside qihse/, exactly as in the source layout.
+            for name in ("memory/include/qihse_uma.h", "memory/include/qihse_memory.h",
+                         "orchestration/include/qihse_hetero.h", "core/qihse_abi.h"):
+                self.assertTrue((headers / name).is_file(), f"Missing transitive header: {name}")
             # Compile roots separately: legacy qihse.h and SQL enums are distinct APIs.
             for name in sorted(installed):
                 source = work / "header.c"
@@ -75,8 +80,8 @@ class PublicAPIInstall(unittest.TestCase):
             # distinct device typedefs; their headers must compose in either order.
             for order, includes in (
                 ("compute-first", ('#include <qihse/qihse_hetero.h>\n'
-                                    '#include <qihse/orchestration/include/qihse_hetero.h>\n')),
-                ("orchestration-first", ('#include <qihse/orchestration/include/qihse_hetero.h>\n'
+                                    '#include <orchestration/include/qihse_hetero.h>\n')),
+                ("orchestration-first", ('#include <orchestration/include/qihse_hetero.h>\n'
                                           '#include <qihse/qihse_hetero.h>\n')),
             ):
                 source = work / f"hetero-{order}.c"

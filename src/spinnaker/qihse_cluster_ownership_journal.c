@@ -134,8 +134,14 @@ static bool txn_shape_valid(const qihse_cluster_ownership_txn_t* t) {
         if (slot < bitmap_first) bitmap_first = (uint16_t)slot;
         bitmap_last = (uint16_t)slot;
     }
-    if (t->next_generation[0]) {
+    if (t->next_generation[0] || t->lane_id[0]) {
         if (!bitmap_any || t->start != bitmap_first || t->end != bitmap_last) return false;
+        /* A group CT2 receipt describes one exact interval. Promotions may
+         * cover sparse membership; transfers may not hide holes in the frame. */
+        if (!t->next_generation[0])
+            for (uint32_t slot = t->start; slot <= t->end; ++slot)
+                if (!(t->slot_bitmap[slot / 8u] & (uint8_t)(1u << (slot % 8u))))
+                    return false;
     } else if (bitmap_any) return false;
     if (t->phase == QIHSE_OWNERSHIP_COMMITTED || t->phase == QIHSE_OWNERSHIP_FINALIZED ||
         t->phase == QIHSE_OWNERSHIP_ADOPTED)
@@ -371,6 +377,11 @@ static bool same_intent_prepare(const qihse_cluster_ownership_txn_t* intent,
     qihse_cluster_ownership_txn_t a = *intent, b = *prepared;
     a.phase = b.phase;
     a.source_lsn = b.source_lsn;
+    /* A lane promotion records its identity before obtaining a common grant.
+     * Only this unassigned epoch may be filled by PREPARED; a known epoch is
+     * immutable, just like every other request field. */
+    if (a.lane_id[0] && a.next_generation[0] && !a.config_epoch && b.config_epoch)
+        a.config_epoch = b.config_epoch;
     return same_txn(&a, &b);
 }
 

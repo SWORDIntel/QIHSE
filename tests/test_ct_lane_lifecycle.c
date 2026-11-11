@@ -129,6 +129,20 @@ int main(void) {
     assert(qihse_kv_ct_lane_source_baseline_snapshot_create(store, op, LANE_A,
         &base_a, &seq_a, digest_a) == 0);
     assert(base_a && seq_a == 0u);
+    char empty_image[256];
+    assert(snprintf(empty_image, sizeof(empty_image), "%s/empty-baseline.bin", data_dir) > 0);
+    FILE* empty_file = fopen(empty_image, "wb");
+    assert(empty_file);
+    uint64_t empty_bytes = 0u, empty_offset = 0u;
+    assert(qihse_kv_replica_snapshot_size(base_a, op, &empty_bytes));
+    while (empty_offset < empty_bytes) {
+        unsigned char bytes[4096]; size_t got = 0u;
+        assert(qihse_kv_replica_snapshot_read(base_a, op, empty_offset,
+            bytes, sizeof(bytes), &got) && got);
+        assert(fwrite(bytes, 1u, got, empty_file) == got);
+        empty_offset += got;
+    }
+    assert(fclose(empty_file) == 0);
     qihse_kv_replica_snapshot_destroy(base_a);
 
     qihse_kv_replica_snapshot_t* base_b = NULL;
@@ -337,6 +351,30 @@ int main(void) {
     /* 3.5: Repeated equal bitmap is a no-op */
     assert(qihse_kv_ct_lane_receiver_prune(store, op, LANE_A, GEN_C, slots_a, new_token_a));
 
+    /* A historical receiver frame in the removed slot must not be replayed
+     * against a later same-generation staging bitmap after restart. */
+    assert(qihse_kv_ct_lane_receiver_baseline_install(store, op, op, LANE_A,
+        slots_a, empty_image, 0u, 0u, digest_a, new_token_a));
+    char* removed_key = key_for_slot("data/receiver-removed-", slot_a2);
+    qihse_kv_ct_record_t received = {0};
+    received.key = removed_key;
+    received.value = "old-receiver-frame";
+    received.classification = 4u;
+    received.sci_compartment = 1u;
+    received.change_seq = 1u;
+    received.actor_kind = QIHSE_KV_CT_ACTOR_USER;
+    qihse_kv_ct_group_t receiver_group = {0};
+    snprintf(receiver_group.source_id, sizeof(receiver_group.source_id), "%s", reserved_claim.target_qkp_id);
+    snprintf(receiver_group.generation, sizeof(receiver_group.generation), "%s", GEN_C);
+    receiver_group.stream_position = 1u;
+    receiver_group.first_seq = receiver_group.last_seq = 1u;
+    receiver_group.records = &received;
+    receiver_group.count = 1u;
+    uint64_t received_cursor = 0u;
+    assert(qihse_kv_ct_lane_receiver_apply(store, peer, LANE_A,
+        &receiver_group, &received_cursor) && received_cursor == 1u);
+    free(removed_key);
+
     /* 3.6: Strict subset prune: remove slot_a2, keep slot_a1 */
     uint8_t pruned_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
     bitmap_set(pruned_bitmap, slot_a1);
@@ -349,11 +387,51 @@ int main(void) {
     assert(qihse_kv_ct_lane_status(store, op, LANE_A, &status_a));
     assert(memcmp(status_a.slot_bitmap, pruned_bitmap, sizeof(pruned_bitmap)) == 0);
     assert(!status_a.baseline_sealed);
-    assert(status_a.durable_position == 0u);
+    assert(status_a.durable_position == 1u);
 
     /* LANE_B remains intact */
     assert(qihse_kv_ct_lane_status(store, op, LANE_B, &status_b));
     assert(status_b.mode == QIHSE_KV_CT_LANE_SOURCE && status_b.admitted);
+
+    qihse_kv_ct_lane_authority_claim_t incoming_transfer = reserved_claim;
+    incoming_transfer.operation = QIHSE_KV_CT_LANE_AUTH_TRANSFER;
+    snprintf(incoming_transfer.transfer_id, sizeof(incoming_transfer.transfer_id),
+             "reuse-empty-staging");
+    snprintf(incoming_transfer.target_group_id, sizeof(incoming_transfer.target_group_id),
+             "%s", LANE_B);
+    snprintf(incoming_transfer.source_qkp_id, sizeof(incoming_transfer.source_qkp_id),
+             "%s", reserved_claim.target_qkp_id);
+    snprintf(incoming_transfer.target_qkp_id, sizeof(incoming_transfer.target_qkp_id), "node-b");
+    snprintf(incoming_transfer.successor_qkp_id, sizeof(incoming_transfer.successor_qkp_id), "peer-b");
+    snprintf(incoming_transfer.source_generation, sizeof(incoming_transfer.source_generation), "%s", GEN_C);
+    snprintf(incoming_transfer.target_generation, sizeof(incoming_transfer.target_generation), "%s", GEN_B);
+    memcpy(incoming_transfer.slots, pruned_bitmap, sizeof(pruned_bitmap));
+    qihse_kv_ct_proof_t* incoming_proof = qihse_kv_ct_lane_authority_proof_create(
+        store, op, op, &incoming_transfer, verify_strict_reserved, NULL);
+    assert(incoming_proof);
+    unsigned char incoming_token[QIHSE_KV_CT_TOKEN_BYTES];
+    /* A live nonempty receiver cannot be replaced by a transfer context. */
+    assert(!qihse_kv_ct_lane_receiver_prepare(store, op, op, &incoming_transfer,
+        incoming_proof, verify_strict_reserved, NULL, incoming_token));
+    uint8_t no_slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    assert(qihse_kv_ct_lane_receiver_prune(store, op, LANE_A, GEN_C,
+        no_slots, new_token_a));
+    assert(!qihse_kv_ct_lane_receiver_prepare(store, low, op, &incoming_transfer,
+        incoming_proof, verify_strict_reserved, NULL, incoming_token));
+    assert(qihse_kv_ct_lane_receiver_prepare(store, op, op, &incoming_transfer,
+        incoming_proof, verify_strict_reserved, NULL, incoming_token));
+    assert(memcmp(incoming_token, new_token_a, sizeof(incoming_token)) != 0);
+    unsigned char same_incoming_token[QIHSE_KV_CT_TOKEN_BYTES];
+    assert(qihse_kv_ct_lane_receiver_prepare(store, op, op, &incoming_transfer,
+        incoming_proof, verify_strict_reserved, NULL, same_incoming_token));
+    assert(memcmp(incoming_token, same_incoming_token, sizeof(incoming_token)) == 0);
+    assert(qihse_kv_ct_lane_status(store, op, LANE_A, &status_a));
+    assert(!strcmp(status_a.peer_id, "node-b") && !status_a.admitted &&
+        !status_a.baseline_sealed && status_a.durable_position == 0u &&
+        !memcmp(status_a.slot_bitmap, pruned_bitmap, sizeof(pruned_bitmap)));
+    assert(qihse_kv_ct_lane_status(store, op, LANE_B, &status_b));
+    assert(status_b.mode == QIHSE_KV_CT_LANE_SOURCE && status_b.admitted);
+    qihse_kv_ct_proof_destroy(incoming_proof);
 
     printf("[PASS] qihse_kv_ct_lane_receiver_prune passed\n");
 
@@ -373,7 +451,7 @@ int main(void) {
     assert(status_a.mode == QIHSE_KV_CT_LANE_RECEIVER);
     assert(strcmp(status_a.generation, GEN_C) == 0);
     assert(memcmp(status_a.slot_bitmap, pruned_bitmap, sizeof(pruned_bitmap)) == 0);
-    assert(!status_a.baseline_sealed);
+    assert(!status_a.baseline_sealed && status_a.durable_position == 0u);
 
     assert(qihse_kv_ct_lane_status(store2, op, LANE_B, &status_b));
     assert(status_b.mode == QIHSE_KV_CT_LANE_SOURCE);
@@ -384,6 +462,20 @@ int main(void) {
         "peer-b", GEN_B, digest_b, 0u));
     assert(qihse_kv_ct_lane_status(store2, op, LANE_B, &status_b));
     assert(status_b.admitted);
+
+    unsigned char disable_token[QIHSE_KV_CT_TOKEN_BYTES] = {0};
+    assert(qihse_kv_ct_lane_owner_token_get(store2, op, LANE_B, disable_token));
+    assert(!qihse_kv_ct_lane_source_disable(store2, low, LANE_B, GEN_B, disable_token));
+    assert(!qihse_kv_ct_lane_source_disable(store2, NULL, LANE_B, GEN_B, disable_token));
+    assert(!qihse_kv_ct_lane_source_disable(store2, op, LANE_B, GEN_C, disable_token));
+    disable_token[0] ^= 1u;
+    assert(!qihse_kv_ct_lane_source_disable(store2, op, LANE_B, GEN_B, disable_token));
+    disable_token[0] ^= 1u;
+    assert(qihse_kv_ct_lane_source_disable(store2, op, LANE_B, GEN_B, disable_token));
+    assert(qihse_kv_ct_lane_source_disable(store2, op, LANE_B, GEN_B, disable_token));
+    assert(!qihse_kv_ct_lane_source_ack(store2, peer, LANE_B, "peer-b", GEN_B, 0u));
+    assert(qihse_kv_ct_lane_status(store2, op, LANE_B, &status_b));
+    assert(status_b.mode == QIHSE_KV_CT_LANE_RECEIVER && !status_b.admitted);
 
     qihse_kv_store_destroy(store2);
 

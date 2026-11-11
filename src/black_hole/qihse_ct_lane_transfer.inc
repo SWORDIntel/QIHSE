@@ -210,6 +210,7 @@ static bool ct_lane_transfer_snapshot_image(qihse_kv_replica_snapshot_t* snapsho
     }
     if (fclose(f) != 0) ok = false;
     if (ok) {
+        if (out->count > 1u)
         qsort(out->rows, out->count, sizeof(*out->rows), ct_image_row_cmp);
         for (size_t i = 1u; i < out->count; ++i)
             if (strcmp(out->rows[i-1u].key, out->rows[i].key) == 0) ok = false;
@@ -245,8 +246,7 @@ static bool ct_lane_transfer_local_image_locked(qihse_kv_store_t* store,
         if (!qihse_auth_can_access(principal, m->classification, m->sci_compartment) ||
             !ct_range_export_add(&x.collect, m->key, NULL, m)) goto failed;
     }
-    if (x.collect.count > 1u)
-        qsort(x.collect.rows, x.collect.count, sizeof(*x.collect.rows),
+    if (x.collect.count > 1u) qsort(x.collect.rows, x.collect.count, sizeof(*x.collect.rows),
               ct_range_export_entry_cmp);
     out->rows = calloc(x.collect.count ? x.collect.count : 1u, sizeof(*out->rows));
     if (!out->rows) goto failed;
@@ -361,8 +361,7 @@ int qihse_kv_ct_lane_transfer_source_export(qihse_kv_store_t* store,
         }
         if (!ct_range_export_add(&x.collect, meta->key, NULL, meta)) goto export_done;
     }
-    if (x.collect.count > 1u)
-        qsort(x.collect.rows, x.collect.count, sizeof(*x.collect.rows),
+    if (x.collect.count > 1u) qsort(x.collect.rows, x.collect.count, sizeof(*x.collect.rows),
               ct_range_export_entry_cmp);
     for (size_t i = 1; i < x.collect.count; ++i)
         if (strcmp(x.collect.rows[i-1].key, x.collect.rows[i].key) == 0) {
@@ -444,9 +443,12 @@ int qihse_kv_ct_lane_transfer_source_export(qihse_kv_store_t* store,
     /* The first successful export pins the selected target group's ACK cut
      * alongside the exported image. Retries must reproduce both the image
      * and that exact cut, including the valid zero-cut case. */
-    state->claim.target_cursor = claim->target_cursor;
+    state->claim = *claim;
+    state->target_cursor = claim->target_cursor;
     memcpy(state->image_digest, out_image_digest, 32u);
     memcpy(state->range_digest, out_range_digest, 32u);
+    memcpy(state->claim.image_digest, out_image_digest, 32u);
+    memcpy(state->claim.range_digest, out_range_digest, 32u);
     if (!ct_lane_transfer_state_write(store)) { store->recovery_pending = true; goto export_done; }
     off_t end = ftello(image);
     if (end < 0) goto export_done;
@@ -527,7 +529,9 @@ bool qihse_kv_ct_lane_transfer_target_import_begin(qihse_kv_store_t* store,
         receiver->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
         !receiver->status.admitted &&
         strcmp(receiver->status.source_id, claim->source_qkp_id) == 0 &&
-        strcmp(receiver->status.peer_id, claim->target_qkp_id) == 0 &&
+        (!strcmp(receiver->status.peer_id, claim->target_qkp_id) ||
+         (target && target->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
+          !strcmp(receiver->status.peer_id, claim->successor_qkp_id))) &&
         strcmp(receiver->status.generation, claim->source_generation) == 0;
     bool source_is_fenced_successor = receiver &&
         receiver->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
@@ -692,6 +696,8 @@ bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
     qihse_kv_ct_lane_transfer_state_t* state = store->lane_transfer;
     bool source_is_receiver = receiver &&
         receiver->status.mode == QIHSE_KV_CT_LANE_RECEIVER;
+    bool target_is_receiver = target &&
+        target->status.mode == QIHSE_KV_CT_LANE_RECEIVER;
     bool source_is_fenced_owner = receiver &&
         receiver->status.mode == QIHSE_KV_CT_LANE_SOURCE;
     bool source_slots_owned = source_is_fenced_owner;
@@ -713,7 +719,9 @@ bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
     bool source_role_ok = source_is_receiver
         ? (!receiver->status.admitted &&
            strcmp(receiver->status.source_id, claim->source_qkp_id) == 0 &&
-           strcmp(receiver->status.peer_id, claim->target_qkp_id) == 0 &&
+           (!strcmp(receiver->status.peer_id, claim->target_qkp_id) ||
+            (target && target->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
+             !strcmp(receiver->status.peer_id, claim->successor_qkp_id))) &&
            strcmp(receiver->status.generation, claim->source_generation) == 0)
         : (source_is_fenced_owner && state && receiver->status.admitted &&
            state->source_cut <= receiver->status.durable_position &&
@@ -768,7 +776,8 @@ bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
                 claim->source_group_id, &installed) &&
                 installed.mode == QIHSE_KV_CT_LANE_RECEIVER && !installed.admitted &&
                 strcmp(installed.source_id, claim->source_qkp_id) == 0 &&
-                strcmp(installed.peer_id, claim->target_qkp_id) == 0 &&
+                (!strcmp(installed.peer_id, claim->target_qkp_id) ||
+                 (target_is_receiver && !strcmp(installed.peer_id, claim->successor_qkp_id))) &&
                 strcmp(installed.generation, claim->source_generation) == 0;
             for (size_t i = 0; ok && i < sizeof(claim->slots); ++i)
                 if (claim->slots[i] & (uint8_t)~installed.slot_bitmap[i]) ok = false;
@@ -1038,7 +1047,8 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
     bool source_role_ok = (source_is_owner || source_is_receiver) &&
         strcmp(source->status.generation, claim->source_generation) == 0 &&
         strcmp(source->status.source_id, claim->source_qkp_id) == 0 &&
-        (source_is_owner || strcmp(source->status.peer_id, claim->target_qkp_id) == 0);
+        (source_is_owner || !strcmp(source->status.peer_id, claim->target_qkp_id) ||
+         (target_is_receiver && !strcmp(source->status.peer_id, claim->successor_qkp_id)));
     bool target_role_ok = !target || ((target_is_owner || target_is_receiver) &&
         (target_is_owner ? (target->status.durable_position >= claim->target_cursor &&
                             target->status.acknowledged_position >= claim->target_cursor) :
@@ -1094,6 +1104,14 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
             state->claim = old_claim; state->phase = 2u;
             kv_store_unlock(store); return false;
         }
+    }
+
+    /* Same-generation membership changes invalidate the bitmap against
+     * which old QKV6 frames were admitted. Checkpoint those rows first;
+     * independent per-source logs retain outstanding replication frames. */
+    if (!kv_sync_store_locked(store)) {
+        kv_store_unlock(store);
+        return false;
     }
 
     qihse_kv_ct_lane_t source_old = *source;

@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include "qihse_container_keys_fixture.h"
 #include "qihse_vector_db.h"
 #include "qihse_auth.h"
 #include "qihse_audit.h"
@@ -39,6 +40,7 @@ int main(void) {
     assert(mkdtemp(root));
     assert(setenv("QIHSE_DATA_DIR", root, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
+    qihse_test_container_keys(root);
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("VectorGraphOomTest123!"));
     qihse_user_t *operator_user = qihse_auth_get_user(0u);

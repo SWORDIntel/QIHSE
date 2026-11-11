@@ -61,6 +61,22 @@ The learned cut is checked against the actual frozen store. Export and import
 compare it exactly, including zero. A nonzero caller-supplied fence cut must
 match the actual cut. The final typed receipt binds all learned evidence.
 
+## Baseline membership binding
+
+Group `STATUS` appends the current slot-bitmap digest (14 fields). Group
+`BASELINE STATUS` appends the immutable image's bitmap digest (8 fields).
+The source captures that digest under the same KV lock as the snapshot bytes;
+a later membership change cannot relabel an older image. Both replies retain
+pinned transport identity and the explicit snapshot data principal.
+
+Before replacing a receiver image, its worker requires both remote scope
+digests to match its own persisted receiver bitmap digest. A mismatch waits
+for the existing common-FINAL reconciliation. It does not derive membership
+from the remote caller. This prevents a narrowed source baseline from
+tombstoning rows that the receiver is about to serve in another SOURCE group.
+Same-generation bitmap changes checkpoint historical shared WAL frames before
+publishing the new bitmap; independent retained source logs preserve ACK work.
+
 ## Transfer A to existing destination group C
 
 The original grant names source owner A, target owner C, and C's successor D.
@@ -97,6 +113,10 @@ C remains SOURCE on C and RECEIVER on D. Unselected bits/cursors remain.
 An emptied temporary receiver can retire only when historical replay remains
 possible. A durable phase-3 intent alone never authorizes membership; restart
 revalidates the common decision and repeats finalization idempotently.
+Phase 4 records completed local membership publication. Only that durable
+completed state may be replaced by a different transfer; phase 3 must remain
+retryable until its bitmap and cache changes finish. Completed same-ID retries
+must still return the original result.
 
 ## Promotion and certificate recovery
 
@@ -106,6 +126,13 @@ gate. Replication baseline/certificate exchange may proceed. Baseline ACK
 does not itself authorize ownership. The actual ready marker, original signed
 certificate history and successor ACK precede common FINALIZE; an explicit
 proof-verified admission step follows it.
+
+Applying FINAL also durably fences any local SOURCE context superseded by the
+promotion before updating its routing view. Routing changes alone do not revoke
+a KV writer token or an old-generation ACK path. A returned former owner can
+become the new successor through the existing verified authority claim; its
+stale persisted role must neither block that transition forever nor be reset
+from the original CLI map. Unrelated local groups remain usable.
 
 Certificate logs can contain signed prepared/aborted attempts. Recovery pages
 are original signed envelopes, not assertions re-signed by a later node.

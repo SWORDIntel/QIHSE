@@ -11,6 +11,7 @@
  *   - AGENTS.md invariant 3: a low-clearance principal does NOT see a
  *     document indexed above its clearance, through the fused path.
  */
+#include "qihse_container_keys_fixture.h"
 #include "qihse_resp_wire.h"
 #include "qihse_fusion.h"
 #include "qihse_fts.h"
@@ -19,6 +20,8 @@
 #include "../persistence/qihse_vector_store.h"
 
 #include <assert.h>
+#include <ftw.h>
+#include "qihse_audit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,12 +57,18 @@ static bool reply_has_id(const char* reply, uint64_t id) {
     return strstr(reply, needle) != NULL;
 }
 
-int main(void) {
-{
-    /* Per-test audit/chain isolation (parallel aggregates). */
-    char qdd[] = "build/test_resp_hybrid_XXXXXX";
-    if (mkdtemp(qdd)) setenv("QIHSE_DATA_DIR", qdd, 1);
+static int remove_entry(const char* path, const struct stat* info, int type,
+                        struct FTW* walk) {
+    (void)info; (void)type; (void)walk;
+    return remove(path);
 }
+
+int main(void) {
+    /* Per-test audit/chain/key isolation (parallel aggregates). */
+    char qdd[] = "tests/test-resp-hybrid-XXXXXX";
+    assert(mkdtemp(qdd));
+    assert(setenv("QIHSE_DATA_DIR", qdd, 1) == 0);
+    qihse_test_container_keys(qdd);
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator("OperatorPass123!"));
     qihse_user_t* op = qihse_auth_get_user(0);
@@ -259,6 +268,10 @@ int main(void) {
     qihse_resp_server_destroy(g_server);
     /* cfg.fts is owned by the server from create onward. */
     qihse_kv_store_destroy(store);
+    qihse_auth_shutdown_rate_limiter();
+    qihse_auth_shutdown_volume_limiter();
+    qihse_audit_shutdown();
+    assert(nftw(qdd, remove_entry, 16, FTW_DEPTH | FTW_PHYS) == 0);
     printf("test_resp_hybrid: all hybrid FTS+vector server-path tests passed\n");
     return 0;
 }

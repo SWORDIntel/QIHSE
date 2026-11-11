@@ -447,6 +447,7 @@ static bool qihse_bus_signed_envelope_create(qihse_cluster_bus_t* bus,
     if (out_len) *out_len = 0;
     if (!bus || !data || !len || !out || !out_len ||
         !bus->federation_sign_key || !bus->has_local_node_uuid ||
+        len > QIHSE_CLUSTER_BUS_HEADER_SIZE + QIHSE_CLUSTER_BUS_MAX_PAYLOAD ||
         len > SIZE_MAX - QIHSE_CLUSTER_BUS_SIG_TRAILER_MAX) return false;
 
     uint8_t signature[4627];
@@ -476,7 +477,7 @@ static bool qihse_bus_signed_envelope_create(qihse_cluster_bus_t* bus,
     *cursor++ = 'Q'; *cursor++ = 'B'; *cursor++ = 'S';
     OPENSSL_cleanse(signature, sizeof(signature));
     if ((size_t)(cursor - envelope) != total ||
-        total > QIHSE_CLUSTER_BUS_CT1_CERTIFICATE_MAX) {
+        total > QIHSE_CLUSTER_BUS_MAX_DATAGRAM) {
         OPENSSL_cleanse(envelope, total);
         free(envelope);
         return false;
@@ -2417,6 +2418,15 @@ bool qihse_cluster_bus_ct1_promotion_certificate_create(
     memcpy(frame + QIHSE_CLUSTER_BUS_HEADER_SIZE, update, sizeof(*update));
     bool ok = qihse_bus_signed_envelope_create(bus, frame, sizeof(frame),
         out_envelope, out_envelope_len);
+    /* The reusable signer also serves full-size ordinary bus datagrams.
+     * Only persisted/relayed CT1 certificates have the smaller bound. */
+    if (ok && *out_envelope_len > QIHSE_CLUSTER_BUS_CT1_CERTIFICATE_MAX) {
+        OPENSSL_cleanse(*out_envelope, *out_envelope_len);
+        free(*out_envelope);
+        *out_envelope = NULL;
+        *out_envelope_len = 0;
+        ok = false;
+    }
     OPENSSL_cleanse(frame, sizeof(frame));
     return ok;
 }

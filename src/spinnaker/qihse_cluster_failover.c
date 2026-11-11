@@ -91,7 +91,7 @@ static bool fo_lane_journal_scan(const qihse_cluster_ownership_txn_t* txn,
                                 void* opaque) {
     fo_lane_journal_scan_t* scan = opaque;
     if (!txn || !scan || !scan->lane_id) return false;
-    if (!strcmp(txn->lane_id, scan->lane_id)) {
+    if (txn->next_generation[0] && !strcmp(txn->lane_id, scan->lane_id)) {
         scan->txn = *txn;
         scan->found = true;
     }
@@ -895,10 +895,10 @@ static bool fo_lane_wait_for_successor(qihse_cluster_ownership_context_t* owners
         /* The promoted lane must remain non-routable/non-writable until the
          * common FINAL has been durably recorded. */
         if (out_status->baseline_sealed && out_status->promotion_pending &&
-            !out_status->admitted &&
-            out_status->baseline_stream_cut == txn->target_lsn &&
-            out_status->durable_position >= txn->source_lsn &&
-            out_status->acknowledged_position >= txn->source_lsn &&
+            out_status->admitted &&
+            out_status->baseline_row_seq == txn->target_lsn &&
+            out_status->durable_position >= out_status->baseline_stream_cut &&
+            out_status->acknowledged_position >= out_status->baseline_stream_cut &&
             CRYPTO_memcmp(out_status->certificate_head_digest,
                 certificate_digest, 32u) == 0 &&
             CRYPTO_memcmp(out_status->certificate_ack_digest,
@@ -909,6 +909,67 @@ static bool fo_lane_wait_for_successor(qihse_cluster_ownership_context_t* owners
     } while (true);
     (void)event_digest;
     return false;
+}
+
+/* A common FINAL can precede the local admission or FINALIZED journal write.
+ * Recover that completed authority decision from its persisted readiness
+ * marker, without repeating the obsolete election or RESERVED-only bind. */
+static bool fo_lane_resume_final(qihse_cluster_ownership_context_t* ownership,
+    qihse_cluster_ownership_txn_t* txn, const char* data_dir,
+    bool* out_final_seen, char* err, size_t err_cap) {
+    *out_final_seen = false;
+    qihse_kv_ct_lane_authority_claim_t final_claim = {0}, marker = {0};
+    fo_lane_verify_context_t verifier = {ownership, ownership->principal};
+    if (!ownership->lane_claim(ownership->range_authority_context,
+            ownership->principal, txn, &final_claim) ||
+        !final_claim.final_decision_index ||
+        !ownership->lane_verify_claim(ownership->range_authority_context,
+            ownership->principal, &final_claim, true)) return false;
+    *out_final_seen = true;
+    qihse_kv_ct_proof_t* ready = qihse_kv_ct_lane_promoted_proof_get(
+        ownership->store, ownership->principal, ownership->data_principal,
+        txn->lane_id, final_claim.promotion_event_digest,
+        fo_lane_verify_adapter, &verifier);
+    bool ok = ready && qihse_kv_ct_lane_authority_proof_fields(
+            ownership->store, ownership->principal, ownership->data_principal,
+            ready, &marker) &&
+        !strcmp(marker.transfer_id, txn->transfer_id) &&
+        !strcmp(marker.source_group_id, txn->lane_id) &&
+        !strcmp(marker.target_group_id, txn->lane_id) &&
+        !strcmp(marker.source_qkp_id, txn->source_qkp_id) &&
+        !strcmp(marker.target_qkp_id, txn->target_qkp_id) &&
+        !strcmp(marker.source_generation, txn->generation) &&
+        !strcmp(marker.target_generation, txn->next_generation) &&
+        marker.source_cut == txn->source_lsn && marker.target_cursor == txn->target_lsn &&
+        marker.grant_epoch == txn->config_epoch &&
+        CRYPTO_memcmp(marker.slots, txn->slot_bitmap, sizeof(txn->slot_bitmap)) == 0 &&
+        CRYPTO_memcmp(marker.promotion_event_digest,
+            final_claim.promotion_event_digest, 32u) == 0;
+    qihse_kv_ct_proof_destroy(ready);
+    if (ok) {
+        memcpy(final_claim.range_digest, marker.range_digest, 32u);
+        memcpy(final_claim.image_digest, marker.image_digest, 32u);
+        memcpy(final_claim.certificate_head_digest, marker.certificate_head_digest, 32u);
+    }
+    qihse_kv_ct_proof_t* proof = ok ? qihse_kv_ct_lane_authority_proof_create(
+        ownership->store, ownership->principal, ownership->data_principal,
+        &final_claim, fo_lane_verify_adapter, &verifier) : NULL;
+    ok = proof && qihse_kv_ct_lane_promotion_finalize(ownership->store,
+        ownership->principal, ownership->data_principal, &final_claim,
+        proof, fo_lane_verify_adapter, &verifier) &&
+        ownership->range_refresh(ownership->range_authority_context,
+            ownership->principal, txn->slot_bitmap, err, err_cap);
+    qihse_kv_ct_proof_destroy(proof);
+    if (ok && txn->phase != QIHSE_OWNERSHIP_FINALIZED) {
+        txn->phase = QIHSE_OWNERSHIP_FINALIZED;
+        ok = qihse_cluster_ownership_journal_append_txn(data_dir, txn) == 0;
+    }
+    OPENSSL_cleanse(&marker, sizeof(marker));
+    OPENSSL_cleanse(&final_claim, sizeof(final_claim));
+    if (!ok) fo_set_err(err, err_cap,
+        "common FINAL is durable; local readiness/admission recovery remains pending");
+    else fo_set_err(err, err_cap, "");
+    return ok;
 }
 
 bool qihse_cluster_failover_promote_lane(
@@ -958,18 +1019,32 @@ bool qihse_cluster_failover_promote_lane(
         (scan.txn.phase == QIHSE_OWNERSHIP_INTENT ||
          scan.txn.phase == QIHSE_OWNERSHIP_PREPARED ||
          scan.txn.phase == QIHSE_OWNERSHIP_COMMITTED);
-    if (scan.found && scan.txn.phase == QIHSE_OWNERSHIP_FINALIZED) {
-        qihse_cluster_ownership_txn_t finalized = scan.txn;
-        bool done = fo_lane_status_matches_txn(&lane, &finalized,
-                finalized.target_qkp_id) && lane.admitted &&
-            !lane.promotion_pending && ownership->range_refresh(
-                ownership->range_authority_context, ownership->principal,
-                finalized.slot_bitmap, err, err_cap);
+    *out_pending = have_txn;
+    if (scan.found && scan.txn.phase == QIHSE_OWNERSHIP_FINALIZED &&
+        fo_lane_status_matches_txn(&lane, &scan.txn, scan.txn.target_qkp_id)) {
+        qihse_kv_ct_lane_authority_claim_t completed = {0};
+        bool done = lane.admitted && !lane.promotion_pending &&
+            ownership->lane_claim(ownership->range_authority_context,
+                ownership->principal, &scan.txn, &completed) &&
+            ownership->lane_verify_claim(ownership->range_authority_context,
+                ownership->principal, &completed, true) &&
+            ownership->range_refresh(ownership->range_authority_context,
+                ownership->principal, scan.txn.slot_bitmap, err, err_cap);
+        OPENSSL_cleanse(&completed, sizeof(completed));
         OPENSSL_cleanse(&lane, sizeof(lane));
-        OPENSSL_cleanse(&finalized, sizeof(finalized));
         if (!done) fo_set_err(err, err_cap, "finalized lane promotion is not durably admitted");
         else fo_set_err(err, err_cap, "");
         return done;
+    }
+    if (scan.found && scan.txn.phase == QIHSE_OWNERSHIP_COMMITTED) {
+        bool final_seen = false;
+        bool done = fo_lane_resume_final(ownership, &scan.txn, data_dir,
+            &final_seen, err, err_cap);
+        if (done || final_seen) {
+            OPENSSL_cleanse(&lane, sizeof(lane));
+            *out_pending = !done;
+            return done;
+        }
     }
     uint16_t local_index = qihse_cluster_topology_local_node(ownership->topology);
     uint16_t source_index = QIHSE_CLUSTER_NODE_NONE;
@@ -1122,6 +1197,26 @@ bool qihse_cluster_failover_promote_lane(
     }
     qihse_kv_ct_proof_destroy(reserved_proof);
 
+    /* The new generation starts at CT position zero. Its immutable baseline
+     * row watermark is captured after receiver promotion; the old receiver's
+     * baseline and old generation's CT cursor are different sequence domains.
+     * Seal this image before signing the event so retries retain one tuple. */
+    qihse_kv_replica_snapshot_t* baseline = NULL;
+    uint64_t baseline_row = 0;
+    uint8_t baseline_digest[32];
+    bool baseline_ok = qihse_kv_ct_lane_source_baseline_snapshot_create(
+        ownership->store, ownership->data_principal, lane_id, &baseline,
+        &baseline_row, baseline_digest) == 0;
+    qihse_kv_replica_snapshot_destroy(baseline);
+    OPENSSL_cleanse(baseline_digest, sizeof(baseline_digest));
+    if (!baseline_ok || (txn.phase == QIHSE_OWNERSHIP_COMMITTED &&
+                         txn.target_lsn != baseline_row)) {
+        OPENSSL_cleanse(&claim, sizeof(claim));
+        fo_set_err(err, err_cap, "new-generation immutable baseline is unavailable or differs from its signed promotion");
+        goto lane_pending;
+    }
+    txn.target_lsn = baseline_row;
+
     qihse_cluster_bus_ct1_promotion_update_v2_t update;
     memset(&update, 0, sizeof(update));
     uint8_t* envelope = NULL;
@@ -1157,8 +1252,9 @@ bool qihse_cluster_failover_promote_lane(
     qihse_cluster_bus_ct1_certificate_free(envelope, envelope_len);
     envelope = NULL;
     envelope_len = 0;
+    bool needs_commit = txn.phase != QIHSE_OWNERSHIP_COMMITTED;
     txn.phase = QIHSE_OWNERSHIP_COMMITTED;
-    if (qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
+    if (needs_commit && qihse_cluster_ownership_journal_append_txn(data_dir, &txn) != 0) {
         OPENSSL_cleanse(&update, sizeof(update));
         OPENSSL_cleanse(&claim, sizeof(claim));
         OPENSSL_cleanse(certificate_digest, sizeof(certificate_digest));

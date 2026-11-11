@@ -220,6 +220,11 @@ int qihse_kv_ct_lane_source_baseline_snapshot_create(qihse_kv_store_t* store,
     qihse_user_t* principal, const char* lane_id,
     qihse_kv_replica_snapshot_t** out_snapshot,
     uint64_t* out_baseline_row_seq, unsigned char out_digest[32]);
+/* Authenticated immutable membership digest of a lane baseline snapshot.
+ * Ordinary unscoped snapshots are rejected; failed calls zero the output. */
+bool qihse_kv_ct_lane_baseline_scope_digest(
+    const qihse_kv_replica_snapshot_t* snapshot, qihse_user_t* principal,
+    unsigned char out_digest[32]);
 bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     qihse_user_t* operator_principal, qihse_user_t* data_principal,
     const char* lane_id,
@@ -542,6 +547,31 @@ bool qihse_kv_ct_lane_transfer_membership_finalize(qihse_kv_store_t* store,
     const unsigned char target_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
 bool qihse_kv_ct_lane_transfer_write_allowed(qihse_kv_store_t* store,
     qihse_user_t* principal, const char* key);
+bool qihse_kv_ct_lane_promotion_retire(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* final_claim,
+    const qihse_kv_ct_proof_t* final_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify, void* verify_context);
+/* Prepare a reserved promotion receiver, or create/reuse an empty completed
+ * transfer staging receiver. Transfer preparation cannot reset a SOURCE or
+ * nonempty replica; exact retries preserve their baseline and cursors. */
+bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
+    qihse_user_t* control_principal, qihse_user_t* data_principal,
+    const qihse_kv_ct_lane_authority_claim_t* reserved_claim,
+    const qihse_kv_ct_proof_t* reserved_proof,
+    qihse_kv_ct_lane_authority_verify_fn verify_reserved, void* verify_context,
+    unsigned char out_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Metadata-only reduction of a non-owner replica's assigned slots. This
+ * cannot add slots, turn a receiver into a source, or admit ordinary reads. */
+bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id, const char* generation,
+    const uint8_t subset_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Subtractive control operation: permanently disarm this exact source
+ * context. It grants no slots or data admission and leaves other lanes alone. */
+bool qihse_kv_ct_lane_source_disable(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, const char* lane_id, const char* generation,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
 /* Release a pre-activation intent only against the separate verifier for an
  * actual committed ABORT. A normal reservation/final proof is insufficient. */
 bool qihse_kv_ct_lane_transfer_abort(qihse_kv_store_t* store,
