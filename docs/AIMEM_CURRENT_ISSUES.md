@@ -369,3 +369,17 @@ error even though ordinary owner inventory succeeds. No fresh backup artifact
 was published. This remains open alongside the documented CT cleanup and
 placement residuals. The [range-group deployment record](validation/cluster_range_groups_20261110.md#live-native-deployment--2026-11-11)
 contains the current evidence; [ROADMAP.md](../ROADMAP.md) remains authoritative.
+
+### Owner-backup follow-up — 2026-11-11
+
+Revision `8a8593e` fixes the live failure: the snapshot readiness check now
+accepts completed CT2 history but still refuses active transfer states. Three
+focused tests and a scoped KV sanitizer run passed; no full suite was rerun.
+Native packages were rolled to all six daemons one at a time. Authenticated
+owner counts and slot maps stayed identical, and all three replication pairs
+remained caught up. All three owners exported data-only backup containers, and
+offline verification passed for each. T420's backup restored into an isolated
+CT-disabled store with the same authenticated 8,858-record count. The earlier
+failure above is retained as historical evidence; CT cleanup and placement
+residuals remain open. The [live repair record](validation/cluster_range_groups_20261110.md#live-owner-backup-repair--2026-11-11)
+contains the exact scope.

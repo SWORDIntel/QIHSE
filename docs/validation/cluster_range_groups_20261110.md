@@ -110,6 +110,46 @@ live failure needs investigation independently of the passing repair tests.
 Existing backup artifacts were not changed. No fresh verified owner backup is
 claimed by this deployment record.
 
+## Live owner-backup repair — 2026-11-11
+
+The T420 failure came from an owner-snapshot readiness predicate that treated
+completed CT2 transfer history as an active transfer. Revision
+`8a8593eabb4ad91e6496a8b502c91b6c181ab3dc` accepts terminal source
+committed, target activated and target aborted states while still refusing an
+active fence/import. It preserves transfer evidence and the existing
+authorization, admission and recovery checks. The Python SDK now returns the
+bounded server error for a refused BEGIN instead of misreporting an invalid
+manifest.
+
+Focused `test-ct-transfer-storage`, `test-backup-owner-data` and
+`test-owner-snapshot-sdk` passed together against the integrated library.
+The CT2 fixture covers terminal states after restart, active-state refusal,
+protected labels and tombstones, excluded moved rows, and unchanged exact
+retry evidence. A scoped KV ASan/UBSan run passed with leak detection disabled.
+No complete-suite rerun was made for this follow-up.
+
+Native packages were built separately from the exact revision on all three
+hosts. The T420, 730xd and T320 packages passed respectively 113, 107 and 170
+checksum checks plus loader checks. All three successors and then all three
+owners were restarted one at a time; each process maps its new package daemon
+and library. Existing arguments, identities and data directories were kept.
+
+| Host | Active package | Owner records before / after | Source durable / ACK / receiver cursor | Verified owner backup bytes |
+| --- | --- | --- | --- | ---: |
+| T420 | `native-t420-8a8593e` | 8,858 / 8,858 | 26 / 26 / 26 | 5,161,703 |
+| 730xd | `native-730xd-8a8593e` | 209,856 / 209,856 | 11,100 / 11,100 / 11,100 | 1,705,687,929 |
+| T320 | `native-t320-8a8593e` | 52,661 / 52,661 | 24 / 24 / 24 | 53,625,909 |
+
+All three authenticated owner PING/DBSIZE results and slot-map digests matched
+before and after the rolling restart and after backup. The offline
+`qihse-backup verify` operation accepted all three exported containers. The
+T420 container restored successfully into a new CT-disabled local store; an
+authenticated Operator count of that restored store returned 8,858, matching
+the live owner. This validates container integrity and T420 record count, not
+byte-for-byte equality of every value or a whole-cluster replay. The owner
+backups are data-only and do not include CT identity or journals. The separate
+HAX AIMEM service was not changed.
+
 ## Current integration checks
 
 - The library and daemon build with the shared group transfer finish path.

@@ -2168,11 +2168,14 @@ the gold pack (`make test-gold`).
 
 Stated plainly rather than omitted:
 
-**Live owner-backup limitation (2026-11-11):** after the native cluster rollout,
-T420's authenticated `OWNER.SNAPSHOT.BEGIN BACKUP` returns a creation/authorization
-error while ordinary owner inventory succeeds. No fresh verified backup was
-created. The source-level backup tests do not close this live failure; see the
-[deployment record](validation/cluster_range_groups_20261110.md#live-native-deployment--2026-11-11).
+**Live owner-backup status (2026-11-11):** revision `8a8593e` permits online
+backup when CT2 transfer history is terminal (source committed, target activated
+or target aborted). An active fence or import remains refused. Authenticated
+exports from all three live owners passed offline container verification;
+T420's export also restored into an isolated store with 8,858 authorized rows,
+matching its live count. The SDK now reports bounded server error replies from
+`OWNER.SNAPSHOT.BEGIN BACKUP` rather than masking them as invalid manifests.
+See the [deployment record](validation/cluster_range_groups_20261110.md#live-owner-backup-repair--2026-11-11).
 
 1. **Backup writer — implemented.** An earlier revision of this list (and of
    the ROADMAP) said the writer that produces the referenced data was not
