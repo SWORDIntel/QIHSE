@@ -79,6 +79,23 @@ class SourceTests(unittest.TestCase):
         path.unlink(); path.symlink_to('different.c')
         self.assertNotEqual(before['worktree_v2'], bridge.source_identity(self.repo)['worktree_v2'])
 
+    def test_large_untracked_listing_streams_without_changing_digest(self):
+        bulk = self.repo/'bulk'
+        bulk.mkdir()
+        for i in range(34000):
+            (bulk/(f'{i:05d}-' + 'x'*118 + '.c')).touch()
+        selected = bridge.SELECTED
+        paths = self.git('ls-files', '--others', '--exclude-standard', '-z', *selected)
+        self.assertGreater(len(paths), bridge.GIT_LIMIT)
+        status = self.git('status', '--porcelain=v1', '-z', '--untracked-files=normal', *selected)
+        diff = self.git('diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *selected)
+        index = self.git('ls-files', '--stage', '-z', *selected)
+        expected = hashlib.sha256(status+b'\0'+diff+b'\0'+index+b'\0')
+        empty_digest = hashlib.sha256(b'').hexdigest().encode()
+        for name in paths.split(b'\0')[:-1]:
+            expected.update(name+b'\0f\0'+empty_digest+b'\0')
+        self.assertEqual(bridge.source_identity(self.repo)['worktree_v2'], expected.hexdigest())
+
     def test_staged_only_identity(self):
         path = self.repo/'tracked.c'
         path.write_text('index-a'); self.git('add', '.'); path.write_text('working')

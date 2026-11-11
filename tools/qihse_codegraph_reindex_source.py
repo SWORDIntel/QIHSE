@@ -22,32 +22,42 @@ POLICY = 'git-status-diff-index-untracked-v2'
 MAX_LINE = 262144
 GIT_LIMIT = 4 * 1024 * 1024
 TIMEOUT = 5.0
+UNTRACKED_TIMEOUT = 30.0
+UNTRACKED_MAX_FILES = 200000
+UNTRACKED_MAX_BYTES = 64 * 1024 * 1024
+UNTRACKED_MAX_PATH = 4096
 SELECTED = ('--', '.', ':(exclude).code-review-graph')
 HEX64 = re.compile(r'[0-9a-f]{64}\Z')
 HEAD = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})\Z')
 
 
-def _git(repo: Path, *args: str) -> bytes:
-    """Bound both time and captured output; kill Git and its children on failure."""
+def _git(repo: Path, *args: str, on_chunk=None, timeout: float | None = None) -> bytes:
+    """Bound Git execution; optionally consume output without retaining it."""
     process = subprocess.Popen(['git', '--no-optional-locks', *args], cwd=repo,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                start_new_session=True)
     output = bytearray()
-    deadline = time.monotonic() + TIMEOUT
+    deadline = time.monotonic() + (TIMEOUT if timeout is None else timeout)
+    idle_deadline = time.monotonic() + TIMEOUT
     try:
         assert process.stdout is not None
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
-                remaining = deadline - time.monotonic()
+                remaining = min(deadline, idle_deadline) - time.monotonic()
                 if remaining <= 0 or not selector.select(remaining):
                     raise ValueError('Git source verification timed out')
-                chunk = os.read(process.stdout.fileno(), min(65536, GIT_LIMIT + 1 - len(output)))
+                chunk = os.read(process.stdout.fileno(),
+                                65536 if on_chunk is not None else min(65536, GIT_LIMIT + 1 - len(output)))
                 if not chunk:
                     break
-                output.extend(chunk)
-                if len(output) > GIT_LIMIT:
-                    raise ValueError('Git source verification exceeds output limit')
+                if on_chunk is not None:
+                    on_chunk(chunk, deadline)
+                else:
+                    output.extend(chunk)
+                    if len(output) > GIT_LIMIT:
+                        raise ValueError('Git source verification exceeds output limit')
+                idle_deadline = time.monotonic() + TIMEOUT
         if process.wait(timeout=max(0.001, deadline-time.monotonic())):
             raise ValueError('Git source verification failed')
         return bytes(output)
@@ -135,13 +145,39 @@ def _git_source_identity(repo: Path | str) -> dict[str, str]:
     diff = _git(repo, 'diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *SELECTED)
     legacy = hashlib.sha256(status + b'\0' + diff).hexdigest()
     digest = hashlib.sha256(status + b'\0' + diff + b'\0' + index + b'\0')
-    deadline = time.monotonic() + TIMEOUT
-    paths = _git(repo, 'ls-files', '--others', '--exclude-standard', '-z', *SELECTED)
-    if paths and not paths.endswith(b'\0'):
+    pending = bytearray()
+    count = 0
+    listing_bytes = 0
+
+    def consume_untracked(chunk: bytes, deadline: float) -> None:
+        nonlocal count, listing_bytes
+        listing_bytes += len(chunk)
+        if listing_bytes > UNTRACKED_MAX_BYTES:
+            raise ValueError('Untracked source listing exceeds output limit')
+        start = 0
+        while start < len(chunk):
+            end = chunk.find(b'\0', start)
+            if end < 0:
+                pending.extend(chunk[start:])
+                if len(pending) >= UNTRACKED_MAX_PATH:
+                    raise ValueError('Untracked source path exceeds limit')
+                break
+            pending.extend(chunk[start:end])
+            if not pending or len(pending) >= UNTRACKED_MAX_PATH:
+                raise ValueError('Malformed untracked source path')
+            if count >= UNTRACKED_MAX_FILES:
+                raise ValueError('Too many untracked source files')
+            raw = bytes(pending)
+            pending.clear()
+            kind, content = _untracked_digest(repo, raw, deadline)
+            digest.update(raw + b'\0' + kind + b'\0' + content + b'\0')
+            count += 1
+            start = end + 1
+
+    _git(repo, 'ls-files', '--others', '--exclude-standard', '-z', *SELECTED,
+         on_chunk=consume_untracked, timeout=UNTRACKED_TIMEOUT)
+    if pending:
         raise ValueError('Malformed untracked source listing')
-    for raw in paths.split(b'\0')[:-1]:
-        kind, content = _untracked_digest(repo, raw, deadline)
-        digest.update(raw + b'\0' + kind + b'\0' + content + b'\0')
     return dict(head=head, worktree=legacy, worktree_v2=digest.hexdigest(), freshness=POLICY)
 
 
