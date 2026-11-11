@@ -2046,8 +2046,8 @@ static bool git_spawn_pipe(const char *repo, const char *const args[], pid_t *ch
     return true;
 }
 
-static bool git_capture(const char *repo, const char *const args[], unsigned char **out,
-                        size_t *out_len) {
+static bool git_capture_until(const char *repo, const char *const args[], unsigned char **out,
+                              size_t *out_len, double overall_deadline) {
     *out = NULL;
     *out_len = 0;
     pid_t pid;
@@ -2058,6 +2058,8 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
     unsigned char *buf = malloc(cap);
     bool ok = buf != NULL;
     double deadline = monotonic_ms() + 5000.0;
+    if (overall_deadline > 0 && overall_deadline < deadline)
+        deadline = overall_deadline;
     while (ok) {
         double remaining = deadline - monotonic_ms();
         if (remaining <= 0) {
@@ -2121,44 +2123,132 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
     *out_len = used;
     return true;
 }
-static bool hash_untracked_path(cg_state *st, EVP_MD_CTX *ctx, const char *name,
-                                double deadline) {
-        if (monotonic_ms() >= deadline || !*name || !safe_relative(name))
-            return false;
-        char path[PATH_MAX], digest[65], parent[PATH_MAX], resolved[PATH_MAX];
-        if (snprintf(path, sizeof(path), "%s/%s", st->repository, name) >= (int)sizeof(path)) {
-            return false;
+static bool git_capture(const char *repo, const char *const args[], unsigned char **out,
+                        size_t *out_len) {
+    return git_capture_until(repo, args, out, out_len, 0);
+}
+
+typedef struct {
+    double deadline;
+    size_t paths;
+    size_t listing_bytes;
+} cg_git_identity_budget;
+
+static bool git_v2_identity(const char *repo, cg_git_identity_budget *budget,
+                            unsigned depth, char head_out[65], char digest_out[65]);
+
+/* Open every path component without following symlinks before treating a Git
+ * trailing-slash record as another repository. Gitfiles are allowed for
+ * linked worktrees, but the .git entry itself may not be a symlink. */
+static bool nested_repo_path(const char *repo, const char *name, char nested[PATH_MAX],
+                             double deadline) {
+    size_t length = strlen(name);
+    if (length < 2 || name[length - 1] != '/' || length >= PATH_MAX)
+        return false;
+    char relative[PATH_MAX];
+    memcpy(relative, name, length - 1);
+    relative[length - 1] = '\0';
+    if (!safe_relative(relative) ||
+        snprintf(nested, PATH_MAX, "%s/%s", repo, relative) >= PATH_MAX)
+        return false;
+    int fd = open(repo, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    bool ok = true;
+    char *part = relative;
+    while (ok && *part) {
+        char *slash = strchr(part, '/');
+        if (slash) *slash = '\0';
+        int child = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (child < 0) {
+            ok = false;
+        } else {
+            close(fd);
+            fd = child;
         }
-        snprintf(parent, sizeof(parent), "%s", path);
-        *strrchr(parent, '/') = 0;
-        if (!realpath(parent, resolved)) {
-            return false;
-        }
-        size_t root_len = strlen(st->repository);
-        if (strncmp(resolved, st->repository, root_len) ||
-            (resolved[root_len] && resolved[root_len] != '/')) {
-            return false;
-        }
-        struct stat info;
-        if (lstat(path, &info)) {
-            return false;
-        }
-        const char *kind = "f";
-        bool ok;
-        if (S_ISLNK(info.st_mode)) {
-            char target[PATH_MAX];
-            ssize_t n = readlink(path, target, sizeof(target));
-            kind = "l";
-            ok = n >= 0 && n < (ssize_t)sizeof(target) && sha256_buffer(target, (size_t)n, digest);
-        } else
-            ok = S_ISREG(info.st_mode) && sha256_file(path, digest, deadline);
-        if (ok)
-            ok = EVP_DigestUpdate(ctx, name, strlen(name) + 1) == 1 &&
-                 EVP_DigestUpdate(ctx, kind, 2) == 1 && EVP_DigestUpdate(ctx, digest, 65) == 1;
+        if (!slash) break;
+        part = slash + 1;
+    }
+    struct stat git_entry;
+    if (ok)
+        ok = fstatat(fd, ".git", &git_entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+             (S_ISDIR(git_entry.st_mode) || S_ISREG(git_entry.st_mode));
+    close(fd);
+    if (!ok || monotonic_ms() >= deadline)
+        return false;
+    const char *const args[] = {"git", "--no-optional-locks", "rev-parse", "--show-toplevel", NULL};
+    unsigned char *top = NULL;
+    size_t n = 0;
+    ok = git_capture_until(nested, args, &top, &n, deadline);
+    while (ok && n && (top[n - 1] == '\n' || top[n - 1] == '\r')) n--;
+    ok = ok && n == strlen(nested) && memcmp(top, nested, n) == 0;
+    free(top);
     return ok;
 }
 
-static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
+static bool hash_untracked_path(const char *repo, EVP_MD_CTX *ctx, const char *name,
+                                cg_git_identity_budget *budget, unsigned depth) {
+    if (monotonic_ms() >= budget->deadline || !*name)
+        return false;
+    if (name[strlen(name) - 1] == '/') {
+        if (depth >= 4)
+            return false;
+        char nested[PATH_MAX], head[65], inner[65], digest[65];
+        if (!nested_repo_path(repo, name, nested, budget->deadline) ||
+            !git_v2_identity(nested, budget, depth + 1, head, inner))
+            return false;
+        EVP_MD_CTX *nested_ctx = EVP_MD_CTX_new();
+        unsigned char sum[32];
+        unsigned int n = 0;
+        bool ok = nested_ctx && EVP_DigestInit_ex(nested_ctx, EVP_sha256(), NULL) == 1 &&
+            EVP_DigestUpdate(nested_ctx, "qihse-nested-git-v1\0", 20) == 1 &&
+            EVP_DigestUpdate(nested_ctx, head, strlen(head) + 1) == 1 &&
+            EVP_DigestUpdate(nested_ctx, inner, strlen(inner)) == 1 &&
+            EVP_DigestFinal_ex(nested_ctx, sum, &n) == 1 && n == 32;
+        EVP_MD_CTX_free(nested_ctx);
+        if (!ok) return false;
+        digest_hex(sum, n, digest);
+        return EVP_DigestUpdate(ctx, name, strlen(name) + 1) == 1 &&
+            EVP_DigestUpdate(ctx, "r", 2) == 1 &&
+            EVP_DigestUpdate(ctx, digest, 65) == 1;
+    }
+    if (!safe_relative(name))
+        return false;
+    char path[PATH_MAX], digest[65], parent[PATH_MAX], resolved[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", repo, name) >= (int)sizeof(path)) {
+        return false;
+    }
+    snprintf(parent, sizeof(parent), "%s", path);
+    *strrchr(parent, '/') = 0;
+    if (!realpath(parent, resolved)) {
+        return false;
+    }
+    size_t root_len = strlen(repo);
+    if (strncmp(resolved, repo, root_len) ||
+        (resolved[root_len] && resolved[root_len] != '/')) {
+        return false;
+    }
+    struct stat info;
+    if (lstat(path, &info)) {
+        return false;
+    }
+    const char *kind = "f";
+    bool ok;
+    if (S_ISLNK(info.st_mode)) {
+        char target[PATH_MAX];
+        ssize_t n = readlink(path, target, sizeof(target));
+        kind = "l";
+        ok = n >= 0 && n < (ssize_t)sizeof(target) && sha256_buffer(target, (size_t)n, digest);
+    } else
+        ok = S_ISREG(info.st_mode) && sha256_file(path, digest, budget->deadline);
+    if (ok)
+        ok = EVP_DigestUpdate(ctx, name, strlen(name) + 1) == 1 &&
+             EVP_DigestUpdate(ctx, kind, 2) == 1 && EVP_DigestUpdate(ctx, digest, 65) == 1;
+    return ok;
+}
+
+static bool hash_untracked(const char *repo, EVP_MD_CTX *ctx,
+                           cg_git_identity_budget *budget, unsigned depth) {
     /* Git can list far more than 4 MiB of paths for a large live workspace.
      * Parse the NUL stream one path at a time; preserve Git order and the v2
      * digest framing without retaining the complete listing in memory. */
@@ -2167,13 +2257,13 @@ static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
                                 ":(exclude).code-review-graph", NULL};
     pid_t pid;
     int reader;
-    if (!git_spawn_pipe(st->repository, args, &pid, &reader))
+    if (!git_spawn_pipe(repo, args, &pid, &reader))
         return false;
-    const double deadline = monotonic_ms() + 30000.0;
+    const double deadline = budget->deadline;
     double idle_deadline = monotonic_ms() + 5000.0;
     char name[PATH_MAX];
     unsigned char chunk[65536];
-    size_t name_len = 0, total = 0, files = 0;
+    size_t name_len = 0;
     bool ok = true;
     while (ok) {
         double remaining = (deadline < idle_deadline ? deadline : idle_deadline) - monotonic_ms();
@@ -2198,11 +2288,12 @@ static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
         }
         if (n == 0)
             break;
-        if ((size_t)n > (64u << 20) - total) {
+        if (budget->listing_bytes > (64u << 20) ||
+            (size_t)n > (64u << 20) - budget->listing_bytes) {
             ok = false;
             break;
         }
-        total += (size_t)n;
+        budget->listing_bytes += (size_t)n;
         for (size_t off = 0; ok && off < (size_t)n;) {
             unsigned char *end = memchr(chunk + off, 0, (size_t)n - off);
             size_t length = end ? (size_t)(end - (chunk + off)) : (size_t)n - off;
@@ -2215,8 +2306,8 @@ static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
             off += length;
             if (end) {
                 name[name_len] = '\0';
-                if (++files > 200000 ||
-                    !hash_untracked_path(st, ctx, name, deadline))
+                if (++budget->paths > 200000 ||
+                    !hash_untracked_path(repo, ctx, name, budget, depth))
                     ok = false;
                 name_len = 0;
                 off++;
@@ -2246,6 +2337,68 @@ static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
         } while (waited < 0 && errno == EINTR);
     }
     return ok && waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool git_v2_identity(const char *repo, cg_git_identity_budget *budget,
+                            unsigned depth, char head_out[65], char digest_out[65]) {
+    if (depth > 4 || monotonic_ms() >= budget->deadline)
+        return false;
+    const char *const flags_args[] = {"git", "--no-optional-locks", "ls-files", "--stage",
+                                      "-v", "-f", "-z", "--", ".",
+                                      ":(exclude).code-review-graph", NULL};
+    const char *const head_args[] = {"git", "--no-optional-locks", "rev-parse", "--verify",
+                                     "HEAD", NULL};
+    const char *const status_args[] = {"git", "--no-optional-locks", "status",
+                                       "--porcelain=v1", "-z", "--untracked-files=normal",
+                                       "--", ".", ":(exclude).code-review-graph", NULL};
+    const char *const diff_args[] = {"git", "--no-optional-locks", "diff", "--no-ext-diff",
+                                     "--no-textconv", "--binary", "HEAD", "--", ".",
+                                     ":(exclude).code-review-graph", NULL};
+    unsigned char *flags = NULL, *head = NULL, *status = NULL, *diff = NULL;
+    size_t nflags = 0, nhead = 0, nstatus = 0, ndiff = 0, nindex = 0;
+    bool ok = git_capture_until(repo, flags_args, &flags, &nflags, budget->deadline);
+    for (size_t offset = 0; ok && offset < nflags;) {
+        unsigned char *end = memchr(flags + offset, 0, nflags - offset);
+        unsigned char flag = flags[offset];
+        if (!end || end - (flags + offset) < 3 || flags[offset + 1] != ' ' || flag == 'S' ||
+            (flag >= 'a' && flag <= 'z')) {
+            ok = false;
+            break;
+        }
+        size_t next = (size_t)(end - flags) + 1;
+        size_t bytes = (size_t)(end - flags - offset) - 1;
+        memmove(flags + nindex, flags + offset + 2, bytes);
+        nindex += bytes;
+        offset = next;
+    }
+    if (ok)
+        ok = git_capture_until(repo, head_args, &head, &nhead, budget->deadline) &&
+             git_capture_until(repo, status_args, &status, &nstatus, budget->deadline) &&
+             git_capture_until(repo, diff_args, &diff, &ndiff, budget->deadline);
+    while (ok && nhead && (head[nhead - 1] == '\n' || head[nhead - 1] == '\r')) nhead--;
+    if (ok)
+        ok = (nhead == 40 || nhead == 64) && nhead < 65;
+    if (ok) {
+        memcpy(head_out, head, nhead);
+        head_out[nhead] = '\0';
+        ok = hex_n(head_out, nhead);
+    }
+    unsigned char sum[32];
+    unsigned int n = 0;
+    EVP_MD_CTX *ctx = ok ? EVP_MD_CTX_new() : NULL;
+    ok = ok && ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+         EVP_DigestUpdate(ctx, status, nstatus) == 1 && EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
+         EVP_DigestUpdate(ctx, diff, ndiff) == 1 && EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
+         EVP_DigestUpdate(ctx, flags, nindex) == 1 && EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
+         hash_untracked(repo, ctx, budget, depth) &&
+         EVP_DigestFinal_ex(ctx, sum, &n) == 1 && n == 32;
+    EVP_MD_CTX_free(ctx);
+    if (ok) digest_hex(sum, n, digest_out);
+    free(flags);
+    free(head);
+    free(status);
+    free(diff);
+    return ok;
 }
 static bool freshness(cg_state *st, const char **reason) {
     if (!st->manifest || !source_schema(st->manifest, false)) {
@@ -2338,13 +2491,15 @@ static bool freshness(cg_state *st, const char **reason) {
     char status_hash[65] = {0};
     unsigned char sum[32];
     unsigned int n = 0;
+    cg_git_identity_budget budget = {.deadline = monotonic_ms() + 90000.0};
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     bool ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
     if (ok)
         ok = EVP_DigestUpdate(ctx, worktree, nstatus) == 1 && EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
              EVP_DigestUpdate(ctx, diff, ndiff) == 1 && EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
              EVP_DigestUpdate(ctx, index, nindex) == 1 && EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
-             hash_untracked(st, ctx) && EVP_DigestFinal_ex(ctx, sum, &n) == 1 && n == 32;
+             hash_untracked(st->repository, ctx, &budget, 0) &&
+             EVP_DigestFinal_ex(ctx, sum, &n) == 1 && n == 32;
     EVP_MD_CTX_free(ctx);
     if (ok)
         digest_hex(sum, n, status_hash);

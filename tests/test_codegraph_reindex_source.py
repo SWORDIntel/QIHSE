@@ -299,6 +299,55 @@ class SourceTests(unittest.TestCase):
         (self.repo/name).write_bytes(b'two')
         self.assertFalse(native('status')['fresh'])
 
+    def test_native_nested_untracked_git_identity(self):
+        if BINARY is None:
+            self.skipTest('pass --binary to validate native freshness')
+        nested = self.repo/'nested'
+        nested.mkdir()
+        subprocess.run(['git', 'init', '-q'], cwd=nested, check=True)
+        (nested/'inside.c').write_text('int inside(void) { return 1; }\n')
+        subprocess.run(['git', 'add', '.'], cwd=nested, check=True)
+        subprocess.run(['git', '-c', 'user.name=Fixture', '-c',
+                        'user.email=fixture@example.invalid', 'commit', '-qm', 'nested'],
+                       cwd=nested, check=True)
+        (nested/'scratch.c').write_text('int scratch(void) { return 1; }\n')
+        selected = bridge.SELECTED
+        paths = self.git('ls-files', '--others', '--exclude-standard', '-z', *selected)
+        self.assertEqual(paths, b'nested/\0')
+        status = self.git('status', '--porcelain=v1', '-z', '--untracked-files=normal', *selected)
+        diff = self.git('diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *selected)
+        index = self.git('ls-files', '--stage', '-z', *selected)
+        inner = bridge.source_identity(nested)
+        nested_digest = hashlib.sha256(
+            b'qihse-nested-git-v1\0' + inner['head'].encode() + b'\0' +
+            inner['worktree_v2'].encode()).hexdigest().encode()
+        outer = hashlib.sha256(status+b'\0'+diff+b'\0'+index+b'\0'+
+                               b'nested/\0r\0'+nested_digest+b'\0').hexdigest()
+        identity = dict(head=self.git('rev-parse', '--verify', 'HEAD').strip().decode(),
+                        worktree=hashlib.sha256(status+b'\0'+diff).hexdigest(),
+                        worktree_v2=outer, freshness=bridge.POLICY)
+        self.write_export(identity)
+        bridge.prepare_export(self.export, self.destination, identity)
+        env = {**os.environ, 'HOME':str(self.root), 'XDG_STATE_HOME':str(self.root/'state'),
+               'LD_LIBRARY_PATH':str(BINARY.parent)}
+        def native(*args):
+            result = subprocess.run([str(BINARY), *args, '--repo', str(self.repo)], env=env,
+                                    capture_output=True, text=True, timeout=45)
+            self.assertEqual(result.returncode, 0, result.stderr+result.stdout)
+            return json.loads(result.stdout)
+        native('import', '--input', str(self.destination))
+        self.assertTrue(native('status')['fresh'])
+        (nested/'scratch.c').write_text('int scratch(void) { return 2; }\n')
+        self.assertFalse(native('status')['fresh'])
+        (nested/'scratch.c').write_text('int scratch(void) { return 1; }\n')
+        self.assertTrue(native('status')['fresh'])
+        (nested/'inside.c').write_text('int inside(void) { return 2; }\n')
+        subprocess.run(['git', 'add', '.'], cwd=nested, check=True)
+        subprocess.run(['git', '-c', 'user.name=Fixture', '-c',
+                        'user.email=fixture@example.invalid', 'commit', '-qm', 'nested changed'],
+                       cwd=nested, check=True)
+        self.assertFalse(native('status')['fresh'])
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
