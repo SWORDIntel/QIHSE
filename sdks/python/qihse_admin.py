@@ -42,6 +42,7 @@ class QihseAdminError(Exception):
 
 
 _OWNER_SNAPSHOT_MAX_READ = 512 * 1024
+_OWNER_SNAPSHOT_MAX_ERROR = 512
 
 
 def _owner_snapshot_bulk(reply: bytes) -> bytes:
@@ -65,6 +66,18 @@ def _owner_snapshot_bulk(reply: bytes) -> bytes:
 
 def _owner_snapshot_manifest(reply: bytes) -> tuple[int, int]:
     """Decode the fixed `[byte_length, source_change_seq]` RESP2 manifest."""
+    if (isinstance(reply, bytes) and 4 <= len(reply) <= _OWNER_SNAPSHOT_MAX_ERROR
+            and reply.startswith(b"-") and reply.endswith(b"\r\n")):
+        # execute_resp preserves RESP error frames. Report a complete bounded
+        # error line using the same exception/exit code as execute(), without
+        # attaching malformed frames or arbitrary non-error payloads.
+        try:
+            message = reply[1:-2].decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if message and all(c.isprintable() for c in message):
+                raise QihseAdminError(message, exit_code=5)
     if not isinstance(reply, bytes) or not reply.startswith(b"*2\r\n"):
         # Do not attach an arbitrary reply to the exception: it might contain
         # server data if a future protocol regression returns the wrong frame.

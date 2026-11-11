@@ -9170,10 +9170,16 @@ int qihse_kv_ct_owner_data_snapshot_create(qihse_kv_store_t* store,
     close(seed_fd);
 
     kv_store_wrlock(store);
+    /* Successful source/target completion and target abort retain their
+     * terminal tuple for exact retries. That history is not an active fence;
+     * keep it intact and let the serializer exclude moved slots normally. */
+    bool terminal_transfer =
+        (store->ct_fence_state == 0u && store->ct_transfer_source_id[0] == '\0') ||
+        store->ct_fence_state == 2u || store->ct_fence_state == 3u ||
+        store->ct_fence_state == 4u;
     bool owner_ready = store->ct_enabled && store->ct_mode == 1u &&
         store->ct_admitted && !store->recovery_pending &&
-        store->ct_fence_state == 0u && store->ct_transfer_phase == 0u &&
-        store->ct_transfer_source_id[0] == '\0';
+        terminal_transfer && store->ct_transfer_phase == 0u;
     if (!owner_ready) errno = EBUSY;
     int save_rc = owner_ready
         ? qihse_kv_save_replica_snapshot_file(store, path, principal, "*",

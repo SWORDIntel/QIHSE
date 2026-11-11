@@ -126,6 +126,43 @@ class OwnerSnapshotSdkTests(unittest.TestCase):
                     self.assertEqual(fake.commands[-1], ("OWNER.SNAPSHOT.END",))
                 self.assertEqual(list(Path(directory).glob(".*.partial")), [])
 
+    def test_refused_begin_preserves_server_error_without_creating_output(self):
+        for reply in (b"-ERR owner snapshot creation or authorization check failed\r\n",
+                      b"-NOPERM active full-ceiling system Operator required\r\n"):
+            for method in ("owner_inventory", "backup_owner_data"):
+                with self.subTest(reply=reply, method=method):
+                    fake = FakeSession(b"HIGH_SECRET", begin_reply=reply)
+                    with tempfile.TemporaryDirectory() as directory:
+                        target = Path(directory) / "owner.qbk"
+                        with self.assertRaises(QihseAdminError) as caught:
+                            getattr(sdk_session(fake), method)(target)
+                        self.assertEqual(str(caught.exception),
+                                         reply[1:-2].decode("ascii"))
+                        self.assertEqual(caught.exception.exit_code, 5)
+                        self.assertEqual(len(fake.commands), 1)
+                        self.assertFalse(target.exists())
+                        self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_malformed_error_begin_does_not_echo_reply(self):
+        for reply in (b"-ERR HIGH_SECRET",
+                      b"-ERR HIGH_SECRET\r\n+OK\r\n",
+                      b"-ERR HIGH_SECRET\x00\r\n",
+                      b"-ERR HIGH_SECRET\xff\r\n",
+                      b"-ERR HIGH_SECRET\n\r\n",
+                      b"-ERR " + b"HIGH_SECRET" * 64 + b"\r\n",
+                      b"-\r\n",
+                      bulk(b"HIGH_SECRET")):
+            with self.subTest(reply=reply):
+                fake = FakeSession(b"HIGH_SECRET", begin_reply=reply)
+                with tempfile.TemporaryDirectory() as directory:
+                    target = Path(directory) / "owner.qbk"
+                    with self.assertRaisesRegex(QihseAdminError,
+                                                "invalid manifest") as caught:
+                        sdk_session(fake).backup_owner_data(target)
+                    self.assertNotIn("HIGH_SECRET", str(caught.exception))
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_failed_end_does_not_publish_and_closes_stale_session(self):
         fake = FakeSession(b"complete-data", end_reply=b"-ERR denied\r\n")
         session = sdk_session(fake)

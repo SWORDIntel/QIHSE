@@ -19,7 +19,7 @@
 
 /* The receipt verifier is deliberately a test double. Production verifies
  * the pinned QKP peer's authenticated, phase-specific receipt. */
-enum { PREPARED = 1, SEALED = 2, COMMITTED = 3 };
+enum { PREPARED = 1, SEALED = 2, COMMITTED = 3, ABORTED = 4 };
 typedef struct {
     int phase;
     qihse_kv_ct_target_receipt_claim_t expected;
@@ -36,6 +36,11 @@ static bool verified_phase(const qihse_kv_ct_target_receipt_claim_t* claim,
 static bool verify_prepared(const qihse_kv_ct_target_receipt_claim_t* claim,
                             void* opaque) {
     return verified_phase(claim, opaque, PREPARED);
+}
+
+static bool verify_aborted(const qihse_kv_ct_target_receipt_claim_t* claim,
+                           void* opaque) {
+    return verified_phase(claim, opaque, ABORTED);
 }
 
 static bool verify_sealed(const qihse_kv_ct_target_receipt_claim_t* claim,
@@ -195,17 +200,97 @@ static void check_value(qihse_kv_store_t* store, qihse_user_t* user,
     free(value);
 }
 
+static void owner_backup_busy(qihse_kv_store_t* store, qihse_user_t* op) {
+    if (large_transfer_mode) return;
+    qihse_kv_replica_snapshot_t* snapshot = NULL;
+    errno = 0;
+    assert(qihse_kv_ct_owner_data_snapshot_create(store, op, &snapshot) == -1);
+    assert(errno == EBUSY && !snapshot);
+}
+
+/* Decode the real authorized image to check rows, labels and retained deletes,
+ * while verifying that snapshot creation does not consume terminal evidence. */
+static void owner_backup_check(qihse_kv_store_t* store, qihse_user_t* op,
+    qihse_user_t* low, bool has_source, const char* source_value,
+    const char* local_value, bool has_outside) {
+    if (large_transfer_mode) return;
+    const char* deleted = "t:7/aimem:backup-deleted";
+    unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
+    qihse_kv_ct_writer_scope_t* scope = NULL;
+    qihse_kv_ct_source_status_t status = {0};
+    assert(qihse_kv_ct_owner_token_get(store, op, token));
+    assert(qihse_kv_ct_writer_scope_enter(store, op, token, &scope));
+    assert(qihse_kv_set_user(store, deleted, "deleted-secret", 4u, 2u, op));
+    assert(qihse_kv_del_user(store, deleted, op));
+    assert(qihse_kv_ct_source_status(store, op, &status));
+    assert(qihse_kv_ct_source_ack(store, op, status.successor_id,
+        status.generation, status.durable_lsn));
+    assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+    qihse_kv_replica_snapshot_t* snapshot = NULL;
+    assert(qihse_kv_ct_owner_data_snapshot_create(store, low, &snapshot) == -2);
+    assert(!snapshot);
+    qihse_kv_ct_transfer_status_detail_t before = {0}, after = {0};
+    assert(qihse_kv_ct_transfer_status_detail(store, op, &before));
+    int rc = qihse_kv_ct_owner_data_snapshot_create(store, op, &snapshot);
+    if (rc != 0) fprintf(stderr,
+        "owner backup failed: fence=%u phase=%u rc=%d errno=%d\n",
+        before.base.fence_state, before.base.transfer_phase, rc, errno);
+    assert(rc == 0 && snapshot);
+    assert(qihse_kv_ct_transfer_status_detail(store, op, &after));
+    assert(memcmp(&before, &after, sizeof(before)) == 0);
+    uint64_t bytes = 0u;
+    assert(qihse_kv_replica_snapshot_size(snapshot, op, &bytes));
+    FILE* image = tmpfile();
+    assert(image);
+    for (uint64_t offset = 0u; offset < bytes;) {
+        unsigned char chunk[1024]; size_t got = 0u;
+        size_t want = bytes - offset < sizeof(chunk)
+            ? (size_t)(bytes - offset) : sizeof(chunk);
+        assert(qihse_kv_replica_snapshot_read(snapshot, op, offset, chunk,
+            want, &got) && got == want);
+        assert(fwrite(chunk, 1u, got, image) == got);
+        offset += got;
+    }
+    qihse_kv_replica_snapshot_destroy(snapshot);
+    rewind(image);
+    qihse_kv_store_t* decoded = qihse_kv_open_snapshot_user(image, op,
+        128u * 1024u * 1024u, 10000u);
+    assert(decoded && fclose(image) == 0);
+    char* value = NULL; qihse_kv_record_meta_t meta = {0};
+    assert(qihse_kv_snapshot_get_record_user(decoded, deleted, op, &value, &meta));
+    assert(value && !*value && (meta.flags & 1u) &&
+        meta.classification == 4u && meta.sci_compartment == 2u);
+    free(value); value = NULL;
+    assert(qihse_kv_snapshot_get_record_user(decoded, local_key, op, &value, &meta));
+    assert(value && !strcmp(value, local_value) && meta.classification == 4u &&
+        meta.sci_compartment == 2u);
+    free(value); value = NULL;
+    assert(qihse_kv_snapshot_get_record_user(decoded, source_key, op,
+        &value, &meta) == has_source);
+    if (has_source) assert(value && !strcmp(value, source_value) &&
+        meta.classification == 4u && meta.sci_compartment == 2u);
+    free(value); value = NULL;
+    assert(qihse_kv_snapshot_get_record_user(decoded, outside_key, op,
+        &value, &meta) == has_outside);
+    if (has_outside) assert(value && !strcmp(value, "keep-outside"));
+    free(value); value = NULL;
+    assert(!qihse_kv_snapshot_get_record_user(decoded, local_key, low, &value, &meta));
+    assert(!value);
+    qihse_kv_store_destroy(decoded);
+}
+
 static void child_phase(const char* phase, const char* data_dir,
                         const char* shared_dir) {
     bool reverse = strncmp(phase, "reverse-", 8u) == 0;
-    const char* step = reverse ? phase + 8u : phase;
+    bool abort_round = strncmp(phase, "abort-", 6u) == 0;
+    const char* step = reverse ? phase + 8u : abort_round ? phase + 6u : phase;
     const char* source_id = reverse ? "target:1" : "source:1";
     const char* target_id = reverse ? "source:1" : "target:1";
     const char* source_peer = reverse ? "target-successor:1" : "source-successor:1";
     const char* target_peer = reverse ? "source-successor:1" : "target-successor:1";
     const char* source_generation = reverse ? "target-gen:1" : "source-gen:1";
     const char* target_generation = reverse ? "source-gen:1" : "target-gen:1";
-    const char* transfer_id = reverse ? "transfer:2" : "transfer:1";
+    const char* transfer_id = abort_round ? "abort:1" : reverse ? "transfer:2" : "transfer:1";
     assert(setenv("QIHSE_DATA_DIR", data_dir, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
     assert(qihse_auth_init());
@@ -276,6 +361,7 @@ static void child_phase(const char* phase, const char* data_dir,
         uint64_t cut = UINT64_MAX;
         assert(qihse_kv_ct_fence_range(store, op, transfer_id, transfer_first, transfer_last,
                                         token, &cut));
+        owner_backup_busy(store, op);
         qihse_kv_ct_range_snapshot_t* denied = NULL;
         uint64_t denied_cut = 0u;
         unsigned char denied_digest[32];
@@ -376,6 +462,34 @@ static void child_phase(const char* phase, const char* data_dir,
         assert(memcmp(again.range_checksum, prepared.range_checksum, 32u) == 0);
         qihse_kv_ct_proof_destroy(proof);
         qihse_kv_ct_range_snapshot_destroy(retry);
+    } else if (strcmp(step, "target-prepare") == 0) {
+        admitted_source(store, op, target_peer, target_generation);
+        assert(qihse_kv_ct_owner_token_get(store, op, token));
+        qihse_kv_ct_target_receipt_claim_t prepared = read_claim(prepared_path);
+        receipt_fixture_t receipt = {PREPARED, prepared};
+        uint64_t cut = 0u;
+        assert(qihse_kv_ct_target_prepare(store, op, &prepared,
+            verify_prepared, &receipt, token, &cut));
+        owner_backup_busy(store, op);
+    } else if (strcmp(step, "source-abort") == 0) {
+        admitted_source(store, op, source_peer, source_generation);
+        assert(qihse_kv_ct_owner_token_get(store, op, token));
+        owner_backup_busy(store, op);
+        assert(qihse_kv_ct_fence_finish(store, op, transfer_id, false, token));
+        owner_backup_check(store, op, low, true, "source-secret",
+            "source-local-memory", false);
+    } else if (strcmp(step, "target-abort") == 0 ||
+               strcmp(step, "target-abort-reopen") == 0) {
+        assert(qihse_kv_ct_owner_token_get(store, op, token));
+        qihse_kv_ct_target_receipt_claim_t prepared = read_claim(prepared_path);
+        receipt_fixture_t receipt = {ABORTED, prepared};
+        assert(qihse_kv_ct_target_abort(store, op, &prepared,
+            verify_aborted, &receipt, token));
+        admitted_source(store, op, target_peer, target_generation);
+        owner_backup_check(store, op, low, false, NULL,
+            "target-local-memory", true);
+        assert(qihse_kv_ct_target_abort(store, op, &prepared,
+            verify_aborted, &receipt, token));
     } else if (strcmp(step, "target-import") == 0 ||
                strcmp(step, "target-import-crash") == 0) {
         qihse_kv_ct_transfer_status_detail_t transfer_status = {0};
@@ -394,6 +508,7 @@ static void child_phase(const char* phase, const char* data_dir,
             verify_prepared, &refused, token, &local_cut));
         assert(qihse_kv_ct_target_prepare(store, op, &prepared,
             verify_prepared, &source_receipt, token, &local_cut));
+        owner_backup_busy(store, op);
         if (large_transfer_mode) {
             /* Preparation fences the whole destination range. Neither point
              * reads nor enumeration/replica readers may observe staged data. */
@@ -438,6 +553,7 @@ static void child_phase(const char* phase, const char* data_dir,
             source_id, source_generation, transfer_first, transfer_last, prepared.source_cut,
             image_path, image_sha, token, &target_position));
         assert(target_position > local_cut);
+        owner_backup_busy(store, op);
         if (large_transfer_mode) {
             assert(target_position - local_cut == 2u);
             fprintf(stderr, "large CT2 target durable groups: %llu\n",
@@ -568,6 +684,20 @@ static void child_phase(const char* phase, const char* data_dir,
         check_value(store, op, local_key, !strcmp(leaf + 1, "source") ?
             "source-local-memory" : "target-local-memory");
     check_value(store, low, local_key, NULL);
+    if (!strcmp(step, "source-commit") || !strcmp(step, "source-reopen"))
+        owner_backup_check(store, op, low, false, NULL,
+            !strcmp(leaf + 1, "source") ? "source-local-memory" : "target-local-memory",
+            strcmp(leaf + 1, "source") != 0);
+    if (!strcmp(step, "target-activate") || !strcmp(step, "target-reopen")) {
+        owner_backup_check(store, op, low, true,
+            reverse ? "returned-write" : "source-secret",
+            !strcmp(leaf + 1, "source") ? "source-local-memory" : "target-local-memory",
+            strcmp(leaf + 1, "source") != 0);
+        qihse_kv_ct_target_receipt_claim_t committed = read_claim(sealed_path);
+        receipt_fixture_t receipt = {COMMITTED, committed};
+        assert(qihse_kv_ct_target_activate(store, op, NULL, &committed,
+            verify_committed, &receipt, token));
+    }
     qihse_kv_store_destroy(store);
 }
 
@@ -604,6 +734,13 @@ int main(int argc, char** argv) {
     assert(mkdir(target_dir, 0700) == 0);
     run_child(argv[0], "source-setup", source_dir, base);
     run_child(argv[0], "target-setup", target_dir, base);
+    if (!large) {
+        run_child(argv[0], "abort-source-export", source_dir, base);
+        run_child(argv[0], "abort-target-prepare", target_dir, base);
+        run_child(argv[0], "abort-source-abort", source_dir, base);
+        run_child(argv[0], "abort-target-abort", target_dir, base);
+        run_child(argv[0], "abort-target-abort-reopen", target_dir, base);
+    }
     run_child(argv[0], "source-export", source_dir, base);
     usleep(1600000u); /* The physical TTL passes before the restarted retry. */
     if (!large) run_child(argv[0], "source-export-retry", source_dir, base);
