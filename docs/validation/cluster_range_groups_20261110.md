@@ -2,8 +2,7 @@
 
 This is a source integration record. It is not a live deployment result.
 The authoritative program checklist remains [ROADMAP.md](../../ROADMAP.md).
-CT.1 and CT.2 remain partial pending repair of complete-suite failures and the
-documented cleanup/placement residuals.
+CT.1 and CT.2 remain partial for the documented cleanup/placement residuals.
 
 ## Integrated and verified
 
@@ -40,9 +39,15 @@ These are observed failure signatures, not established root causes.
 
 ## Follow-up repairs — 2026-11-11
 
-The first complete run above exposed four repair groups. Focused fixes pass;
-the combined final `make test TEST_JOBS=32` run is in progress and must be
-reported separately from these focused results.
+The first complete run above exposed four repair groups. All nine failed
+non-gold targets and all three failed gold workloads now pass. The follow-up
+runs seven direct targets plus the three failed gold workloads; gold runs the
+failed RESP hybrid and legacy CT2 targets, avoiding duplicate executions.
+The replacement full run was stopped at the user's request after 62 targets
+passed with no recorded failures. This is targeted follow-up evidence, not a
+new full-suite pass. Source repairs are published as `0925649` on
+`candidate/cluster-recovery-20261109`; native deployment packages are being
+staged separately.
 
 - Legacy CT2 could durably finalize target activation while successor/replay
   admission was still pending. RECEIPT now retries and verifies admission before
@@ -157,8 +162,8 @@ quorum, snapshot/resume and lost-ACK cases plus the scheduling regression.
 
 ## Remaining work and limits
 
-- Finish combined complete-suite validation of the focused repairs above. No
-  live upgrade is implied by source validation.
+- Source validation is complete for the requested failure-only rerun. Package
+  staging and live activation are separate deployment steps.
 - A cancelled temporary incoming receiver can retain its staging bitmap.
   Reuse for a different range after ABORT needs proof-driven retirement that
   preserves a legitimate pre-existing replica. Completed empty staging reuse
