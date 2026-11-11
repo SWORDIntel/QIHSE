@@ -2168,6 +2168,12 @@ the gold pack (`make test-gold`).
 
 Stated plainly rather than omitted:
 
+**Live owner-backup limitation (2026-11-11):** after the native cluster rollout,
+T420's authenticated `OWNER.SNAPSHOT.BEGIN BACKUP` returns a creation/authorization
+error while ordinary owner inventory succeeds. No fresh verified backup was
+created. The source-level backup tests do not close this live failure; see the
+[deployment record](validation/cluster_range_groups_20261110.md#live-native-deployment--2026-11-11).
+
 1. **Backup writer — implemented.** An earlier revision of this list (and of
    the ROADMAP) said the writer that produces the referenced data was not
    written. The writer and reader exist in `src/federation/qihse_backup.c`,

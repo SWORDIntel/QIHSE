@@ -352,3 +352,20 @@ The standalone daemon now defaults to a 30-second KV sweep cadence (`--kv-sweep-
 ## Protected backlog
 
 The bridge backlog was last verified as 260 blocked and 7 queued. No replay, deletion, or mutation was performed; preserve it until separately authorized and investigated.
+
+
+## Cluster rollout update — 2026-11-11
+
+Native code revision `0925649` is deployed to all six cluster daemons across
+T420, 730xd and T320. Owner counts and slot maps are unchanged; all three
+configured replication pairs are caught up. All nine failed non-gold targets
+and the three failed gold workloads pass targeted retests. The full rerun was
+stopped after 62 clean targets at the user's request; no new full-suite pass
+is claimed. Historical source-only notes above retain their original scope.
+The separate standalone HAX AIMEM service was not changed.
+
+T420's online owner BACKUP creation returns a generic creation/authorization
+error even though ordinary owner inventory succeeds. No fresh backup artifact
+was published. This remains open alongside the documented CT cleanup and
+placement residuals. The [range-group deployment record](validation/cluster_range_groups_20261110.md#live-native-deployment--2026-11-11)
+contains the current evidence; [ROADMAP.md](../ROADMAP.md) remains authoritative.

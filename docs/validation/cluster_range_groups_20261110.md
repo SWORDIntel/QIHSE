@@ -1,6 +1,7 @@
 # Cluster range-group repair — 2026-11-10
 
-This is a source integration record. It is not a live deployment result.
+This record separates source integration evidence from the live rolling
+deployment on 2026-11-11 documented below.
 The authoritative program checklist remains [ROADMAP.md](../../ROADMAP.md).
 CT.1 and CT.2 remain partial for the documented cleanup/placement residuals.
 
@@ -46,8 +47,7 @@ failed RESP hybrid and legacy CT2 targets, avoiding duplicate executions.
 The replacement full run was stopped at the user's request after 62 targets
 passed with no recorded failures. This is targeted follow-up evidence, not a
 new full-suite pass. Source repairs are published as `0925649` on
-`candidate/cluster-recovery-20261109`; native deployment packages are being
-staged separately.
+`candidate/cluster-recovery-20261109`; native deployment is recorded below.
 
 - Legacy CT2 could durably finalize target activation while successor/replay
   admission was still pending. RECEIPT now retries and verifies admission before
@@ -71,6 +71,44 @@ staged separately.
   missing-key denial target pass; no production key gate was relaxed.
 - Gold's graph evidence is updated from 19 to the actual 23 successful checks;
   the real graph gold workload passes with the evidence check retained.
+
+## Live native deployment — 2026-11-11
+
+Exact code revision `0925649f7e11ca6c988e07a13d59b8ec5ddfc1d8` was built
+separately on T420, 730xd and T320. Native flags respect each host: T320 has
+AVX without F16C/AVX2; T420 enables F16C without AVX2; 730xd enables AVX2.
+The existing loader/dependency bundles were retained. Package checksum and
+loader checks passed before activation.
+
+All three successor daemons were restarted individually, followed by the three
+owners. Only each existing unit's package-launcher prefix changed. Data
+paths, identities, pins, generations and other arguments were preserved. Each
+process was verified to map its new daemon and library; all six units remain
+active/running with zero automatic restarts after activation.
+
+| Host | Package | Owner records before / after | Source durable / ACK / receiver cursor |
+| --- | --- | --- | --- |
+| T420 | `native-t420-0925649` | 8,858 / 8,858 | 26 / 26 / 26 |
+| 730xd | `native-730xd-0925649` | 209,856 / 209,856 | 11,100 / 11,100 / 11,100 |
+| T320 | `native-t320-0925649` | 52,661 / 52,661 | 24 / 24 / 24 |
+
+Authenticated owner PING/DBSIZE and all three full slot maps match the pre-rollout
+observations. Every replication pair remains baseline-sealed with matching
+identities, generation and baseline digest. Counts and routing are validation
+of those properties; they are not a byte-for-byte comparison of every value.
+No restore, import, rebalance or data deletion was performed.
+
+The rollout retains the existing six-daemon legacy configuration. It does not
+enable `--ct-group`, `--brain` or `--brain-act`. The separate standalone HAX
+AIMEM service is outside this cluster rollout.
+
+**New live backup issue:** authenticated T420 `OWNER.SNAPSHOT.BEGIN BACKUP`
+returns `ERR owner snapshot creation or authorization check failed`.
+The same principal can begin ordinary owner inventory successfully. The failed
+SDK export publishes no backup file; inventory is not a restore backup. This
+live failure needs investigation independently of the passing repair tests.
+Existing backup artifacts were not changed. No fresh verified owner backup is
+claimed by this deployment record.
 
 ## Current integration checks
 
@@ -162,8 +200,8 @@ quorum, snapshot/resume and lost-ACK cases plus the scheduling regression.
 
 ## Remaining work and limits
 
-- Source validation is complete for the requested failure-only rerun. Package
-  staging and live activation are separate deployment steps.
+- Source validation and the six-daemon native rollout above are complete for
+  this repair batch. Investigate the live owner BACKUP creation failure above.
 - A cancelled temporary incoming receiver can retain its staging bitmap.
   Reuse for a different range after ABORT needs proof-driven retirement that
   preserves a legitimate pre-existing replica. Completed empty staging reuse
