@@ -22,22 +22,27 @@ POLICY = 'git-status-diff-index-untracked-v2'
 MAX_LINE = 262144
 GIT_LIMIT = 4 * 1024 * 1024
 TIMEOUT = 5.0
-UNTRACKED_TIMEOUT = 30.0
+UNTRACKED_TIMEOUT = 90.0
 UNTRACKED_MAX_FILES = 200000
 UNTRACKED_MAX_BYTES = 64 * 1024 * 1024
 UNTRACKED_MAX_PATH = 4096
+NESTED_GIT_MAX_DEPTH = 4
+NESTED_GIT_DOMAIN = b'qihse-nested-git-v1\0'
 SELECTED = ('--', '.', ':(exclude).code-review-graph')
 HEX64 = re.compile(r'[0-9a-f]{64}\Z')
 HEAD = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})\Z')
 
 
-def _git(repo: Path, *args: str, on_chunk=None, timeout: float | None = None) -> bytes:
+def _git(repo: Path, *args: str, on_chunk=None, timeout: float | None = None,
+         absolute_deadline: float | None = None) -> bytes:
     """Bound Git execution; optionally consume output without retaining it."""
     process = subprocess.Popen(['git', '--no-optional-locks', *args], cwd=repo,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                start_new_session=True)
     output = bytearray()
     deadline = time.monotonic() + (TIMEOUT if timeout is None else timeout)
+    if absolute_deadline is not None:
+        deadline = min(deadline, absolute_deadline)
     idle_deadline = time.monotonic() + TIMEOUT
     try:
         assert process.stdout is not None
@@ -127,10 +132,53 @@ def _untracked_digest(repo: Path, raw: bytes, deadline: float) -> tuple[bytes, b
         os.close(fd)
 
 
-def _git_source_identity(repo: Path | str) -> dict[str, str]:
+def _nested_git_digest(repo: Path, raw: bytes, budget: dict[str, float | int],
+                       depth: int) -> tuple[bytes, bytes]:
+    if (depth >= NESTED_GIT_MAX_DEPTH or not raw.endswith(b'/') or
+            raw.startswith((b'/', b'~')) or b'\\' in raw or
+            len(os.fsencode(repo)) + len(raw) >= UNTRACKED_MAX_PATH or
+            any(part in (b'', b'..', b'.git') for part in raw[:-1].split(b'/'))):
+        raise ValueError('Unsafe nested Git source path')
+    fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in raw[:-1].split(b'/'):
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=fd)
+            os.close(fd)
+            fd = child
+        before = os.fstat(fd)
+        git_marker = os.stat('.git', dir_fd=fd, follow_symlinks=False)
+        if not (stat.S_ISREG(git_marker.st_mode) or stat.S_ISDIR(git_marker.st_mode)):
+            raise ValueError('Untracked directory is not a nested Git repository')
+        nested = repo / os.fsdecode(raw[:-1])
+        top = _git(nested, 'rev-parse', '--show-toplevel',
+                   absolute_deadline=float(budget['deadline'])).rstrip(b'\r\n')
+        if not top or Path(os.fsdecode(top)).resolve(strict=True) != nested.resolve(strict=True):
+            raise ValueError('Untracked directory has no independent Git root')
+        identity = _git_source_identity(nested, _budget=budget, _depth=depth+1)
+        after = os.fstat(fd)
+        if ((before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns) !=
+                (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError('Nested Git source changed during verification')
+        framed = NESTED_GIT_DOMAIN + identity['head'].encode('ascii') + b'\0' + identity['worktree_v2'].encode('ascii')
+        return b'r', hashlib.sha256(framed).hexdigest().encode('ascii')
+    finally:
+        os.close(fd)
+
+
+def _git_source_identity(repo: Path | str, *, _budget: dict[str, float | int] | None = None,
+                         _depth: int = 0) -> dict[str, str]:
     """Reproduce native Git identity, rejecting unverifiable index flags/paths."""
     repo = Path(repo).resolve(strict=True)
-    flags = _git(repo, 'ls-files', '--stage', '-v', '-f', '-z', *SELECTED)
+    budget = _budget if _budget is not None else {
+        'deadline': time.monotonic() + UNTRACKED_TIMEOUT,
+        'paths': 0,
+        'listing_bytes': 0,
+    }
+    if _depth > NESTED_GIT_MAX_DEPTH or time.monotonic() >= float(budget['deadline']):
+        raise ValueError('Nested Git source verification limit exceeded')
+    flags = _git(repo, 'ls-files', '--stage', '-v', '-f', '-z', *SELECTED,
+                 absolute_deadline=float(budget['deadline']))
     if flags and not flags.endswith(b'\0'):
         raise ValueError('Malformed Git index listing')
     index = bytearray()
@@ -138,21 +186,20 @@ def _git_source_identity(repo: Path | str) -> dict[str, str]:
         if len(row) < 3 or row[1:2] != b' ' or row[:1] == b'S' or b'a' <= row[:1] <= b'z':
             raise ValueError('Unverifiable Git index trust flags')
         index.extend(row[2:] + b'\0')
-    head = _git(repo, 'rev-parse', '--verify', 'HEAD').rstrip(b'\r\n').decode('ascii')
+    head = _git(repo, 'rev-parse', '--verify', 'HEAD',
+                absolute_deadline=float(budget['deadline'])).rstrip(b'\r\n').decode('ascii')
     if not HEAD.fullmatch(head):
         raise ValueError('Invalid Git HEAD')
-    status = _git(repo, 'status', '--porcelain=v1', '-z', '--untracked-files=normal', *SELECTED)
-    diff = _git(repo, 'diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *SELECTED)
+    status = _git(repo, 'status', '--porcelain=v1', '-z', '--untracked-files=normal', *SELECTED,
+                  absolute_deadline=float(budget['deadline']))
+    diff = _git(repo, 'diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *SELECTED,
+                absolute_deadline=float(budget['deadline']))
     legacy = hashlib.sha256(status + b'\0' + diff).hexdigest()
     digest = hashlib.sha256(status + b'\0' + diff + b'\0' + index + b'\0')
     pending = bytearray()
-    count = 0
-    listing_bytes = 0
-
     def consume_untracked(chunk: bytes, deadline: float) -> None:
-        nonlocal count, listing_bytes
-        listing_bytes += len(chunk)
-        if listing_bytes > UNTRACKED_MAX_BYTES:
+        budget['listing_bytes'] += len(chunk)
+        if budget['listing_bytes'] > UNTRACKED_MAX_BYTES:
             raise ValueError('Untracked source listing exceeds output limit')
         start = 0
         while start < len(chunk):
@@ -165,17 +212,21 @@ def _git_source_identity(repo: Path | str) -> dict[str, str]:
             pending.extend(chunk[start:end])
             if not pending or len(pending) >= UNTRACKED_MAX_PATH:
                 raise ValueError('Malformed untracked source path')
-            if count >= UNTRACKED_MAX_FILES:
+            if budget['paths'] >= UNTRACKED_MAX_FILES:
                 raise ValueError('Too many untracked source files')
             raw = bytes(pending)
             pending.clear()
-            kind, content = _untracked_digest(repo, raw, deadline)
+            budget['paths'] += 1
+            if raw.endswith(b'/'):
+                kind, content = _nested_git_digest(repo, raw, budget, _depth)
+            else:
+                kind, content = _untracked_digest(repo, raw, deadline)
             digest.update(raw + b'\0' + kind + b'\0' + content + b'\0')
-            count += 1
             start = end + 1
 
     _git(repo, 'ls-files', '--others', '--exclude-standard', '-z', *SELECTED,
-         on_chunk=consume_untracked, timeout=UNTRACKED_TIMEOUT)
+         on_chunk=consume_untracked, timeout=UNTRACKED_TIMEOUT,
+         absolute_deadline=float(budget['deadline']))
     if pending:
         raise ValueError('Malformed untracked source listing')
     return dict(head=head, worktree=legacy, worktree_v2=digest.hexdigest(), freshness=POLICY)

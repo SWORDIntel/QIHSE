@@ -97,6 +97,34 @@ class SourceTests(unittest.TestCase):
             expected.update(name+b'\0f\0'+empty_digest+b'\0')
         self.assertEqual(bridge.source_identity(self.repo)['worktree_v2'], expected.hexdigest())
 
+    def test_nested_git_repository_is_bound_to_outer_identity(self):
+        nested = self.repo/'nested'
+        nested.mkdir()
+        subprocess.run(['git', 'init', '-q'], cwd=nested, check=True)
+        source = nested/'child.c'
+        source.write_text('int nested(void) { return 1; }\n')
+        subprocess.run(['git', 'add', 'child.c'], cwd=nested, check=True)
+        subprocess.run(['git', '-c', 'user.name=Fixture', '-c',
+                        'user.email=fixture@example.invalid', 'commit', '-qm', 'nested'],
+                       cwd=nested, check=True)
+        before = bridge.source_identity(self.repo)
+        nested_identity = bridge.source_identity(nested)
+        nested_digest = hashlib.sha256(
+            bridge.NESTED_GIT_DOMAIN + nested_identity['head'].encode() + b'\0'
+            + nested_identity['worktree_v2'].encode()).hexdigest().encode()
+        selected = bridge.SELECTED
+        status = self.git('status', '--porcelain=v1', '-z', '--untracked-files=normal', *selected)
+        diff = self.git('diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *selected)
+        index = self.git('ls-files', '--stage', '-z', *selected)
+        expected = hashlib.sha256(status+b'\0'+diff+b'\0'+index+b'\0')
+        expected.update(b'nested/\0r\0'+nested_digest+b'\0')
+        self.assertEqual(before['worktree_v2'], expected.hexdigest())
+        source.write_text('int nested(void) { return 2; }\n')
+        self.assertNotEqual(before['worktree_v2'], bridge.source_identity(self.repo)['worktree_v2'])
+        source.write_text('int nested(void) { return 1; }\n')
+        (nested/'untracked.c').write_text('int extra;\n')
+        self.assertNotEqual(before['worktree_v2'], bridge.source_identity(self.repo)['worktree_v2'])
+
     def test_staged_only_identity(self):
         path = self.repo/'tracked.c'
         path.write_text('index-a'); self.git('add', '.'); path.write_text('working')
