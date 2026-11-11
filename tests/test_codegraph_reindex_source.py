@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -224,6 +225,51 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr+result.stdout)
             if args[0] == 'status':
                 self.assertTrue(json.loads(result.stdout)['fresh'])
+
+    def test_native_streams_large_untracked_listing(self):
+        if BINARY is None:
+            self.skipTest('pass --binary to validate native freshness')
+        # A Git shim supplies a >4 MiB NUL path stream without creating tens
+        # of thousands of fixtures. Each entry resolves to the same real file;
+        # the expected digest retains every entry in Git output order.
+        name = 'bulk/' + 'x' * 220
+        count = 20000
+        (self.repo/'bulk').mkdir()
+        (self.repo/name).write_bytes(b'one')
+        identity = bridge.source_identity(self.repo)
+        selected = bridge.SELECTED
+        status = self.git('status', '--porcelain=v1', '-z', '--untracked-files=normal', *selected)
+        diff = self.git('diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', *selected)
+        index = self.git('ls-files', '--stage', '-z', *selected)
+        digest = hashlib.sha256(status+b'\0'+diff+b'\0'+index+b'\0')
+        row = (name.encode()+b'\0f\0'+hashlib.sha256(b'one').hexdigest().encode()+b'\0')
+        for _ in range(count):
+            digest.update(row)
+        identity['worktree_v2'] = digest.hexdigest()
+        self.write_export(identity)
+        bridge.prepare_export(self.export, self.destination, identity)
+        shim_dir = self.root/'git-shim'; shim_dir.mkdir()
+        shim = shim_dir/'git'
+        real_git = shutil.which('git')
+        self.assertIsNotNone(real_git)
+        shim.write_text(
+            f'#!{sys.executable}\nimport os,sys\n'
+            f'if "ls-files" in sys.argv and "--others" in sys.argv:\n'
+            f' sys.stdout.buffer.write(({name.encode()!r}+b"\\0")*{count})\n'
+            f'else: os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n')
+        shim.chmod(0o700)
+        env = {**os.environ, 'HOME':str(self.root), 'XDG_STATE_HOME':str(self.root/'state'),
+               'LD_LIBRARY_PATH':str(BINARY.parent),
+               'PATH':str(shim_dir)+os.pathsep+os.environ.get('PATH', '')}
+        def native(*args):
+            result = subprocess.run([str(BINARY), *args, '--repo', str(self.repo)], env=env,
+                                    capture_output=True, text=True, timeout=45)
+            self.assertEqual(result.returncode, 0, result.stderr+result.stdout)
+            return json.loads(result.stdout)
+        native('import', '--input', str(self.destination))
+        self.assertTrue(native('status')['fresh'])
+        (self.repo/name).write_bytes(b'two')
+        self.assertFalse(native('status')['fresh'])
 
 
 if __name__ == '__main__':

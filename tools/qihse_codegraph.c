@@ -1999,10 +1999,8 @@ done:
 
 /* Git metadata is compared at request time. A changed HEAD, staged work or
  * edited tracked files makes the old snapshot stale and review fails closed. */
-static bool git_capture(const char *repo, const char *const args[], unsigned char **out,
-                        size_t *out_len) {
-    *out = NULL;
-    *out_len = 0;
+static bool git_spawn_pipe(const char *repo, const char *const args[], pid_t *child,
+                           int *reader) {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0)
         return false;
@@ -2043,6 +2041,19 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
         return false;
     }
     close(fds[1]);
+    *child = pid;
+    *reader = fds[0];
+    return true;
+}
+
+static bool git_capture(const char *repo, const char *const args[], unsigned char **out,
+                        size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    pid_t pid;
+    int reader;
+    if (!git_spawn_pipe(repo, args, &pid, &reader))
+        return false;
     size_t cap = 4096, used = 0;
     unsigned char *buf = malloc(cap);
     bool ok = buf != NULL;
@@ -2053,7 +2064,7 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
             ok = false;
             break;
         }
-        struct pollfd ready = {.fd = fds[0], .events = POLLIN};
+        struct pollfd ready = {.fd = reader, .events = POLLIN};
         int polled = poll(&ready, 1, (int)remaining + 1);
         if (polled < 0 && errno == EINTR)
             continue;
@@ -2074,7 +2085,7 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
             buf = next;
             cap *= 2;
         }
-        ssize_t n = read(fds[0], buf + used, cap - used);
+        ssize_t n = read(reader, buf + used, cap - used);
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0)
@@ -2083,7 +2094,7 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
             break;
         used += (size_t)n;
     }
-    close(fds[0]);
+    close(reader);
     int status = 0;
     pid_t waited = -1;
     while (ok) {
@@ -2110,58 +2121,30 @@ static bool git_capture(const char *repo, const char *const args[], unsigned cha
     *out_len = used;
     return true;
 }
-static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
-    double deadline = monotonic_ms() + 5000.0;
-    const char *const args[] = {"git",
-                                "--no-optional-locks",
-                                "ls-files",
-                                "--others",
-                                "--exclude-standard",
-                                "-z",
-                                "--",
-                                ".",
-                                ":(exclude).code-review-graph",
-                                NULL};
-    unsigned char *listing = NULL;
-    size_t length = 0;
-    if (!git_capture(st->repository, args, &listing, &length))
-        return false;
-    bool ok = true;
-    for (size_t offset = 0; ok && offset < length;) {
-        if (monotonic_ms() >= deadline) {
-            ok = false;
-            break;
-        }
-        char *name = (char *)listing + offset;
-        char *end = memchr(name, 0, length - offset);
-        if (!end || !*name || !safe_relative(name)) {
-            ok = false;
-            break;
-        }
-        offset += (size_t)(end - name) + 1;
+static bool hash_untracked_path(cg_state *st, EVP_MD_CTX *ctx, const char *name,
+                                double deadline) {
+        if (monotonic_ms() >= deadline || !*name || !safe_relative(name))
+            return false;
         char path[PATH_MAX], digest[65], parent[PATH_MAX], resolved[PATH_MAX];
         if (snprintf(path, sizeof(path), "%s/%s", st->repository, name) >= (int)sizeof(path)) {
-            ok = false;
-            break;
+            return false;
         }
         snprintf(parent, sizeof(parent), "%s", path);
         *strrchr(parent, '/') = 0;
         if (!realpath(parent, resolved)) {
-            ok = false;
-            break;
+            return false;
         }
         size_t root_len = strlen(st->repository);
         if (strncmp(resolved, st->repository, root_len) ||
             (resolved[root_len] && resolved[root_len] != '/')) {
-            ok = false;
-            break;
+            return false;
         }
         struct stat info;
         if (lstat(path, &info)) {
-            ok = false;
-            break;
+            return false;
         }
         const char *kind = "f";
+        bool ok;
         if (S_ISLNK(info.st_mode)) {
             char target[PATH_MAX];
             ssize_t n = readlink(path, target, sizeof(target));
@@ -2172,9 +2155,97 @@ static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
         if (ok)
             ok = EVP_DigestUpdate(ctx, name, strlen(name) + 1) == 1 &&
                  EVP_DigestUpdate(ctx, kind, 2) == 1 && EVP_DigestUpdate(ctx, digest, 65) == 1;
-    }
-    free(listing);
     return ok;
+}
+
+static bool hash_untracked(cg_state *st, EVP_MD_CTX *ctx) {
+    /* Git can list far more than 4 MiB of paths for a large live workspace.
+     * Parse the NUL stream one path at a time; preserve Git order and the v2
+     * digest framing without retaining the complete listing in memory. */
+    const char *const args[] = {"git", "--no-optional-locks", "ls-files", "--others",
+                                "--exclude-standard", "-z", "--", ".",
+                                ":(exclude).code-review-graph", NULL};
+    pid_t pid;
+    int reader;
+    if (!git_spawn_pipe(st->repository, args, &pid, &reader))
+        return false;
+    const double deadline = monotonic_ms() + 30000.0;
+    double idle_deadline = monotonic_ms() + 5000.0;
+    char name[PATH_MAX];
+    unsigned char chunk[65536];
+    size_t name_len = 0, total = 0, files = 0;
+    bool ok = true;
+    while (ok) {
+        double remaining = (deadline < idle_deadline ? deadline : idle_deadline) - monotonic_ms();
+        if (remaining <= 0) {
+            ok = false;
+            break;
+        }
+        struct pollfd ready = {.fd = reader, .events = POLLIN};
+        int polled = poll(&ready, 1, (int)remaining + 1);
+        if (polled < 0 && errno == EINTR)
+            continue;
+        if (polled <= 0) {
+            ok = false;
+            break;
+        }
+        ssize_t n = read(reader, chunk, sizeof(chunk));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0) {
+            ok = false;
+            break;
+        }
+        if (n == 0)
+            break;
+        if ((size_t)n > (64u << 20) - total) {
+            ok = false;
+            break;
+        }
+        total += (size_t)n;
+        for (size_t off = 0; ok && off < (size_t)n;) {
+            unsigned char *end = memchr(chunk + off, 0, (size_t)n - off);
+            size_t length = end ? (size_t)(end - (chunk + off)) : (size_t)n - off;
+            if (length >= sizeof(name) - name_len) {
+                ok = false;
+                break;
+            }
+            memcpy(name + name_len, chunk + off, length);
+            name_len += length;
+            off += length;
+            if (end) {
+                name[name_len] = '\0';
+                if (++files > 200000 ||
+                    !hash_untracked_path(st, ctx, name, deadline))
+                    ok = false;
+                name_len = 0;
+                off++;
+            }
+        }
+        idle_deadline = monotonic_ms() + 5000.0;
+    }
+    close(reader);
+    if (name_len)
+        ok = false; /* A truncated final path is never a valid Git -z listing. */
+    int status = 0;
+    pid_t waited = -1;
+    while (ok) {
+        waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid)
+            break;
+        if ((waited < 0 && errno != EINTR) || monotonic_ms() >= deadline) {
+            ok = false;
+            break;
+        }
+        poll(NULL, 0, 1);
+    }
+    if (!ok) {
+        kill(-pid, SIGKILL);
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+    }
+    return ok && waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 static bool freshness(cg_state *st, const char **reason) {
     if (!st->manifest || !source_schema(st->manifest, false)) {
