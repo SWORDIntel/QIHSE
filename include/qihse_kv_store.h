@@ -824,6 +824,45 @@ bool qihse_kv_del_with_receipt_user(qihse_kv_store_t* store,
     uint16_t receipt_classification, uint16_t receipt_sci,
     qihse_kv_receipt_builder_t build_receipt, void* context,
     qihse_user_t* user, uint64_t* out_delete_seq);
+
+/* DIRECTEYE canonical mutation + outbox. The record row and event row are
+ * written in one independently checksummed WAL frame. `record_value == NULL`
+ * emits a source tombstone; otherwise it is an upsert. The keys must be in the
+ * caller's `directeye:canonical:v1:<tenant>:` and
+ * `directeye:outbox:v1:<tenant>:` namespaces. `expected_source_seq == 0`
+ * requires an absent source row; otherwise it is an exact CAS against the
+ * live row's current sequence. The event builder is called under the write
+ * lock with the reserved source generation, outbox cursor and durable source
+ * timestamp in milliseconds. Exact retries
+ * with the same event key and event bytes return the original cursor; reuse
+ * with different bytes is rejected. A failure after writing any WAL bytes
+ * fences the store until authenticated reopen. CT-mode stores are rejected.
+ */
+#define QIHSE_KV_DIRECTEYE_MAX_EVENT (256u * 1024u)
+typedef bool (*qihse_kv_directeye_event_builder_t)(uint64_t generation,
+    uint64_t cursor, uint64_t committed_at_ms, char* out_value,
+    size_t capacity, void* context);
+bool qihse_kv_directeye_mutate_user(qihse_kv_store_t* store,
+    const char* record_key, const char* record_value,
+    uint64_t expected_source_seq, const char* event_key,
+    uint16_t classification, uint16_t sci_compartment,
+    qihse_kv_directeye_event_builder_t build_event, void* context,
+    qihse_user_t* user, uint64_t* out_generation, uint64_t* out_cursor);
+#define QIHSE_KV_DIRECTEYE_FEED_MAX_PAGE 128u
+typedef struct {
+    uint64_t cursor;
+    char* json;
+} qihse_kv_directeye_event_t;
+bool qihse_kv_directeye_feed_read_user(qihse_kv_store_t* store,
+    qihse_user_t* reader, uint64_t after_cursor, size_t limit,
+    qihse_kv_directeye_event_t** out_events, size_t* out_count,
+    uint64_t* out_next_cursor);
+void qihse_kv_directeye_feed_events_free(qihse_kv_directeye_event_t* events,
+                                          size_t count);
+/* Persist a monotonic ACK for this provisioned index identity. The watermark
+ * is atomically replaced and fsynced before success; outbox rows are retained. */
+bool qihse_kv_directeye_feed_ack_user(qihse_kv_store_t* store,
+    qihse_user_t* reader, uint64_t cursor, uint64_t* out_ack_cursor);
 /* Read state only for an authorized live record or retained tombstone.
  * Success with sequence 0 means LEGACY_UNVERSIONED, not ordered mutation,
  * version, or cursor evidence. Callers requiring such evidence must reject 0.

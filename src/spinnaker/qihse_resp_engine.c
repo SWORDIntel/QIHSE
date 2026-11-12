@@ -676,6 +676,10 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"command", -1, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"decr", 2, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_FAST, 1, 1, 1},
     {"debug", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
+    {"directeye.feed.ack", 2, QIHSE_COMMAND_WRITE, 0, 0, 0},
+    {"directeye.feed.read", 3, QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"directeye.record.get", 2, QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"directeye.record.mutate", -5, QIHSE_COMMAND_WRITE, 0, 0, 0},
     {"del", -2, QIHSE_COMMAND_WRITE, 1, -1, 1},
     {"echo", 2, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"exists", -2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, -1, 1},
@@ -20311,6 +20315,340 @@ static bool qihse_resp_handle_maintenance(qihse_resp_session_t* session, const q
     return qihse_resp_error(session, "ERR expected CLUSTER MAINTENANCE BEGIN, STATUS or RELEASE");
 }
 
+typedef struct {
+    const char* operation_id;
+    const char* record_id;
+    const char* record_key;
+    const char* mutation;
+    uint32_t tenant;
+    uint16_t classification;
+    uint16_t sci;
+    const char* record_json;
+} qihse_resp_directeye_event_ctx_t;
+
+static bool qihse_resp_directeye_event_build(uint64_t generation, uint64_t cursor,
+        uint64_t committed_at_ms, char* out, size_t capacity, void* opaque) {
+    const qihse_resp_directeye_event_ctx_t* ctx = opaque;
+    if (!ctx || !out || !capacity) return false;
+    int n;
+    if (committed_at_ms) {
+        n = snprintf(out, capacity,
+            "{\"schema\":1,\"event_id\":\"%s\",\"record_id\":\"%s\","
+            "\"record_key\":\"%s\",\"mutation\":\"%s\",\"tenant\":%u,"
+            "\"classification\":%u,\"sci\":%u,\"generation\":%llu,"
+            "\"cursor\":%llu,\"committed_at_ms\":%llu,\"record\":%s}",
+            ctx->operation_id, ctx->record_id, ctx->record_key, ctx->mutation,
+            ctx->tenant, ctx->classification, ctx->sci,
+            (unsigned long long)generation, (unsigned long long)cursor,
+            (unsigned long long)committed_at_ms,
+            ctx->record_json ? ctx->record_json : "null");
+    } else {
+        n = snprintf(out, capacity,
+            "{\"schema\":1,\"event_id\":\"%s\",\"record_id\":\"%s\","
+            "\"record_key\":\"%s\",\"mutation\":\"%s\",\"tenant\":%u,"
+            "\"classification\":%u,\"sci\":%u,\"generation\":%llu,"
+            "\"cursor\":%llu,\"record\":%s}",
+            ctx->operation_id, ctx->record_id, ctx->record_key, ctx->mutation,
+            ctx->tenant, ctx->classification, ctx->sci,
+            (unsigned long long)generation, (unsigned long long)cursor,
+            ctx->record_json ? ctx->record_json : "null");
+    }
+    return n >= 0 && (size_t)n < capacity;
+}
+
+static const uint8_t* qihse_directeye_json_ws(const uint8_t* p, const uint8_t* end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    return p;
+}
+
+static bool qihse_directeye_json_hex4(const uint8_t* p, const uint8_t* end, uint16_t* out) {
+    if ((size_t)(end - p) < 4u) return false;
+    uint16_t value = 0u;
+    for (unsigned i = 0u; i < 4u; ++i) {
+        uint8_t c = p[i];
+        unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+            c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10u) :
+            c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10u) : 16u;
+        if (digit > 15u) return false;
+        value = (uint16_t)((value << 4) | digit);
+    }
+    *out = value;
+    return true;
+}
+
+static const uint8_t* qihse_directeye_json_string(const uint8_t* p, const uint8_t* end) {
+    if (p >= end || *p++ != '"') return NULL;
+    while (p < end) {
+        uint8_t c = *p++;
+        if (c == '"') return p;
+        if (c < 0x20u) return NULL;
+        if (c == '\\') {
+            if (p >= end) return NULL;
+            c = *p++;
+            if (c == 'u') {
+                uint16_t code = 0u;
+                if (!qihse_directeye_json_hex4(p, end, &code)) return NULL;
+                p += 4u;
+                if (code >= 0xd800u && code <= 0xdbffu) {
+                    uint16_t low = 0u;
+                    if ((size_t)(end - p) < 6u || p[0] != '\\' || p[1] != 'u' ||
+                        !qihse_directeye_json_hex4(p + 2u, end, &low) ||
+                        low < 0xdc00u || low > 0xdfffu) return NULL;
+                    p += 6u;
+                } else if (code >= 0xdc00u && code <= 0xdfffu) return NULL;
+            } else if (!strchr("\\\"/bfnrt", c)) return NULL;
+        }
+    }
+    return NULL;
+}
+
+static const uint8_t* qihse_directeye_json_value(const uint8_t* p,
+        const uint8_t* end, unsigned depth) {
+    if (depth > 64u) return NULL;
+    p = qihse_directeye_json_ws(p, end);
+    if (p >= end) return NULL;
+    if (*p == '"') return qihse_directeye_json_string(p, end);
+    if (*p == '{') {
+        p = qihse_directeye_json_ws(p + 1u, end);
+        if (p < end && *p == '}') return p + 1u;
+        for (;;) {
+            p = qihse_directeye_json_string(p, end);
+            if (!p || (p = qihse_directeye_json_ws(p, end)) >= end || *p++ != ':') return NULL;
+            p = qihse_directeye_json_value(p, end, depth + 1u);
+            if (!p) return NULL;
+            p = qihse_directeye_json_ws(p, end);
+            if (p < end && *p == '}') return p + 1u;
+            if (p >= end || *p++ != ',') return NULL;
+            p = qihse_directeye_json_ws(p, end);
+        }
+    }
+    if (*p == '[') {
+        p = qihse_directeye_json_ws(p + 1u, end);
+        if (p < end && *p == ']') return p + 1u;
+        for (;;) {
+            p = qihse_directeye_json_value(p, end, depth + 1u);
+            if (!p) return NULL;
+            p = qihse_directeye_json_ws(p, end);
+            if (p < end && *p == ']') return p + 1u;
+            if (p >= end || *p++ != ',') return NULL;
+        }
+    }
+    const char* literal = *p == 't' ? "true" : *p == 'f' ? "false" :
+                          *p == 'n' ? "null" : NULL;
+    if (literal) {
+        size_t n = strlen(literal);
+        return (size_t)(end - p) >= n && memcmp(p, literal, n) == 0 ? p + n : NULL;
+    }
+    const uint8_t* start = p;
+    if (*p == '-') ++p;
+    if (p < end && *p == '0') ++p;
+    else {
+        if (p >= end || *p < '1' || *p > '9') return NULL;
+        do { ++p; } while (p < end && *p >= '0' && *p <= '9');
+    }
+    if (p < end && *p == '.') {
+        ++p;
+        if (p >= end || *p < '0' || *p > '9') return NULL;
+        do { ++p; } while (p < end && *p >= '0' && *p <= '9');
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        ++p;
+        if (p < end && (*p == '+' || *p == '-')) ++p;
+        if (p >= end || *p < '0' || *p > '9') return NULL;
+        do { ++p; } while (p < end && *p >= '0' && *p <= '9');
+    }
+    return p == start ? NULL : p;
+}
+
+static bool qihse_directeye_json_utf8_valid(const uint8_t* data, size_t length) {
+    for (size_t i = 0; i < length;) {
+        uint8_t c = data[i++];
+        if (c < 0x80u) continue;
+        size_t extra;
+        uint8_t low = 0x80u, high = 0xbfu;
+        if (c >= 0xc2u && c <= 0xdfu) extra = 1u;
+        else if (c >= 0xe0u && c <= 0xefu) {
+            extra = 2u;
+            if (c == 0xe0u) low = 0xa0u;
+            if (c == 0xedu) high = 0x9fu;
+        } else if (c >= 0xf0u && c <= 0xf4u) {
+            extra = 3u;
+            if (c == 0xf0u) low = 0x90u;
+            if (c == 0xf4u) high = 0x8fu;
+        } else return false;
+        if (extra > length - i || data[i] < low || data[i] > high) return false;
+        ++i;
+        while (--extra) {
+            if (data[i] < 0x80u || data[i] > 0xbfu) return false;
+            ++i;
+        }
+    }
+    return true;
+}
+
+static bool qihse_directeye_json_object(const uint8_t* data, size_t length) {
+    if (!data || !length || length > QIHSE_KV_DIRECTEYE_MAX_EVENT ||
+        memchr(data, 0, length) || !qihse_directeye_json_utf8_valid(data, length)) return false;
+    const uint8_t* end = data + length;
+    const uint8_t* p = qihse_directeye_json_ws(data, end);
+    if (p >= end || *p != '{') return false;
+    p = qihse_directeye_json_value(p, end, 0u);
+    return p && qihse_directeye_json_ws(p, end) == end;
+}
+
+static bool qihse_resp_directeye_id(const qihse_resp_arg_t* arg, bool uuid) {
+    if (!arg || !arg->len || arg->len > (uuid ? 36u : 128u) ||
+        memchr(arg->data, 0, arg->len)) return false;
+    if (uuid && arg->len != 36u) return false;
+    for (size_t i = 0; i < arg->len; ++i) {
+        uint8_t c = arg->data[i];
+        if (uuid) {
+            if (i == 8u || i == 13u || i == 18u || i == 23u) {
+                if (c != '-') return false;
+            } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        } else if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+    }
+    return true;
+}
+
+static bool qihse_resp_bulk_u64(qihse_resp_session_t* session, uint64_t value) {
+    char text[32];
+    int n = snprintf(text, sizeof(text), "%" PRIu64, value);
+    return n > 0 && (size_t)n < sizeof(text) && qihse_resp_bulk(session, text, (size_t)n);
+}
+
+static bool qihse_resp_handle_directeye(qihse_resp_session_t* session,
+        const qihse_resp_request_t* request) {
+    if (!session || !session->server || !session->server->store || !session->user ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH authenticated session required");
+    qihse_kv_store_t* store = session->server->store;
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.GET")) {
+        if (request->argc != 2u) return qihse_resp_wrong_arity(session, "directeye.record.get");
+        if (!qihse_resp_directeye_id(&request->argv[1], false))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE record identifier");
+        char record_id[129], record_key[192];
+        memcpy(record_id, request->argv[1].data, request->argv[1].len);
+        record_id[request->argv[1].len] = '\0';
+        uint32_t tenant = qihse_user_get_tenant_id(session->user);
+        int n = snprintf(record_key, sizeof(record_key),
+                         "t:%u/directeye/canonical/v1/%s", tenant, record_id);
+        if (n <= 0 || (size_t)n >= sizeof(record_key))
+            return qihse_resp_error(session, "ERR DIRECTEYE key too long");
+        qihse_kv_change_meta_t meta = {0};
+        char* value = NULL;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool found = qihse_kv_change_meta_user(store, record_key, session->user, &meta);
+        if (found && !meta.tombstone)
+            value = qihse_kv_get_user(store, record_key, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        bool live = found && !meta.tombstone && value != NULL;
+        bool emitted = qihse_resp_array(session, 3u) &&
+            qihse_resp_bulk_u64(session, found ? meta.change_seq : 0u) &&
+            qihse_resp_bulk_u64(session, found && meta.tombstone ? 1u : 0u) &&
+            (live ? qihse_resp_bulk_text(session, value) : qihse_resp_null(session));
+        free(value);
+        return emitted;
+    }
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.MUTATE")) {
+        bool upsert = request->argc >= 4u && qihse_resp_arg_equal(&request->argv[3], "UPSERT");
+        bool deletion = request->argc >= 4u && qihse_resp_arg_equal(&request->argv[3], "DELETE");
+        if ((!upsert && !deletion) || request->argc != (upsert ? 6u : 5u))
+            return qihse_resp_wrong_arity(session, "directeye.record.mutate");
+        if (!qihse_resp_directeye_id(&request->argv[1], true) ||
+            !qihse_resp_directeye_id(&request->argv[2], false))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE operation or record identifier");
+        uint64_t expected = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[4], &expected) ||
+            (deletion && expected == 0u))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE expected sequence");
+        char operation_id[37], record_id[129], record_key[192], event_key[192];
+        memcpy(operation_id, request->argv[1].data, 36u); operation_id[36] = '\0';
+        memcpy(record_id, request->argv[2].data, request->argv[2].len); record_id[request->argv[2].len] = '\0';
+        uint32_t tenant = qihse_user_get_tenant_id(session->user);
+        int r = snprintf(record_key, sizeof(record_key), "t:%u/directeye/canonical/v1/%s", tenant, record_id);
+        int e = snprintf(event_key, sizeof(event_key), "t:%u/directeye/outbox/v1/%s", tenant, operation_id);
+        if (r <= 0 || (size_t)r >= sizeof(record_key) || e <= 0 || (size_t)e >= sizeof(event_key))
+            return qihse_resp_error(session, "ERR DIRECTEYE key too long");
+        char* record_json = NULL;
+        if (upsert) {
+            const qihse_resp_arg_t* payload = &request->argv[5];
+            if (!qihse_directeye_json_object(payload->data, payload->len))
+                return qihse_resp_error(session, "ERR DIRECTEYE payload must be a JSON object");
+            record_json = malloc(payload->len + 1u);
+            if (!record_json) return qihse_resp_error(session, "ERR out of memory");
+            memcpy(record_json, payload->data, payload->len); record_json[payload->len] = '\0';
+        }
+        uint16_t classification = qihse_user_get_classification(session->user);
+        uint16_t sci = qihse_user_get_sci(session->user);
+        qihse_kv_change_meta_t event_meta, source_meta;
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool prior_event = qihse_kv_change_meta_user(store, event_key, session->user, &event_meta);
+        bool source_exists = qihse_kv_change_meta_user(store, record_key, session->user, &source_meta);
+        if (prior_event) {
+            classification = event_meta.classification;
+            sci = event_meta.sci_compartment;
+        } else if (source_exists) {
+            classification = source_meta.classification;
+            sci = source_meta.sci_compartment;
+        } else if (deletion || expected != 0u) {
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            free(record_json);
+            return qihse_resp_error(session, "ERR DIRECTEYE source record unavailable or sequence mismatch");
+        }
+        qihse_resp_directeye_event_ctx_t event = {
+            .operation_id = operation_id, .record_id = record_id, .record_key = record_key,
+            .mutation = upsert ? "upsert" : "delete", .tenant = tenant,
+            .classification = classification, .sci = sci, .record_json = record_json
+        };
+        uint64_t generation = 0u, cursor = 0u;
+        bool ok = qihse_kv_directeye_mutate_user(store, record_key, record_json,
+            expected, event_key, classification, sci, qihse_resp_directeye_event_build,
+            &event, session->user, &generation, &cursor);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        free(record_json);
+        if (!ok) return qihse_resp_error(session, "ERR DIRECTEYE mutation denied, stale, conflicting, or unavailable");
+        return qihse_resp_array(session, 2u) && qihse_resp_bulk_u64(session, generation) &&
+               qihse_resp_bulk_u64(session, cursor);
+    }
+    if (qihse_resp_command_is(request, "DIRECTEYE.FEED.READ")) {
+        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "directeye.feed.read");
+        uint64_t after = 0u, limit = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &after) ||
+            !qihse_resp_parse_u64_arg(&request->argv[2], &limit) || limit == 0u ||
+            limit > QIHSE_KV_DIRECTEYE_FEED_MAX_PAGE)
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE feed cursor or page size");
+        qihse_kv_directeye_event_t* events = NULL;
+        size_t count = 0u;
+        uint64_t next = 0u;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool ok = qihse_kv_directeye_feed_read_user(store, session->user, after,
+            (size_t)limit, &events, &count, &next);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!ok) return qihse_resp_error(session, "NOPERM DIRECTEYE feed requires a provisioned index identity");
+        bool emitted = qihse_resp_array(session, 2u + count * 2u) &&
+            qihse_resp_bulk_u64(session, next) && qihse_resp_bulk_u64(session, count);
+        for (size_t i = 0u; emitted && i < count; ++i)
+            emitted = qihse_resp_bulk_u64(session, events[i].cursor) &&
+                      qihse_resp_bulk_text(session, events[i].json);
+        qihse_kv_directeye_feed_events_free(events, count);
+        return emitted;
+    }
+    if (qihse_resp_command_is(request, "DIRECTEYE.FEED.ACK")) {
+        if (request->argc != 2u) return qihse_resp_wrong_arity(session, "directeye.feed.ack");
+        uint64_t cursor = 0u, ack = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &cursor))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE ACK cursor");
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool ok = qihse_kv_directeye_feed_ack_user(store, session->user, cursor, &ack);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!ok) return qihse_resp_error(session, "NOPERM or invalid monotonic DIRECTEYE feed ACK");
+        return qihse_resp_bulk_u64(session, ack);
+    }
+    return qihse_resp_error(session, "ERR unknown DIRECTEYE command");
+}
+
 static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -20362,6 +20700,12 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         return qihse_resp_error(session,
             "NOPERM command is outside the authenticated service capability");
     }
+
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.GET") ||
+        qihse_resp_command_is(request, "DIRECTEYE.RECORD.MUTATE") ||
+        qihse_resp_command_is(request, "DIRECTEYE.FEED.READ") ||
+        qihse_resp_command_is(request, "DIRECTEYE.FEED.ACK"))
+        return qihse_resp_handle_directeye(session, request);
 
     const uint8_t* cmd_data = request->argv[0].data;
     size_t cmd_len = request->argv[0].len;

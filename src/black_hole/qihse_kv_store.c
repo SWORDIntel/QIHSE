@@ -1,4 +1,5 @@
 #include "qihse_kv_store.h"
+#include "qihse_keystone.h"
 #include "qihse_cluster_slot.h"
 #include "qihse_cluster_reclaim.h"
 #include "qihse_ct_codec.h"
@@ -51,6 +52,7 @@
 #define KV_WAL_MAGIC_DELETE_RECEIPT "QKV5"
 #define KV_WAL_MAGIC_CT "QKV6"
 #define KV_WAL_MAGIC_CT_LANE_BASELINE "QKV7"
+#define KV_WAL_MAGIC_DIRECTEYE "QKV8"
 #define KV_WAL_CT_LANE_BASELINE_FRAME_BYTES 2256u
 #define KV_REPLICA_CURSOR_MAGIC "QRC1"
 #define KV_REPLICA_CURSOR_MAX_ITEMS 4096u
@@ -2532,6 +2534,20 @@ static uint64_t wal_delete_receipt_crc(const unsigned char hdr[48],
     return fnv1a64_update(h, receipt, receipt_len_bytes);
 }
 
+/* QKV8 atomically commits a DIRECTEYE canonical row and its outbox event. */
+static uint64_t wal_directeye_crc(const unsigned char hdr[64],
+                                  const char* record_key, size_t record_key_len,
+                                  const char* event_key, size_t event_key_len,
+                                  const char* record_value, size_t record_value_len,
+                                  const char* event_value, size_t event_value_len) {
+    uint64_t h = fnv1a64_update(14695981039346656037ULL, hdr, 40u);
+    h = fnv1a64_update(h, hdr + 48u, 16u);
+    h = fnv1a64_update(h, record_key, record_key_len);
+    h = fnv1a64_update(h, event_key, event_key_len);
+    if (record_value_len) h = fnv1a64_update(h, record_value, record_value_len);
+    return fnv1a64_update(h, event_value, event_value_len);
+}
+
 static bool payload_is_dead(const kv_payload_t* p, uint64_t now) {
     return !p || (p->flags & KV_FLAG_TOMBSTONE) != 0u ||
            (p->expire_time_ms != 0u && p->expire_time_ms <= now);
@@ -3832,6 +3848,121 @@ static int wal_replay_new_record(qihse_kv_store_t* store, FILE* f, bool has_sour
     return 1;
 }
 
+static bool directeye_keys_valid(const char* record_key, const char* event_key,
+                                 uint32_t tenant_id);
+static bool directeye_json_uint64(const char* json, const char* field,
+                                  uint64_t* out_value);
+
+static bool directeye_wal_tenant(const char* record_key, uint32_t* out_tenant) {
+    if (!record_key || !out_tenant || strncmp(record_key, "t:", 2u) != 0) return false;
+    const char* p = record_key + 2u;
+    if (*p < '0' || *p > '9') return false;
+    errno = 0;
+    char* end = NULL;
+    unsigned long tenant = strtoul(p, &end, 10);
+    if (errno || !end || end == p || tenant > UINT32_MAX || *end != '/') return false;
+    *out_tenant = (uint32_t)tenant;
+    return true;
+}
+
+static int wal_replay_directeye(qihse_kv_store_t* store, FILE* f,
+                                const kv_read_context_t* context) {
+    unsigned char hdr[64] = {0};
+    memcpy(hdr, KV_WAL_MAGIC_DIRECTEYE, 4u);
+    if (fread(hdr + 4u, 1u, sizeof(hdr) - 4u, f) != sizeof(hdr) - 4u) return 0;
+    uint16_t record_key_len, event_key_len, classification, sci;
+    uint32_t record_value_len, event_value_len;
+    uint64_t generation, cursor, crc;
+    uint8_t operation = hdr[4];
+    memcpy(&record_key_len, hdr + 8u, 2u);
+    memcpy(&event_key_len, hdr + 10u, 2u);
+    memcpy(&record_value_len, hdr + 12u, 4u);
+    memcpy(&event_value_len, hdr + 16u, 4u);
+    memcpy(&classification, hdr + 20u, 2u);
+    memcpy(&sci, hdr + 22u, 2u);
+    memcpy(&generation, hdr + 24u, 8u);
+    memcpy(&cursor, hdr + 32u, 8u);
+    memcpy(&crc, hdr + 40u, 8u);
+    bool tombstone = operation == 2u;
+    if ((operation != 1u && operation != 2u) || hdr[5] || hdr[6] || hdr[7] ||
+        !record_key_len || !event_key_len || !event_value_len ||
+        event_value_len > QIHSE_KV_DIRECTEYE_MAX_EVENT ||
+        record_value_len > KV_MAX_VALUE_LEN || (tombstone ? record_value_len != 0u : record_value_len == 0u) ||
+        !generation || cursor != generation + 1u || !cursor ||
+        memcmp(hdr + 48u, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16u) != 0)
+        return 0;
+    if (!kv_read_allowed(context, classification, sci)) return -2;
+    char* record_key = malloc((size_t)record_key_len + 1u);
+    char* event_key = malloc((size_t)event_key_len + 1u);
+    char* record_value = malloc((size_t)record_value_len + 1u);
+    char* event_value = malloc((size_t)event_value_len + 1u);
+    if (!record_key || !event_key || !record_value || !event_value) {
+        free(record_key); free(event_key); free(record_value); free(event_value);
+        return -1;
+    }
+    bool valid = fread(record_key, 1u, record_key_len, f) == record_key_len &&
+        fread(event_key, 1u, event_key_len, f) == event_key_len &&
+        (!record_value_len || fread(record_value, 1u, record_value_len, f) == record_value_len) &&
+        fread(event_value, 1u, event_value_len, f) == event_value_len;
+    if (valid) {
+        valid = !memchr(record_key, 0, record_key_len) && !memchr(event_key, 0, event_key_len) &&
+            (!record_value_len || !memchr(record_value, 0, record_value_len)) &&
+            !memchr(event_value, 0, event_value_len) &&
+            wal_directeye_crc(hdr, record_key, record_key_len, event_key, event_key_len,
+                record_value, record_value_len, event_value, event_value_len) == crc;
+    }
+    if (!valid) {
+        free(record_key); free(event_key); free(record_value); free(event_value);
+        return 0;
+    }
+    record_key[record_key_len] = '\0'; event_key[event_key_len] = '\0';
+    record_value[record_value_len] = '\0'; event_value[event_value_len] = '\0';
+    uint32_t tenant_id = 0u;
+    if (!directeye_wal_tenant(record_key, &tenant_id) ||
+        !directeye_keys_valid(record_key, event_key, tenant_id)) valid = false;
+    bool fatal = false, ok = valid;
+    if (ok) {
+        kv_lookup_result_t old;
+        kv_lookup_state_t state = logical_lookup(store, record_key, &old);
+        if (state == KV_LOOKUP_ERROR) { fatal = true; ok = false; }
+        else if (state != KV_LOOKUP_MISS && old.change_seq == generation) {
+            ok = (state == (tombstone ? KV_LOOKUP_DEAD : KV_LOOKUP_LIVE)) &&
+                (((old.flags & KV_FLAG_TOMBSTONE) != 0u) == tombstone) &&
+                old.classification == classification && old.sci_compartment == sci &&
+                (tombstone || (old.value && strcmp(old.value, record_value) == 0));
+            if (!ok) fatal = true;
+        } else if (state == KV_LOOKUP_MISS || old.change_seq < generation) {
+            ok = insert_internal(store, record_key, tombstone ? "" : record_value, 0u,
+                classification, sci, tombstone ? KV_FLAG_TOMBSTONE : 0u, generation);
+            if (!ok) fatal = true;
+        }
+        lookup_result_free(&old);
+    }
+    if (ok) {
+        kv_lookup_result_t old;
+        kv_lookup_state_t state = logical_lookup(store, event_key, &old);
+        if (state == KV_LOOKUP_ERROR) { fatal = true; ok = false; }
+        else if (state != KV_LOOKUP_MISS && old.change_seq == cursor) {
+            ok = state == KV_LOOKUP_LIVE && old.value && strcmp(old.value, event_value) == 0 &&
+                 old.classification == classification && old.sci_compartment == sci;
+            if (!ok) fatal = true;
+        } else if (state == KV_LOOKUP_MISS || old.change_seq < cursor) {
+            ok = insert_internal(store, event_key, event_value, 0u,
+                classification, sci, 0u, cursor);
+            if (!ok) fatal = true;
+        } else {
+            /* An operation ID is immutable; a later row at this key cannot
+             * be a legitimate consequence of replaying this frame. */
+            fatal = true;
+            ok = false;
+        }
+        lookup_result_free(&old);
+    }
+    if (ok) kv_change_seq_floor(store, cursor);
+    free(record_key); free(event_key); free(record_value); free(event_value);
+    return ok ? 1 : fatal ? -1 : 0;
+}
+
 static int wal_replay_delete_receipt(qihse_kv_store_t* store, FILE* f,
                                      const kv_read_context_t* context) {
     unsigned char hdr[48] = {0};
@@ -4090,6 +4221,14 @@ static bool recover_from_wal(qihse_kv_store_t* store, const kv_read_context_t* c
             if (store->ct_enabled && !lane_local_wal &&
                 memcmp(magic, KV_WAL_MAGIC_CT, 4u) != 0) {
                 fclose(f); errno = EINVAL; return false;
+            }
+            if (memcmp(magic, KV_WAL_MAGIC_DIRECTEYE, 4u) == 0) {
+                int replay = wal_replay_directeye(store, f, context);
+                if (replay == -2) goto denied;
+                if (replay == -1) { fclose(f); return false; }
+                if (!replay) break;
+                last_good = ftello(f);
+                continue;
             }
             if (memcmp(magic, KV_WAL_MAGIC_DELETE_RECEIPT, 4u) == 0) {
                 int replay = wal_replay_delete_receipt(store, f, context);
@@ -6328,11 +6467,18 @@ static char* kv_get_user_impl(qihse_kv_store_t* store, const char* key, qihse_us
 static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
                              qihse_user_t* user, uint64_t* out_change_seq);
 
+static bool kv_directeye_reserved_key(const char* key) {
+    if (!key || strncmp(key, "t:", 2u) != 0) return false;
+    const char* slash = strchr(key + 2u, '/');
+    return slash && (strncmp(slash, "/directeye/canonical/v1/", 24u) == 0 ||
+                     strncmp(slash, "/directeye/outbox/v1/", 21u) == 0);
+}
+
 static bool set_user_preflight(qihse_kv_store_t* store, const char* key, const char* value,
                                 uint16_t classification, uint16_t sci_compartment,
                                 qihse_user_t* user) {
     if (!store || !store->trie || __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
-        !key || !value || key[0] == '\0') return false;
+        !key || !value || key[0] == '\0' || kv_directeye_reserved_key(key)) return false;
     if (store->ct_enabled && (store->ct_lane_count
         ? !ct_write_allowed(store, user, key)
         : (store->ct_mode != 1u || !ct_write_allowed(store, user, key)))) return false;
@@ -6820,7 +6966,7 @@ bool qihse_kv_exists_user(qihse_kv_store_t* store, const char* key, qihse_user_t
 static bool kv_del_user_impl(qihse_kv_store_t* store, const char* key,
                              qihse_user_t* user, uint64_t* out_change_seq) {
     if (out_change_seq) *out_change_seq = 0u;
-    if (!store || !key) return false;
+    if (!store || !key || kv_directeye_reserved_key(key)) return false;
     if (store->ct_enabled && (store->ct_lane_count
         ? !ct_write_allowed(store, user, key)
         : (store->ct_mode != 1u || !ct_write_allowed(store, user, key)))) return false;
@@ -7025,6 +7171,424 @@ failed:
 done:
     kv_store_unlock(store);
     return ok;
+}
+
+static bool directeye_json_uint64(const char* json, const char* field,
+                                  uint64_t* out_value) {
+    if (out_value) *out_value = 0u;
+    if (!json || !field || !out_value) return false;
+    char needle[64];
+    int n = snprintf(needle, sizeof(needle), "\"%s\"", field);
+    if (n <= 0 || (size_t)n >= sizeof(needle)) return false;
+    const char* p = strstr(json, needle);
+    if (!p) return false;
+    p += (size_t)n;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p++ != ':') return false;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p < '0' || *p > '9') return false;
+    errno = 0;
+    char* end = NULL;
+    unsigned long long value = strtoull(p, &end, 10);
+    if (errno || !end || end == p || (*end != ',' && *end != '}' &&
+        *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n')) return false;
+    *out_value = (uint64_t)value;
+    return *out_value != 0u;
+}
+
+static bool directeye_json_cursor(const char* json, uint64_t* out_cursor) {
+    return directeye_json_uint64(json, "cursor", out_cursor);
+}
+
+static bool directeye_uuid_suffix_valid(const char* value) {
+    if (!value || strlen(value) != 36u) return false;
+    for (size_t i = 0; i < 36u; ++i) {
+        if (i == 8u || i == 13u || i == 18u || i == 23u) {
+            if (value[i] != '-') return false;
+        } else if (!((value[i] >= '0' && value[i] <= '9') ||
+                     (value[i] >= 'a' && value[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+static bool directeye_keys_valid(const char* record_key, const char* event_key,
+                                 uint32_t tenant_id) {
+    char record_prefix[64], event_prefix[64];
+    int rn = snprintf(record_prefix, sizeof(record_prefix),
+                      "t:%" PRIu32 "/directeye/canonical/v1/", tenant_id);
+    int en = snprintf(event_prefix, sizeof(event_prefix),
+                      "t:%" PRIu32 "/directeye/outbox/v1/", tenant_id);
+    if (rn < 0 || en < 0 || (size_t)rn >= sizeof(record_prefix) ||
+        (size_t)en >= sizeof(event_prefix) ||
+        strncmp(record_key, record_prefix, (size_t)rn) != 0 ||
+        !record_key[rn] || strncmp(event_key, event_prefix, (size_t)en) != 0 ||
+        !directeye_uuid_suffix_valid(event_key + en)) return false;
+    for (const unsigned char* p = (const unsigned char*)record_key + rn; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
+            return false;
+    return true;
+}
+
+bool qihse_kv_directeye_mutate_user(qihse_kv_store_t* store,
+    const char* record_key, const char* record_value,
+    uint64_t expected_source_seq, const char* event_key,
+    uint16_t classification, uint16_t sci_compartment,
+    qihse_kv_directeye_event_builder_t build_event, void* context,
+    qihse_user_t* user, uint64_t* out_generation, uint64_t* out_cursor) {
+    if (out_generation) *out_generation = 0u;
+    if (out_cursor) *out_cursor = 0u;
+    if (!store || !record_key || !event_key || !build_event || !user ||
+        !qihse_auth_user_is_active(user) ||
+        !qihse_auth_can_access(user, classification, sci_compartment) ||
+        qihse_keystone_feed_identity_is_indexer(user)) return false;
+    size_t record_key_len = strnlen(record_key, UINT16_MAX + 1u);
+    size_t event_key_len = strnlen(event_key, UINT16_MAX + 1u);
+    size_t record_value_len = record_value ? strnlen(record_value, KV_MAX_VALUE_LEN + 1u) : 0u;
+    if (!record_key_len || !event_key_len || record_key_len > UINT16_MAX ||
+        event_key_len > UINT16_MAX || record_key_len > KV_MAX_KEY_LEN ||
+        event_key_len > KV_MAX_KEY_LEN ||
+        (record_value && (!record_value_len || record_value_len > KV_MAX_VALUE_LEN))) return false;
+    uint32_t tenant_id = qihse_user_get_tenant_id(user);
+    if (!directeye_keys_valid(record_key, event_key, tenant_id)) return false;
+
+    bool ok = false, writing = false;
+    char* event_value = malloc((size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u);
+    if (!event_value) return false;
+    kv_store_wrlock(store);
+    if (!store->trie || !store->wal_fd || store->memory_snapshot || store->ct_enabled ||
+        store->recovery_pending || store->bulk_load_mode || store->durable_batch_mode ||
+        __atomic_load_n(&store->replica_read_only, __ATOMIC_ACQUIRE) ||
+        !qihse_auth_user_is_active(user) ||
+        !qihse_auth_can_access(user, classification, sci_compartment)) goto done;
+
+    kv_lookup_result_t source = {0}, prior_event = {0};
+    kv_lookup_state_t source_state = logical_lookup(store, record_key, &source);
+    kv_lookup_state_t event_state = logical_lookup(store, event_key, &prior_event);
+    if (source_state == KV_LOOKUP_ERROR || event_state == KV_LOOKUP_ERROR) goto lookups_done;
+    if (event_state != KV_LOOKUP_MISS) {
+        if (event_state != KV_LOOKUP_LIVE || !prior_event.value || prior_event.change_seq < 2u ||
+            prior_event.classification != classification ||
+            prior_event.sci_compartment != sci_compartment ||
+            !qihse_auth_can_access(user, prior_event.classification, prior_event.sci_compartment))
+            goto lookups_done;
+        memset(event_value, 0, (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u);
+        uint64_t event_cursor = 0u, committed_at_ms = 0u;
+        (void)directeye_json_uint64(prior_event.value, "committed_at_ms", &committed_at_ms);
+        if (!build_event(prior_event.change_seq - 1u, prior_event.change_seq,
+                         committed_at_ms, event_value,
+                         (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u, context) ||
+            !memchr(event_value, '\0', (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u) ||
+            !directeye_json_cursor(event_value, &event_cursor) ||
+            event_cursor != prior_event.change_seq || strcmp(prior_event.value, event_value) != 0)
+            goto lookups_done;
+        if (out_generation) *out_generation = prior_event.change_seq - 1u;
+        if (out_cursor) *out_cursor = prior_event.change_seq;
+        ok = true;
+        goto lookups_done;
+    }
+    if ((record_value == NULL && source_state != KV_LOOKUP_LIVE) ||
+        (expected_source_seq == 0u && source_state != KV_LOOKUP_MISS) ||
+        (expected_source_seq != 0u &&
+         (source_state != KV_LOOKUP_LIVE && source_state != KV_LOOKUP_DEAD)) ||
+        (expected_source_seq != 0u && source.change_seq != expected_source_seq) ||
+        (source_state != KV_LOOKUP_MISS &&
+         !qihse_auth_can_access(user, source.classification, source.sci_compartment)) ||
+        __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED) >= UINT64_MAX - 2u)
+        goto lookups_done;
+
+    uint64_t generation = kv_change_seq_next(store);
+    uint64_t cursor = kv_change_seq_next(store);
+    uint64_t committed_at_ms = current_time_ms();
+    if (!generation || cursor != generation + 1u || !cursor || !committed_at_ms) goto lookups_done;
+    memset(event_value, 0, (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u);
+    if (!build_event(generation, cursor, committed_at_ms, event_value,
+                     (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u, context) ||
+        !memchr(event_value, '\0', (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u))
+        goto lookups_done;
+    size_t event_value_len = strnlen(event_value, (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u);
+    uint64_t event_cursor = 0u;
+    if (!event_value_len || event_value_len > QIHSE_KV_DIRECTEYE_MAX_EVENT ||
+        !directeye_json_cursor(event_value, &event_cursor) || event_cursor != cursor)
+        goto lookups_done;
+
+    unsigned char hdr[64] = {0};
+    uint8_t operation = record_value ? 1u : 2u;
+    uint16_t record_key_len16 = (uint16_t)record_key_len;
+    uint16_t event_key_len16 = (uint16_t)event_key_len;
+    uint32_t record_value_len32 = (uint32_t)record_value_len;
+    uint32_t event_value_len32 = (uint32_t)event_value_len;
+    memcpy(hdr, KV_WAL_MAGIC_DIRECTEYE, 4u);
+    hdr[4] = operation;
+    memcpy(hdr + 8u, &record_key_len16, 2u);
+    memcpy(hdr + 10u, &event_key_len16, 2u);
+    memcpy(hdr + 12u, &record_value_len32, 4u);
+    memcpy(hdr + 16u, &event_value_len32, 4u);
+    memcpy(hdr + 20u, &classification, 2u);
+    memcpy(hdr + 22u, &sci_compartment, 2u);
+    memcpy(hdr + 24u, &generation, 8u);
+    memcpy(hdr + 32u, &cursor, 8u);
+    uint64_t crc = wal_directeye_crc(hdr, record_key, record_key_len,
+        event_key, event_key_len, record_value, record_value_len,
+        event_value, event_value_len);
+    memcpy(hdr + 40u, &crc, 8u);
+    writing = true;
+    if (aimem_durability_test_fail_once("directeye-partial-header")) {
+        (void)fwrite(hdr, 1u, sizeof(hdr) / 2u, store->wal_fd);
+        goto lookups_done;
+    }
+    if (!fwrite_exact(hdr, 1u, sizeof(hdr), store->wal_fd) ||
+        !fwrite_exact(record_key, 1u, record_key_len, store->wal_fd) ||
+        !fwrite_exact(event_key, 1u, event_key_len, store->wal_fd) ||
+        (record_value_len && !fwrite_exact(record_value, 1u, record_value_len, store->wal_fd)) ||
+        aimem_durability_test_fail_once("directeye-partial-body") ||
+        !fwrite_exact(event_value, 1u, event_value_len, store->wal_fd) ||
+        aimem_durability_test_fail_once("directeye-fflush") || fflush(store->wal_fd) != 0 ||
+        aimem_durability_test_fail_once("directeye-fsync") ||
+        fdatasync(fileno(store->wal_fd)) != 0 || !fsync_dir_path(get_qihse_data_dir()))
+        goto lookups_done;
+    store->wal_unflushed_bytes = 0u;
+    store->durable_batch_mode = true;
+    if (!insert_internal(store, record_key, record_value ? record_value : "", 0u,
+                         classification, sci_compartment,
+                         record_value ? 0u : KV_FLAG_TOMBSTONE, generation) ||
+        !insert_internal(store, event_key, event_value, 0u,
+                         classification, sci_compartment, 0u, cursor)) {
+        store->durable_batch_mode = false;
+        goto lookups_done;
+    }
+    store->durable_batch_mode = false;
+    if (out_generation) *out_generation = generation;
+    if (out_cursor) *out_cursor = cursor;
+    ok = true;
+lookups_done:
+    lookup_result_free(&source);
+    lookup_result_free(&prior_event);
+    if (!ok && writing) __atomic_store_n(&store->recovery_pending, true, __ATOMIC_RELEASE);
+done:
+    kv_store_unlock(store);
+    free(event_value);
+    return ok;
+}
+
+typedef struct {
+    char* key;
+    qihse_kv_directeye_event_t event;
+} directeye_feed_item_t;
+
+typedef struct {
+    directeye_feed_item_t* items;
+    size_t count;
+    size_t limit;
+    uint64_t eligible_count;
+    uint64_t after_cursor;
+    uint64_t snapshot_cursor;
+    bool failed;
+} directeye_feed_scan_t;
+
+static bool directeye_feed_collect_cb(const char* key, const char* value,
+                                      void* user_data) {
+    directeye_feed_scan_t* scan = user_data;
+    uint64_t cursor = 0u;
+    if (!scan || !key || !value || !directeye_json_cursor(value, &cursor)) {
+        if (scan) scan->failed = true;
+        return false;
+    }
+    if (cursor <= scan->after_cursor || cursor > scan->snapshot_cursor) return true;
+    scan->eligible_count++;
+    size_t slot = scan->count;
+    if (scan->count == scan->limit) {
+        slot = 0u;
+        for (size_t i = 1u; i < scan->count; ++i)
+            if (scan->items[i].event.cursor > scan->items[slot].event.cursor) slot = i;
+        if (cursor >= scan->items[slot].event.cursor) return true;
+        free(scan->items[slot].key);
+        free(scan->items[slot].event.json);
+        scan->items[slot].key = NULL;
+        scan->items[slot].event.json = NULL;
+    } else {
+        scan->count++;
+    }
+    size_t key_len = strlen(key);
+    size_t value_len = strnlen(value, (size_t)QIHSE_KV_DIRECTEYE_MAX_EVENT + 1u);
+    if (!key_len || value_len == 0u || value_len > QIHSE_KV_DIRECTEYE_MAX_EVENT) {
+        scan->failed = true;
+        return false;
+    }
+    scan->items[slot].key = malloc(key_len + 1u);
+    scan->items[slot].event.json = malloc(value_len + 1u);
+    if (!scan->items[slot].key || !scan->items[slot].event.json) {
+        free(scan->items[slot].key); free(scan->items[slot].event.json);
+        scan->items[slot].key = NULL; scan->items[slot].event.json = NULL;
+        scan->failed = true;
+        return false;
+    }
+    memcpy(scan->items[slot].key, key, key_len + 1u);
+    memcpy(scan->items[slot].event.json, value, value_len + 1u);
+    scan->items[slot].event.cursor = cursor;
+    return true;
+}
+
+static int directeye_feed_item_compare(const void* left, const void* right) {
+    const directeye_feed_item_t* a = left;
+    const directeye_feed_item_t* b = right;
+    return a->event.cursor < b->event.cursor ? -1 : a->event.cursor > b->event.cursor;
+}
+
+void qihse_kv_directeye_feed_events_free(qihse_kv_directeye_event_t* events,
+                                          size_t count) {
+    if (!events) return;
+    for (size_t i = 0u; i < count; ++i) free(events[i].json);
+    free(events);
+}
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t tenant_id;
+    uint32_t user_id;
+    uint32_t reserved;
+    uint64_t cursor;
+    uint64_t checksum;
+} directeye_ack_disk_t;
+
+static bool directeye_ack_path(uint32_t tenant_id, uint32_t user_id,
+                               char* path, size_t capacity) {
+    const char* dir = get_qihse_data_dir();
+    if (!dir || !path || !capacity) return false;
+    int n = snprintf(path, capacity, "%sdirecteye-feed-ack-%" PRIu32 "-%" PRIu32 ".bin",
+                     dir, tenant_id, user_id);
+    return n > 0 && (size_t)n < capacity;
+}
+
+static bool directeye_ack_load(const char* path, uint32_t tenant_id,
+                               uint32_t user_id, uint64_t* out_cursor) {
+    *out_cursor = 0u;
+    int fd = open_secure_read(path);
+    if (fd < 0) return errno == ENOENT;
+    FILE* f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
+    directeye_ack_disk_t disk;
+    memset(&disk, 0, sizeof(disk));
+    bool ok = fread(&disk, 1u, sizeof(disk), f) == sizeof(disk) &&
+              fgetc(f) == EOF && !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    uint64_t expected = disk.checksum;
+    if (ok) {
+        ok = memcmp(disk.magic, "DACK0001", 8u) == 0 && disk.version == 1u &&
+            disk.tenant_id == tenant_id && disk.user_id == user_id &&
+            disk.reserved == 0u && expected == fnv1a64_update(
+                14695981039346656037ULL, &disk, offsetof(directeye_ack_disk_t, checksum));
+    }
+    if (ok) *out_cursor = disk.cursor;
+    OPENSSL_cleanse(&disk, sizeof(disk));
+    return ok;
+}
+
+bool qihse_kv_directeye_feed_ack_user(qihse_kv_store_t* store,
+    qihse_user_t* reader, uint64_t cursor, uint64_t* out_ack_cursor) {
+    if (out_ack_cursor) *out_ack_cursor = 0u;
+    if (!store || !reader || !out_ack_cursor ||
+        !qihse_auth_user_is_active(reader) ||
+        !qihse_keystone_feed_identity_is_indexer(reader)) return false;
+    uint32_t tenant_id = qihse_user_get_tenant_id(reader);
+    uint32_t user_id = qihse_user_get_id(reader);
+    char path[4096], temp[4160];
+    if (!directeye_ack_path(tenant_id, user_id, path, sizeof(path))) return false;
+    kv_store_wrlock(store);
+    bool ok = false;
+    uint64_t prior = 0u;
+    if (store->recovery_pending || !store->trie ||
+        !qihse_auth_user_is_active(reader) ||
+        !qihse_keystone_feed_identity_is_indexer(reader) ||
+        cursor > __atomic_load_n(&store->change_seq, __ATOMIC_RELAXED) ||
+        !directeye_ack_load(path, tenant_id, user_id, &prior) || cursor < prior)
+        goto done;
+    if (cursor == prior) {
+        *out_ack_cursor = prior;
+        ok = true;
+        goto done;
+    }
+    directeye_ack_disk_t disk;
+    memset(&disk, 0, sizeof(disk));
+    memcpy(disk.magic, "DACK0001", 8u);
+    disk.version = 1u;
+    disk.tenant_id = tenant_id;
+    disk.user_id = user_id;
+    disk.cursor = cursor;
+    disk.checksum = fnv1a64_update(14695981039346656037ULL, &disk,
+        offsetof(directeye_ack_disk_t, checksum));
+    FILE* f = NULL;
+    if (!atomic_file_begin(path, temp, sizeof(temp), &f)) {
+        OPENSSL_cleanse(&disk, sizeof(disk));
+        goto done;
+    }
+    bool written = fwrite_exact(&disk, 1u, sizeof(disk), f);
+    OPENSSL_cleanse(&disk, sizeof(disk));
+    if (!written || !atomic_file_commit(f, temp, path) ||
+        !fsync_dir_path(get_qihse_data_dir())) {
+        unlink(temp);
+        goto done;
+    }
+    *out_ack_cursor = cursor;
+    ok = true;
+done:
+    kv_store_unlock(store);
+    return ok;
+}
+
+bool qihse_kv_directeye_feed_read_user(qihse_kv_store_t* store,
+    qihse_user_t* reader, uint64_t after_cursor, size_t limit,
+    qihse_kv_directeye_event_t** out_events, size_t* out_count,
+    uint64_t* out_next_cursor) {
+    if (out_events) *out_events = NULL;
+    if (out_count) *out_count = 0u;
+    if (out_next_cursor) *out_next_cursor = 0u;
+    if (!store || !reader || !out_events || !out_count || !out_next_cursor ||
+        limit == 0u || limit > QIHSE_KV_DIRECTEYE_FEED_MAX_PAGE ||
+        !qihse_auth_user_is_active(reader) ||
+        !qihse_keystone_feed_identity_is_indexer(reader)) return false;
+    char prefix[64];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "t:%" PRIu32 "/directeye/outbox/v1/",
+                              qihse_user_get_tenant_id(reader));
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix)) return false;
+    uint64_t snapshot_cursor = qihse_kv_change_seq(store);
+    if (after_cursor > snapshot_cursor) return false;
+    directeye_feed_scan_t scan = {0};
+    scan.limit = limit;
+    scan.after_cursor = after_cursor;
+    scan.snapshot_cursor = snapshot_cursor;
+    scan.items = calloc(limit, sizeof(*scan.items));
+    if (!scan.items) return false;
+    bool iter_ok = qihse_kv_foreach_prefix_user(store, prefix, reader,
+        directeye_feed_collect_cb, &scan);
+    if (!iter_ok || scan.failed) goto fail;
+    qsort(scan.items, scan.count, sizeof(*scan.items), directeye_feed_item_compare);
+    for (size_t i = 0u; i < scan.count; ++i) {
+        qihse_kv_change_meta_t meta;
+        if (!qihse_kv_change_meta_user(store, scan.items[i].key, reader, &meta) ||
+            meta.tombstone || meta.change_seq != scan.items[i].event.cursor) goto fail;
+    }
+    qihse_kv_directeye_event_t* events = calloc(scan.count ? scan.count : 1u, sizeof(*events));
+    if (!events) goto fail;
+    for (size_t i = 0u; i < scan.count; ++i) {
+        events[i] = scan.items[i].event;
+        scan.items[i].event.json = NULL;
+    }
+    *out_events = events;
+    *out_count = scan.count;
+    *out_next_cursor = scan.eligible_count > limit
+        ? events[scan.count - 1u].cursor : snapshot_cursor;
+    for (size_t i = 0u; i < scan.count; ++i) free(scan.items[i].key);
+    free(scan.items);
+    return true;
+fail:
+    for (size_t i = 0u; i < scan.count; ++i) {
+        free(scan.items[i].key);
+        free(scan.items[i].event.json);
+    }
+    free(scan.items);
+    return false;
 }
 
 /* Compare a retry against the stored bytes even if the key's TTL has elapsed.

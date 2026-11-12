@@ -409,7 +409,7 @@ test-ops-scripts:
 
 test-serial: test-owner-snapshot-sdk test-ops-scripts
 
-.PHONY: test-kv-durable-batch test-kv-restore-durability
+.PHONY: test-kv-durable-batch test-kv-restore-durability test-directeye-outbox test-directeye-resp
 test-kv-durable-batch: lib
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
@@ -420,6 +420,21 @@ test-kv-durable-batch: lib
 	  QIHSE_KV_DURABLE_BATCH_DIR="$$work" LD_LIBRARY_PATH=. ./tests/test_kv_durable_batch
 
 test-serial: test-kv-durable-batch
+
+test-directeye-outbox: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_directeye_outbox tests/test_directeye_outbox.c \
+	    src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	@umask 077; LD_LIBRARY_PATH=. ./tests/test_directeye_outbox
+
+test-serial: test-directeye-outbox
+
+test-directeye-resp: lib
+	$(CC) $(CFLAGS) -o tests/test_directeye_resp tests/test_directeye_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_directeye_resp
+
+test-serial: test-directeye-resp
 
 test-kv-restore-durability: lib
 	@mkdir -p build && chmod 0700 build

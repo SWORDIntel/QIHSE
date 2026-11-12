@@ -15,8 +15,10 @@
 > feed, the MongoDB wire adapter, and the derived cluster-node federation UUID —
 > and, since the Phase 10 remainder landed, the scoped consensus module
 > ([§8.9](#89-scoped-consensus--includeqihse_consensush)), the controller C
-> client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), and the
-> incremental (delta) export ([§8.11](#811-incremental-export--includeqihse_exporth)).
+> client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), the
+> incremental (delta) export ([§8.11](#811-incremental-export--includeqihse_exporth)),
+> and the native DIRECTEYE canonical/outbox path ([§6](#6-key-value-store--includeqihse_kv_storeh),
+> [§10.4](#104-directeye-authenticated-resp-commands)).
 > The node-side CRL loaders joined the mTLS section
 > ([§5.1](#51-federation-ca--includeqihse_federation_mtlsh)), the signed backup
 > container joined [§2.3](#23-snapshot-backup--includeqihse_backuph), and the
@@ -69,7 +71,7 @@ above):
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 17 | 17 |
-| `include/qihse_kv_store.h` | 144 | 141 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 148 | 145 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ## Conventions
@@ -694,6 +696,26 @@ intentionally restricted to unclassified data.
 | `int qihse_kv_export_incremental_user(qihse_kv_store_t* store, qihse_user_t* user, uint64_t since_seq, qihse_kv_delta_record_t** out_records, size_t* out_count, uint64_t* out_resume_seq)` | In-memory delta: exactly the mutations strictly greater than `since_seq`, in ascending sequence order, tombstones included, authorization-filtered at the KV layer. The resume point is the highest sequence the principal may see — never the global high-water, so hidden mutations cannot be counted from it. | non-zero |
 | `int qihse_kv_save_delta_user(qihse_kv_store_t* store, const char* filepath, qihse_user_t* user, uint64_t since_seq, uint64_t* out_resume_seq)` | File form of the same delta stream; `qihse_backup_incremental_user()` ([§2.3](#23-snapshot-backup--includeqihse_backuph)) seals it into a `BACKUP_INCREMENTAL` container. | non-zero |
 | `void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count)` | Release a delta record array. | n/a |
+| `qihse_kv_directeye_mutate_user(...)` | Atomically persist one authenticated canonical mutation and its outbox event in QKV8; exact operation retries return the original generation/cursor. See below. | `false` |
+| `qihse_kv_directeye_feed_read_user(...)` | Read a bounded tenant/clearance/SCI-filtered page for a provisioned read-only index identity. | `false` |
+| `qihse_kv_directeye_feed_ack_user(...)` | Persist that index identity's monotonic ACK after the consumer has durably published. | `false` |
+| `qihse_kv_directeye_feed_events_free(...)` | Free a feed page and its event JSON. | n/a |
+
+### DIRECTEYE durable canonical/outbox APIs
+
+These APIs reserve the `t:<tenant>/directeye/canonical/v1/` and
+`t:<tenant>/directeye/outbox/v1/` key namespaces. Ordinary KV SET/DEL paths
+refuse those keys; a canonical mutation and its outbox event are committed in
+one QKV8 WAL frame. The checksum detects accidental corruption; it is not a
+cryptographic authenticator. Mutations are unavailable in CT, bulk-load,
+durable-batch, recovery-pending, and replica-read-only modes.
+
+| Function | Purpose | On failure |
+|---|---|---|
+| `qihse_kv_directeye_mutate_user(...)` | Authenticated canonical upsert/tombstone plus immutable outbox event. The builder receives the reserved generation, cursor, and QIHSE commit timestamp. An identical retry returns the original generation/cursor; conflicting operation-ID reuse fails. | `false`; a partial WAL write fences the store until reopen/recovery |
+| `qihse_kv_directeye_feed_read_user(...)` | Bounded page for a provisioned KEYSTONE index identity; page limit is 1–128. QIHSE applies tenant, clearance, and SCI filtering from that authenticated identity. Caller frees the returned array with `qihse_kv_directeye_feed_events_free()`. | `false` |
+| `qihse_kv_directeye_feed_ack_user(...)` | Persist the index identity's monotonic feed ACK using an atomic replacement and directory sync. The consumer must ACK only after its projection is durably published. | `false` for unauthorized identity, regression, invalid cursor, or I/O failure |
+| `qihse_kv_directeye_feed_events_free(...)` | Free event JSON strings and the page returned by `feed_read_user`. | n/a |
 
 **Group baseline scope.**
 `qihse_kv_ct_lane_baseline_scope_digest(snapshot, principal, out_digest)` returns
@@ -1822,7 +1844,7 @@ actually depends on.
 
 | Protocol | Implementation | Notes |
 |---|---|---|
-| RESP2 / RESP3 | `src/spinnaker/qihse_resp_engine.c` | Redis-compatible command set plus `FEDERATION.*`; see [§10.3](#103-resp-cluster-mutation-authorization-and-fts-scopes) for cluster authorization and FTS scope rules |
+| RESP2 / RESP3 | `src/spinnaker/qihse_resp_engine.c` | Redis-compatible command set plus `FEDERATION.*` and authenticated `DIRECTEYE.*`; see [§10.3](#103-resp-cluster-mutation-authorization-and-fts-scopes) for cluster authorization and FTS scope rules, and [§10.4](#104-directeye-authenticated-resp-commands) for canonical records/feed |
 | PostgreSQL wire | `src/spinnaker/qihse_pg_wire.c` | Simple and extended query flows, transactions, virtual catalogs |
 | MongoDB wire | `src/spinnaker/qihse_mongo_wire.c` | BSON, CRUD, query operators, aggregation pipeline, admin commands |
 | Bolt / Cypher | `src/spinnaker/qihse_bolt.c`, `src/tractable/qihse_cypher_*.c` | Bolt 4.x handshake, PackStream, message flow |
@@ -1990,6 +2012,42 @@ is an engineering dependency graph, not part of the RESP protocol. Namespace
 isolation is complete; resumable indexing depends on it, convergence reporting
 depends on acknowledged-write recovery coverage, and degraded-health reporting
 depends on the indexing and convergence signals.
+
+### 10.4 DIRECTEYE authenticated RESP commands
+
+These commands use the active authenticated QIHSE session (normally sealed by
+QKP). Tenant, classification, and SCI are derived from QIHSE identity state;
+there is no caller-supplied tenant argument or HTTP identity substitute. They
+are separate from `KEYSTONE.FEED.*`, which remains the analysis-artifact feed.
+
+```text
+DIRECTEYE.RECORD.GET <record_id>
+DIRECTEYE.RECORD.MUTATE <lowercase-operation-uuid> <record_id> UPSERT <expected-source-seq> <record-json-object>
+DIRECTEYE.RECORD.MUTATE <lowercase-operation-uuid> <record_id> DELETE <expected-source-seq>
+DIRECTEYE.FEED.READ <after-cursor> <limit>
+DIRECTEYE.FEED.ACK <cursor>
+```
+
+`record_id` is 1–128 ASCII characters from `[A-Za-z0-9._-]`; operation IDs
+are canonical lowercase UUIDs. UPSERT with expected sequence 0 requires an
+absent row; nonzero is exact compare-and-swap. DELETE requires a live row and
+its exact nonzero sequence. Mutation returns `[source_generation, outbox_cursor]`;
+retries must reuse the same UUID and bytes. Conflicting UUID reuse fails.
+GET returns `[source_sequence, tombstone, record_json_or_nil]`. Missing/expired
+and unauthorized rows are indistinguishable (`[0,0,nil]`); an authorized retained
+tombstone returns its source sequence, tombstone flag, and nil payload.
+
+FEED.READ is limited to the provisioned read-only index identity and returns
+`[next_cursor, count, cursor, event_json, ...]`, with at most 128 events per
+page. Each event carries the source generation, outbox cursor, commit time,
+record key, tenant, classification, SCI, mutation, and bounded record payload
+(or tombstone). FEED.ACK is identity-scoped, durable, and monotonic. Publish and
+verify the KEYSTONE generation before acknowledging its cursor. There is no
+HTTP canonical-write facade or raw-store bypass in this contract.
+
+Focused tests: `make test-directeye-outbox` and `make test-directeye-resp`
+cover durable mutation/retry/conflict/tombstone/recovery, authenticated QKP
+record read/write, identity-filtered feed, ACK, and denial paths.
 
 ---
 
