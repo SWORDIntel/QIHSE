@@ -1,18 +1,15 @@
 /**
  * QIHSE - Quantum-Inspired Hilbert Space Expansion Search
  *
- * Ultra-high-performance search using higher-dimensional Hilbert space expansion,
- * Grover-inspired amplitude amplification, and heterogeneous parallel compute.
+ * Scalar exact lookup with Random Fourier Feature candidate scoring, plus
+ * experimental mathematical and heterogeneous-compute interfaces.
  *
  * Features:
  * - Dynamic Hilbert space dimension calculation
  * - Random Fourier Features kernel embedding
- * - Tensor product phase entanglement
- * - Heterogeneous parallel execution (CPU AMX/VNNI/AVX512 + NPU + GPUs)
+ * - Bounded-memory, query-dependent candidate scoring
  * - Configurable accuracy verification modes
- * - Universal data type support
- *
- * Performance: 200-2000x speedup vs binary search
+ * - Descriptor-based equality for fixed-width records
  */
 
 #ifndef QIHSE_H
@@ -27,6 +24,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include "qihse_math_types.h"
 #include "qihse_hetero.h"
 #include "qihse_anchor_search.h"  /* Native QIHSE anchor-search compatibility */
 
@@ -147,29 +145,12 @@ typedef struct qihse_verify_config_s qihse_verify_config_t;
 typedef struct qihse_collapse_result_s qihse_collapse_result_t;
 typedef struct qihse_dimension_params_s qihse_dimension_params_t;
 
-typedef struct qihse_amplification_config_s {
-    int min_rounds;             /* Minimum amplification rounds */
-    int max_rounds;             /* Maximum amplification rounds (0 = auto) */
-    double convergence_threshold; /* Stop when amplitude delta < threshold */
-    double oracle_selectivity;  /* How strict the oracle marking is (0.0-1.0) */
-    bool adaptive_rounds;       /* Use adaptive round count based on problem size */
-    int fixed_rounds;           /* Fixed round count (if adaptive_rounds=false) */
-} qihse_amplification_config_t;
-
-typedef enum {
-    QIHSE_VERIFY_NONE = 0,
-    QIHSE_VERIFY_FAST = 1,
-    QIHSE_VERIFY_WINDOW = 2,
-    QIHSE_VERIFY_FALLBACK = 3,
-    QIHSE_VERIFY_EXACT = 4
-} qihse_verify_mode_t;
-
 typedef struct qihse_verify_config_s {
     qihse_verify_mode_t mode;
     size_t window_size;
     double min_confidence;
     bool fallback_to_classical;
-    size_t max_verification_time_us;
+    size_t max_verification_time_us; /* Reserved; exact verification is not truncated */
 } qihse_verify_config_t;
 
 typedef struct qihse_collapse_result_s {
@@ -235,10 +216,10 @@ typedef struct {
 
 typedef struct qihse_dimension_params_s {
     size_t optimal_dims;        /* Calculated optimal dimension count */
-    size_t expansion_factor;    /* Actual expansion ratio (1.5x to 16x) */
-    double data_entropy;        /* Shannon entropy of data gaps */
-    double gap_coefficient;     /* Coefficient of variation for gaps */
-    size_t effective_rank;      /* Estimated intrinsic dimensionality */
+    size_t expansion_factor;    /* Output dimensions per scalar input */
+    double data_entropy;        /* NAN when the selector has not measured it */
+    double gap_coefficient;     /* NAN when the selector has not measured it */
+    size_t effective_rank;      /* 0 when intrinsic rank has not been measured */
     size_t array_size;          /* Size of input array */
     qihse_data_type_t data_type; /* Detected or specified data type */
 } qihse_dimension_params_t;
@@ -246,14 +227,14 @@ typedef struct qihse_dimension_params_s {
 /**
  * @brief Analyze data and compute optimal Hilbert space dimensions
  *
- * Calculates dimensions based on data entropy, gap variance, array size,
- * and available compute capabilities.
+ * Uses a bounded size-based heuristic. Unmeasured distribution statistics are
+ * reported as NAN (rank as 0), rather than inferred from the element count.
  *
  * @param data Raw data array
  * @param n Number of elements
  * @param element_size Size of each element in bytes
  * @param type Data type (or QIHSE_TYPE_CUSTOM for auto-detection)
- * @param pool Compute pool for capability reference
+ * @param pool Optional reserved compute-capability hint
  * @param params Output dimension parameters
  * @return 0 on success, negative on error
  */
@@ -281,7 +262,7 @@ typedef struct qihse_config_s {
     size_t min_dimensions;      /* Lower bound for auto mode */
 
     /* Data type configuration */
-    qihse_data_type_t data_type; /* Data type (auto-detected if CUSTOM) */
+    qihse_data_type_t data_type; /* CUSTOM requires an explicit comparator */
     qihse_type_descriptor_t type_descriptor; /* For custom types */
 
     /* Kernel configuration */
@@ -295,8 +276,8 @@ typedef struct qihse_config_s {
     qihse_verify_config_t verification;
 
     /* Compute configuration */
-    bool use_heterogeneous;     /* Use all available devices in parallel */
-    bool enable_acceleration;   /* Enable high-performance backends (CUDA, Julia, FORTRAN) */
+    bool use_heterogeneous;     /* Reserved by scalar qihse_search; separate orchestration APIs */
+    bool enable_acceleration;   /* Reserved by scalar qihse_search; explicit backend APIs */
     size_t max_batch_size;      /* Maximum batch size per device */
     bool enable_profiling;      /* Collect detailed performance metrics */
 
@@ -305,8 +286,8 @@ typedef struct qihse_config_s {
     size_t max_parallel_pipelines;  /* Maximum number of parallel pipelines */
 
     /* Timeout and error handling */
-    uint32_t timeout_ms;        /* Overall operation timeout */
-    bool fail_fast;             /* Stop on first device error */
+    uint32_t timeout_ms;        /* Reserved by scalar qihse_search; no deadline enforcement */
+    bool fail_fast;             /* Reserved by scalar qihse_search */
 
     /* Language backend configuration */
     qihse_backend_priority_t backend_priority[8]; /* Ordered list of preferred backends */
@@ -337,14 +318,16 @@ int qihse_config_init(
 /**
  * @brief Quantum-Inspired Hilbert Space Expansion Search
  *
- * Main QIHSE search function that uses higher-dimensional Hilbert space
- * expansion, Grover-inspired amplitude amplification, and heterogeneous
- * parallel compute for ultra-high-performance search.
+ * Score scalar numeric candidates with a signed RFF inner product, then verify
+ * equality against original data. Scratch storage is O(dimensions), independent
+ * of n. Exact/fallback mode searches all records if the candidate does not match.
+ * Non-numeric records use descriptor-based verification directly. The CPU
+ * streaming path does not dispatch the experimental amplification/device APIs.
  *
- * @param data Sorted array to search in
+ * @param data Array of fixed-width records; need not be sorted
  * @param n Number of elements in array
  * @param query Value to search for
- * @param table Anchor table for learning (can be NULL)
+ * @param table Reserved on this streaming path (can be NULL)
  * @param config QIHSE configuration
  * @return Index of found element, or NOT_STISLA_NOT_FOUND if not found
  */
@@ -400,9 +383,9 @@ typedef struct {
     double device_time_ns[QIHSE_DEV_COUNT]; /* Time spent per device */
 
     /* Quality metrics */
-    double avg_confidence;      /* Average measurement confidence */
-    double verification_rate;   /* % of results that needed verification */
-    size_t classical_fallbacks; /* Number of classical fallbacks */
+    double avg_confidence;      /* Scalar search: verified hit=1, no hit=0 */
+    double verification_rate;   /* Scalar search: 1, every candidate is checked */
+    size_t classical_fallbacks; /* Reserved/uninstrumented by scalar search */
 
     /* QIHSE native anchor learning metrics */
     size_t anchors_learned;     /* New anchors learned */
@@ -416,8 +399,8 @@ typedef struct {
     double anchor_memory_usage_mb; /* Memory used by anchor tables */
 
     /* Resource usage */
-    size_t peak_memory_bytes;   /* Peak memory usage */
-    size_t total_operations;    /* Total operations performed */
+    size_t peak_memory_bytes;   /* Scalar search: kernel + feature scratch bytes */
+    size_t total_operations;    /* Reserved/uninstrumented by scalar search */
 } qihse_performance_stats_t;
 
 /**

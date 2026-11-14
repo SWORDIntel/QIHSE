@@ -12,6 +12,8 @@
 #ifndef QIHSE_RFF_H
 #define QIHSE_RFF_H
 
+#include "../include/qihse_math_types.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -34,19 +36,7 @@ extern "C" {
  * - b are random biases drawn from U[0, 2π]
  * - D is the output dimension (number of features)
  */
-typedef struct qihse_rff_kernel_s {
-    size_t input_dims;         /* Input dimensionality */
-    size_t output_dims;        /* Output dimensionality (D) */
-    double gamma;              /* RBF kernel parameter */
-    uint64_t seed;             /* Random seed for reproducibility */
-
-    /* Random parameters - allocated dynamically */
-    double* omega;             /* Random frequencies [input_dims * output_dims] */
-    double* bias;              /* Random biases [output_dims] */
-
-    /* Internal state */
-    void* internal_state;      /* Backend-specific state (if needed) */
-} qihse_rff_kernel_t;
+/* ABI-stable definitions are shared with the installed public headers. */
 
 /* ============================================================================
  * RFF KERNEL MANAGEMENT

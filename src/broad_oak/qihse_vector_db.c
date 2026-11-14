@@ -2629,8 +2629,9 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
 
     memset(results, 0, max_results * sizeof(*results));
 
-    /* Exact rerank of INT8 candidates */
-    for (i = 0u; i < pool_count && i < candidate_count && out_count < top_k; i++) {
+    /* Approximate order is not exact order. Score the whole admitted pool;
+     * insert_exact_result keeps the best top_k and replaces its worst entry. */
+    for (i = 0u; i < pool_count && i < candidate_count; i++) {
         const qihse_index_row_t* row = &vdb->rows[pool[i].id];
         const float* vector;
         float score;
@@ -2922,11 +2923,11 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
     qihse_binary_cand_t* raw_cands = NULL;
     size_t pool_count = 0u;
 
-    if (!vdb || !query || !query->query_vector || !results ||
+    if (!vdb || !query || !query->user || !query->query_vector || !results ||
         max_results == 0u || query->vector_dims != vdb->vector_dims ||
         vdb->binary_status != QIHSE_VDB_BINARY_VALID ||
         !vdb->binary_vectors) {
-        errno = EINVAL;
+        errno = query && !query->user ? EACCES : EINVAL;
         return -1;
     }
 
@@ -2968,6 +2969,11 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
+
+        /* Hidden rows must neither enter the pool nor displace an authorized
+         * candidate when candidate_count is smaller than the source universe. */
+        if (!qihse_auth_can_access(query->user, row->classification,
+                                     row->sci_compartment)) continue;
 
         uint32_t hamming = qihse_vdb_hamming_distance(
             q_binary,
@@ -3023,11 +3029,14 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
 
     memset(results, 0, max_results * sizeof(*results));
 
-    /* Exact rerank of binary candidates */
-    for (i = 0u; i < pool_count && i < candidate_count && out_count < top_k; i++) {
+    /* Hamming order is only candidate selection. Rerank every candidate even
+     * after top_k entries have been admitted to the bounded exact result set. */
+    for (i = 0u; i < pool_count && i < candidate_count; i++) {
         if (i + 1 < pool_count && i + 1 < candidate_count) {
             const qihse_index_row_t* next_row = &vdb->rows[pool[i + 1].id];
-            const float* next_vec = qihse_vdb_vector_at(vdb, next_row);
+            const float* next_vec = qihse_auth_can_access(query->user,
+                next_row->classification, next_row->sci_compartment)
+                ? qihse_vdb_vector_at(vdb, next_row) : NULL;
             if (next_vec) {
                 _mm_prefetch((const char*)next_vec, _MM_HINT_T0);
             }
@@ -3040,6 +3049,10 @@ static int qihse_vdb_search_binary_candidates(qihse_vector_db_t vdb,
             (row->row_flags & QIHSE_ROW_F_TOMBSTONE) != 0u) {
             continue;
         }
+        /* Recheck before materializing payloads; clearance may have changed
+         * since candidate selection. */
+        if (!qihse_auth_can_access(query->user, row->classification,
+                                     row->sci_compartment)) continue;
         vector = qihse_vdb_vector_at(vdb, row);
         if (!vector) {
             continue;

@@ -37,6 +37,30 @@ class PublicAPIInstall(unittest.TestCase):
             self.run_command(self.cc + ["-std=c11", "-D_GNU_SOURCE", "-Werror",
                 "-fsyntax-only", f"-I{ROOT / 'include'}", str(source)], cwd=directory)
 
+    def test_staged_core_math_headers(self):
+        """Canonical math types compose in an installed C or C++ consumer."""
+        with tempfile.TemporaryDirectory(prefix="qihse-core-headers-") as directory:
+            work = Path(directory)
+            stage = work / "stage"
+            self.run_command(["make", "--no-print-directory", "install-headers",
+                              f"DESTDIR={stage}", "PREFIX=/sdk"])
+            headers = stage / "sdk/include"
+            names = ("qihse.h", "qihse_math.h", "qihse_search.h", "qihse_math_types.h")
+            for name in names:
+                self.assertTrue((headers / "qihse" / name).is_file(), name)
+            cases = [(name, (name,)) for name in names]
+            cases.extend((("combined", names), ("reverse", tuple(reversed(names)))))
+            for compiler, standard, extension in ((self.cc, "c11", "c"),
+                                                   (self.cxx, "c++11", "cpp")):
+                for label, includes in cases:
+                    with self.subTest(language=standard, headers=label):
+                        source = work / f"consumer.{extension}"
+                        source.write_text("".join(
+                            f"#include <qihse/{name}>\n" for name in includes))
+                        self.run_command(compiler + [f"-std={standard}", "-D_GNU_SOURCE",
+                            "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+                            f"-I{headers}", str(source)], cwd=work)
+
     def test_staged_install_and_dependency_failure(self):
         with tempfile.TemporaryDirectory(prefix="qihse-public-api-") as directory:
             work = Path(directory)
@@ -55,7 +79,8 @@ class PublicAPIInstall(unittest.TestCase):
             self.assertTrue((sdk / "bin/qihse-backup").is_file())
             self.assertTrue((sdk / "bin/qihse-admin-cli").is_file())
             # Do not let omitted API roots silently skip their compile checks.
-            required = {"qihse.h", "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
+            required = {"qihse.h", "qihse_math.h", "qihse_search.h", "qihse_math_types.h",
+                        "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
                         "qihse_backup.h", "qihse_operations.h",
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",

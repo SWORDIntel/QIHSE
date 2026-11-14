@@ -36,70 +36,40 @@ void qihse_rff_avx512_project(
     const float* input,
     float* output
 ) {
-    if (!kernel || !input || !output) return;
+    if (!kernel || !input || !output || !kernel->omega_real || !kernel->bias ||
+        kernel->input_dims == 0 || kernel->output_dims == 0 ||
+        kernel->output_dims > SIZE_MAX / sizeof(float) ||
+        kernel->input_dims > SIZE_MAX / sizeof(float) / kernel->output_dims) return;
 
     const float scale = sqrtf(2.0f / (float)kernel->output_dims);
-
 #ifdef __AVX512F__
-    /* AVX-512 implementation using 512-bit vectors (16 floats) */
-    __m512 scale_vec = _mm512_set1_ps(scale);
-
     for (size_t d = 0; d < kernel->output_dims; d += 16) {
-        /* Load bias for 16 output dimensions */
-        __m512 bias_vec = _mm512_loadu_ps(&kernel->bias[d]);
-
-        /* Initialize dot product accumulator */
-        __m512 dot_vec = _mm512_setzero_ps();
-
-        /* Compute ω·x for each of the 16 output dimensions */
+        const size_t lanes = kernel->output_dims - d < 16 ?
+                             kernel->output_dims - d : 16;
+        __m512 dot = _mm512_setzero_ps();
         for (size_t i = 0; i < kernel->input_dims; i++) {
-            __m512 input_vec = _mm512_set1_ps(input[i]);
-
-            /* Load 16 omega values for this input dimension */
-            __m512 omega_vec = _mm512_loadu_ps(&kernel->omega_real[d * kernel->input_dims + i]);
-
-            /* Accumulate dot product: dot += omega * input */
-            dot_vec = _mm512_fmadd_ps(omega_vec, input_vec, dot_vec);
+            /* omega is row-major [output_dims][input_dims].  Adjacent
+             * output rows are input_dims apart, not adjacent floats. */
+            float frequencies[16] __attribute__((aligned(64))) = {0};
+            for (size_t lane = 0; lane < lanes; lane++)
+                frequencies[lane] = kernel->omega_real[(d + lane) * kernel->input_dims + i];
+            dot = _mm512_fmadd_ps(_mm512_loadu_ps(frequencies),
+                      _mm512_set1_ps(input[i]), dot);
         }
-
-        /* Add bias: dot += bias */
-        dot_vec = _mm512_add_ps(dot_vec, bias_vec);
-
-        /* Compute cos(dot) using full SIMD polynomial approximation */
-        /* Taylor series: cos(x) ≈ 1 - x²/2! + x⁴/4! - x⁶/6! + x⁸/8! */
-        __m512 x = dot_vec;
-        __m512 x2 = _mm512_mul_ps(x, x);           /* x² */
-        __m512 x4 = _mm512_mul_ps(x2, x2);         /* x⁴ */
-        __m512 x6 = _mm512_mul_ps(x4, x2);         /* x⁶ */
-        __m512 x8 = _mm512_mul_ps(x4, x4);         /* x⁸ */
-
-        /* Compute polynomial terms using SIMD operations */
-        __m512 term1 = _mm512_set1_ps(1.0f);                           /* 1 */
-        __m512 term2 = _mm512_mul_ps(x2, _mm512_set1_ps(-0.5f));       /* -x²/2 */
-        __m512 term3 = _mm512_mul_ps(x4, _mm512_set1_ps(1.0f/24.0f));  /* +x⁴/24 */
-        __m512 term4 = _mm512_mul_ps(x6, _mm512_set1_ps(-1.0f/720.0f));/* -x⁶/720 */
-        __m512 term5 = _mm512_mul_ps(x8, _mm512_set1_ps(1.0f/40320.0f));/* +x⁸/40320 */
-
-        /* Sum all terms using SIMD addition */
-        __m512 cos_vec = _mm512_add_ps(term1, term2);
-        cos_vec = _mm512_add_ps(cos_vec, term3);
-        cos_vec = _mm512_add_ps(cos_vec, term4);
-        cos_vec = _mm512_add_ps(cos_vec, term5);
-
-        /* Apply scale: result = scale * cos(dot + bias) */
-        cos_vec = _mm512_mul_ps(cos_vec, scale_vec);
-
-        /* Store result */
-        _mm512_storeu_ps(&output[d], cos_vec);
+        float phases[16] __attribute__((aligned(64)));
+        _mm512_storeu_ps(phases, dot);
+        /* libm supplies range reduction, including large phases.  A raw
+         * Taylor polynomial here is not a cosine and can exceed the feature
+         * bound sqrt(2/D).  A vector cosine may replace this after validation. */
+        for (size_t lane = 0; lane < lanes; lane++)
+            output[d + lane] = scale * cosf(phases[lane] + kernel->bias[d + lane]);
     }
 #else
-    /* Fallback to scalar implementation if AVX2 not available at compile time */
     for (size_t d = 0; d < kernel->output_dims; d++) {
-        float dot_product = kernel->bias[d];
-        for (size_t i = 0; i < kernel->input_dims; i++) {
+        float dot_product = 0.0f;
+        for (size_t i = 0; i < kernel->input_dims; i++)
             dot_product += kernel->omega_real[d * kernel->input_dims + i] * input[i];
-        }
-        output[d] = scale * cosf(dot_product);
+        output[d] = scale * cosf(dot_product + kernel->bias[d]);
     }
 #endif
 }

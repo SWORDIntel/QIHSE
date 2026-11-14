@@ -16,7 +16,8 @@ int qihse_compute_optimal_dimensions(
     qihse_dimension_params_t* params
 ) {
     (void)data;
-    if (!params || n == 0 || !pool) return -EINVAL;
+    (void)pool;
+    if (!data || !params || n == 0 || element_size == 0) return -EINVAL;
 
     double entropy = log2((double)n + 1.0);
     size_t dims = (size_t)(entropy * 4.0);
@@ -24,10 +25,10 @@ int qihse_compute_optimal_dimensions(
     if (dims > 2048) dims = 2048;
 
     params->optimal_dims = dims;
-    params->expansion_factor = dims / (double)element_size;
-    params->data_entropy = entropy;
-    params->gap_coefficient = entropy * 0.1;
-    params->effective_rank = dims / 2;
+    params->expansion_factor = dims;
+    params->data_entropy = NAN;
+    params->gap_coefficient = NAN;
+    params->effective_rank = 0;
     params->array_size = n;
     params->data_type = type;
 
@@ -36,19 +37,30 @@ int qihse_compute_optimal_dimensions(
 
 int qihse_config_init(
     qihse_config_t* config,
-    qihse_data_type_t data_type __attribute__((unused)),
-    size_t array_size __attribute__((unused))
+    qihse_data_type_t data_type,
+    size_t array_size
 ) {
-    if (!config) return -EINVAL;
+    if (!config || data_type < QIHSE_TYPE_INT64 || data_type > QIHSE_TYPE_CUSTOM) return -EINVAL;
 
     memset(config, 0, sizeof(*config));
     config->data_type = data_type;
+    config->type_descriptor.type = data_type;
+    switch (data_type) {
+        case QIHSE_TYPE_INT64: config->type_descriptor.element_size = sizeof(int64_t); break;
+        case QIHSE_TYPE_UINT64: config->type_descriptor.element_size = sizeof(uint64_t); break;
+        case QIHSE_TYPE_DOUBLE: config->type_descriptor.element_size = sizeof(double); break;
+        default: break; /* The caller supplies the fixed record width. */
+    }
+    config->rff_gamma = 1.0;
+    config->random_seed = 42;
+    qihse_amplification_config_init(&config->amplification, array_size);
+    qihse_verify_config_init(&config->verification, 1.0);
     config->max_dimensions = 2048;
     config->min_dimensions = 64;
     config->fixed_dimensions = 256;
     config->auto_dimensions = true;
     config->enable_acceleration = false;
-    config->use_heterogeneous = true;
+    config->use_heterogeneous = false;
     config->enable_profiling = false;
     config->max_batch_size = 4096;
     config->timeout_ms = 5000;

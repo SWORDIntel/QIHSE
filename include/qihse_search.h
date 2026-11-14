@@ -14,6 +14,12 @@ extern "C" {
 
 void qihse_amplification_config_init(qihse_amplification_config_t* config,
                                     size_t problem_size);
+int qihse_amplify(qihse_superposition_t* superposition,
+                  const size_t* target_indices, size_t num_targets,
+                  const qihse_amplification_config_t* config);
+/* Legacy unsized adapter: returns -1 with errno=ENOTSUP; use typed state APIs. */
+int qihse_amplify_internal(void* data, size_t n, const void* query,
+                           qihse_data_type_t type, void* config);
 int qihse_adaptive_amplify(qihse_superposition_t* superposition,
                            const void* query, qihse_data_type_t query_type,
                            const qihse_amplification_config_t* config);
@@ -31,6 +37,10 @@ void qihse_verify_config_init(qihse_verify_config_t* config, double target_accur
 qihse_collapse_result_t qihse_dimensional_collapse_l2_norm(
     const qihse_superposition_t* superposition);
 not_stisla_result_t qihse_verify_search_result(
+    const void* data, size_t n, const void* query, qihse_data_type_t type,
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config);
+/* Compatibility spelling; both entry points perform actual typed equality. */
+not_stisla_result_t qihse_verify_result(
     const void* data, size_t n, const void* query, qihse_data_type_t type,
     const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config);
 
@@ -177,5 +187,3 @@ extern qihse_optimization_db_t g_optimization_db;
 #endif
 
 #endif /* QIHSE_SEARCH_H */
-int qihse_amplify_internal(void* data, size_t n, const void* query, qihse_data_type_t type, void* config);
-int qihse_amplify(void* data, size_t n, const void* query, qihse_data_type_t type, void* config);

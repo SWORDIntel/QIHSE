@@ -12,6 +12,8 @@
 #ifndef QIHSE_AMPLIFICATION_H
 #define QIHSE_AMPLIFICATION_H
 
+#include "../include/qihse_math_types.h"
+
 #include "qihse_superposition.h"
 
 #ifdef __cplusplus
@@ -26,16 +28,7 @@ extern "C" {
  * Grover amplification configuration.
  * Controls the amplitude amplification process.
  */
-typedef struct qihse_amplification_config_s {
-    int min_rounds;             /* Minimum amplification rounds */
-    int max_rounds;             /* Maximum amplification rounds (0 = auto) */
-    double convergence_threshold; /* Stop when amplitude delta < threshold */
-    double oracle_selectivity;  /* How strict the oracle marking is (0.0-1.0) */
-    int adaptive_rounds;        /* 1 = use adaptive round count based on problem size */
-    int fixed_rounds;           /* Fixed round count (if adaptive_rounds=0) */
-    double oracle_threshold;    /* Threshold for oracle marking */
-    int use_diffusion;          /* 1 = include diffusion operator */
-} qihse_amplification_config_t;
+/* ABI-stable definitions are shared with the installed public headers. */
 
 /**
  * Initialize amplification config with smart defaults.
@@ -102,7 +95,8 @@ void qihse_diffusion_operator(qihse_superposition_t* superposition);
  * Compute optimal number of Grover rounds.
  *
  * Based on problem size N and number of solutions M:
- * Optimal rounds = π/4 * sqrt(N/M)
+ * Uniform-state optimum uses theta=asin(sqrt(M/N)); the materialized
+ * simulator caps the returned count at 50. Invalid counts return -1.
  *
  * @param problem_size Total search space size (N)
  * @param num_solutions Expected number of solutions (M)
@@ -131,7 +125,8 @@ int qihse_amplification_converged(
 /**
  * Fixed-point amplitude amplification.
  *
- * Uses fixed-point arithmetic for higher precision in constrained environments.
+ * Reserved API: returns -1 with errno=ENOTSUP. Ordinary Grover rotations
+ * are not a fixed-point amplification algorithm.
  *
  * @param superposition Superposition to amplify
  * @param target_indices Target state indices

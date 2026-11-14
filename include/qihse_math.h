@@ -2,6 +2,7 @@
 #define QIHSE_MATH_H
 
 #include "qihse.h"
+#include "qihse_math_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,14 +12,6 @@ extern "C" {
  * RANDOM FOURIER FEATURES KERNEL EMBEDDING
  * ============================================================================ */
 
-typedef struct {
-    double* omega;              /* Random frequency matrix [dims x input_dims] */
-    double* bias;               /* Random phase offsets [dims] */
-    size_t input_dims;          /* Input dimension count */
-    size_t output_dims;         /* Output dimension count (Hilbert space) */
-    double gamma;               /* RBF kernel bandwidth parameter */
-    uint64_t seed;              /* Random seed for reproducibility */
-} qihse_rff_kernel_t;
 
 qihse_rff_kernel_t* qihse_rff_create(size_t input_dims, size_t output_dims,
                                     double gamma, uint64_t seed);
@@ -30,19 +23,39 @@ void qihse_rff_project(const qihse_rff_kernel_t* kernel, const double* input,
  * SUPERPOSITION STATE ENCODING
  * ============================================================================ */
 
-typedef struct qihse_superposition_s {
-    double* real;               /* Real amplitude components */
-    double* imag;               /* Imaginary amplitude components */
-    double* phase;              /* Per-element phase angles */
-    size_t num_states;          /* Number of superposition states */
-    size_t dims_per_state;      /* Dimensions per quantum state */
-    double global_phase;        /* Global quantum phase */
-    double measurement_confidence; /* Confidence in quantum measurement */
-} qihse_superposition_t;
 
 int qihse_create_superposition(const double* rff_data, size_t n, size_t rff_dims,
                               qihse_superposition_t* superposition);
 void qihse_destroy_superposition(qihse_superposition_t* superposition);
+int qihse_create_superposition_from_amplitudes(const double* real, const double* imag,
+                                              size_t n, qihse_superposition_t* state);
+int qihse_superposition_normalize(qihse_superposition_t* state);
+int qihse_superposition_is_normalized(const qihse_superposition_t* state);
+double qihse_superposition_state_fidelity(const qihse_superposition_t* a,
+                                         const qihse_superposition_t* b);
+/* Legacy raw-float ABI: normalized squared overlap, not an unbounded dot product. */
+int qihse_superposition_fidelity(const void* a, const void* b, size_t n,
+                                 double* fidelity);
+size_t qihse_superposition_measure(const qihse_superposition_t* state, uint64_t seed);
+double qihse_superposition_get_measurement_confidence(const qihse_superposition_t* state);
+
+
+void qihse_verification_config_init(qihse_verification_config_t* config,
+                                     qihse_verification_mode_t mode);
+void qihse_verification_result_init(qihse_verification_result_t* result);
+void qihse_verification_result_destroy(qihse_verification_result_t* result);
+
+/* Sized APIs consume exactly data_size float elements. EXACT checks equality;
+ * PRECISION checks every element against absolute config->tolerance. Other
+ * modes report bounded cosine similarity, not a calibrated probability. */
+int qihse_verify_result_advanced_sized(const void* query, const float* result,
+                                      const float* ground_truth, size_t data_size,
+                                      const qihse_verification_config_t* config,
+                                      qihse_verification_result_t* verification_result);
+int qihse_verify_batch_sized(const void* const* queries, const float* const* results,
+                            const float* const* ground_truths, const size_t* data_sizes,
+                            size_t batch_size, const qihse_verification_config_t* config,
+                            qihse_verification_result_t* verification_results);
 
 /* ============================================================================
  * INTEL ONEAPI ENHANCEMENT
@@ -131,12 +144,14 @@ int qihse_fortran_get_performance_stats(qihse_fortran_performance_t* stats);
  * ADVANCED MATHEMATICAL OPTIMIZATIONS
  * ============================================================================ */
 
+/* Compatibility selectors: all five currently use the libm implementation.
+ * These names do not promise distinct error bounds or approximate fast paths. */
 typedef enum {
-    QIHSE_MATH_PRECISION_FULL = 0,    /* Full IEEE 754 precision */
-    QIHSE_MATH_PRECISION_HIGH = 1,    /* High precision (1e-12 relative) */
-    QIHSE_MATH_PRECISION_MEDIUM = 2,  /* Medium precision (1e-8 relative) */
-    QIHSE_MATH_PRECISION_LOW = 3,     /* Low precision (1e-4 relative) */
-    QIHSE_MATH_PRECISION_FAST = 4     /* Fast approximations */
+    QIHSE_MATH_PRECISION_FULL = 0,
+    QIHSE_MATH_PRECISION_HIGH = 1,
+    QIHSE_MATH_PRECISION_MEDIUM = 2,
+    QIHSE_MATH_PRECISION_LOW = 3,
+    QIHSE_MATH_PRECISION_FAST = 4
 } qihse_math_precision_t;
 
 typedef struct {
@@ -178,6 +193,3 @@ int qihse_math_get_performance_stats(qihse_math_performance_t* stats);
 #endif
 
 #endif /* QIHSE_MATH_H */
-int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity);
-int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity);
-int qihse_superposition_fidelity(const void* a, const void* b, size_t n, double* fidelity);

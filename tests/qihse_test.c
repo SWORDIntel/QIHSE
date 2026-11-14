@@ -80,8 +80,10 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < 100; i++) {
         not_stisla_result_t result = qihse_search(test_data, test_size,
                                                 &test_queries[i], NULL, &config);
-        if (result != NOT_STISLA_NOT_FOUND) {
+        if (result < test_size && test_data[result] == test_queries[i]) {
             found++;
+        } else {
+            fprintf(stderr, "QIHSE returned an incorrect result for query %d\n", i);
         }
     }
 
@@ -95,6 +97,11 @@ int main(int argc, char* argv[]) {
     printf("   Average time per query: %.3f microseconds\n", avg_time * 1e6);
     printf("   Throughput: %.0f queries/second\n", 100.0 / total_time);
 
+    int64_t absent_query = -1;
+    bool absent_rejected = qihse_search(test_data, test_size, &absent_query,
+                                       NULL, &config) == NOT_STISLA_NOT_FOUND;
+    if (!absent_rejected) fprintf(stderr, "QIHSE returned a hit for an absent query\n");
+
     /* Compare with classical NOT_STISLA */
     printf("\nComparing with classical NOT_STISLA...\n");
 
@@ -105,7 +112,7 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < 100; i++) {
         not_stisla_result_t result = not_stisla_search(test_data, test_size,
                                                      test_queries[i], table, 8);
-        if (result != NOT_STISLA_NOT_FOUND) {
+        if (result < test_size && test_data[result] == test_queries[i]) {
             classical_found++;
         }
     }
@@ -131,8 +138,10 @@ int main(int argc, char* argv[]) {
     free(test_queries);
     free(test_data);
 
-    printf("\n✅ QIHSE test completed successfully!\n");
-    return 0;
+    bool passed = found == 100 && classical_found == 100 && absent_rejected;
+    printf("\n%s QIHSE test %s\n", passed ? "✅" : "❌",
+           passed ? "completed successfully!" : "failed correctness checks!");
+    return passed ? 0 : 1;
 }
 
 /* ============================================================================

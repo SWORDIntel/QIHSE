@@ -1,7 +1,8 @@
 # QIHSE API Reference
 
 > **Status: implemented** — except the explicitly source-only standalone
-> maintenance subsection (§7.1), every C function in this reference is declared
+> maintenance subsection (§7.1) and the separately labelled core-math addendum
+> (§8.14), every C function in the historical inventory below is declared
 > in a header under `include/` and was checked against the built `libqihse.so`; the Python
 > surface is read from `python/qihse/`. Nothing here is transcribed from a design
 > document. The sections that describe something not built are marked `planned`
@@ -33,8 +34,9 @@ Status vocabulary used across the documentation tree is defined in
 
 ## How this reference was verified
 
-Every function named below was checked against the header that declares it, and
-the header list was checked against the built shared object:
+The historical function inventory was checked against its declaring headers and
+the built shared object. The separately labelled source/test addendum in §8.14
+does not inherit that earlier shared-library verification claim:
 
 ```
 nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
@@ -1711,6 +1713,187 @@ V2 files are not addressable through the legacy topic-name APIs.
 | `bool qihse_event_stream_read_batch(qihse_event_stream_t*, const qihse_user_t*, const qihse_es_scope_t*, uint64_t*, qihse_es_read_record_t*, size_t, size_t, size_t*)` | Read a bounded authorized page at a byte cursor; cursor advances only on success. Every payload digest is verified before disclosure. | `false` for denied scope, invalid cursor/budget, corruption or I/O failure |
 | `void qihse_event_stream_batch_free(qihse_es_read_record_t*, size_t)` | Free payloads returned by the batch reader. | n/a |
 | `bool qihse_event_stream_archive_id(..., const char* scan_version, uint32_t schema_id, uint8_t out_id[48])` / `bool qihse_event_stream_member_id(...)` | Domain-separated stable identities bind archive/member content, exact member name, scan version and schema version. | `false` |
+
+### 8.14 Core search and numerical contracts — source/test addendum (2026-11-14)
+
+**Status: implemented in source; targeted regression checks.** This subsection
+records the core correction, not a new full-library ABI certification. It is
+excluded from the historical `libqihse.so` inventory claim above. The complete
+suite remains `make test TEST_JOBS=32`; report its result separately from focused
+checks and mathematical experiments.
+
+Headers: `include/qihse.h`, `include/qihse_math.h`,
+`include/qihse_math_types.h`, `include/qihse_search.h`, and
+`algorithms/qihse_verification.h`. Sources: `core/qihse.c`,
+`core/qihse_helpers.c`, `src/bombe/qihse_math.c`, and the corresponding
+`algorithms/` implementations. This correction does not change database schemas
+or durable memory formats.
+
+#### Exact lookup with a numerical candidate hint
+
+`qihse_search(data, n, query, table, config)` returns an index only after comparing
+the original record with the query. The RFF score supplies a candidate; neither
+its magnitude nor a collapse confidence value substitutes for equality.
+`QIHSE_VERIFY_EXACT` or enabled classical fallback scans the remaining records
+when the candidate fails. `NOT_STISLA_NOT_FOUND` represents absence or a rejected
+call; argument/resource errors set `errno` where documented by the source.
+
+For INT64, UINT64 and DOUBLE, the streaming candidate scorer uses the **signed**
+inner product of query and row features. Its scalar numeric cost is O(nD), with
+O(D) kernel/feature scratch, followed by at most O(n) exact verification. It does
+not allocate an n-by-D complex state. Integer-to-double projection collisions do
+not authorize a match: final comparison uses the original integer records.
+Non-numeric records use their fixed-width descriptor and equality directly;
+STRING uses NUL-terminated slots, BINARY/STRUCT use byte equality, and CUSTOM
+requires `compare_fn`. Callers supply the non-numeric record width.
+
+`qihse_batch_search` uses the descriptor's element stride for both records and
+queries and currently invokes the scalar search for each query. It does not
+promise shared feature caching, parallel queries or a device speedup. The
+streaming core does not dispatch the experimental amplification, GPU/NPU or
+multi-pipeline functions; related configuration fields remain for compatibility.
+The anchor-table argument is retained but is not consumed by this path.
+`timeout_ms` and `verification.max_verification_time_us` are not enforced by
+the scalar core; they are not operation deadlines.
+
+`qihse_config_init` initializes numeric record widths, `rff_gamma=1.0`,
+`random_seed=42`, automatic dimensions bounded by 64 and 2048, and exact
+verification with classical fallback. Hardware and parallel acceleration are
+disabled for this core path. `fixed_dimensions=256` applies when automatic
+dimensions are disabled. The dimension choice is a size heuristic, not a measured
+entropy, effective rank, or proof of approximation accuracy.
+
+The scalar compatibility entries `qihse_verify_result` and
+`qihse_verify_search_result` both validate typed equality for INT64, UINT64 and
+DOUBLE. Their signatures lack a record descriptor and cannot verify the
+non-numeric cases supported by `qihse_search`. A caller-provided candidate index
+alone is insufficient. Non-default modes can return a false
+negative when exhaustive fallback is disabled, but cannot return an unchecked
+false match. Use the default exact configuration when lookup completeness matters.
+
+The legacy `qihse_adaptive_amplify` entry returns `-ENOTSUP`, and the void
+`qihse_apply_oracle` entry sets `errno=ENOTSUP` without mutating the state: their
+signatures do not supply a valid query-to-state marking rule. State experiments
+must use `qihse_amplify` with explicit target indices.
+The separately named `qihse_amplify_internal` and
+`qihse_amplify_fixed_point` return `-1` with `errno=ENOTSUP`; the latter does not
+substitute ordinary Grover rotations for a fixed-point method. Historical
+untyped export stubs for superposition creation/destruction/operators and
+configuration initialization also report `-1`/`ENOTSUP` instead of false success.
+
+#### RFF basis, randomness and floating-point helpers
+
+`qihse_rff_create(input_dims, output_dims, gamma, seed)` requires positive
+dimensions and finite positive gamma. It draws frequencies with variance
+`2*gamma`, so `sqrt(2/D)*cos(omega*x+b)` approximates
+`exp(-gamma*||x-y||^2)`. Invalid parameters return `NULL`/`EINVAL`; checked
+allocation arithmetic rejects overflow with `EOVERFLOW`.
+
+Seeds, including zero, select deterministic kernel-local SplitMix64 streams;
+kernel creation neither calls `srand` nor consumes global `rand` state. Exact
+bit reproduction is limited to the same implementation/math platform. Persisted
+or cached features must use the same actual basis as queries and must be rebuilt
+when that basis changes; a seed is not a cross-version file-format guarantee.
+
+AVX2 kernel creation retains eight-coordinate output rounding and converts the
+canonical basis to float. Compare against the scalar kernel using the **actual
+rounded output dimension**. SIMD projection uses row-major input strides and
+handles output tails. Float basis overflow is rejected with `ERANGE`. These CPU
+checks establish no CUDA, GPU or NPU equivalence.
+
+The precision enum remains ABI-compatible. `qihse_math_fast_exp`,
+`qihse_math_fast_log`, `qihse_math_fast_sqrt` and `qihse_math_fast_sincos` currently
+use libm for all precision selectors; the labels do not assert independently
+validated error bounds or a speedup for a polynomial approximation.
+
+#### Shared state layouts and bounded verification
+
+`qihse_math_types.h` is the single declaration of RFF, superposition,
+amplification and vector-verification structures. Algorithms must not append
+private fields to these public objects or reinterpret a different struct layout.
+
+| API | Contract |
+|---|---|
+| `qihse_superposition_state_fidelity(a, b)` | Typed complex-state normalized squared overlap in [0,1]. Zero/invalid mass is reported with `errno`; it is not a search success probability. |
+| `qihse_superposition_fidelity(a, b, n, out)` | Preserved four-argument raw-float compatibility API; normalized squared overlap, not an unbounded dot product. Returns 0 on success, -1 with `errno` on error. |
+| `qihse_verify_result_advanced_sized(query, result, ground_truth, data_size, config, verification_result)` | Explicitly bounded float-vector verification against required ground truth. Callers initialize/destroy the result with the existing verification-result helpers. |
+| `qihse_verify_batch_sized(queries, results, ground_truths, data_sizes, batch_size, config, verification_results)` | Supplies an explicit length for every result/ground-truth vector. |
+| Legacy `qihse_verify_result_advanced` and `qihse_verify_batch` | Retained symbols refuse unsized verification with -1 and `errno=ENOTSUP`. They must not infer a vector length from a verification mode. |
+
+These numeric APIs operate on caller-owned arrays. They do not replace a database
+authorization boundary. Similarity, fidelity and a successful scalar equality
+comparison are distinct concepts; none is automatically a statistically
+calibrated confidence estimate.
+
+For sized float-vector verification, EXACT requires elementwise equality and
+PRECISION requires every absolute difference to be at most `config.tolerance`.
+Other supported similarity modes report bounded cosine scores, not an exact
+comparison or a probability. Ground truth is mandatory, inputs must be finite
+and nonempty, and NONE returns `-1` with `errno=ENOTSUP`. Destroy a populated
+verification result before reusing it so any owned error message is released.
+
+`qihse_superposition_get_measurement_confidence` is the largest normalized row
+mass, not a correctness estimate. `qihse_amplify_adaptive` reports performed
+rounds and uses the requested target mass. These standalone state experiments
+are not invoked by the scalar exact lookup.
+
+#### Vector candidate rerank and binary authorization
+
+INT8 and binary selectors in `src/broad_oak/qihse_vector_db.c` exact-score every
+admitted candidate and retain `top_k` by the requested DOT/COSINE/EUCLIDEAN
+metric. Earlier approximate order cannot terminate reranking when the first k
+results fill the output. Candidate selection remains approximate; exact rerank
+cannot recover rows omitted from `candidate_pool_size`.
+
+The binary selector requires an explicit user, filters clearance/SCI before
+admitting candidates, and rechecks before materializing vector or metadata
+payloads. Its direct public candidate entry also rejects `NULL` with
+`EACCES`. A hidden nearest row therefore cannot consume the authorized binary
+candidate pool. This describes clearance/SCI handling, not a new tenant/project
+policy or a concurrent source-snapshot fence.
+
+Focused regression sources include `tests/test_core_search_regressions.c`,
+`tests/test_core_math_regressions.c` and `tests/test_runtime_math_regressions.c`.
+`tests/test_public_api_install.py` also checks the installed core headers alone
+and together as C and C++. The new public candidate regression lives in
+`tests/test_vector_candidate_rerank.c`; executing its real-principal fixture
+requires the library-backed test target and is distinct from the isolated
+numerical selector checks.
+The paired-feature script in
+`benchmarks/scripts/qihse_rff_pairing_experiment.py` is a **synthetic formula
+experiment**, not an engine throughput or production recall benchmark. Proposed
+feature-map changes remain explicit research work in
+[Core feature experiments](plans/qihse_core_experiments.md).
+
+#### Migration note
+
+Rebuild consumers against the canonical headers. Replace the unsized vector
+verification calls with their `_sized` forms and the actual float count; replace
+query-dependent legacy amplification calls with `qihse_amplify` only when the
+caller can supply explicit target indices. The typed state-fidelity function is
+`qihse_superposition_state_fidelity`; the four-argument raw-float API remains
+available. The old untyped export stubs have no compatible operational contract;
+use typed `qihse_create_superposition`/`qihse_destroy_superposition` and the explicit
+RFF/state APIs in the current headers.
+
+Installed public layouts are preserved. Code that included the former duplicate
+`algorithms/` structs must rebuild: their extra internal-state and amplification
+fields are removed instead of extending the public ABI. Raw struct serialization
+has no compatibility guarantee. Explicit target indices define marked states;
+amplification `selectivity` remains validated reserved metadata.
+
+No stored database schema or `.qdb` container migration is required. INT8 and
+binary formats are unchanged. Regenerate any separately retained RFF features
+when upgrading the RNG/basis implementation, and keep each query's feature
+profile identical to the data profile. From the repository root, rebuild and
+run the complete gate with:
+
+```sh
+make clean && make lib && make test TEST_JOBS=32
+```
+
+This command is upgrade guidance, not a claim that the dependency-heavy full
+library suite has passed in the environment used for the source correction.
 
 ## 9. Python SDK — `python/qihse/`
 
