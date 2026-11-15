@@ -3476,6 +3476,53 @@ static kv_lookup_state_t logical_lookup(qihse_kv_store_t* store, const char* key
     return lookup_sstables(store, key, out);
 }
 
+/* CT replay must compare equal-version bytes even after TTL expiry. Ordinary
+ * logical lookups deliberately hide an expired value; this internal check
+ * returns only a boolean and never exposes the physical bytes to callers. */
+static bool ct_replay_expired_value_matches(qihse_kv_store_t* store,
+                                            const kv_read_context_t* context,
+                                            const qihse_kv_ct_record_t* row) {
+    if (!store || !context || !context->user || !row || !row->key || !row->value ||
+        !kv_read_allowed(context, row->classification, row->sci_compartment)) return false;
+    size_t size = 0u;
+    kv_payload_t* p = (kv_payload_t*)qihse_trinary_trie_search(store->trie, row->key, &size);
+    if (p) return size >= sizeof(*p) + 1u &&
+        size <= sizeof(*p) + KV_MAX_VALUE_LEN + 1u &&
+        memchr(p->val, '\0', size - sizeof(*p)) != NULL &&
+        p->change_seq == row->change_seq &&
+        p->classification == row->classification &&
+        p->sci_compartment == row->sci_compartment &&
+        p->expire_time_ms == row->expire_time_ms &&
+        p->flags == 0u && strcmp(p->val, row->value) == 0;
+    if (!store->sst_meta || store->sst_meta->degraded) return false;
+    int32_t sid = -1;
+    uint64_t offset = 0u, expire = 0u;
+    uint16_t classification = 0u, sci = 0u;
+    uint8_t flags = 0u;
+    if (!sst_meta_index_lookup(store->sst_meta, row->key,
+                               &classification, &sci, &expire, &flags,
+                               &sid, &offset) ||
+        classification != row->classification || sci != row->sci_compartment ||
+        expire != row->expire_time_ms || flags != 0u ||
+        !kv_read_allowed(context, classification, sci)) return false;
+    const char* dir = get_qihse_data_dir();
+    if (!dir) return false;
+    pthread_mutex_lock(&store->sst_fd_lock);
+    int fd = sst_fd_get(store, dir, sid);
+    pthread_mutex_unlock(&store->sst_fd_lock);
+    if (fd < 0) return false;
+    kv_disk_record_t disk;
+    if (disk_record_read_at(fd, offset, &disk) != 1) return false;
+    bool same = strcmp(disk.key, row->key) == 0 &&
+        disk.change_seq == row->change_seq &&
+        disk.classification == row->classification &&
+        disk.sci_compartment == row->sci_compartment &&
+        disk.expire_time_ms == row->expire_time_ms &&
+        disk.flags == 0u && disk.val && strcmp(disk.val, row->value) == 0;
+    disk_record_free(&disk);
+    return same;
+}
+
 static void lookup_result_free(kv_lookup_result_t* r) {
     if (!r) return;
     free(r->value);
@@ -4183,7 +4230,11 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
                         old.expire_time_ms == r->expire_time_ms &&
                         (((old.flags & KV_FLAG_TOMBSTONE) != 0u) == r->tombstone) &&
                         (r->tombstone || (old.value && r->value &&
-                                          strcmp(old.value, r->value) == 0));
+                                          strcmp(old.value, r->value) == 0) ||
+                         (state == KV_LOOKUP_DEAD &&
+                          (old.flags & KV_FLAG_TOMBSTONE) == 0u &&
+                          old.expire_time_ms != 0u &&
+                          ct_replay_expired_value_matches(store, context, r)));
                     lookup_result_free(&old);
                     if (!same) { ok = false; break; }
                     continue;

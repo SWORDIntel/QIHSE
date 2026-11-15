@@ -49,6 +49,12 @@ In legacy `REPL.CT1 STATUS`, the field after durable position is **oldest LSN**
 with policy zero can mean native receiver status is unavailable (including a
 recovery fence); it does not establish that persisted receiver state was reset.
 
+An expired, non-tombstone row can remain in a checkpointed SST and its
+retained CT WAL. Cold replay must compare the authenticated physical value
+bytes for an equal-sequence frame, not infer mismatch because ordinary GET
+logically hides expired values. This repair changes neither the stored format
+nor read visibility; a conflicting equal-sequence frame still fails closed.
+
 Legacy CT1 receivers and not-yet-admitted sources also defer physical expiry
 tombstones without poisoning recovery state. Expired values remain logically
 absent; only the admitted source may durably publish and replicate an expiry.

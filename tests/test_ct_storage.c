@@ -24,8 +24,10 @@ static char* ct_large_payload(void) {
 
 int main(int argc, char** argv) {
     if (argc == 7 && (strcmp(argv[1], "receiver") == 0 ||
-                      strcmp(argv[1], "receiver-mismatch") == 0)) {
+                      strcmp(argv[1], "receiver-mismatch") == 0 ||
+                      strcmp(argv[1], "receiver-expired") == 0)) {
         bool mismatch = strcmp(argv[1], "receiver-mismatch") == 0;
+        bool expired = strcmp(argv[1], "receiver-expired") == 0;
         assert(qihse_auth_init());
         assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
         qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
@@ -72,6 +74,65 @@ int main(int argc, char** argv) {
         fclose(f);
         assert(group2.count == 1u && group2.records[0].value &&
                strlen(group2.records[0].value) == 32768u);
+        if (expired) {
+            assert(group.count == 1u && !group.records[0].tombstone &&
+                   group.records[0].value && group.stream_position == 1u &&
+                   group.records[0].classification == 4u &&
+                   group.records[0].sci_compartment == 2u &&
+                   group.records[0].change_seq == baseline_seq + 1u);
+            group.records[0].expire_time_ms = 1u;
+            const char* key = group.records[0].key;
+            uint64_t cursor = 0u;
+            qihse_kv_ct_receiver_status_t before = {0}, after = {0};
+            qihse_kv_sstable_stats_t sst_before = {0}, sst_after = {0};
+            assert(!qihse_kv_ct_receiver_apply(receiver, low, &group, &cursor));
+            assert(qihse_kv_ct_receiver_apply(receiver, service, &group, &cursor) &&
+                   cursor == 1u);
+            assert(qihse_kv_ct_receiver_status(receiver, op, &before) &&
+                   before.baseline_sealed && before.durable_cursor == 1u &&
+                   strcmp(before.source_id, "source:1") == 0 &&
+                   strcmp(before.generation, "gen:1") == 0);
+            assert(qihse_kv_get_user(receiver, key, op) == NULL);
+            assert(qihse_kv_get_user(receiver, key, low) == NULL);
+            assert(qihse_kv_sstable_stats(receiver, &sst_before));
+            assert(qihse_kv_sync_store(receiver));
+            assert(qihse_kv_sstable_stats(receiver, &sst_after) &&
+                   sst_after.sstable_counter > sst_before.sstable_counter &&
+                   sst_after.live_sstable_files > sst_before.live_sstable_files &&
+                   !sst_after.index_degraded);
+            char wal_path[512];
+            assert(snprintf(wal_path, sizeof(wal_path), "%s/wal.log",
+                            getenv("QIHSE_DATA_DIR")) > 0);
+            struct stat wal_before, wal_after;
+            assert(stat(wal_path, &wal_before) == 0 && wal_before.st_size > 0);
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver); /* exact expired SET in retained WAL vs SST */
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            assert(stat(wal_path, &wal_after) == 0 &&
+                   wal_after.st_size == wal_before.st_size);
+            assert(qihse_kv_ct_receiver_status(receiver, op, &after) &&
+                   after.baseline_sealed == before.baseline_sealed &&
+                   after.durable_cursor == before.durable_cursor &&
+                   after.tenant_policy == before.tenant_policy &&
+                   after.tenant_id == before.tenant_id &&
+                   strcmp(after.source_id, before.source_id) == 0 &&
+                   strcmp(after.generation, before.generation) == 0 &&
+                   memcmp(after.baseline_digest, before.baseline_digest, 32u) == 0);
+            assert(qihse_kv_get_user(receiver, key, op) == NULL);
+            assert(!qihse_kv_ct_receiver_status(receiver, low, &after));
+            assert(qihse_kv_ct_receiver_apply(receiver, service, &group, &cursor) &&
+                   cursor == 1u);
+            group.records[0].value[0] ^= 1;
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group, &cursor));
+            group.records[0].value[0] ^= 1;
+            assert(qihse_kv_ct_receiver_status(receiver, op, &after) &&
+                   after.durable_cursor == 1u);
+            qihse_ct_codec_clear(&group);
+            qihse_ct_codec_clear(&group2);
+            qihse_kv_store_destroy(receiver);
+            return 0;
+        }
         if (mismatch) {
             assert(group2.count == 1u && group2.records[0].value);
             group2.records[0].value[0] ^= 1;
@@ -444,6 +505,18 @@ int main(int argc, char** argv) {
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char expired_dir[] = "./ct_receiver_expired_XXXXXX";
+    assert(mkdtemp(expired_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", expired_dir, 1) == 0);
+        execl(argv[0], argv[0], "receiver-expired", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     s = qihse_kv_store_create_user(op);
     assert(s);
     assert(qihse_kv_ct_fence_finish(s, op, "move:1", false, token));
@@ -464,6 +537,7 @@ int main(int argc, char** argv) {
     assert(unlink(group_path) == 0);
     aimem_fixture_cleanup(receiver_dir);
     aimem_fixture_cleanup(mismatch_dir);
+    aimem_fixture_cleanup(expired_dir);
     aimem_fixture_cleanup(dir);
     puts("ct storage: PASS");
     return 0;
