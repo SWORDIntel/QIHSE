@@ -124,6 +124,68 @@ class Ct1RealDaemonTests(unittest.TestCase):
         self.assertEqual(ct1_receiver_status(self.primary_to_successor)["durable_cursor"],
                          restarted_status["durable_cursor"])
 
+    def test_reopens_primary_with_exact_retained_unacked_successor_tail(self):
+        generation = self.start_pair(new_generation(), ack_timeout_ms=3000)
+        self.wait_for_pair(generation)
+        self.assertEqual(self.primary_admin.execute_resp(
+            "SET", "ct1:recovery:seed", "ACKED-SEED"), b"+OK\r\n")
+        acked = ct1_source_status(self.successor_to_primary)
+        self.assertEqual(acked["acknowledged_lsn"], acked["durable_lsn"])
+        self.assertGreater(acked["durable_lsn"], 0)
+        ack_lsn = acked["durable_lsn"]
+
+        self.primary_to_successor.close()
+        self.cluster.kill("successor")
+        key, value = "ct1:recovery:pending", "UNCERTAIN-NX-VALUE"
+        # This one conditional write has an uncertain outcome; never retry it.
+        reply = self.primary_admin.execute_resp("SET", key, value, "NX")
+        self.assertTrue(reply.startswith(b"-"), reply)
+        self.assertIn(b"outcome unresolved", reply)
+        pending = ct1_source_status(self.successor_to_primary)
+        self.assertEqual(pending["acknowledged_lsn"], ack_lsn)
+        self.assertEqual(pending["durable_lsn"], ack_lsn + 1)
+        self.assertGreater(pending["retained_bytes"], 0)
+        self.assertTrue(self.primary_admin.execute_resp("GET", key).startswith(b"-TRYAGAIN"))
+        self.assertTrue(self.primary_admin.execute_resp(
+            "SET", "ct1:recovery:fenced", "MUST-NOT-APPLY").startswith(b"-TRYAGAIN"))
+        self.assertEqual(ct1_source_status(self.successor_to_primary)["durable_lsn"],
+                         ack_lsn + 1)
+
+        self.successor_to_primary.close()
+        self.primary_admin.close()
+        self.cluster.kill("lead")
+        self.successor_process, self.successor_admin = self.restart_successor(generation)
+        self.primary_to_successor = self.cluster.replication_peer_client(
+            identity_name="lead", node_id="ct-primary", target_name="successor")
+        receiver = ct1_receiver_status(self.primary_to_successor)
+        self.assertTrue(receiver["baseline_sealed"])
+        self.assertEqual(receiver["durable_cursor"], ack_lsn)
+        self.primary_process, self.primary_admin = self.cluster.start_ct1_node(
+            "lead", 0, "primary", "successor", "ct-primary", "ct-successor",
+            generation, ack_timeout_ms=3000, topology_names=self.topology_names)
+        self.successor_to_primary = self.cluster.replication_peer_client(
+            identity_name="successor", node_id="ct-successor", target_name="lead")
+
+        def caught_up():
+            source = ct1_source_status(self.successor_to_primary)
+            target = ct1_receiver_status(self.primary_to_successor)
+            return (source, target) if (
+                source["generation"] == target["generation"] == generation and
+                source["durable_lsn"] == source["acknowledged_lsn"] ==
+                target["durable_cursor"] == ack_lsn + 1 and
+                target["baseline_sealed"] and source["retained_bytes"] == 0
+            ) else None
+        self.cluster.wait_until(caught_up, timeout=30.0)
+        self.wait_for_pair(generation)
+        self.assertEqual(parse_resp_frame(self.primary_admin.execute_resp("GET", key)),
+                         value.encode())
+        self.assertEqual(parse_resp_frame(self.primary_admin.execute_resp(
+            "GET", "ct1:recovery:fenced")), None)
+        self.assertEqual(self.primary_admin.execute_resp(
+            "SET", "ct1:recovery:fresh", "POST-CATCHUP"), b"+OK\r\n")
+        self.assertEqual(parse_resp_frame(self.primary_admin.execute_resp(
+            "GET", "ct1:recovery:fresh")), b"POST-CATCHUP")
+
     def test_wrong_generation_and_forged_pin_are_denied_without_payload(self):
         generation = self.start_pair(new_generation())
         self.wait_for_pair(generation)

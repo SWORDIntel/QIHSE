@@ -3092,10 +3092,18 @@ static void ct_group_failover_tick(qihse_kv_store_t* store,
     }
 }
 
-static bool ct1_primary_peer_preflight(const char* host, uint16_t port,
+static bool ct1_primary_peer_preflight(qihse_kv_store_t* store,
+        qihse_user_t* replication_principal, const char* host, uint16_t port,
         const qihse_qkp_config_t* qkp, const char* generation,
         uint64_t source_durable_position,
         const unsigned char expected_baseline_digest[32]) {
+    qihse_kv_ct_source_status_t local;
+    if (!qihse_kv_ct_source_status(store, replication_principal, &local) ||
+        strcmp(local.source_id, qkp->node_id) != 0 ||
+        strcmp(local.successor_id, qkp->replication_peer_node_id) != 0 ||
+        strcmp(local.generation, generation) != 0 ||
+        local.durable_lsn != source_durable_position)
+        return false;
     mini_resp_t peer;
     if (mini_resp_connect_mode(&peer, host, port, qkp, false, 0u) < 0)
         return false;
@@ -3130,9 +3138,25 @@ static bool ct1_primary_peer_preflight(const char* host, uint16_t port,
         strcmp(fields[2], generation) == 0 &&
         (source_durable_position == 0u || (sealed == 1u &&
             tenant_policy == QIHSE_KV_CT_TENANT_SYSTEM_ALL &&
-            target_cursor >= source_durable_position));
+            target_cursor >= local.acknowledged_lsn &&
+            target_cursor <= local.durable_lsn));
     mini_resp_free_array(fields, count);
     mini_resp_close(&peer);
+    /* Allow the listener to serve an exact retained tail after cold restart.
+     * This is not admission: ordinary data stays fenced until peer RECONCILE. */
+    uint64_t cursor = target_cursor;
+    while (ok && source_durable_position != 0u && cursor < local.durable_lsn) {
+        qihse_kv_ct_group_t* groups = NULL;
+        size_t group_count = 0u;
+        uint64_t resume = cursor;
+        ok = qihse_kv_ct_source_read(store, replication_principal, generation,
+            cursor, 1u, QIHSE_KV_DURABLE_BATCH_MAX_BYTES,
+            &groups, &group_count, &resume) && group_count == 1u &&
+            groups[0].stream_position == cursor + 1u &&
+            resume == groups[0].stream_position && resume <= local.durable_lsn;
+        qihse_kv_ct_groups_free(groups, group_count);
+        if (ok) cursor = resume;
+    }
     return ok;
 }
 
@@ -5076,7 +5100,8 @@ int main(int argc, char** argv) {
      * blocking accept loop and does not observe this process's g_stop flag,
      * which otherwise makes systemd wait for SIGKILL at TimeoutStopSec. */
     if (ct_configured && !ct_group_mode && strcmp(ct_role, "primary") == 0 &&
-        !ct1_primary_peer_preflight(ct_peer_host, ct_peer_port, &pqc,
+        !ct1_primary_peer_preflight(store, replication_service_principal,
+                                    ct_peer_host, ct_peer_port, &pqc,
                                     ct_generation_hex, ct_source_durable_position,
                                     ct_source_baseline_digest)) {
         fprintf(stderr, "qihse-cluster-daemon: CT primary refused startup; pinned successor STATUS preflight failed\n");
