@@ -61,6 +61,15 @@ absent; only the admitted source may durably publish and replicate an expiry.
 A cold reopen replays the existing log; never discard an expired retained row
 or reset CT metadata to clear a recovery fence.
 
+Before a source retires fully ACKed CT1 WAL frames, it durably publishes its
+mutation-sequence floor using the existing `restore-highwater.bin` format.
+Otherwise compaction can later prune the highest-sequence tombstone and a cold
+reopen could allocate an older row sequence. A failed floor publication keeps
+the retained WAL available for an exact ACK retry. This protects future ACK
+retirement; it does not reconstruct a predecessor's already-pruned history or
+resolve an existing conflicting pending group. The focused restart/compaction
+regression runs with `make test-ct-storage test-ct-storage-crash`.
+
 No stored-data format migration or public API change is required. Rebuild with
 `make lib cluster-daemon`, stage a new immutable runtime, and restart the selected
 successor and then primary with their retained configuration and pinned peer.

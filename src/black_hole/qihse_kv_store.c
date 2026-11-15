@@ -5367,9 +5367,12 @@ bool qihse_kv_ct_source_ack(qihse_kv_store_t* store, qihse_user_t* principal,
     }
     if (ok && store->ct_ack_lsn == store->ct_durable_lsn &&
         store->ct_retained_bytes != 0u) {
-        /* The SST and its directory entry must be durable before the only
-         * recovery copy of an ACKed QKV6 frame can be retired. */
+        /* The SST, its directory entry, and the sequence floor must be durable
+         * before retiring the only recovery copy of an ACKed QKV6 frame: a
+         * later compaction may legitimately prune its highest tombstone. */
         if (!kv_sync_store_locked(store)) ok = false;
+        if (ok && !image_highwater_publish(
+                __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE))) ok = false;
         if (ok) {
             store->ct_retained_bytes = 0u;
             if (!ct_state_write(store) || !rotate_wal_empty(store) ||

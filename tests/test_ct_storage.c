@@ -23,6 +23,63 @@ static char* ct_large_payload(void) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "source-highwater") == 0) {
+        assert(qihse_auth_init());
+        assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+        qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+        assert(op);
+        qihse_user_t* service = qihse_auth_create_user(op, 8302u,
+            QIHSE_ROLE_ANALYST, 5u, 2u, "CtStorageService1!", false);
+        assert(service);
+        qihse_kv_store_t* source = qihse_kv_store_create_user(op);
+        assert(source);
+        assert(qihse_kv_ct_source_enable(source, op, "source:1", "target:1",
+                                         "gen:1", NULL, 128u * 1024u * 1024u));
+        qihse_kv_store_set_replication_principal_id(source, 8302u);
+        unsigned char token[QIHSE_KV_CT_TOKEN_BYTES], digest[32];
+        assert(qihse_kv_ct_owner_token_get(source, op, token));
+        qihse_kv_replica_snapshot_t* snapshot = NULL;
+        uint64_t baseline_seq = 0u;
+        assert(qihse_kv_ct_source_baseline_snapshot_create(source, op,
+            &snapshot, &baseline_seq, digest) == 0 && snapshot);
+        qihse_kv_replica_snapshot_destroy(snapshot);
+        assert(qihse_kv_ct_source_reconcile_peer(source, op, service,
+            "target:1", "gen:1", digest, 0u));
+        for (unsigned phase = 0u; phase < 2u; phase++) {
+            for (unsigned i = 0u; i < 16u; i++) {
+                char key[48];
+                assert(snprintf(key, sizeof(key), "commons/highwater-%u", i) > 0);
+                qihse_kv_ct_writer_scope_t* scope = NULL;
+                assert(qihse_kv_ct_writer_scope_enter(source, op, token, &scope));
+                assert(phase ? qihse_kv_del_user(source, key, op) :
+                    qihse_kv_set_user(source, key, "value", 0u, 0u, op));
+                qihse_kv_ct_source_status_t status = {0};
+                assert(qihse_kv_ct_source_status(source, op, &status) &&
+                       status.durable_lsn == (uint64_t)phase * 16u + i + 1u);
+                assert(qihse_kv_ct_source_ack(source, op, "target:1", "gen:1",
+                                              status.durable_lsn));
+                assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+            }
+        }
+        uint64_t floor = qihse_kv_change_seq(source);
+        qihse_kv_ct_source_status_t before = {0}, after = {0};
+        assert(qihse_kv_ct_source_status(source, op, &before) &&
+               before.durable_lsn == 32u && before.acknowledged_lsn == 32u &&
+               before.retained_bytes == 0u);
+        qihse_kv_sweep_expired(source);
+        qihse_kv_sstable_stats_t stats = {0};
+        assert(qihse_kv_sstable_stats(source, &stats) &&
+               stats.live_sstable_files == 0u && !stats.index_degraded);
+        qihse_kv_store_destroy(source);
+        source = qihse_kv_store_create_user(op);
+        assert(source && qihse_kv_change_seq(source) >= floor);
+        assert(qihse_kv_ct_source_status(source, op, &after) &&
+               after.durable_lsn == before.durable_lsn &&
+               after.acknowledged_lsn == before.acknowledged_lsn &&
+               after.retained_bytes == 0u && !after.admitted);
+        qihse_kv_store_destroy(source);
+        return 0;
+    }
     if (argc == 7 && (strcmp(argv[1], "receiver") == 0 ||
                       strcmp(argv[1], "receiver-mismatch") == 0 ||
                       strcmp(argv[1], "receiver-expired") == 0)) {
@@ -342,7 +399,28 @@ int main(int argc, char** argv) {
     assert(qihse_kv_get_user(s, "commons/new", op) == NULL);
     assert(!qihse_kv_ct_source_ack(s, low, "target:1", "gen:1", 1u));
     assert(!qihse_kv_ct_source_ack(s, op, "wrong", "gen:1", 1u));
+    uint64_t ack_floor = qihse_kv_change_seq(s);
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "restore-highwater-commit", 1) == 0);
+    assert(!qihse_kv_ct_source_ack(s, op, "target:1", "gen:1", 1u));
+    assert(unsetenv("QIHSE_AIMEM_FAIL_AT") == 0);
+    qihse_kv_ct_source_status_t failed_gc = {0};
+    assert(qihse_kv_ct_source_status(s, op, &failed_gc) &&
+           failed_gc.durable_lsn == 1u && failed_gc.acknowledged_lsn == 1u &&
+           failed_gc.retained_bytes > 0u);
+#endif
     assert(qihse_kv_ct_source_ack(s, op, "target:1", "gen:1", 1u));
+    char highwater_path[512];
+    assert(snprintf(highwater_path, sizeof(highwater_path),
+                    "%s/restore-highwater.bin", getenv("QIHSE_DATA_DIR")) > 0);
+    FILE* highwater = fopen(highwater_path, "rb");
+    assert(highwater);
+    unsigned char marker[5];
+    uint64_t persisted_floor = 0u;
+    assert(fread(marker, 1u, sizeof(marker), highwater) == sizeof(marker) &&
+           memcmp(marker, "QRHW1", sizeof(marker)) == 0 &&
+           fread(&persisted_floor, sizeof(persisted_floor), 1u, highwater) == 1u &&
+           persisted_floor >= ack_floor && fclose(highwater) == 0);
     assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
     qihse_kv_ct_source_status_t post_gc = {0};
     assert(qihse_kv_ct_source_status(s, op, &post_gc) &&
@@ -517,6 +595,17 @@ int main(int argc, char** argv) {
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char highwater_dir[] = "./ct_source_highwater_XXXXXX";
+    assert(mkdtemp(highwater_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", highwater_dir, 1) == 0);
+        execl(argv[0], argv[0], "source-highwater", (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     s = qihse_kv_store_create_user(op);
     assert(s);
     assert(qihse_kv_ct_fence_finish(s, op, "move:1", false, token));
@@ -538,6 +627,7 @@ int main(int argc, char** argv) {
     aimem_fixture_cleanup(receiver_dir);
     aimem_fixture_cleanup(mismatch_dir);
     aimem_fixture_cleanup(expired_dir);
+    aimem_fixture_cleanup(highwater_dir);
     aimem_fixture_cleanup(dir);
     puts("ct storage: PASS");
     return 0;
