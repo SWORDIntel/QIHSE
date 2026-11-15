@@ -536,10 +536,13 @@ int fsync(int fd) {
                     except (FileNotFoundError, ConnectionRefusedError):
                         pass
                 time.sleep(0.02)
-            process.terminate()
+            exited = process.poll() is not None
+            if not exited:
+                process.terminate()
             stdout, stderr = process.communicate(timeout=5)
-            raise AssertionError(("reader startup exceeded 30 seconds", process.returncode,
-                                  stdout, stderr))
+            reason = ("reader exited during startup" if exited else
+                      "reader startup exceeded 30 seconds")
+            raise AssertionError((reason, process.returncode, stdout, stderr))
 
         def stop_reader(process):
             process.terminate()

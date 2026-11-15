@@ -2588,6 +2588,11 @@ static int qihse_vdb_search_int8_candidates_prequantized(qihse_vector_db_t vdb,
             continue;
         }
 
+        /* Match the binary selector: a hidden row must not consume a slot
+         * and displace an authorized row from the bounded candidate pool. */
+        if (!qihse_auth_can_access(query->user, row->classification,
+                                     row->sci_compartment)) continue;
+
         if (i + 4 < vdb->total_vectors) {
             _mm_prefetch((const char*)&vdb->int8_vectors[(i + 4) * vdb->int8_dims], _MM_HINT_T0);
         }

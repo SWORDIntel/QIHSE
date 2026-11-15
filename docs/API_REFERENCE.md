@@ -1721,6 +1721,9 @@ records the core correction, not a new full-library ABI certification. It is
 excluded from the historical `libqihse.so` inventory claim above. The complete
 suite remains `make test TEST_JOBS=32`; report its result separately from focused
 checks and mathematical experiments.
+Subsequent real-library integration and full-suite status are recorded in the
+[validation follow-up](plans/qihse_core_validation.md), without changing the
+historical benchmark measurements.
 
 Headers: `include/qihse.h`, `include/qihse_math.h`,
 `include/qihse_math_types.h`, `include/qihse_search.h`, and
@@ -1900,7 +1903,7 @@ mass, not a correctness estimate. `qihse_amplify_adaptive` reports performed
 rounds and uses the requested target mass. These standalone state experiments
 are not invoked by the scalar exact lookup.
 
-#### Vector candidate rerank and binary authorization
+#### Vector candidate rerank and authorization
 
 INT8 and binary selectors in `src/broad_oak/qihse_vector_db.c` exact-score every
 admitted candidate and retain `top_k` by the requested DOT/COSINE/EUCLIDEAN
@@ -1908,20 +1911,20 @@ metric. Earlier approximate order cannot terminate reranking when the first k
 results fill the output. Candidate selection remains approximate; exact rerank
 cannot recover rows omitted from `candidate_pool_size`.
 
-The binary selector requires an explicit user, filters clearance/SCI before
-admitting candidates, and rechecks before materializing vector or metadata
-payloads. Its direct public candidate entry also rejects `NULL` with
-`EACCES`. A hidden nearest row therefore cannot consume the authorized binary
-candidate pool. This describes clearance/SCI handling, not a new tenant/project
-policy or a concurrent source-snapshot fence.
+Both INT8 and binary selectors check the caller's clearance/SCI before admitting
+candidates and again during exact reranking. An excluded row cannot consume a
+bounded candidate slot and displace an authorized result. The binary selector
+also requires an explicit user at its direct public candidate entry, rejecting
+`NULL` with `EACCES`. These checks describe clearance/SCI handling, not a new
+tenant/project policy or a concurrent source-snapshot fence.
 
 Focused regression sources include `tests/test_core_search_regressions.c`,
 `tests/test_core_math_regressions.c` and `tests/test_runtime_math_regressions.c`.
 `tests/test_public_api_install.py` also checks the installed core headers alone
 and together as C and C++. The new public candidate regression lives in
-`tests/test_vector_candidate_rerank.c`; executing its real-principal fixture
-requires the library-backed test target and is distinct from the isolated
-numerical selector checks.
+`tests/test_vector_candidate_rerank.c`; its real-principal fixture has also
+passed through the library-backed target, as recorded in the validation
+follow-up. That result is distinct from the isolated numerical selector checks.
 The C method benchmark measures the actual core on synthetic workloads. The
 separate paired-feature script in
 `benchmarks/scripts/qihse_rff_pairing_experiment.py` is a **synthetic formula

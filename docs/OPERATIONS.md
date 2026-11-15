@@ -362,6 +362,20 @@ PYTHONPATH=python LD_LIBRARY_PATH=. python3 -m unittest discover -s python/tests
 cd rust/qihse-rs && LD_LIBRARY_PATH=../.. cargo test --offline
 ```
 
+The Python controller E2E tests compile
+`python/tests/controller_sdk_fixture.c` against the canonical
+`qihse_resp_wire.h` configuration and link the checkout's `libqihse.so`.
+The server runs in an isolated child process on loopback; Python passes
+opaque handles instead of maintaining a second copy of the C configuration
+layout. Run `make lib` after changing native headers. Missing compiler or
+library prerequisites skip the E2E class; helper compilation and server
+startup errors fail it. The authenticated operator and denied guest and
+unauthenticated cases all use the real server.
+
+On 2026-11-15, the controller target passed all 61 tests with no skips:
+57 unit/mock cases and all four native E2E cases. The E2E run includes both
+denied-access checks; the earlier skipped-class result in §2.2 is historical.
+
 The Rust run was verified on this branch: 22 controller integration tests
 pass (plus the lib unit tests). The FFI side of `rust/qihse-rs` links
 `libqihse.so` from the repository root — hence `LD_LIBRARY_PATH=../..`.

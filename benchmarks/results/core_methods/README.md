@@ -65,7 +65,12 @@ controls. `QIHSE_CORE_BENCH_SANITIZERS=1` enables a correctness-only build;
 sanitizer timings are not performance evidence. A separate 25-case small sweep
 passed ASan/UBSan with leak detection disabled for the ptrace environment.
 
-The integrated focused core/math/runtime runners and installed-header checks
-passed. The complete `make test TEST_JOBS=32` gate remains blocked during the
-shared-library build by the missing `lua.h` dependency; this reference does not
-stand in for that gate.
+At reference capture, the integrated focused core/math/runtime runners and
+installed-header checks passed. The initial `make test TEST_JOBS=32` attempt
+stopped during the shared-library build at a missing `lua.h` header. That is
+the historical environment state for this reference, not a current dependency
+diagnosis. The original measurements and source manifest remain unchanged;
+this benchmark does not stand in for the full suite.
+Later dependency preparation, real-library candidate testing and the current
+suite outcome are tracked in the separate
+[validation follow-up](../../../docs/plans/qihse_core_validation.md).

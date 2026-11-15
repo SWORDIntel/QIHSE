@@ -122,19 +122,20 @@ static void test_selectors(qihse_user_t *operator_user) {
     qihse_vector_db_destroy(db);
 }
 
-static void test_binary_clearance(const char *root, qihse_user_t *operator_user) {
+static void test_candidate_clearance(const char *root, qihse_user_t *operator_user) {
     char path[512];
-    assert(snprintf(path, sizeof(path), "%s/binary-clearance.qdb", root) < (int)sizeof(path));
+    assert(snprintf(path, sizeof(path), "%s/candidate-clearance.qdb", root) < (int)sizeof(path));
     qihse_user_t *guest = qihse_auth_create_user(operator_user, 771u,
         QIHSE_ROLE_GUEST, QIHSE_CLASS_UNCLASSIFIED, QIHSE_SCI_NONE,
-        "BinaryCandidateGuest123!", false);
+        "CandidateClearanceGuest123!", false);
     assert(guest);
     assert(!qihse_auth_can_access(guest, QIHSE_CLASS_SECRET, QIHSE_SCI_SI));
     assert(qihse_auth_can_access(operator_user, QIHSE_CLASS_SECRET, QIHSE_SCI_SI));
 
-    /* The hidden row has strictly better Hamming distance and exact score.
-     * A pool of one must still return the visible row for the guest. */
-    const float protected_vectors[4] = {100.0f, 100.0f, 1.0f, -0.1f};
+    /* The hidden row ranks first in both approximate selectors. A pool of
+     * one must still return the visible row for the guest, whose permitted
+     * row has the better exact DOT score. */
+    const float protected_vectors[4] = {100.0f, 100.0f, 101.0f, -100.0f};
     const char protected_metadata[] = "protected\0public";
     qihse_index_row_t rows[2] = {0};
     rows[0].vector_id = 900u;
@@ -163,11 +164,10 @@ static void test_binary_clearance(const char *root, qihse_user_t *operator_user)
     assert(qihse_vector_store_flush(path, &flush));
     qihse_vector_db_t db = qihse_vector_db_open(QIHSE_VECTOR_DB_INMEMORY,
         NULL, path, QIHSE_VDB_OPEN_FILE_BACKED);
-    assert(db && qihse_vector_db_build_binary(db));
+    assert(db && qihse_vector_db_build_binary(db) && qihse_vector_db_build_int8(db));
 
-    const float q[2] = {1.0f, 1.0f};
     qihse_vector_query_t query = {0};
-    query.query_vector = q;
+    query.query_vector = needle;
     query.vector_dims = 2u;
     query.query_mode = QIHSE_VDB_QUERY_BINARY;
     query.distance_metric = QIHSE_DISTANCE_DOT_PRODUCT;
@@ -176,20 +176,29 @@ static void test_binary_clearance(const char *root, qihse_user_t *operator_user)
     query.similarity_threshold = -FLT_MAX;
     qihse_vector_result_t results[2] = {0};
 
-    query.user = operator_user;
-    int count = qihse_vector_db_search(db, &query, results, 2u);
-    assert(count == 1 && results[0].id == 900u);
-    free_results(results, count);
-    memset(results, 0, sizeof(results));
-    qihse_vector_db_clear_cache(db);
-    query.user = guest;
-    count = qihse_vector_db_search(db, &query, results, 2u);
-    assert(count == 1 && results[0].id == 901u);
-    assert(results[0].vector_dims == 2u && results[0].vector);
-    assert(memcmp(results[0].vector, protected_vectors + 2u, 2u * sizeof(float)) == 0);
-    assert(results[0].metadata_size == sizeof("public"));
-    assert(memcmp(results[0].metadata, "public", sizeof("public")) == 0);
-    free_results(results, count);
+    const qihse_vector_db_query_mode_t modes[2] = {
+        QIHSE_VDB_QUERY_INT8, QIHSE_VDB_QUERY_BINARY
+    };
+    for (size_t m = 0; m < 2u; ++m) {
+        query.query_mode = modes[m];
+        query.user = operator_user;
+        memset(results, 0, sizeof(results));
+        qihse_vector_db_clear_cache(db);
+        int count = qihse_vector_db_search(db, &query, results, 2u);
+        assert(count == 1 && results[0].id == 900u);
+        free_results(results, count);
+        memset(results, 0, sizeof(results));
+        qihse_vector_db_clear_cache(db);
+        query.user = guest;
+        count = qihse_vector_db_search(db, &query, results, 2u);
+        assert(count == 1 && results[0].id == 901u);
+        assert(results[0].score == oracle_score(1u, QIHSE_DISTANCE_DOT_PRODUCT));
+        assert(results[0].vector_dims == 2u && results[0].vector);
+        assert(memcmp(results[0].vector, protected_vectors + 2u, 2u * sizeof(float)) == 0);
+        assert(results[0].metadata_size == sizeof("public"));
+        assert(memcmp(results[0].metadata, "public", sizeof("public")) == 0);
+        free_results(results, count);
+    }
 
     /* Direct public candidate entry points also require an explicit user. */
     query.user = NULL;
@@ -216,11 +225,11 @@ int main(void) {
     qihse_user_t *operator_user = qihse_auth_get_user(0u);
     assert(operator_user);
     test_selectors(operator_user);
-    test_binary_clearance(root, operator_user);
+    test_candidate_clearance(root, operator_user);
     qihse_auth_shutdown_rate_limiter();
     qihse_auth_shutdown_volume_limiter();
     qihse_audit_shutdown();
     assert(nftw(root, remove_entry, 16, FTW_DEPTH | FTW_PHYS) == 0);
-    puts("PASS full-pool exact rerank, metrics, payloads, filters, and binary clearance boundary");
+    puts("PASS full-pool exact rerank, metrics, payloads, filters, and INT8/binary clearance boundary");
     return 0;
 }

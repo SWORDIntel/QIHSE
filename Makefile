@@ -4,10 +4,14 @@
 CC=gcc
 CXX=g++
 
+PKG_CONFIG ?= pkg-config
+LUAJIT_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags luajit 2>/dev/null)
+LUAJIT_LIBS ?= $(shell $(PKG_CONFIG) --libs luajit 2>/dev/null || printf '%s' '-lluajit-5.1')
+
 PYTHON_INCLUDES ?= $(shell python3-config --includes 2>/dev/null || pkg-config --cflags python3 2>/dev/null || echo "-I/usr/include/python3.13")
 PYTHON_LDFLAGS  ?= $(shell python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || pkg-config --libs python3 2>/dev/null || echo "-lpython3.13")
 
-INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
+INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include $(LUAJIT_CFLAGS) -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
 QIHSE_ARCH_FLAGS ?=
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS) $(PYTHON_INCLUDES)
 CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS)
@@ -151,8 +155,8 @@ ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) $(LUAJIT_LIBS) -lssl -lcrypto -lbpf -lxdp -lsqlite3
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) $(LUAJIT_LIBS) -lssl -lcrypto -lbpf -lxdp -lsqlite3
 ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
 LDFLAGS += -lonnxruntime
 AIMEM_ONNX_EXEC_SOURCE :=
@@ -852,6 +856,9 @@ COBJS = $(CSRCS:.c=.o)
 CXXOBJS = $(CXXSRCS:.cpp=.o)
 OBJS = $(COBJS) $(CXXOBJS)
 
+# Tree-sitter ships the Unicode headers its amalgamated source includes.
+vendor/tree-sitter/lib/src/lib.o: CFLAGS += -I./vendor/tree-sitter/lib/src
+
 # Header dependency tracking. Without this a change to a struct in a header
 # leaves every .o that included it compiled against the OLD layout while the
 # rest of the tree is rebuilt against the new one, and the link succeeds: the
@@ -887,11 +894,8 @@ $(LIB_TARGET): $(OBJS)
 	$(CXX) -shared -fPIC -o $(LIB_TARGET) $(OBJS) $(filter-out -lqihse,$(LDFLAGS)) -lsqlite3
 	@echo "$(LIB_TARGET) build successful"
 
-lib-ctypes: $(filter-out sdks/python/qihse.o,$(OBJS))
-	@echo "Building libqihse.so..."
-	$(CXX) -shared -fPIC -o libqihse.so $(subst .c,.o,$(subst .cpp,.o,$(SRCS))) \
-	    -L. -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 $$(pkg-config --libs sqlite3)
-	@echo "libqihse.so build successful"
+# ctypes uses the canonical library, including the native Python entry points.
+lib-ctypes: lib
 
 persistence: test-persist
 persistence-check: test-persist
@@ -974,7 +978,7 @@ test-http-lifecycle:
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_maintenance.c -Wl,--gc-sections -L. -lqihse -pthread -lcrypto
-	./build/test_cluster_bus_bind
+	LD_LIBRARY_PATH=".$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" ./build/test_cluster_bus_bind
 
 test-serial: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
@@ -1899,7 +1903,7 @@ test-document-store-user: lib
 
 test-cluster-maintenance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance tests/test_cluster_maintenance.c src/spinnaker/qihse_cluster_maintenance.c -pthread $(LDFLAGS)
-	./tests/test_cluster_maintenance
+	LD_LIBRARY_PATH=".$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" ./tests/test_cluster_maintenance
 
 test-cluster-maintenance-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance_resp tests/test_cluster_maintenance_resp.c -L. -lqihse $(LDFLAGS)

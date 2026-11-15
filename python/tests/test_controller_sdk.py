@@ -15,7 +15,8 @@ Three layers:
      handling and reconnect resumption — against a scripted loopback
      mock server (localhost, ephemeral ports only; no external service).
   3. E2E (skipped automatically when the pieces are unavailable): the
-     real federation RESP server built via ctypes inside a forked child
+     real federation RESP server configured by a canonical-header C helper
+     and invoked via ctypes inside a forked child
      process (its process-global auth/data-dir state must not leak into
      this pytest run), including the invariant-3 negatives mirrored from
      tests/test_controller_api.c — an unauthenticated principal and a
@@ -165,11 +166,11 @@ class ScriptedRESPServer(threading.Thread):
         self._sock.bind(("127.0.0.1", 0))          # ephemeral port
         self._sock.listen(8)
         self.port = self._sock.getsockname()[1]
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def run(self):
         self._sock.settimeout(0.2)
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 conn, _ = self._sock.accept()
             except (socket.timeout, TimeoutError):
@@ -236,7 +237,7 @@ class ScriptedRESPServer(threading.Thread):
             conn.sendall(response)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         try:
             self._sock.close()
         except OSError:
@@ -936,97 +937,10 @@ class TestWatchSemantics(unittest.TestCase):
 _OPERATOR_PASSWORD = "PyCtrlSdkPass1!"     # >= 12 chars, like the C test
 _GUEST_PASSWORD = "PyCtrlGuest1!"
 
-# ctypes mirror of qihse_resp_server_config_t (field order is
-# ABI-significant).  Before the struct is ever handed to the library, an
-# ABI probe compiled from the repo headers verifies the size and every
-# field offset — a stale libqihse.so can never be fed a mismatched layout.
-_RESP_CONFIG_FIELDS = [
-    ("store", ctypes.c_void_p),
-    ("vdb", ctypes.c_void_p),
-    ("tsdb", ctypes.c_void_p),
-    ("column_store", ctypes.c_void_p),
-    ("fts", ctypes.c_void_p),
-    ("topology", ctypes.c_void_p),
-    ("bind_address", ctypes.c_char_p),
-    ("advertise_address", ctypes.c_char_p),
-    ("node_id", ctypes.c_char_p),
-    ("port", ctypes.c_uint16),
-    ("bus_port", ctypes.c_uint16),
-    ("local_node_index", ctypes.c_uint16),
-    ("max_clients", ctypes.c_size_t),
-    ("max_request_bytes", ctypes.c_size_t),
-    ("auth_required", ctypes.c_bool),
-    ("require_full_coverage", ctypes.c_bool),
-    ("pin_workers", ctypes.c_bool),
-    ("strict_hardware_affinity", ctypes.c_bool),
-    ("numa_node_id", ctypes.c_int),
-    ("enable_bus", ctypes.c_bool),
-    ("enable_failover", ctypes.c_bool),
-    ("enable_guard_throttle", ctypes.c_bool),
-    ("xdp_interface", ctypes.c_char_p),
-    ("veil_key", ctypes.c_char_p),
-    ("guard_window_ms", ctypes.c_uint64),
-    ("guard_saturation_fraction", ctypes.c_double),
-    ("enable_scatter", ctypes.c_bool),
-    ("scatter_timeout_ms", ctypes.c_uint32),
-    ("enable_task_queue", ctypes.c_bool),
-    ("enable_task_workers", ctypes.c_bool),
-    ("task_worker_count", ctypes.c_uint32),
-    ("task_python_binary", ctypes.c_char_p),
-    ("enable_task_scheduler", ctypes.c_bool),
-    ("task_queue", ctypes.c_void_p),
-    ("task_workers", ctypes.c_void_p),
-    ("task_scheduler", ctypes.c_void_p),
-    ("pubsub_log_directory", ctypes.c_char_p),
-    ("channel_classification", ctypes.c_uint16),
-    ("channel_sci", ctypes.c_uint16),
-    ("federation_journal_directory", ctypes.c_char_p),
-    ("federation_journal_durability", ctypes.c_int),
-    ("federation_key_directory", ctypes.c_char_p),
-    ("enable_uwp_bridge", ctypes.c_bool),
-    ("enable_fabric_dispatch", ctypes.c_bool),
-    ("fabric_dispatch_bind", ctypes.c_char_p),
-    ("fabric_dispatch_port", ctypes.c_uint16),
-    ("fabric_dispatch_ca_cert_path", ctypes.c_char_p),
-    ("fabric_dispatch_node_cert_path", ctypes.c_char_p),
-    ("fabric_dispatch_node_id", ctypes.c_char_p),
-    ("quotas", ctypes.c_void_p),
-    ("blobs", ctypes.c_void_p),
-    ("bundle_keys_dir", ctypes.c_char_p),
-    ("bundle_dsa_private_key_path", ctypes.c_char_p),
-    ("enable_killswitch_channel", ctypes.c_bool),
-    ("kv_sweep_interval_seconds", ctypes.c_uint32),
-    ("cluster_migrate_password", ctypes.c_char_p),
-    ("redundancy_peer", ctypes.c_char_p),
-]
-
-_ABI_PROBE_C = """
-#include <stdio.h>
-#include <stddef.h>
-#include "qihse_resp_wire.h"
-int main(void) {
-    printf("sizeof %zu\\n", sizeof(qihse_resp_server_config_t));
-#define F(f) printf("%s %zu\\n", #f, offsetof(qihse_resp_server_config_t, f));
-    F(store) F(vdb) F(tsdb) F(column_store) F(fts) F(topology)
-    F(bind_address) F(advertise_address) F(node_id) F(port) F(bus_port)
-    F(local_node_index) F(max_clients) F(max_request_bytes) F(auth_required)
-    F(require_full_coverage) F(pin_workers) F(strict_hardware_affinity)
-    F(numa_node_id) F(enable_bus) F(enable_failover) F(enable_guard_throttle)
-    F(xdp_interface) F(veil_key) F(guard_window_ms) F(guard_saturation_fraction)
-    F(enable_scatter) F(scatter_timeout_ms) F(enable_task_queue)
-    F(enable_task_workers) F(task_worker_count) F(task_python_binary)
-    F(enable_task_scheduler) F(task_queue) F(task_workers) F(task_scheduler)
-    F(pubsub_log_directory) F(channel_classification) F(channel_sci)
-    F(federation_journal_directory) F(federation_journal_durability)
-    F(federation_key_directory) F(enable_uwp_bridge) F(enable_fabric_dispatch)
-    F(fabric_dispatch_bind) F(fabric_dispatch_port) F(fabric_dispatch_ca_cert_path)
-    F(fabric_dispatch_node_cert_path) F(fabric_dispatch_node_id) F(quotas)
-    F(blobs) F(bundle_keys_dir) F(bundle_dsa_private_key_path)
-    F(enable_killswitch_channel) F(kv_sweep_interval_seconds)
-    F(cluster_migrate_password) F(redundancy_peer)
-    return 0;
-}
-"""
+# The test helper owns qihse_resp_server_config_t in C, compiled against the
+# canonical header. Python passes opaque handles and scalar arguments only;
+# configuration growth cannot leave another ctypes struct mirror stale.
+_SERVER_FIXTURE_C = Path(__file__).with_name("controller_sdk_fixture.c")
 
 
 def _free_tcp_port() -> int:
@@ -1046,7 +960,7 @@ def _find_c_compiler():
     return None
 
 
-def _run_server_child(status_fd, tmp_dir: str) -> None:
+def _run_server_child(status_fd, tmp_dir: str, fixture_path: str) -> None:
     """Child-process body: build and run the auth-required RESP server.
 
     Mirrors tests/test_controller_api.c main() — operator bootstrap, a
@@ -1065,9 +979,11 @@ def _run_server_child(status_fd, tmp_dir: str) -> None:
         from qihse import core as qihse_core  # noqa: PLC0415
         lib = qihse_core._lib
 
-        struct_cls = type(
-            "RespServerConfig", (ctypes.Structure,),
-            {"_fields_": _RESP_CONFIG_FIELDS})
+        fixture = ctypes.CDLL(fixture_path, use_errno=True)
+        fixture.qihse_test_controller_server_create.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_uint16, ctypes.c_uint16]
+        fixture.qihse_test_controller_server_create.restype = ctypes.c_void_p
 
         lib.qihse_kv_store_create.argtypes = []
         lib.qihse_kv_store_create.restype = ctypes.c_void_p
@@ -1075,11 +991,6 @@ def _run_server_child(status_fd, tmp_dir: str) -> None:
         lib.qihse_kv_store_destroy.restype = None
         lib.qihse_cluster_node_id_from_seed.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
-        lib.qihse_resp_server_config_init.argtypes = [
-            ctypes.POINTER(struct_cls)]
-        lib.qihse_resp_server_config_init.restype = None
-        lib.qihse_resp_server_create.argtypes = [ctypes.POINTER(struct_cls)]
-        lib.qihse_resp_server_create.restype = ctypes.c_void_p
         lib.qihse_resp_server_start.argtypes = [ctypes.c_void_p]
         lib.qihse_resp_server_start.restype = ctypes.c_bool
         lib.qihse_auth_create_tenant_user.argtypes = [
@@ -1110,26 +1021,19 @@ def _run_server_child(status_fd, tmp_dir: str) -> None:
         seed = b"py-ctrl-sdk-e2e-node"
         lib.qihse_cluster_node_id_from_seed(seed, len(seed), node_id_buf)
 
-        config = struct_cls()
-        lib.qihse_resp_server_config_init(ctypes.byref(config))
-        config.store = store
-        config.node_id = node_id_buf.value
-        config.bind_address = b"127.0.0.1"
-        config.advertise_address = b"127.0.0.1"
+        # Retain argument bytes for the entire child lifetime, even if a future
+        # native implementation borrows rather than copies these strings.
+        node_id = node_id_buf.value
+        journal_path = journal_dir.encode()
         port = _free_tcp_port()
-        config.port = port
-        config.bus_port = _free_tcp_port()
-        config.enable_bus = False
-        config.enable_failover = False
-        config.auth_required = True          # the invariant under test
-        config.federation_journal_directory = journal_dir.encode()
-
-        server = lib.qihse_resp_server_create(ctypes.byref(config))
+        server = fixture.qihse_test_controller_server_create(
+            store, node_id, journal_path, port, _free_tcp_port())
         if not server:
-            raise RuntimeError("qihse_resp_server_create() failed")
+            raise RuntimeError(
+                f"qihse_resp_server_create() failed (errno={ctypes.get_errno()})")
         if not lib.qihse_resp_server_start(server):
             raise RuntimeError("qihse_resp_server_start() failed")
-    except Exception as exc:  # report and die — parent turns this into a skip
+    except Exception as exc:  # report and die — parent fails the E2E fixture
         try:
             os.write(status_fd, f"ERROR {type(exc).__name__}: {exc}\n".encode())
         except OSError:
@@ -1172,53 +1076,26 @@ class TestControllerE2E(unittest.TestCase):
         compiler = _find_c_compiler()
         if compiler is None:
             raise unittest.SkipTest(
-                "no C compiler (cc/gcc/clang) found for the RESP-config ABI "
-                "probe; refusing to feed a ctypes struct mirror to "
-                "libqihse.so without verifying its layout")
+                "no C compiler (cc/gcc/clang) found for the canonical-header "
+                "RESP server fixture")
 
-        # ABI probe in the PARENT: compile from the repo headers and
-        # verify the ctypes mirror matches every field offset.
+        # Compile the configuration boundary from the same checkout's header
+        # and link the existing library; never duplicate its struct in Python.
         cls._tmp = tempfile.mkdtemp(prefix="qihse_py_ctrl_sdk_")
-        probe_src = os.path.join(cls._tmp, "abi_probe.c")
-        probe_bin = os.path.join(cls._tmp, "abi_probe")
-        with open(probe_src, "w") as fh:
-            fh.write(_ABI_PROBE_C)
+        fixture_path = os.path.join(cls._tmp, "controller_sdk_fixture.so")
         try:
             subprocess.run(
-                [compiler, "-I", str(REPO_ROOT / "include"), probe_src,
-                 "-o", probe_bin],
-                check=True, capture_output=True, timeout=60)
-            probe_out = subprocess.run(
-                [probe_bin], check=True, capture_output=True,
-                timeout=30).stdout.decode()
+                [compiler, "-std=c99", "-D_GNU_SOURCE", "-shared", "-fPIC",
+                 "-Wall", "-Wextra", "-Werror", "-Wl,-z,defs",
+                 "-I", str(REPO_ROOT / "include"), "-I", str(REPO_ROOT),
+                 str(_SERVER_FIXTURE_C), str(REPO_ROOT / "libqihse.so"),
+                 "-o", fixture_path],
+                check=True, capture_output=True, text=True, timeout=60)
         except (subprocess.SubprocessError, OSError) as exc:
             cls._cleanup_tmp()
-            raise unittest.SkipTest(
-                f"ABI probe failed ({exc}); cannot verify "
-                "qihse_resp_server_config_t layout") from exc
-
-        struct_cls = type(
-            "RespServerConfig", (ctypes.Structure,),
-            {"_fields_": _RESP_CONFIG_FIELDS})
-        layout = {}
-        for line in probe_out.splitlines():
-            name, _, value = line.partition(" ")
-            layout[name.strip()] = int(value)
-        mismatches = [
-            f"{name}: ctypes={getattr(struct_cls, name).offset} c={offset}"
-            for name, offset in layout.items()
-            if name != "sizeof"
-            and getattr(struct_cls, name).offset != offset
-        ]
-        if ctypes.sizeof(struct_cls) != layout.get("sizeof"):
-            mismatches.append(
-                f"sizeof: ctypes={ctypes.sizeof(struct_cls)} "
-                f"c={layout.get('sizeof')}")
-        if mismatches:
-            cls._cleanup_tmp()
-            raise unittest.SkipTest(
-                "libqihse.so ABI does not match the repo headers "
-                f"({'; '.join(mismatches)}); rebuild the library")
+            details = getattr(exc, "stderr", None) or str(exc)
+            raise RuntimeError(
+                f"canonical-header RESP fixture compilation failed: {details}") from exc
 
         # Spawn the server child (fork+exec via subprocess): the auth
         # bootstrap and the server's process-global library state live in
@@ -1227,10 +1104,11 @@ class TestControllerE2E(unittest.TestCase):
             "import sys\n"
             f"sys.path.insert(0, {str(PY_PKG_DIR)!r})\n"
             "from tests.test_controller_sdk import _run_server_child\n"
-            f"_run_server_child(1, {cls._tmp!r})\n"
+            f"_run_server_child(1, {cls._tmp!r}, {fixture_path!r})\n"
         )
         child_env = dict(os.environ)
         child_env["QIHSE_DATA_DIR"] = cls._tmp
+        child_env["QIHSE_LIB_PATH"] = str(REPO_ROOT / "libqihse.so")
         cls._child = subprocess.Popen(
             [sys.executable, "-c", child_code],
             env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1257,11 +1135,11 @@ class TestControllerE2E(unittest.TestCase):
         if line.startswith("ERROR"):
             cls._reap_child()
             cls._cleanup_tmp()
-            raise unittest.SkipTest(f"e2e server child failed: {line[6:]}")
+            raise RuntimeError(f"e2e server child failed: {line[6:]}")
         if not line.startswith("PORT"):
             stderr_tail = cls._reap_child()
             cls._cleanup_tmp()
-            raise unittest.SkipTest(
+            raise RuntimeError(
                 f"e2e server child did not report a port ({line!r}); "
                 f"stderr tail: {stderr_tail!r}")
         cls.server_port = int(line.split()[1])
@@ -1279,12 +1157,12 @@ class TestControllerE2E(unittest.TestCase):
         else:
             cls._reap_child()
             cls._cleanup_tmp()
-            raise unittest.SkipTest("RESP server did not start listening")
+            raise RuntimeError("RESP server did not start listening")
 
     @classmethod
     def _reap_child(cls):
         """Terminate the server child; return a tail of its stderr (if
-        any) for skip diagnostics."""
+        any) for startup diagnostics."""
         child = getattr(cls, "_child", None)
         if child is None:
             return ""
@@ -1304,6 +1182,9 @@ class TestControllerE2E(unittest.TestCase):
                     errors="replace")[-500:]
             except (OSError, ValueError):
                 pass
+        for stream in (child.stdout, child.stderr):
+            if stream is not None:
+                stream.close()
         cls._child = None
         return stderr_tail
 

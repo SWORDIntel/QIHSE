@@ -286,6 +286,9 @@ separate evidence. Proposed small optimizations and more unusual feature maps
 are in [Core feature experiments](../../plans/qihse_core_experiments.md).
 The single [migration note](../../API_REFERENCE.md#migration-note) records
 compatibility changes, feature regeneration and the rebuild command.
+The [validation follow-up](../../plans/qihse_core_validation.md) records later
+shared-library integration and the full-suite outcome separately from the
+original synthetic benchmark.
 
 ## VectorDB boundary
 
@@ -293,8 +296,9 @@ The modern VectorDB dispatcher is separate from the original scalar lookup.
 Its INT8 and binary selectors exact-score every admitted candidate, retaining
 the requested top-k by the exact metric. Approximate candidate omission is
 still possible; complete reranking is not exhaustive search over omitted rows.
-The binary selector requires an explicit user, restricts clearance/SCI before
-candidate admission, and rechecks before payload materialization.
+Both selectors restrict clearance/SCI before candidate admission and recheck
+during exact reranking, so an excluded row cannot displace an authorized row
+from a bounded pool. The direct binary candidate entry requires an explicit user.
 
 For database authorization, federation, transport, installed SDK contracts and
 other public runtime surfaces, use [the main API reference](../../API_REFERENCE.md)
