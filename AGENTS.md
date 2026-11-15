@@ -38,6 +38,13 @@ Changes that violate any invariant above are merge blockers. Performance, compat
 
 Always run the complete suite with the maximum parallelism supported by the Makefile: `make test TEST_JOBS=32`. The suite runner builds shared artifacts first, runs only its audited process-isolated targets concurrently, and keeps unapproved targets serial. Do not substitute `make -j32 test`, `make test-serial`, or a parallel-only diagnostic lane for the complete suite. Focused tests may run during development but do not replace this final check; report any failures rather than omitting targets.
 
+## API definitions and upgrade notes
+
+- Keep public structs, enums and prototypes in one canonical header; internal headers should include it instead of maintaining another copy.
+- Update API documentation and affected bindings in the same change as the implementation. Name the replacement when an old entry point is retired.
+- Put upgrade instructions in one short migration note: compatibility impact, required rebuild or reindex, and the exact command to run. Say explicitly when stored data needs no migration.
+- Prefer a small compatibility adapter and a repeatable migration over a second implementation. Keep ordinary upgrades incremental so local work can be rebased or cherry-picked without a coordinated rewrite.
+
 <!-- START: RELATIVE_PATHS_RULE -->
 ## Path Resolution Policy (this QIHSE repository only)
 > **CRITICAL RULE**: This policy applies ONLY to code, configuration, scripts, and

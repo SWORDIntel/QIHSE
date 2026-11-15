@@ -103,8 +103,8 @@ static int test_amplification_functionality(void) {
 
     /* Create test superposition */
     qihse_superposition_t superposition;
-    double real_data[4] = {1.0, 0.5, 0.3, 0.2};
-    double imag_data[4] = {0.0, 0.5, 0.7, 0.8};
+    double real_data[4] = {0.5, 0.5, 0.5, 0.5};
+    double imag_data[4] = {0.0, 0.0, 0.0, 0.0};
 
     int ret = qihse_create_superposition_from_amplitudes(real_data, imag_data, 4, &superposition);
     TEST_ASSERT_EQ(ret, 0, "Superposition creation failed");
@@ -114,9 +114,12 @@ static int test_amplification_functionality(void) {
     qihse_amplification_config_init(&config, 4);
 
     /* Test amplification */
-    size_t target_indices[2] = {0, 1}; /* Target first two states */
-    int rounds = qihse_amplify(&superposition, target_indices, 2, &config);
-    TEST_ASSERT(rounds > 0, "Amplification failed");
+    size_t target_indices[1] = {0};
+    int rounds = qihse_amplify(&superposition, target_indices, 1, &config);
+    TEST_ASSERT_EQ(rounds, 1, "Four uniform states need one round for one target");
+    double probabilities[4];
+    qihse_superposition_get_probabilities(&superposition, probabilities);
+    TEST_ASSERT_NEAR(probabilities[0], 1.0, 1e-12, "Amplification did not select the marked state");
 
     qihse_destroy_superposition(&superposition);
     printf("Amplification functionality test passed\n");
@@ -170,9 +173,20 @@ static int test_verification_functionality(void) {
     qihse_verification_result_t result;
     qihse_verification_result_init(&result);
 
-    int ret = qihse_verify_result_advanced(NULL, NULL, NULL, &config, &result);
-    TEST_ASSERT_EQ(ret, -1, "Verification with NULL result should fail");
+    int ret = qihse_verify_result_advanced_sized(NULL, NULL, NULL, 0, &config, &result);
+    TEST_ASSERT_EQ(ret, -1, "Sized verification with NULL input should fail");
+    qihse_verification_result_destroy(&result);
 
+    const float actual[2] = {1.0f, 2.0f};
+    const float different[2] = {1.0f, 3.0f};
+    qihse_verification_config_init(&config, QIHSE_VERIFY_EXACT);
+    ret = qihse_verify_result_advanced_sized(NULL, actual, actual, 2, &config, &result);
+    TEST_ASSERT_EQ(ret, 0, "Identical bounded vectors should verify");
+    TEST_ASSERT(result.is_valid, "Identical vectors must be marked valid");
+    qihse_verification_result_destroy(&result);
+    ret = qihse_verify_result_advanced_sized(NULL, actual, different, 2, &config, &result);
+    TEST_ASSERT_EQ(ret, -1, "Unequal vectors must fail exact verification");
+    TEST_ASSERT(!result.is_valid, "Unequal vectors must not be marked valid");
     qihse_verification_result_destroy(&result);
     printf("Verification functionality test passed\n");
     return 1;

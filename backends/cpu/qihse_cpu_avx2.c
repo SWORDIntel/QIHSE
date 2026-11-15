@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
+#include <float.h>
 #include <malloc.h>  /* For posix_memalign */
 
 #ifndef M_PI
@@ -92,14 +93,24 @@ qihse_rff_kernel_avx2_t* qihse_rff_avx2_create(
     double gamma,
     uint64_t seed
 ) {
-    if (input_dims == 0 || output_dims == 0 || gamma <= 0.0) {
+    if (input_dims == 0 || output_dims == 0 || !isfinite(gamma) || gamma <= 0.0) {
         errno = EINVAL;
+        return NULL;
+    }
+
+    if (output_dims > SIZE_MAX - 7) {
+        errno = EOVERFLOW;
         return NULL;
     }
 
     /* Ensure output_dims is multiple of 8 for AVX2 efficiency */
     if (output_dims % 8 != 0) {
         output_dims = ((output_dims + 7) / 8) * 8; /* Round up to multiple of 8 */
+    }
+    if (output_dims > SIZE_MAX / sizeof(float) ||
+        input_dims > SIZE_MAX / sizeof(float) / output_dims) {
+        errno = EOVERFLOW;
+        return NULL;
     }
 
     qihse_rff_kernel_avx2_t* kernel = calloc(1, sizeof(qihse_rff_kernel_avx2_t));
@@ -135,31 +146,28 @@ qihse_rff_kernel_avx2_t* qihse_rff_avx2_create(
         return NULL;
     }
 
-    /* Initialize random parameters */
-    uint64_t current_seed = seed;
-    float sigma = sqrtf(2.0f * (float)gamma);
-
-    /* Generate Gaussian random frequencies using Box-Muller transform */
+    /* Reuse the canonical basis generator.  Equal dimensions, bandwidth and
+     * seed must describe the same transform across CPU backends; only storage
+     * precision differs. */
+    qihse_rff_kernel_t* reference = qihse_rff_create(input_dims, output_dims, gamma, seed);
+    if (!reference) {
+        qihse_rff_avx2_destroy(kernel);
+        return NULL;
+    }
     for (size_t i = 0; i < output_dims * input_dims; i++) {
-        /* Generate two uniform random variables */
-        current_seed = (current_seed * 1103515245ULL + 12345) & 0x7fffffffULL;
-        float u1 = (float)current_seed / 2147483647.0f;
-
-        current_seed = (current_seed * 1103515245ULL + 12345) & 0x7fffffffULL;
-        float u2 = (float)current_seed / 2147483647.0f;
-
-        /* Box-Muller transform for Gaussian distribution */
-        float z0 = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
-
-        kernel->omega_real[i] = z0 * sigma;
-        kernel->omega_imag[i] = 0.0f; /* Use real-valued kernels */
+        double frequency = reference->omega[i];
+        if (!isfinite(frequency) || fabs(frequency) > FLT_MAX) {
+            qihse_rff_destroy(reference);
+            qihse_rff_avx2_destroy(kernel);
+            errno = ERANGE;
+            return NULL;
+        }
+        kernel->omega_real[i] = (float)frequency;
+        kernel->omega_imag[i] = 0.0f;
     }
-
-    /* Generate uniform random biases */
-    for (size_t i = 0; i < output_dims; i++) {
-        current_seed = (current_seed * 1103515245 + 12345) & 0x7fffffff;
-        kernel->bias[i] = 2.0f * (float)M_PI * ((float)current_seed / 0x7fffffff);
-    }
+    for (size_t i = 0; i < output_dims; i++)
+        kernel->bias[i] = (float)reference->bias[i];
+    qihse_rff_destroy(reference);
 
     /* Set blocking parameters */
     kernel->block_size = qihse_avx2_optimal_block_size(64, 256 * 1024);
@@ -183,74 +191,40 @@ void qihse_rff_avx2_project(
     const float* input,
     float* output
 ) {
-    if (!kernel || !input || !output) return;
+    if (!kernel || !input || !output || !kernel->omega_real || !kernel->bias ||
+        kernel->input_dims == 0 || kernel->output_dims == 0 ||
+        kernel->output_dims > SIZE_MAX / sizeof(float) ||
+        kernel->input_dims > SIZE_MAX / sizeof(float) / kernel->output_dims) return;
 
     const float scale = sqrtf(2.0f / (float)kernel->output_dims);
-
 #ifdef __AVX2__
-    /* QIHSE-NOT_STISLA Integration: AVX2 implementation with chunked processing */
-    /* QIHSE-NOT_STISLA Integration: Process output dimensions in SIMD-optimized chunks */
-    /* Use chunked processing for better register utilization and cache efficiency */
-    const size_t chunk_size = QIHSE_AVX2_CHUNK_SIZE; /* 4 elements per chunk for optimal SIMD */
-    __m256 scale_vec = _mm256_set1_ps(scale);
-
-    /* Process in chunks that align with SIMD register boundaries */
-    for (size_t d = 0; d < kernel->output_dims; d += chunk_size * 2) { /* Process 8 elements per iteration (2 chunks) */
-        /* Load bias for 8 output dimensions */
-        __m256 bias_vec = _mm256_loadu_ps(&kernel->bias[d]);
-
-        /* Initialize dot product accumulator */
-        __m256 dot_vec = _mm256_setzero_ps();
-
-        /* Compute ω·x for each of the 8 output dimensions */
+    for (size_t d = 0; d < kernel->output_dims; d += 8) {
+        const size_t lanes = kernel->output_dims - d < 8 ?
+                             kernel->output_dims - d : 8;
+        __m256 dot = _mm256_setzero_ps();
         for (size_t i = 0; i < kernel->input_dims; i++) {
-            __m256 input_vec = _mm256_set1_ps(input[i]);
-
-            /* Load 8 omega values for this input dimension */
-            __m256 omega_vec = _mm256_loadu_ps(&kernel->omega_real[d * kernel->input_dims + i]);
-
-            /* Accumulate dot product: dot += omega * input */
-            dot_vec = _mm256_fmadd_ps(omega_vec, input_vec, dot_vec);
+            /* omega is row-major [output_dims][input_dims].  Adjacent
+             * output rows are input_dims apart, not adjacent floats. */
+            float frequencies[8] __attribute__((aligned(32))) = {0};
+            for (size_t lane = 0; lane < lanes; lane++)
+                frequencies[lane] = kernel->omega_real[(d + lane) * kernel->input_dims + i];
+            dot = _mm256_fmadd_ps(_mm256_loadu_ps(frequencies),
+                      _mm256_set1_ps(input[i]), dot);
         }
-
-        /* Add bias: dot += bias */
-        dot_vec = _mm256_add_ps(dot_vec, bias_vec);
-
-        /* Compute cos(dot) using full SIMD polynomial approximation */
-        /* Taylor series: cos(x) ≈ 1 - x²/2! + x⁴/4! - x⁶/6! + x⁸/8! */
-        __m256 x = dot_vec;
-        __m256 x2 = _mm256_mul_ps(x, x);           /* x² */
-        __m256 x4 = _mm256_mul_ps(x2, x2);         /* x⁴ */
-        __m256 x6 = _mm256_mul_ps(x4, x2);         /* x⁶ */
-        __m256 x8 = _mm256_mul_ps(x4, x4);         /* x⁸ */
-
-        /* Compute polynomial terms using SIMD operations */
-        __m256 term1 = _mm256_set1_ps(1.0f);                           /* 1 */
-        __m256 term2 = _mm256_mul_ps(x2, _mm256_set1_ps(-0.5f));       /* -x²/2 */
-        __m256 term3 = _mm256_mul_ps(x4, _mm256_set1_ps(1.0f/24.0f));  /* +x⁴/24 */
-        __m256 term4 = _mm256_mul_ps(x6, _mm256_set1_ps(-1.0f/720.0f));/* -x⁶/720 */
-        __m256 term5 = _mm256_mul_ps(x8, _mm256_set1_ps(1.0f/40320.0f));/* +x⁸/40320 */
-
-        /* Sum all terms using SIMD addition */
-        __m256 cos_vec = _mm256_add_ps(term1, term2);
-        cos_vec = _mm256_add_ps(cos_vec, term3);
-        cos_vec = _mm256_add_ps(cos_vec, term4);
-        cos_vec = _mm256_add_ps(cos_vec, term5);
-
-        /* Apply scale: result = scale * cos(dot + bias) */
-        cos_vec = _mm256_mul_ps(cos_vec, scale_vec);
-
-        /* Store result */
-        _mm256_storeu_ps(&output[d], cos_vec);
+        float phases[8] __attribute__((aligned(32)));
+        _mm256_storeu_ps(phases, dot);
+        /* libm supplies range reduction, including large phases.  A raw
+         * Taylor polynomial here is not a cosine and can exceed the feature
+         * bound sqrt(2/D).  A vector cosine may replace this after validation. */
+        for (size_t lane = 0; lane < lanes; lane++)
+            output[d + lane] = scale * cosf(phases[lane] + kernel->bias[d + lane]);
     }
 #else
-    /* Fallback to scalar implementation if AVX2 not available at compile time */
     for (size_t d = 0; d < kernel->output_dims; d++) {
-        float dot_product = kernel->bias[d];
-        for (size_t i = 0; i < kernel->input_dims; i++) {
+        float dot_product = 0.0f;
+        for (size_t i = 0; i < kernel->input_dims; i++)
             dot_product += kernel->omega_real[d * kernel->input_dims + i] * input[i];
-        }
-        output[d] = scale * cosf(dot_product);
+        output[d] = scale * cosf(dot_product + kernel->bias[d]);
     }
 #endif
 }
@@ -335,26 +309,13 @@ int qihse_superposition_avx2_create(
                 rff_vec = _mm256_loadu_ps(temp);
             }
 
-            /* Create phase encoding */
+            /* Build lanes directly: blend immediates must be compile-time
+             * constants, so a runtime 1 << i mask is not a portable intrinsic. */
             float phase_offset = 2.0f * (float)M_PI * (float)state / (float)n;
-            __m256 phase_vec = _mm256_set1_ps(phase_offset);
-
-            /* Create dimension-based phase variation */
-            __m256 dim_phases[8];
-            for (size_t i = 0; i < 8; i++) {
-                float dim_phase = 2.0f * (float)M_PI * (float)(dim + i) / (float)rff_dims;
-                dim_phases[i] = _mm256_set1_ps(dim_phase);
-            }
-
-            /* Combine phases */
-            __m256 total_phase = _mm256_add_ps(phase_vec, dim_phases[0]);
-            for (size_t i = 1; i < 8; i++) {
-                total_phase = _mm256_blend_ps(total_phase, _mm256_add_ps(phase_vec, dim_phases[i]), 1 << i);
-            }
-
-            /* Compute cos and sin */
             float phase_vals[8];
-            _mm256_storeu_ps(phase_vals, total_phase);
+            for (size_t i = 0; i < 8; i++)
+                phase_vals[i] = phase_offset + 2.0f * (float)M_PI *
+                                (float)(dim + i) / (float)rff_dims;
 
             __m256 cos_vec = _mm256_setr_ps(
                 cosf(phase_vals[0]), cosf(phase_vals[1]), cosf(phase_vals[2]), cosf(phase_vals[3]),

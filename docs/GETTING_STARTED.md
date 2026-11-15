@@ -17,6 +17,14 @@ For the project overview, start with the [root README](../README.md). For subsys
 
 QIHSE is a native C/C++ project targeting Linux. The build also integrates Python, OpenSSL, liburing, LuaJIT, eBPF/XDP, SQLite, nlohmann-json, and post-quantum cryptography components.
 
+The complete `make test TEST_JOBS=32` workflow builds the Redis adapter and
+CodeGraph as well as the shared library. Their development dependencies include
+ONNX Runtime (`onnxruntime/onnxruntime_c_api.h` and `libonnxruntime`), JSON-C and
+libzstd. Tree-sitter's required Unicode headers are already vendored; its build
+does not require a system ICU installation.
+The Rust SDK TLS tests also require `rustc` and `cargo` on `PATH` when running
+the complete suite.
+
 SQL English full-text analysis additionally needs the **runtime** library
 `libstemmer.so.0d` (Debian/Ubuntu package `libstemmer0d`) in the loader path of
 every process using it, including chroot/container runtimes. It is loaded with
@@ -55,6 +63,48 @@ Equivalent Makefile workflow:
 make           # runs the mandatory ISA check, then builds
 make check-isa # report the resolved ISA matrix only
 ```
+
+### Dependency discovery and local prefixes
+
+LuaJIT headers and linker flags come from the `luajit` pkg-config module.
+`PKG_CONFIG` selects the executable for this discovery; `LUAJIT_CFLAGS` and
+`LUAJIT_LIBS` can override its results, including for a prepared dependency
+prefix outside the system directories. The build uses `-lluajit-5.1` as the
+linker fallback when that module is unavailable; provide `LUAJIT_CFLAGS`
+explicitly if the headers also need a nonstandard include directory. The
+`lib-ctypes` target is a compatibility alias for `lib`: both build the same
+canonical `libqihse.so`, including its existing CPython exports. They use these
+settings and the existing `PYTHON_INCLUDES` / `PYTHON_LDFLAGS` overrides.
+
+For example, after installing dependencies into a prefix containing
+`include/`, `lib/` and `lib/pkgconfig/`, export the paths before building:
+
+```bash
+qihse_dep_prefix="$(pwd)/build/deps"
+qihse_dep_lib="$qihse_dep_prefix/lib"
+export PKG_CONFIG_PATH="$qihse_dep_lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export CPATH="$qihse_dep_prefix/include${CPATH:+:$CPATH}"
+export LIBRARY_PATH="$qihse_dep_lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$qihse_dep_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_RUN_PATH="$qihse_dep_lib${LD_RUN_PATH:+:$LD_RUN_PATH}"
+make test TEST_JOBS=32
+```
+
+For an extracted Debian package tree, select its `usr/` prefix and
+`lib/$(gcc -print-multiarch)` library directory instead. Its pkg-config files
+must describe that prefix, or be relocated with `PKG_CONFIG_SYSROOT_DIR`.
+Include every nonstandard dependency library directory in the runtime paths.
+`LD_RUN_PATH` supplies a run path when the linker command has no explicit
+`-rpath`; this lets the newly linked shared library find its dependencies even
+in test recipes that set `LD_LIBRARY_PATH=.`. It does not change an existing
+binary, so relink after changing these paths.
+
+Use these exported dependency variables rather than replacing the complete
+`CFLAGS` or `LDFLAGS` values. The suite starts nested make processes and removes
+their inherited make jobserver flags; ordinary Makefile assignments are then
+reapplied, while the documented `?=` overrides and exported search paths remain
+available. `QIHSE_DEPS_PREFIX` separately selects where the vendored liboqs and
+OpenSSL provider are installed.
 
 **Build on each machine natively.** Every per-ISA SIMD kernel (AVX2,
 AVX-512, AVX-VNNI, AMX, F16C) is compile-time gated behind the resolved
@@ -99,14 +149,26 @@ for the entire codebase.
 
 ## 3. Run tests
 
+The full suite includes PostgreSQL client interoperability and browser/WebAuthn
+fixtures. Install their Python dependencies into a virtual environment from the
+repository root, keeping any native dependency-prefix variables from §2 exported:
+
 ```bash
-./qihse test
+python3 -m venv build/test-venv
+. build/test-venv/bin/activate
+python -m pip install -r python/requirements-test.txt
+make test TEST_JOBS=32
 ```
 
-or:
+[The test requirements](../python/requirements-test.txt) include the existing
+`python/requirements.txt` plus `psycopg2-binary`, `psycopg[binary]`, `asyncpg` and
+`fido2`. They complement the native build dependencies above. Keep the virtual
+environment active so the suite's `python3` subprocesses use those packages.
+
+The launcher also runs the tests from that environment:
 
 ```bash
-make test TEST_JOBS=32
+./qihse test
 ```
 
 Security-sensitive protocol code has additional regression, sanitizer, concurrency, TLS, ACL, and fuzz coverage. See [Security](security/README.md) and the [August 2026 UWP audit](security/UWP_AUDIT_2026-08.md).

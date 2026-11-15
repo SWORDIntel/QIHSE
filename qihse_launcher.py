@@ -68,8 +68,8 @@ def cmd_build(args: list[str]) -> int:
 
 
 def cmd_build_ctypes(args: list[str]) -> int:
-    """Build ctypes-only variant (no Python C extension linking)."""
-    print("[qihse] Building libqihse.so (ctypes-only) ...")
+    """Build the shared library for ctypes (the same artifact as build)."""
+    print("[qihse] Building libqihse.so for ctypes ...")
     return _run_make("lib-ctypes")
 
 
@@ -392,7 +392,7 @@ def _help() -> None:
         "  browse         Launch QIHSE Operator Browser (web dashboard)\n"
         "  fans           Cluster thermal telemetry & fan engine (or: thermal)\n"
         "  build          Build libqihse.so (auto-detect SIMD)\n"
-        "  build-ctypes   Build ctypes-only variant (no Python extension)\n"
+        "  build-ctypes   Build shared libqihse.so for ctypes\n"
         "  build-native   Build via build-native.sh (full SIMD auto-detect)\n"
         "  build-tui      Interactive build configuration TUI\n"
         "  test           Run full test suite\n"

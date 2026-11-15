@@ -4,10 +4,14 @@
 CC=gcc
 CXX=g++
 
+PKG_CONFIG ?= pkg-config
+LUAJIT_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags luajit 2>/dev/null)
+LUAJIT_LIBS ?= $(shell $(PKG_CONFIG) --libs luajit 2>/dev/null || printf '%s' '-lluajit-5.1')
+
 PYTHON_INCLUDES ?= $(shell python3-config --includes 2>/dev/null || pkg-config --cflags python3 2>/dev/null || echo "-I/usr/include/python3.13")
 PYTHON_LDFLAGS  ?= $(shell python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || pkg-config --libs python3 2>/dev/null || echo "-lpython3.13")
 
-INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
+INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include $(LUAJIT_CFLAGS) -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
 QIHSE_ARCH_FLAGS ?=
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS) $(PYTHON_INCLUDES)
 CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS)
@@ -151,8 +155,8 @@ ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) $(LUAJIT_LIBS) -lssl -lcrypto -lbpf -lxdp -lsqlite3
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) $(LUAJIT_LIBS) -lssl -lcrypto -lbpf -lxdp -lsqlite3
 ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
 LDFLAGS += -lonnxruntime
 AIMEM_ONNX_EXEC_SOURCE :=
@@ -202,7 +206,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
      codecs/qihse_trinary_tryte_codec.c \
      quantization/src/qihse_quantization.c quantization/src/qihse_pq.c \
      core/qihse_helpers.c core/qihse_plugin.c \
-     algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c \
+     algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c algorithms/qihse_superposition.c \
      backends/cpu/qihse_cpu_detect.c \
      backends/cpu/qihse_cpu_distance.c \
      backends/npu/qihse_npu_openvino.c \
@@ -356,9 +360,9 @@ CFLAGS += -mamx-tile -mamx-int8 -mamx-bf16 -DQIHSE_ENABLE_AMX=1
 SRCS += backends/cpu/qihse_cpu_amx.c
 endif
 
-# Note: core/qihse_plugin.c and algorithms/qihse_superposition.c etc are EXCLUDED 
-# because their functionality is already partially in qihse_math.c / qihse_search.c 
-# or provided by qihse_exports.c stubs.
+# RFF creation/projection is owned by src/bombe/qihse_math.c. State operations
+# are owned by algorithms/qihse_superposition.c. Do not link duplicate owners
+# or replace mathematical operations with successful no-op exports.
 
 .PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install install-host dev-setup docs redis-server redis-cluster-node cluster-daemon backup-cli test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli stress-session-delivery bench-cluster-crc test-object-acl test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec test-hnsw-anchor-seeding test-column-tsdb-anchor test-neural-fts-fusion test-af-xdp-keystone-ingest test-dist-planner-hardware bench-keystone-integrated test-uwp-regression test-uwp-metrics fuzz-uwp test-replica-security test-replica-qkp test-replica-crash test-w10-aimem
 .NOTPARALLEL: validate-reference-workflow
@@ -901,6 +905,9 @@ COBJS = $(CSRCS:.c=.o)
 CXXOBJS = $(CXXSRCS:.cpp=.o)
 OBJS = $(COBJS) $(CXXOBJS)
 
+# Tree-sitter ships the Unicode headers its amalgamated source includes.
+vendor/tree-sitter/lib/src/lib.o: CFLAGS += -I./vendor/tree-sitter/lib/src
+
 # Header dependency tracking. Without this a change to a struct in a header
 # leaves every .o that included it compiled against the OLD layout while the
 # rest of the tree is rebuilt against the new one, and the link succeeds: the
@@ -936,11 +943,8 @@ $(LIB_TARGET): $(OBJS)
 	$(CXX) -shared -fPIC -o $(LIB_TARGET) $(OBJS) $(filter-out -lqihse,$(LDFLAGS)) -lsqlite3
 	@echo "$(LIB_TARGET) build successful"
 
-lib-ctypes: $(filter-out sdks/python/qihse.o,$(OBJS))
-	@echo "Building libqihse.so..."
-	$(CXX) -shared -fPIC -o libqihse.so $(subst .c,.o,$(subst .cpp,.o,$(SRCS))) \
-	    -L. -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 $$(pkg-config --libs sqlite3)
-	@echo "libqihse.so build successful"
+# ctypes uses the canonical library, including the native Python entry points.
+lib-ctypes: lib
 
 persistence: test-persist
 persistence-check: test-persist
@@ -979,6 +983,34 @@ test-vector-tenant-isolation: lib
 
 test-serial: test-vector-tenant-isolation
 
+.PHONY: test-core-search-regressions test-core-math-regressions test-runtime-math-regressions test-vector-candidate-rerank
+test-core-search-regressions:
+	bash scripts/run-core-search-regressions.sh
+
+test-core-math-regressions:
+	sh scripts/test_core_math_regressions.sh
+
+test-runtime-math-regressions:
+	bash scripts/run-runtime-math-regressions.sh
+
+test-vector-candidate-rerank: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_vector_candidate_rerank tests/test_vector_candidate_rerank.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_candidate_rerank
+
+test-serial: test-core-search-regressions test-core-math-regressions test-runtime-math-regressions test-vector-candidate-rerank
+
+.PHONY: test-core-methodologies test-rff-maps bench-core-methods
+test-core-methodologies:
+	bash scripts/run-core-methodology-regressions.sh
+
+test-rff-maps:
+	bash scripts/run-rff-map-regressions.sh
+
+bench-core-methods:
+	bash scripts/run-core-methods-bench.sh $(BENCH_ARGS)
+
+test-serial: test-core-methodologies test-rff-maps
+
 .PHONY: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
 test-container-lifecycle: lib
@@ -995,7 +1027,7 @@ test-http-lifecycle:
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_maintenance.c -Wl,--gc-sections -L. -lqihse -pthread -lcrypto
-	./build/test_cluster_bus_bind
+	LD_LIBRARY_PATH=".$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" ./build/test_cluster_bus_bind
 
 test-serial: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
@@ -2021,7 +2053,7 @@ test-document-store-user: lib
 
 test-cluster-maintenance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance tests/test_cluster_maintenance.c src/spinnaker/qihse_cluster_maintenance.c -pthread $(LDFLAGS)
-	./tests/test_cluster_maintenance
+	LD_LIBRARY_PATH=".$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" ./tests/test_cluster_maintenance
 
 test-cluster-maintenance-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance_resp tests/test_cluster_maintenance_resp.c -L. -lqihse $(LDFLAGS)
@@ -2601,10 +2633,10 @@ pristine: clean workspace-clean
 
 # Public C API roots and their local-header closure, not source/data internals.
 PREFIX ?= /usr/local
-PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_limit.h \
+PUBLIC_API_HEADERS := qihse.h qihse_math_types.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_limit.h \
     qihse_hetero.h qihse_math.h qihse_instr.h qihse_search.h \
     qihse_vector_db.h qihse_uwp.h qihse_uwp_tls.h qihse_uwp_metrics.h \
-    qihse_kv_store.h qihse_backup.h qihse_operations.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
+    qihse_kv_store.h qihse_backup.h qihse_shared_backup.h qihse_operations.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
     qihse_timeseries.h qihse_event_stream.h qihse_repl.h qihse_pooler.h \
     qihse_txn.h qihse_platform.h qihse_schema.h qihse_table_store.h \
     qihse_sql_parser.h qihse_sql_extensions.h qihse_sql_fts.h \

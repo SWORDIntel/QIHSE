@@ -5,19 +5,14 @@
 >   SIMD ISA and `make all` runs the mandatory host-ISA verification.
 > - Cluster install: `scripts/install_qihse.sh` (provisions keys/config, systemd
 >   units, health checks; this mutates live deployment state).
-> - Rolling binary updates: `scripts/cluster_rolling_restart.sh` is an entry
->   point, not proof of rolling compatibility or current health. It targets the
->   executable and `libqihse.so` mapped by each running unit (including
->   loader-started daemons), checks those paths remotely, and uses only pinned
->   QKP probes. It requires an explicit `QIHSE_CLUSTER_NODES_FILE`,
->   `QIHSE_ADMIN_CLI`, `QIHSE_ADMIN_IDENTITY_DIR`, and `QIHSE_ADMIN_NODE_ID`.
->   The node file has one `name|ssh-target|systemd-unit|build-dir|resp-ip|port|trusted-public-key-basename`
->   record per line; use `local` for the current machine. It refuses to replace
->   artifacts inside versioned or commit-labelled release paths. Activate a
->   fresh release through the actual systemd configuration before using a
->   rolling deployment there. After restart, it checks both mapped paths and
->   their SHA-256 against the build artifacts. Apply the staged upgrade gates
->   below before activation.
+> - Rolling binary updates: follow the version/format-aware
+>   [Operations §1.6](../OPERATIONS.md#16-staged-installation-and-upgrade-gates)
+>   and the installed unit/dependency inventory. The old rolling bringup runbook
+>   is superseded. `scripts/cluster_rolling_restart.sh` is not a validated plan
+>   for all six recovery units: it uses operator-supplied entries/order, refuses
+>   immutable release paths and does not establish CT recovery or mixed-version
+>   compatibility. Versioned package activation needs a separately reviewed
+>   per-unit plan, not an instruction to run that helper.
 > - Replication: `scripts/cluster_replica_deploy.sh` (read-only QKP-pinned
 >   replica units, one namespace each).
 > - Operator access on hardened nodes: `qihse-admin-cli` (pinned QKP admin
@@ -826,6 +821,37 @@ Transfer accepts validated store v3–v5 images only, despite general store
 read compatibility with v1–v5. Current writes use store v5/schema v4; old-format
 read support does **not** imply binary downgrade support or conversion.
 
+For the bounded local CT-disabled KV/SQL/blob/coordinator combination, use
+[shared backup v1](../contracts/shared-backup-v1.md) through authenticated native
+APIs. It rejects pending/poisoned or unsupported sources and is not a distributed
+CT-owner snapshot. Owner-data containers are data-only recovery images, not CT
+journal/cursor resume images; restore them to a fresh CT-disabled destination
+before the existing cluster admission procedure. Inventory streams are not
+restore backups.
+
+Keep the published shared package immutable; verify its authenticated manifest
+and every member, then unpack to a separate private working directory. Native
+SQL restore creates an input lock sidecar, so do not restore directly from the
+canonical package. Copy the coordinator journal to its own working file. Restore
+SQL/blob terminal receipts as well as live data, register the manifest's stable
+engine IDs, seed the next-ID floor with the maximum of the authenticated
+coordinator floor and restored participant requirements, and replay common
+decisions before exposing application state. Historical receipts must not
+resurrect deletions or reset refs/pins. Verification/unpack alone is not native
+restore acceptance. The package authenticates but does not encrypt its members
+and does not separately capture identity/ACL authority, private keys or service
+configuration.
+
+Retain the last accepted pre-upgrade package, original stores, matching runtime,
+required receipt/journal history and failed recovery evidence until authenticated
+fresh-process restore/replay and application checks are independently accepted.
+Keep authority/configuration recovery material separately under existing access
+controls. A visible `PUBLISHED_UNSYNCED` result is uncertain publication: preserve
+it for inspection, never blindly remove or retry it. Rejected attempts are not
+backups. The [W11 contract](../plans/w11_shared_snapshot.md) documents bounded
+local/process-death and tmpfs exhaustion results, not physical-storage or full
+W11 acceptance.
+
 For other engines and service state, use their supported consistent snapshot
 mechanism or quiesce all writers and take an offline, complete generation.
 Inventory configuration, auth provisioning, trust pins/keys, audit/WAL files,
@@ -864,7 +890,13 @@ This is a required validation procedure, not a claim of a successful live restor
 
 ### CNSA 2.0 Alignment (In Progress)
 
-> **Note:** QIHSE targets CNSA 2.0 alignment but has not completed formal compliance certification. Transport encryption (ChaCha20-Poly1305 AEAD) is implemented and opt-in via ctx->tls_ctx; cleartext is the default.
+> **Note:** QIHSE targets CNSA 2.0 alignment, not completed formal certification.
+> Transport policy is listener-specific: the normal GNUmakefile build selects
+> TLS-1.3-by-default UWP, while cluster RESP uses its separately configured QKP
+> policy (required with replication pins). Neither implies TLS on every adapter,
+> persistent authentication or authorization of application data. Confirm the
+> actual build, service arguments and authenticated client path; do not use a
+> legacy cleartext example as public-exposure guidance.
 
 **Key Management:**
 ```bash
@@ -903,6 +935,21 @@ qihse-security --set-rotation-policy --key-id master-key --interval 90d
 ```
 
 ### Network Security
+
+The firewall and HTTP proxy examples below are historical illustrations, not
+a listener inventory or deployment instructions. Do not execute them as a
+cutover procedure. Before public exposure, inspect each actual bind address,
+port, route, firewall/NAT and TLS termination point: UWP, RESP/QKP, SQL/compatibility
+adapters, admin/replication endpoints, cluster bus and metrics have distinct
+security boundaries. No live public exposure was inspected in this documentation
+review. Keep control/replication/bus listeners private and restrict clients to
+the intended ingress. An HTTP reverse proxy does not wrap native RESP/QKP or
+SQL ports; TLS termination does not authenticate a QIHSE principal or enforce
+its tenant/class/SCI authority. Verify certificate/pin validation, required auth
+and low-clearance denial through the real ingress and deny direct backend bypass.
+A synthetic volatile-auth restart is not production persistent-auth acceptance;
+the daemon currently refuses consensus durable-auth mode and standalone durable
+authority with consensus enabled rather than silently substituting volatile auth.
 
 **Firewall Configuration:**
 ```bash

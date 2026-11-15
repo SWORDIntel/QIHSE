@@ -37,6 +37,30 @@ class PublicAPIInstall(unittest.TestCase):
             self.run_command(self.cc + ["-std=c11", "-D_GNU_SOURCE", "-Werror",
                 "-fsyntax-only", f"-I{ROOT / 'include'}", str(source)], cwd=directory)
 
+    def test_staged_core_math_headers(self):
+        """Canonical math types compose in an installed C or C++ consumer."""
+        with tempfile.TemporaryDirectory(prefix="qihse-core-headers-") as directory:
+            work = Path(directory)
+            stage = work / "stage"
+            self.run_command(["make", "--no-print-directory", "install-headers",
+                              f"DESTDIR={stage}", "PREFIX=/sdk"])
+            headers = stage / "sdk/include"
+            names = ("qihse.h", "qihse_math.h", "qihse_search.h", "qihse_math_types.h")
+            for name in names:
+                self.assertTrue((headers / "qihse" / name).is_file(), name)
+            cases = [(name, (name,)) for name in names]
+            cases.extend((("combined", names), ("reverse", tuple(reversed(names)))))
+            for compiler, standard, extension in ((self.cc, "c11", "c"),
+                                                   (self.cxx, "c++11", "cpp")):
+                for label, includes in cases:
+                    with self.subTest(language=standard, headers=label):
+                        source = work / f"consumer.{extension}"
+                        source.write_text("".join(
+                            f"#include <qihse/{name}>\n" for name in includes))
+                        self.run_command(compiler + [f"-std={standard}", "-D_GNU_SOURCE",
+                            "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+                            f"-I{headers}", str(source)], cwd=work)
+
     def test_staged_install_and_dependency_failure(self):
         with tempfile.TemporaryDirectory(prefix="qihse-public-api-") as directory:
             work = Path(directory)
@@ -55,8 +79,9 @@ class PublicAPIInstall(unittest.TestCase):
             self.assertTrue((sdk / "bin/qihse-backup").is_file())
             self.assertTrue((sdk / "bin/qihse-admin-cli").is_file())
             # Do not let omitted API roots silently skip their compile checks.
-            required = {"qihse.h", "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
-                        "qihse_backup.h", "qihse_operations.h",
+            required = {"qihse.h", "qihse_math.h", "qihse_search.h", "qihse_math_types.h",
+                        "qihse_auth_maintenance.h", "qihse_schema.h", "qihse_table_store.h",
+                        "qihse_backup.h", "qihse_shared_backup.h", "qihse_operations.h",
                         "qihse_sql_parser.h", "qihse_sql_extensions.h",
                         "qihse_sql_fts.h", "qihse_sql_row_index.h",
                         "qihse_uwp_sql_txn_schema.h", "qihse_pg_wire.h",
@@ -106,6 +131,28 @@ class PublicAPIInstall(unittest.TestCase):
             dependencies = self.run_command(["ldd", str(consumer)], cwd=work, env=runtime)
             self.assertNotIn("not found", dependencies)
             self.assertIn(str(library / "libqihse.so"), dependencies)
+            # New recovery APIs must ship their headers and resolve from the staged library.
+            recovery_source = work / "shared_backup_consumer.c"
+            recovery_source.write_text(
+                '#include <qihse/qihse_shared_backup.h>\n'
+                'int main(void) {\n'
+                '    bool (*volatile verify)(const char *, qihse_user_t *,\n'
+                '        const uint8_t *, size_t, qihse_shared_backup_info_t *) =\n'
+                '        qihse_shared_backup_verify_user;\n'
+                '    qihse_shared_backup_result_t (*volatile unpack)(const char *, const char *,\n'
+                '        qihse_user_t *, const uint8_t *, size_t, qihse_shared_backup_info_t *) =\n'
+                '        qihse_shared_backup_unpack_user;\n'
+                '    qihse_shared_backup_result_t (*volatile export_package)(const char *,\n'
+                '        const qihse_shared_backup_sources_t *, qihse_user_t *, const uint8_t *,\n'
+                '        size_t, qihse_shared_backup_info_t *) = qihse_shared_backup_export_user;\n'
+                '    return verify && unpack && export_package ? 0 : 1;\n'
+                '}\n')
+            for compiler, standard in ((self.cc, "c11"), (self.cxx, "c++11")):
+                recovery_consumer = work / f"shared_backup_consumer-{standard}"
+                self.run_command(compiler + [f"-std={standard}", "-D_GNU_SOURCE", "-Wall", "-Wextra",
+                    "-Werror", f"-I{headers}", str(recovery_source), f"-L{library}",
+                    f"-Wl,-rpath-link,{ROOT}", "-lqihse", "-o", str(recovery_consumer)], cwd=work)
+                self.run_command([str(recovery_consumer)], cwd=work, env=runtime)
             # Resolve the public multi-peer APIs from the staged SDK, not checkout headers.
             replication_source = work / "replication_consumer.c"
             replication_source.write_text(

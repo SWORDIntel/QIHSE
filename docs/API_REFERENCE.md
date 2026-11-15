@@ -1,7 +1,8 @@
 # QIHSE API Reference
 
 > **Status: implemented** — except the explicitly source-only standalone
-> maintenance subsection (§7.1), every C function in this reference is declared
+> maintenance subsection (§7.1) and the separately labelled core-math addendum
+> (§8.14), every C function in the historical inventory below is declared
 > in a header under `include/` and was checked against the built `libqihse.so`; the Python
 > surface is read from `python/qihse/`. Nothing here is transcribed from a design
 > document. The sections that describe something not built are marked `planned`
@@ -35,8 +36,9 @@ Status vocabulary used across the documentation tree is defined in
 
 ## How this reference was verified
 
-Every function named below was checked against the header that declares it, and
-the header list was checked against the built shared object:
+The historical function inventory was checked against its declaring headers and
+the built shared object. The separately labelled source/test addendum in §8.14
+does not inherit that earlier shared-library verification claim:
 
 ```
 nm -D --defined-only libqihse.so | awk '{print $3}' | sort -u
@@ -71,8 +73,66 @@ above):
 | `include/qihse_federation_rejoin.h` | 6 | 6 |
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 17 | 17 |
-| `include/qihse_kv_store.h` | 148 | 145 (3 `static inline`) |
+| `include/qihse_shared_backup.h` | 3 | 3 |
+| `include/qihse_kv_store.h` | 150 | 147 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
+
+### Native upgrade surfaces — current-source contracts
+
+The shared-backup header declares three native C entry points; all three resolve
+in `libqihse.so` and are included by `install-headers`. Regenerate this inventory
+with `make docs-api-counts` after API changes. These contracts do not change the
+public transaction/participant layouts or imply SDK/protocol parity.
+
+| Header | Native API | Boundary |
+|---|---|---|
+| `include/qihse_txn.h` | `qihse_txn_manager_create_durable`, `qihse_txn_manager_recover`, `qihse_txn_advance_next_id` | Opt-in durable decision coordinator. The default manager remains volatile. Register stable participant engine IDs and establish the allocator floor before recovery/admission. |
+| `include/qihse_txn.h` | `qihse_txn_register_resource_participant`, `qihse_txn_attach_participant_resource`, `qihse_txn_enlist_attached_resource` | Explicit native resource participation; resource preparation is registered separately, preserving `qihse_txn_participant_t` layout. |
+| `include/qihse_uwp_sql_txn_schema.h` | `qihse_uwp_sql_txn_register_durable_participant`, `qihse_uwp_sql_txn_enlist_durable` | Enlist staged durable SQL DML. Registration raises the coordinator beyond SQL receipts. DDL and retry-key resources refuse this bridge. |
+| `include/qihse_table_store.h` | `qihse_table_txn_prepare_group`, `qihse_table_store_prepare_noop`, `qihse_table_store_resolve_prepared`, `qihse_table_store_decision_next_id` | Durable SQL participant state and decision receipts. PREPARE keeps candidate rows private and fences writes. Replay requires the coordinator's irreversible decision. |
+| `include/qihse_blob.h` | `qihse_blob_prepare_expected_user`, `qihse_blob_resolve_prepared`, `qihse_blob_decision_next_id` | Authenticated hash/length-checked durable PREPARE, invisible until COMMIT. Recorded exact decision retries are idempotent; conflicting decisions fail. Absent ABORT is a no-op without a receipt; absent COMMIT fails. |
+| `include/qihse_table_store.h` | `qihse_table_store_backup`, `qihse_table_store_restore`, `qihse_table_store_snapshot_epoch_user` | Bootstrap Operator-only transfer preserves committed v3–v5 image bytes and receipts, without upgrading them. Restore needs closed source/target handles and a fresh destination. Failure can follow publication: inspect/reopen, never blindly overwrite. |
+| `include/qihse_blob.h` | `qihse_blob_snapshot_all_user`, `qihse_blob_snapshot_epoch_user`, `qihse_blob_archive_export_user`, `qihse_blob_archive_restore_user` | Complete authorized live snapshot differs from filtered `list_user`. Recovery uses the authenticated, unencrypted v2 archive with terminal receipts (v1 import supported); unresolved PREPAREs refuse export. Restore never reapplies historical COMMIT effects. |
+| `include/qihse_kv_store.h` | `qihse_kv_snapshot_checkpoint_user` | Same-live-handle CT-disabled durable fence. Compare instance ID, change sequence and projection epoch, not sequence alone. Bootstrap Operator required; not a logical TTL freeze. |
+| `include/qihse_txn.h` | `qihse_txn_backup_checkpoint_user`, `qihse_txn_backup_export_user` | Bootstrap Operator-only idle, healthy, recovered durable coordinator checkpoint/export. Epoch includes unjournaled BEGIN/rollback and allocator changes. Discard all callback bytes on false, even after complete output. |
+| `include/qihse_shared_backup.h` | `qihse_shared_backup_export_user`, `qihse_shared_backup_verify_user`, `qihse_shared_backup_unpack_user` | Local KV/SQL/blob/coordinator package, not live-store restore or a distributed/service image. |
+
+**Pending decisions and journal.** COMMITTING means COMMIT is irreversible but
+participant acknowledgements remain: retry `qihse_txn_commit_prepared`, never
+switch to ABORT. ABORTING retries `qihse_txn_abort_prepared`. A failed callback can
+mean its effect happened but acknowledgement was lost; participants must durably
+deduplicate by transaction ID. The opt-in journal has portable **36-byte** `QT2P`
+v1 records (32 encoded bytes plus CRC32), not dumped C structs or a full
+one-phase/MVCC registry. Manager APIs refuse inherited handles after fork; use
+exec/exit and arrange proper journal-descriptor handoff rather than reusing them.
+
+**Shared capture and restore.** Retain the same live handles and authenticated
+bootstrap Operator (user 0, tenant 0). Capture all starting checkpoints before
+any export and compare all ending checkpoints after all exports. Mutations,
+pending decisions, unhealthy sources or principal-generation changes reject the
+attempt. KV TTL visibility is defined at its native snapshot capture point in
+that interval. SQL/blob engine IDs must match coordinator registrations.
+HMAC-SHA-384 with exactly 48 caller-managed secret key bytes authenticates the
+manifest checkpoints, canonical names, sizes and SHA-384 hashes; it does **not
+encrypt** payloads. Private sibling staging uses no-replace atomic publication.
+Shared results are `ERROR=0`, `OK=1`, `PUBLISHED_UNSYNCED=2`; the latter means a
+visible destination with uncertain parent durability, not permission to delete
+or blindly retry. Blob archive restore has a different enum (`ERROR=-1`, `OK=0`,
+`PUBLISHED_UNSYNCED=1`); neither enum is a generic boolean.
+
+Verify/unpack authenticates package content, not engine recovery or deployment
+readiness. Unpack creates a fresh payload directory. Restore through native
+authenticated APIs in a fresh process, preserve SQL sidecars and blob receipts,
+register manifest engine IDs, and raise the coordinator allocator to **at least
+the captured `next_txn_id` and above every SQL/blob receipt before recovery**.
+Journal length alone loses unused/unjournaled IDs. Complete common-decision
+replay before application exposure. The package does not separately collect
+principal/ACL authority, external private keys or service configuration. It is
+local and CT-disabled, not a CT-resume image, transparent SDK/protocol transaction,
+full W11 acceptance or production restore-readiness claim. See
+[shared backup contract](contracts/shared-backup-v1.md),
+[bounded evidence and open gates](plans/w11_shared_snapshot.md), and
+[native order-recovery fixture](contracts/w11-order-recovery-fixture.md).
 
 ## Conventions
 
@@ -1212,7 +1272,9 @@ post-rename durable write is absent; use the reopen contract above.
 
 The SQL transaction layer supports bounded DDL-only catalog publication and
 separate DML shadow groups, not arbitrary mixed DDL/DML, savepoints or
-cross-model atomicity. The `QSC1` schema serializer writes **v4**, reads
+transparent cross-model atomicity. Explicit native DML enlistment in the durable
+coordinator is the bounded exception described in the native upgrade inventory;
+it does not extend pgwire COMMIT or admit mixed DDL/DML. The `QSC1` schema serializer writes **v4**, reads
 **v1–v4**, and refuses unsupported definitions rather than silently persisting
 an incomplete catalog (`src/tractable/qihse_schema.c`,
 `qihse_schema_serialize` / `qihse_schema_deserialize`).
@@ -1379,6 +1441,28 @@ score, or even count a record the principal cannot see.
 | `bool qihse_aimem_onnx_embedder_install(const char* model_dir)` (`qihse_aimem_onnx_embedder.h`) | Load an ONNX BERT-family model (`model.onnx` + `vocab.txt`) and install it as the active embedder (name `onnx:<dir>`). The standalone server calls this for `--embedder-onnx`; failure is fatal there. | `false` on any error; built-in embedder remains active |
 | `void qihse_ai_memory_hits_free(qihse_ai_memory_hit_t* hits, size_t count)` | Release the `text` of every hit. | n/a |
 | `void qihse_ai_memory_reset(void)` | Drop the process-local search index (tests / shutdown). | n/a |
+
+#### Durable scoped writes and source-aware knowledge
+
+`qihse_ai_memory_store_scoped_idempotent_with_seq()` returns the canonical row's
+stable local sequence, not a durable acknowledgement.
+`qihse_ai_memory_store_scoped_durable()` returns NEW/REPLAY only after the local
+WAL/SSTable/directory sync fence. Its opaque retry-stable receipt binds principal,
+scope, canonical ID and row sequence, **not** a replication/quorum acknowledgement.
+NOT_DURABLE returns no receipt; retry the same key and payload to resolve survival.
+`qihse_ai_memory_forget_scoped_receipt()` supplies an exact-scope owner-authorized
+durable delete receipt; project read grants do not grant delete authority.
+
+`qihse_ai_memory_knowledge_create_ex()` / `..._revise_ex()` accept provenance with
+an optional exact `qihse_ai_memory_source_ref_t`; QH-05 queries filter exact source
+events or external sources. External identity is caller-supplied opaque metadata:
+a trusted provider must authenticate the exact revision/range before citation
+use. It is not proof of fetching a document or HTTPS response. Native knowledge
+mutation alone does not promise a durable ACK: serialize mutation plus
+`qihse_kv_sync_store()` under the server KV lock. Authenticated RESP
+`CREATE-EX-SOURCE` / `REVISE-EX-SOURCE` wrappers supply that fence; `GET-SOURCE`
+provides scoped source retrieval. Source provenance, local fsync receipts,
+semantic-provider readiness and cluster acceptance are distinct guarantees.
 
 The built-in embedder is a **deterministic lexical vector**, not a learned
 model: it hashes tokens into a fixed-width space, so similarity reflects shared
@@ -1733,6 +1817,261 @@ V2 files are not addressable through the legacy topic-name APIs.
 | `bool qihse_event_stream_read_batch(qihse_event_stream_t*, const qihse_user_t*, const qihse_es_scope_t*, uint64_t*, qihse_es_read_record_t*, size_t, size_t, size_t*)` | Read a bounded authorized page at a byte cursor; cursor advances only on success. Every payload digest is verified before disclosure. | `false` for denied scope, invalid cursor/budget, corruption or I/O failure |
 | `void qihse_event_stream_batch_free(qihse_es_read_record_t*, size_t)` | Free payloads returned by the batch reader. | n/a |
 | `bool qihse_event_stream_archive_id(..., const char* scan_version, uint32_t schema_id, uint8_t out_id[48])` / `bool qihse_event_stream_member_id(...)` | Domain-separated stable identities bind archive/member content, exact member name, scan version and schema version. | `false` |
+
+### 8.14 Core search and numerical contracts — source/test addendum (2026-11-15)
+
+**Status: implemented in source; targeted regression checks.** This subsection
+records the core correction, not a new full-library ABI certification. It is
+excluded from the historical `libqihse.so` inventory claim above. The complete
+suite remains `make test TEST_JOBS=32`; report its result separately from focused
+checks and mathematical experiments.
+Subsequent real-library integration and full-suite status are recorded in the
+[validation follow-up](plans/qihse_core_validation.md), without changing the
+historical benchmark measurements.
+
+Headers: `include/qihse.h`, `include/qihse_math.h`,
+`include/qihse_math_types.h`, `include/qihse_search.h`, and
+`algorithms/qihse_verification.h`. Sources: `core/qihse.c`,
+`core/qihse_helpers.c`, `src/bombe/qihse_math.c`, and the corresponding
+`algorithms/` implementations. This correction does not change database schemas
+or durable memory formats.
+
+#### Exact lookup with a numerical candidate hint
+
+`qihse_search(data, n, query, table, config)` returns an index only after comparing
+the original record with the query. The RFF score supplies a candidate; neither
+its magnitude nor a collapse confidence value substitutes for equality.
+`QIHSE_VERIFY_EXACT` or enabled classical fallback scans the remaining records
+when the candidate fails. `NOT_STISLA_NOT_FOUND` represents absence or a rejected
+call; argument/resource errors set `errno` where documented by the source.
+
+For INT64, UINT64 and DOUBLE, the streaming candidate scorer uses the **signed**
+inner product of query and row features. Its scalar numeric cost is O(nD), with
+O(D) kernel/feature scratch, followed by at most O(n) exact verification. It does
+not allocate an n-by-D complex state. Integer-to-double projection collisions do
+not authorize a match: final comparison uses the original integer records.
+Non-numeric records use their fixed-width descriptor and equality directly;
+STRING uses NUL-terminated slots, BINARY/STRUCT use byte equality, and CUSTOM
+requires `compare_fn`. Callers supply the non-numeric record width.
+
+`qihse_batch_search` uses the descriptor's element stride for both records and
+queries. It now shares one basis and streamed row projections across a tile of
+queries, using the phase-cosine method with a default tile size of 16. This is
+bounded CPU reuse within one call, not a persistent feature cache or parallel
+device execution. The streaming core does not dispatch the experimental
+amplification, GPU/NPU or multi-pipeline functions; related configuration fields
+remain for compatibility.
+The anchor-table argument is retained but is not consumed by this path.
+`timeout_ms` and `verification.max_verification_time_us` are not enforced by
+the scalar core; they are not operation deadlines.
+
+`qihse_config_init` initializes numeric record widths, `rff_gamma=1.0`,
+`random_seed=42`, automatic dimensions bounded by 64 and 2048, and exact
+verification with classical fallback. Hardware and parallel acceleration are
+disabled for this core path. `fixed_dimensions=256` applies when automatic
+dimensions are disabled. The dimension choice is a size heuristic, not a measured
+entropy, effective rank, or proof of approximation accuracy.
+
+The scalar compatibility entries `qihse_verify_result` and
+`qihse_verify_search_result` both validate typed equality for INT64, UINT64 and
+DOUBLE. Their signatures lack a record descriptor and cannot verify the
+non-numeric cases supported by `qihse_search`. A caller-provided candidate index
+alone is insufficient. Non-default modes can return a false
+negative when exhaustive fallback is disabled, but cannot return an unchecked
+false match. Use the default exact configuration when lookup completeness matters.
+
+#### Selectable methods and per-call measurements
+
+The additive `qihse_search_ex` and `qihse_batch_search_ex` interfaces separate
+status from lookup results: return 0 includes an ordinary absent result; return
+-1 sets `errno` for an argument/resource failure. Every successful returned
+index still passes original-record equality. Existing search signatures and
+`qihse_config_t` layouts are unchanged.
+
+Initialize `qihse_search_options_t` with
+`qihse_search_options_init(&options, sizeof(options))` and optional
+`qihse_search_metrics_t` with
+`qihse_search_metrics_init(&metrics, sizeof(metrics))`. Both carry a size and
+version; undersized initialization buffers are rejected without writes. Options
+default to phase-cosine RFF and `tile_size=16`; valid explicit tile sizes are
+1–64. A supplied metrics object is reusable across calls. `NULL` options select
+defaults, while `NULL` metrics disables the per-call report.
+
+| `options.method` | Work and feature budget |
+|---|---|
+| `QIHSE_SEARCH_EXACT` | Direct typed equality scan, no projections and no owned heap scratch. Ignores projection settings; metrics report dimensions 0 and tile size 1. |
+| `QIHSE_SEARCH_RFF_COSINE` | D random-phase cosine coordinates followed by original-record verification. |
+| `QIHSE_SEARCH_RFF_PAIRED` | D/2 frequencies produce D interleaved sine/cosine coordinates, followed by the same verification. Requires an even resolved D. |
+
+For finite numeric records, Q finite queries and tile size T, one basis is built
+per call and each row is projected once per active tile. With no projection errors,
+the row count is `n*ceil(Q/T)` rather than `n*Q`; query projections remain Q.
+Dot-product work remains O(nQD), and owned scratch is O(TD), independent of n.
+Tile size 1 supplies the streaming comparison. Larger tiles trade scratch for
+fewer repeated projections; this does not select a different similarity method.
+
+Metrics report actual candidate hits, fallback queries/hits, direct queries,
+unprojected queries, successful query/row projections, projection failures,
+original-record comparisons, kernel builds, active tiles and peak owned scratch.
+Scratch excludes caller buffers, stack and allocator bookkeeping. Setup,
+scoring, verification and total times include instrumentation overhead. These
+per-call counters supersede guesses based on a feature score or global last-call
+statistics. They do not choose an automatic winner.
+
+`benchmarks/qihse_core_methods_bench.c` exercises these public methods on
+synthetic scalar fixtures. Build and run with
+`scripts/run-core-methods-bench.sh`; `--help` lists method, tile, dimensions,
+dataset, size, repeat, seed, gamma and JSONL/CSV selectors. Each comparison
+includes the exact baseline and validates against an independent typed oracle.
+The benchmark times complete batches, including basis construction. Its
+per-query timing is amortized batch time, not individual-request tail latency.
+
+The legacy `qihse_adaptive_amplify` entry returns `-ENOTSUP`, and the void
+`qihse_apply_oracle` entry sets `errno=ENOTSUP` without mutating the state: their
+signatures do not supply a valid query-to-state marking rule. State experiments
+must use `qihse_amplify` with explicit target indices.
+The separately named `qihse_amplify_internal` and
+`qihse_amplify_fixed_point` return `-1` with `errno=ENOTSUP`; the latter does not
+substitute ordinary Grover rotations for a fixed-point method. Historical
+untyped export stubs for superposition creation/destruction/operators and
+configuration initialization also report `-1`/`ENOTSUP` instead of false success.
+
+#### RFF basis, randomness and floating-point helpers
+
+`qihse_rff_create(input_dims, output_dims, gamma, seed)` requires positive
+dimensions and finite positive gamma. It draws frequencies with variance
+`2*gamma`, so `sqrt(2/D)*cos(omega*x+b)` approximates
+`exp(-gamma*||x-y||^2)`. Invalid parameters return `NULL`/`EINVAL`; checked
+allocation arithmetic rejects overflow with `EOVERFLOW`.
+
+Seeds, including zero, select deterministic kernel-local SplitMix64 streams;
+kernel creation neither calls `srand` nor consumes global `rand` state. Exact
+bit reproduction is limited to the same implementation/math platform. Persisted
+or cached features must use the same actual basis as queries and must be rebuilt
+when that basis changes; a seed is not a cross-version file-format guarantee.
+
+The new opaque `qihse_rff_map_t` owns an explicit feature method.
+`qihse_rff_map_create(..., QIHSE_RFF_PAIRED_SINCOS)` constructs
+`[cos(w0.x), sin(w0.x), ...] / sqrt(D/2)` using D/2 frequencies and no phase
+offsets. `QIHSE_RFF_COSINE_PHASE` preserves the original cosine map. Projection
+through `qihse_rff_map_project` returns 0 or -1/`errno`; nonfinite inputs or
+overflowed projections fail, and failed output must not be consumed.
+
+`qihse_rff_map_get_descriptor` exposes basis version, method, input/output
+dimensions, gamma and seed. Every field belongs in cached-feature identity;
+serialize fields explicitly rather than raw struct padding. Sine/cosine and
+phase-cosine vectors are not interchangeable even at the same dimension and
+seed. Legacy `qihse_rff_kernel_t` and `qihse_rff_create` retain their layouts and
+phase-cosine semantics. Map reproduction remains limited to compatible builds
+and math libraries.
+
+AVX2 kernel creation retains eight-coordinate output rounding and converts the
+canonical basis to float. Compare against the scalar kernel using the **actual
+rounded output dimension**. SIMD projection uses row-major input strides and
+handles output tails. Float basis overflow is rejected with `ERANGE`. These CPU
+checks establish no CUDA, GPU or NPU equivalence.
+
+The precision enum remains ABI-compatible. `qihse_math_fast_exp`,
+`qihse_math_fast_log`, `qihse_math_fast_sqrt` and `qihse_math_fast_sincos` currently
+use libm for all precision selectors; the labels do not assert independently
+validated error bounds or a speedup for a polynomial approximation.
+
+#### Shared state layouts and bounded verification
+
+`qihse_math_types.h` is the single declaration of RFF, superposition,
+amplification and vector-verification structures. Algorithms must not append
+private fields to these public objects or reinterpret a different struct layout.
+
+| API | Contract |
+|---|---|
+| `qihse_superposition_state_fidelity(a, b)` | Typed complex-state normalized squared overlap in [0,1]. Zero/invalid mass is reported with `errno`; it is not a search success probability. |
+| `qihse_superposition_fidelity(a, b, n, out)` | Preserved four-argument raw-float compatibility API; normalized squared overlap, not an unbounded dot product. Returns 0 on success, -1 with `errno` on error. |
+| `qihse_verify_result_advanced_sized(query, result, ground_truth, data_size, config, verification_result)` | Explicitly bounded float-vector verification against required ground truth. Callers initialize/destroy the result with the existing verification-result helpers. |
+| `qihse_verify_batch_sized(queries, results, ground_truths, data_sizes, batch_size, config, verification_results)` | Supplies an explicit length for every result/ground-truth vector. |
+| Legacy `qihse_verify_result_advanced` and `qihse_verify_batch` | Retained symbols refuse unsized verification with -1 and `errno=ENOTSUP`. They must not infer a vector length from a verification mode. |
+
+These numeric APIs operate on caller-owned arrays. They do not replace a database
+authorization boundary. Similarity, fidelity and a successful scalar equality
+comparison are distinct concepts; none is automatically a statistically
+calibrated confidence estimate.
+
+For sized float-vector verification, EXACT requires elementwise equality and
+PRECISION requires every absolute difference to be at most `config.tolerance`.
+Other supported similarity modes report bounded cosine scores, not an exact
+comparison or a probability. Ground truth is mandatory, inputs must be finite
+and nonempty, and NONE returns `-1` with `errno=ENOTSUP`. Destroy a populated
+verification result before reusing it so any owned error message is released.
+
+`qihse_superposition_get_measurement_confidence` is the largest normalized row
+mass, not a correctness estimate. `qihse_amplify_adaptive` reports performed
+rounds and uses the requested target mass. These standalone state experiments
+are not invoked by the scalar exact lookup.
+
+#### Vector candidate rerank and authorization
+
+INT8 and binary selectors in `src/broad_oak/qihse_vector_db.c` exact-score every
+admitted candidate and retain `top_k` by the requested DOT/COSINE/EUCLIDEAN
+metric. Earlier approximate order cannot terminate reranking when the first k
+results fill the output. Candidate selection remains approximate; exact rerank
+cannot recover rows omitted from `candidate_pool_size`.
+
+Both INT8 and binary selectors check the caller's clearance/SCI before admitting
+candidates and again during exact reranking. An excluded row cannot consume a
+bounded candidate slot and displace an authorized result. The binary selector
+also requires an explicit user at its direct public candidate entry, rejecting
+`NULL` with `EACCES`. These checks describe clearance/SCI handling, not a new
+tenant/project policy or a concurrent source-snapshot fence.
+
+Focused regression sources include `tests/test_core_search_regressions.c`,
+`tests/test_core_math_regressions.c` and `tests/test_runtime_math_regressions.c`.
+`tests/test_public_api_install.py` also checks the installed core headers alone
+and together as C and C++. The new public candidate regression lives in
+`tests/test_vector_candidate_rerank.c`; its real-principal fixture has also
+passed through the library-backed target, as recorded in the validation
+follow-up. That result is distinct from the isolated numerical selector checks.
+The C method benchmark measures the actual core on synthetic workloads. The
+separate paired-feature script in
+`benchmarks/scripts/qihse_rff_pairing_experiment.py` is a **synthetic formula
+experiment**, not an engine throughput or production recall benchmark. Remaining
+feature-map research is described in
+[Core feature experiments](plans/qihse_core_experiments.md).
+
+#### Migration note
+
+Rebuild consumers against the canonical headers. Replace the unsized vector
+verification calls with their `_sized` forms and the actual float count; replace
+query-dependent legacy amplification calls with `qihse_amplify` only when the
+caller can supply explicit target indices. The typed state-fidelity function is
+`qihse_superposition_state_fidelity`; the four-argument raw-float API remains
+available. The old untyped export stubs have no compatible operational contract;
+use typed `qihse_create_superposition`/`qihse_destroy_superposition` and the explicit
+RFF/state APIs in the current headers.
+
+To select exact scan or paired features, use the additive `_ex` search APIs and
+initialized versioned options; existing calls retain phase-cosine semantics.
+Legacy batches now reuse a basis and row projections in tiles of 16. This changes
+their execution strategy without changing original-record equality or their
+return-count signature. No benchmark-derived automatic method selection is
+enabled.
+
+Installed public layouts are preserved. Code that included the former duplicate
+`algorithms/` structs must rebuild: their extra internal-state and amplification
+fields are removed instead of extending the public ABI. Raw struct serialization
+has no compatibility guarantee. Explicit target indices define marked states;
+amplification `selectivity` remains validated reserved metadata.
+
+No stored database schema or `.qdb` container migration is required. INT8 and
+binary formats are unchanged. Regenerate any separately retained RFF features
+when upgrading the RNG/basis implementation, and keep each query's feature
+profile identical to the data profile. From the repository root, rebuild and
+run the complete gate with:
+
+```sh
+make clean && make lib && make test TEST_JOBS=32
+```
+
+This command is upgrade guidance, not a claim that the dependency-heavy full
+library suite has passed in the environment used for the source correction.
 
 ## 9. Python SDK — `python/qihse/`
 

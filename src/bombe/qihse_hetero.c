@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <errno.h>
+#include <math.h>
 #ifndef _WIN32
 #include <openssl/rand.h>
 #endif
@@ -471,80 +472,80 @@ qihse_work_schedule_t* qihse_create_work_schedule(
     size_t total_candidates,
     size_t dims __attribute__((unused))
 ) {
-    if (!pool || total_candidates == 0) return NULL;
-
-    qihse_work_schedule_t* schedule = calloc(1, sizeof(qihse_work_schedule_t));
-    if (!schedule) return NULL;
-
-    schedule->total_candidates = total_candidates;
-    schedule->all_completed = false;
-
-    /* Count available devices and calculate total measured TOPS */
-    size_t available_devices = 0;
-    double total_measured_tops = 0.0;
-
-    for (int i = 0; i < QIHSE_DEV_COUNT; i++) {
-        const qihse_compute_device_t* dev = &pool->devices[i];
-        if (dev->available && dev->measured_tops > 0.0) {
-            available_devices++;
-            total_measured_tops += dev->measured_tops;
-        }
-    }
-
-    if (available_devices == 0 || total_measured_tops == 0.0) {
-        free(schedule);
+    if (!pool || total_candidates == 0) {
+        errno = EINVAL;
         return NULL;
     }
 
-    /* Allocate partitions */
-    schedule->partitions = calloc(available_devices, sizeof(qihse_work_partition_t));
+    size_t available_devices = 0;
+    int last_device = -1;
+    double max_tops = 0.0;
+    for (int i = 0; i < QIHSE_DEV_COUNT; i++) {
+        const qihse_compute_device_t* dev = &pool->devices[i];
+        if (dev->available && isfinite(dev->measured_tops) && dev->measured_tops > 0.0) {
+            available_devices++;
+            last_device = i;
+            if (dev->measured_tops > max_tops) max_tops = dev->measured_tops;
+        }
+    }
+    if (available_devices == 0) {
+        errno = ENODEV;
+        return NULL;
+    }
+
+    /* Scale first so even several finite DBL_MAX weights cannot overflow. */
+    long double total_weight = 0.0L;
+    for (int i = 0; i < QIHSE_DEV_COUNT; i++) {
+        const qihse_compute_device_t* dev = &pool->devices[i];
+        if (dev->available && isfinite(dev->measured_tops) && dev->measured_tops > 0.0)
+            total_weight += (long double)dev->measured_tops / max_tops;
+    }
+
+    qihse_work_schedule_t* schedule = calloc(1, sizeof(*schedule));
+    if (!schedule) return NULL;
+    schedule->partitions = calloc(available_devices, sizeof(*schedule->partitions));
     if (!schedule->partitions) {
         free(schedule);
         return NULL;
     }
+    schedule->total_candidates = total_candidates;
 
-    /* Create partitions based on device throughput ratios */
-    size_t partition_idx = 0;
     size_t assigned_candidates = 0;
-
-    for (int i = 0; i < QIHSE_DEV_COUNT; i++) {
+    for (int i = 0; i < QIHSE_DEV_COUNT && assigned_candidates < total_candidates; i++) {
         const qihse_compute_device_t* dev = &pool->devices[i];
-        if (!dev->available || dev->measured_tops <= 0.0) continue;
+        if (!dev->available || !isfinite(dev->measured_tops) || dev->measured_tops <= 0.0)
+            continue;
 
-        qihse_work_partition_t* partition = &schedule->partitions[partition_idx];
+        const size_t remaining = total_candidates - assigned_candidates;
+        size_t partition_size;
+        if (i == last_device) {
+            /* Integer shares may round down.  The final eligible device owns
+             * every remaining candidate, so coverage is exact and disjoint. */
+            partition_size = remaining;
+        } else {
+            long double share = (long double)total_candidates *
+                (((long double)dev->measured_tops / max_tops) / total_weight);
+            partition_size = share >= (long double)remaining ? remaining : (size_t)share;
+            if (partition_size < dev->min_batch_size)
+                partition_size = dev->min_batch_size;
+            if (partition_size > remaining) partition_size = remaining;
+        }
+        if (partition_size == 0) continue;
 
+        qihse_work_partition_t* partition = &schedule->partitions[schedule->partition_count++];
         partition->device = dev->type;
         partition->start_idx = assigned_candidates;
-        partition->completed = false;
-        partition->error_code = 0;
-        partition->execution_time_ns = 0.0;
-
-        /* Calculate partition size based on throughput ratio */
-        double throughput_ratio = dev->measured_tops / total_measured_tops;
-        size_t partition_size = (size_t)(total_candidates * throughput_ratio);
-
-        /* Ensure minimum batch size */
-        if (partition_size < dev->min_batch_size) {
-            partition_size = dev->min_batch_size;
-        }
-
-        /* Ensure we don't exceed total */
-        if (assigned_candidates + partition_size > total_candidates) {
-            partition_size = total_candidates - assigned_candidates;
-        }
-
         partition->count = partition_size;
         assigned_candidates += partition_size;
-        partition_idx++;
-
-        /* Stop if we've assigned all candidates */
-        if (assigned_candidates >= total_candidates) break;
     }
 
-    schedule->partition_count = partition_idx;
-
-    pthread_mutex_init(&schedule->result_mutex, NULL);
-
+    int error = pthread_mutex_init(&schedule->result_mutex, NULL);
+    if (error != 0) {
+        free(schedule->partitions);
+        free(schedule);
+        errno = error;
+        return NULL;
+    }
     return schedule;
 }
 
