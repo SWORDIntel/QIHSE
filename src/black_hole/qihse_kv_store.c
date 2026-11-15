@@ -327,6 +327,13 @@ typedef struct qihse_kv_ct_lane {
     uint32_t tenant_id;
     qihse_kv_ct_tenant_policy_t tenant_policy;
     unsigned char last_group_digest[32];
+    /* Zero means unmarked, including pre-QCTLN004 metadata. The digest binds
+     * a temporary receiver to its reservation and exact lane incarnation. */
+    char staging_transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t staging_reserve_index;
+    unsigned char staging_digest[32];
+    uint64_t staging_source_cut;
+    bool staging_source_cut_known;
 } qihse_kv_ct_lane_t;
 
 typedef struct qihse_kv_ct_lane_transfer_state {
@@ -408,6 +415,7 @@ struct qihse_kv_store {
     uint64_t change_seq;
     uint64_t projection_epoch; /* store-local; invalidates derived delta cursors */
     uint64_t instance_id; /* fresh on every create, including after restart */
+    pid_t owner_pid;
     unsigned char proof_secret[32]; /* fresh per-handle key for opaque proof MACs */
     struct kv_replica_cursor* replica_cursors;
     /* Read-side fd cache: keep a bounded set of SSTable fds open so a
@@ -928,6 +936,7 @@ static bool ct_lane_serialize(FILE* f, uint64_t* hash, const qihse_kv_ct_lane_t*
                               (lane->status.admitted ? 2u : 0u) |
                               (lane->status.promotion_pending ? 4u : 0u) |
                               (lane->status.baseline_refresh_needed ? 8u : 0u));
+    uint8_t source_cut_known = lane->staging_source_cut_known ? 1u : 0u;
     return ct_lane_emit(f, hash, lane->status.lane_id, sizeof(lane->status.lane_id)) &&
         ct_lane_emit(f, hash, lane->status.source_id, sizeof(lane->status.source_id)) &&
         ct_lane_emit(f, hash, lane->status.peer_id, sizeof(lane->status.peer_id)) &&
@@ -948,12 +957,18 @@ static bool ct_lane_serialize(FILE* f, uint64_t* hash, const qihse_kv_ct_lane_t*
         ct_lane_emit_u32(f, hash, (uint32_t)lane->tenant_policy) &&
         ct_lane_emit_u32(f, hash, lane->tenant_id) &&
         ct_lane_emit(f, hash, lane->owner_token, sizeof(lane->owner_token)) &&
-        ct_lane_emit(f, hash, lane->last_group_digest, 32u);
+        ct_lane_emit(f, hash, lane->last_group_digest, 32u) &&
+        ct_lane_emit(f, hash, lane->staging_transfer_id, sizeof(lane->staging_transfer_id)) &&
+        ct_lane_emit_u64(f, hash, lane->staging_reserve_index) &&
+        ct_lane_emit(f, hash, lane->staging_digest, 32u) &&
+        ct_lane_emit_u64(f, hash, lane->staging_source_cut) &&
+        ct_lane_emit(f, hash, &source_cut_known, 1u);
 }
 
 static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lane,
-                               bool has_stream_cut) {
-    uint8_t flags = 0u; uint32_t policy = 0u;
+                               bool has_stream_cut, bool has_staging,
+                               bool has_preparation_cut) {
+    uint8_t flags = 0u, source_cut_known = 0u; uint32_t policy = 0u;
     memset(lane, 0, sizeof(*lane));
     bool ok = ct_lane_read(f, hash, lane->status.lane_id, sizeof(lane->status.lane_id)) &&
         ct_lane_read(f, hash, lane->status.source_id, sizeof(lane->status.source_id)) &&
@@ -975,12 +990,24 @@ static bool ct_lane_deserialize(FILE* f, uint64_t* hash, qihse_kv_ct_lane_t* lan
         ct_lane_read(f, hash, &flags, 1u) && ct_lane_read_u32(f, hash, &policy) &&
         ct_lane_read_u32(f, hash, &lane->tenant_id) &&
         ct_lane_read(f, hash, lane->owner_token, sizeof(lane->owner_token)) &&
-        ct_lane_read(f, hash, lane->last_group_digest, 32u);
-    if (!ok || (flags & ~15u) ||
+        ct_lane_read(f, hash, lane->last_group_digest, 32u) &&
+        (!has_staging ||
+         (ct_lane_read(f, hash, lane->staging_transfer_id, sizeof(lane->staging_transfer_id)) &&
+          ct_lane_read_u64(f, hash, &lane->staging_reserve_index) &&
+          ct_lane_read(f, hash, lane->staging_digest, 32u))) &&
+        (!has_preparation_cut ||
+         (ct_lane_read_u64(f, hash, &lane->staging_source_cut) &&
+          ct_lane_read(f, hash, &source_cut_known, 1u)));
+    if (!ok || (flags & ~15u) || source_cut_known > 1u ||
         lane->status.lane_id[QIHSE_KV_CT_LANE_ID_MAX] != '\0' ||
         lane->status.source_id[QIHSE_KV_CT_ID_MAX] != '\0' ||
         lane->status.peer_id[QIHSE_KV_CT_ID_MAX] != '\0' ||
-        lane->status.generation[QIHSE_KV_CT_ID_MAX] != '\0') return false;
+        lane->status.generation[QIHSE_KV_CT_ID_MAX] != '\0' ||
+        lane->staging_transfer_id[QIHSE_KV_CT_ID_MAX] != '\0' ||
+        (lane->staging_reserve_index &&
+         (!ct_id_valid(lane->staging_transfer_id) ||
+          ct_digest_zero(lane->staging_digest)))) return false;
+    lane->staging_source_cut_known = source_cut_known != 0u;
     lane->used = true;
     lane->status.baseline_sealed = (flags & 1u) != 0u;
     lane->status.admitted = (flags & 2u) != 0u;
@@ -997,7 +1024,7 @@ static bool ct_lanes_state_write(qihse_kv_store_t* store) {
     if (!build_data_path(path, sizeof(path), "ct-lanes.bin") ||
         !atomic_file_begin(path, temp, sizeof(temp), &f)) return false;
     uint64_t hash = 14695981039346656037ULL;
-    bool ok = ct_lane_emit(f, &hash, "QCTLN003", 8u) &&
+    bool ok = ct_lane_emit(f, &hash, "QCTLN005", 8u) &&
               ct_lane_emit_u32(f, &hash, (uint32_t)store->ct_lane_count);
     size_t emitted = 0u;
     for (size_t i = 0; ok && i < store->ct_lane_capacity; ++i)
@@ -1027,7 +1054,11 @@ static bool ct_lanes_state_read(qihse_kv_store_t* store, qihse_user_t* user) {
     uint64_t hash = 14695981039346656037ULL;
     char magic[8]; uint32_t count = 0u;
     bool ok = ct_lane_read(f, &hash, magic, sizeof(magic));
-    bool has_stream_cut = ok && memcmp(magic, "QCTLN003", 8u) == 0;
+    bool has_preparation_cut = ok && memcmp(magic, "QCTLN005", 8u) == 0;
+    bool has_staging = has_preparation_cut ||
+        (ok && memcmp(magic, "QCTLN004", 8u) == 0);
+    bool has_stream_cut = has_staging ||
+        (ok && memcmp(magic, "QCTLN003", 8u) == 0);
     ok = ok && (has_stream_cut || memcmp(magic, "QCTLN002", 8u) == 0) &&
         ct_lane_read_u32(f, &hash, &count) &&
         count <= QIHSE_KV_CT_MAX_LANES;
@@ -1035,7 +1066,7 @@ static bool ct_lanes_state_read(qihse_kv_store_t* store, qihse_user_t* user) {
     if (ok && count && !lanes) ok = false;
     for (uint32_t i = 0; ok && i < count; ++i) {
         qihse_kv_ct_lane_t* lane = &lanes[i];
-        ok = ct_lane_deserialize(f, &hash, lane, has_stream_cut) &&
+        ok = ct_lane_deserialize(f, &hash, lane, has_stream_cut, has_staging, has_preparation_cut) &&
             ct_lane_id_valid(lane->status.lane_id) && ct_id_valid(lane->status.source_id) &&
             ct_id_valid(lane->status.peer_id) && ct_id_valid(lane->status.generation) &&
             (lane->status.mode == QIHSE_KV_CT_LANE_SOURCE || lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER) &&
@@ -1086,7 +1117,7 @@ static bool ct_lanes_state_read(qihse_kv_store_t* store, qihse_user_t* user) {
         errno = EINVAL;
         return false;
     }
-    if ((certificates_changed || !has_stream_cut) && !ct_lanes_state_write(store)) {
+    if ((certificates_changed || !has_preparation_cut) && !ct_lanes_state_write(store)) {
         free(store->lanes);
         store->lanes = NULL;
         store->ct_lane_count = store->ct_lane_capacity = 0u;
@@ -1455,7 +1486,7 @@ static bool ct_lane_log_append_fd(qihse_kv_store_t* store, const char* lane_id,
     uint64_t position, qihse_user_t* principal,
     qihse_kv_ct_tenant_policy_t policy, uint32_t tenant_id, int wal_fd,
     off_t frame_offset, size_t frame_bytes, uint64_t retained_limit,
-    uint64_t* out_retained_bytes);
+    uint64_t* out_retained_bytes, bool recovery);
 
 static bool ct_lane_append_record(qihse_kv_store_t* store, qihse_user_t* user,
     qihse_kv_ct_lane_t* lane, const qihse_kv_ct_record_t* record, bool dry_run) {
@@ -1500,7 +1531,7 @@ static bool ct_lane_append_record(qihse_kv_store_t* store, qihse_user_t* user,
             store->ct_system_principal, QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
             fileno(store->wal_fd),
             frame_offset, frame_bytes, lane->status.limit_bytes,
-            &retained_after) ||
+            &retained_after, false) ||
         retained_after > lane->status.limit_bytes) {
         store->recovery_pending = true;
         if (errno == 0) errno = ENOSPC;
@@ -1798,12 +1829,19 @@ bool qihse_kv_ct_lane_receiver_empty_baseline_seal(qihse_kv_store_t* store,
     EVP_MD_CTX_free(md);
     bool ok = empty;
     if (ok) {
+        uint64_t previous_staging = lane->staging_reserve_index;
         memcpy(lane->status.baseline_digest, digest, 32u);
         lane->status.baseline_sealed = true;
         lane->status.admitted = true;
+        lane->staging_reserve_index = 0u;
         ok = ct_lanes_state_write(store);
         if (ok) memcpy(out_digest, digest, 32u);
-        else { lane->status.baseline_sealed = false; lane->status.admitted = false; memset(lane->status.baseline_digest, 0, 32u); }
+        else {
+            lane->status.baseline_sealed = false;
+            lane->status.admitted = false;
+            memset(lane->status.baseline_digest, 0, 32u);
+            lane->staging_reserve_index = previous_staging;
+        }
     } else errno = EBUSY;
     kv_store_unlock(store);
     return ok;
@@ -2595,7 +2633,7 @@ static bool ct_lane_log_append_fd(qihse_kv_store_t* store, const char* lane_id,
     uint64_t position,
     qihse_user_t* principal, qihse_kv_ct_tenant_policy_t policy,
     uint32_t tenant_id, int wal_fd, off_t frame_offset,
-    size_t frame_bytes, uint64_t retained_limit, uint64_t* out_retained_bytes);
+    size_t frame_bytes, uint64_t retained_limit, uint64_t* out_retained_bytes, bool recovery);
 static bool ct_lane_log_read(qihse_kv_store_t* store, const char* lane_id,
     const char* source_id, const char* generation, qihse_user_t* principal,
     qihse_kv_ct_tenant_policy_t policy, uint32_t tenant_id,
@@ -4182,7 +4220,7 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
                         lane->status.acknowledged_position, group.stream_position,
                         context->user, lane->tenant_policy, lane->tenant_id,
                         fileno(f), frame_offset, frame_bytes,
-                        lane->status.limit_bytes, &retained)) ok = false;
+                        lane->status.limit_bytes, &retained, true)) ok = false;
                 else lane->status.retained_bytes = retained;
             }
             if (ok && group.stream_position > lane->status.durable_position)
@@ -4474,6 +4512,7 @@ static bool sst_index_load_file(qihse_kv_store_t* store, const char* path, int32
 static qihse_kv_store_t* kv_store_allocate(void) {
     qihse_kv_store_t* store = (qihse_kv_store_t*)calloc(1u, sizeof(*store));
     if (!store) return NULL;
+    store->owner_pid = getpid();
     size_t random_bytes = 0u;
     while (random_bytes < sizeof store->instance_id) {
         ssize_t n = getrandom((char*)&store->instance_id + random_bytes,
@@ -6675,7 +6714,7 @@ bool qihse_kv_set_batch_durable_user(qihse_kv_store_t* store,
                     lane->status.acknowledged_position, group.stream_position,
                     store->ct_system_principal, QIHSE_KV_CT_TENANT_SYSTEM_ALL,
                     0u, fileno(store->wal_fd), frame_offset, frame_bytes,
-                    lane->status.limit_bytes, &retained_after) ||
+                    lane->status.limit_bytes, &retained_after, false) ||
                 retained_after > lane->status.limit_bytes) {
                 store->recovery_pending = true;
                 free(rows);
@@ -9572,11 +9611,13 @@ bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
         if (other != lane && other->used &&
             strcmp(other->status.generation, claim.target_generation) == 0) ok = false;
     }
+    uint64_t previous_staging = lane ? lane->staging_reserve_index : 0u;
     qihse_kv_ct_lane_status_t previous;
     unsigned char previous_token[QIHSE_KV_CT_TOKEN_BYTES];
     if (lane) { previous = lane->status; memcpy(previous_token, lane->owner_token, sizeof(previous_token)); }
     if (ok) {
         lane->status.mode = QIHSE_KV_CT_LANE_SOURCE;
+        lane->staging_reserve_index = 0u;
         if (lane->status.limit_bytes == 0u)
             lane->status.limit_bytes = KV_CT_DEFAULT_LANE_LIMIT_BYTES;
         snprintf(lane->status.source_id, sizeof(lane->status.source_id), "%s",
@@ -9598,6 +9639,7 @@ bool qihse_kv_ct_lane_receiver_promote(qihse_kv_store_t* store,
         ok = ct_lanes_state_write(store);
         if (!ok) {
             lane->status = previous;
+            lane->staging_reserve_index = previous_staging;
             memcpy(lane->owner_token, previous_token, sizeof(previous_token));
             store->recovery_pending = true;
         }
@@ -10439,6 +10481,31 @@ bool qihse_kv_projection_marker(qihse_kv_store_t* store,
     *out_epoch = __atomic_load_n(&store->projection_epoch, __ATOMIC_ACQUIRE);
     kv_store_unlock(store);
     return true;
+}
+
+bool qihse_kv_snapshot_checkpoint_user(qihse_kv_store_t* store,
+    const qihse_user_t* user, qihse_kv_snapshot_checkpoint_t* checkpoint) {
+    if (!store || !checkpoint || store->owner_pid != getpid() || !user ||
+        !qihse_auth_user_is_active(user) ||
+        qihse_user_get_role(user) != QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_id(user) != 0u || qihse_user_get_tenant_id(user) != 0u)
+        return false;
+    /* A batch owner can already hold the write lock in this thread. */
+    if (pthread_rwlock_tryrdlock(&store->store_lock) != 0) return false;
+    bool ok = !store->recovery_pending && !store->memory_snapshot &&
+        !store->bulk_load_mode && !store->durable_batch_mode && store->wal_fd &&
+        !store->replica_read_only && !store->ct_enabled && ct_read_ready(store);
+    qihse_kv_snapshot_checkpoint_t captured = {
+        .instance_id = store->instance_id,
+        .change_seq = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE),
+        .projection_epoch = __atomic_load_n(&store->projection_epoch, __ATOMIC_ACQUIRE)
+    };
+    ok = ok && captured.instance_id && captured.projection_epoch &&
+        captured.change_seq != UINT64_MAX && captured.projection_epoch != UINT64_MAX &&
+        qihse_auth_user_is_active(user);
+    if (ok) *checkpoint = captured;
+    kv_store_unlock(store);
+    return ok;
 }
 
 void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count) {

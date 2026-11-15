@@ -48,6 +48,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifdef QIHSE_TABLE_STORE_TESTING
@@ -1064,6 +1065,205 @@ static void test_durable_keys(qihse_user_t* user) {
     assert(unlink(path) == 0 && unlink(lock) == 0 && rmdir(dir) == 0);
 }
 
+typedef struct { int crash_commit; int commits; } sql_2pc_peer_t;
+
+static int sql_2pc_peer_commit(void* opaque, uint64_t txn_id) {
+    (void)txn_id;
+    sql_2pc_peer_t* peer = opaque;
+    if (peer->crash_commit) _exit(77);
+    ++peer->commits;
+    return 0;
+}
+
+static void sql_2pc_crash_after_decision(qihse_user_t* user,
+    const char* path, const char* journal, int* engine) {
+    qihse_uwp_context_t ctx = {0};
+    ctx.sql_engine = engine;
+    ctx.txn_manager = qihse_txn_manager_create_durable(journal);
+    assert(ctx.txn_manager && qihse_uwp_sql_open_durable(&ctx, path) == 0);
+    sql_2pc_peer_t peer = {.crash_commit = 1};
+    qihse_txn_participant_t participant = {
+        .engine_id = 80, .engine_ctx = &peer,
+        .prepare = test_txn_prepare_ok, .commit = sql_2pc_peer_commit,
+        .abort = test_txn_abort_ok,
+    };
+    assert(qihse_txn_register_participant(ctx.txn_manager, participant) == 0);
+    assert(qihse_uwp_sql_txn_register_durable_participant(ctx.txn_manager, 81) == 0);
+    assert(qihse_txn_manager_recover(ctx.txn_manager) == 0);
+    uwp_reply_buf_t out;
+    qihse_txn_t* txn = NULL;
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user,
+        "INSERT INTO bridge_items VALUES (2, 'crash-replay')", &txn, &out) == UWP_STS_OK);
+    assert(qihse_uwp_sql_txn_enlist_durable(ctx.txn_manager, txn, 81) == 0);
+    assert(qihse_txn_prepare(ctx.txn_manager, txn) == 0);
+    (void)qihse_txn_commit_prepared(ctx.txn_manager, txn);
+    _exit(3);
+}
+
+static void test_durable_sql_2pc_bridge(qihse_user_t* user) {
+    char dir[] = "build/qihse-sql-2pc-XXXXXX";
+    assert(mkdtemp(dir));
+    char path[sizeof(dir) + 16], lock[sizeof(dir) + 24];
+    char backup_path[sizeof(dir) + 24], backup_lock[sizeof(dir) + 32];
+    char restored_path[sizeof(dir) + 24], restored_lock[sizeof(dir) + 32];
+    char journal[sizeof(dir) + 24], fresh_journal[sizeof(dir) + 32];
+    char decision[sizeof(dir) + 64];
+    assert(snprintf(path, sizeof path, "%s/rows", dir) < (int)sizeof path);
+    assert(snprintf(lock, sizeof lock, "%s.lock", path) < (int)sizeof lock);
+    assert(snprintf(journal, sizeof journal, "%s/txn.journal", dir) <
+           (int)sizeof journal);
+    assert(snprintf(fresh_journal, sizeof fresh_journal, "%s/fresh.journal", dir) <
+           (int)sizeof fresh_journal);
+    static int engine;
+    qihse_uwp_context_t ctx = {0};
+    ctx.sql_engine = &engine;
+    ctx.schema = qihse_schema_registry_create();
+    ctx.txn_manager = qihse_txn_manager_create_durable(journal);
+    assert(ctx.schema && ctx.txn_manager);
+    assert(qihse_uwp_sql_open_durable(&ctx, path) == 0);
+    uwp_reply_buf_t out;
+    assert(run_sql(&ctx, user, "CREATE TABLE bridge_items (id INT, note TEXT)",
+                   &out) == UWP_STS_OK);
+    assert(qihse_uwp_sql_txn_register_durable_participant(ctx.txn_manager, 81) == 0);
+    assert(qihse_txn_manager_recover(ctx.txn_manager) == 0);
+
+    qihse_txn_t* txn = NULL;
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(run_sql_txn(&ctx, user,
+        "INSERT INTO bridge_items VALUES (1, 'prepared')", &txn, &out) == UWP_STS_OK);
+    assert(txn && qihse_uwp_sql_txn_enlist_durable(ctx.txn_manager, txn, 81) == 0);
+    assert(txn->resource_ctx == NULL);
+    assert(qihse_txn_prepare(ctx.txn_manager, txn) == 0);
+    qihse_table_t* table = qihse_table_store_find_table(
+        qihse_uwp_sql_table_store(), "bridge_items");
+    assert(table && qihse_table_row_count(table) == 0);
+    assert(qihse_txn_commit_prepared(ctx.txn_manager, txn) == 0);
+    assert(qihse_table_row_count(table) == 1);
+    assert(qihse_txn_release(ctx.txn_manager, txn) == 0);
+    txn = NULL;
+
+    uint64_t generation_before_noop = 0, generation_after_noop = 0;
+    assert(qihse_table_generation_user(table, user, &generation_before_noop));
+    txn = qihse_txn_begin(ctx.txn_manager, QIHSE_ISO_READ_COMMITTED);
+    assert(txn && qihse_txn_prepare(ctx.txn_manager, txn) == 0);
+    assert(qihse_txn_commit_prepared(ctx.txn_manager, txn) == 0);
+    assert(qihse_txn_release(ctx.txn_manager, txn) == 0);
+    assert(qihse_table_generation_user(table, user, &generation_after_noop));
+    assert(generation_after_noop == generation_before_noop);
+
+    qihse_uwp_sql_close_durable(&ctx);
+    qihse_schema_registry_destroy(ctx.schema);
+    qihse_txn_manager_destroy(ctx.txn_manager);
+
+    ctx = (qihse_uwp_context_t){0};
+    ctx.sql_engine = &engine;
+    ctx.txn_manager = qihse_txn_manager_create_durable(journal);
+    assert(ctx.txn_manager && qihse_uwp_sql_open_durable(&ctx, path) == 0);
+    assert(qihse_uwp_sql_txn_register_durable_participant(ctx.txn_manager, 81) == 0);
+    assert(qihse_txn_manager_recover(ctx.txn_manager) == 0);
+    table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "bridge_items");
+    assert(table && qihse_table_row_count(table) == 1);
+    qihse_uwp_sql_close_durable(&ctx);
+    qihse_schema_registry_destroy(ctx.schema);
+    qihse_txn_manager_destroy(ctx.txn_manager);
+
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) sql_2pc_crash_after_decision(user, path, journal, &engine);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 77);
+
+    ctx = (qihse_uwp_context_t){0};
+    ctx.sql_engine = &engine;
+    ctx.txn_manager = qihse_txn_manager_create_durable(journal);
+    assert(ctx.txn_manager && qihse_uwp_sql_open_durable(&ctx, path) == 0);
+    table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "bridge_items");
+    assert(table && qihse_table_row_count(table) == 1); /* still unpublished */
+    sql_2pc_peer_t peer = {0};
+    qihse_txn_participant_t participant = {
+        .engine_id = 80, .engine_ctx = &peer,
+        .prepare = test_txn_prepare_ok, .commit = sql_2pc_peer_commit,
+        .abort = test_txn_abort_ok,
+    };
+    assert(qihse_txn_register_participant(ctx.txn_manager, participant) == 0);
+    assert(qihse_uwp_sql_txn_register_durable_participant(ctx.txn_manager, 81) == 0);
+    assert(qihse_txn_manager_recover(ctx.txn_manager) == 0);
+    table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "bridge_items");
+    assert(table && qihse_table_row_count(table) == 2 && peer.commits == 1);
+    assert(snprintf(backup_path, sizeof backup_path, "%s/rows.backup", dir) <
+           (int)sizeof backup_path);
+    assert(snprintf(backup_lock, sizeof backup_lock, "%s.lock", backup_path) <
+           (int)sizeof backup_lock);
+    assert(snprintf(restored_path, sizeof restored_path, "%s/rows.restored", dir) <
+           (int)sizeof restored_path);
+    assert(snprintf(restored_lock, sizeof restored_lock, "%s.lock", restored_path) <
+           (int)sizeof restored_lock);
+    assert(qihse_table_store_backup(qihse_uwp_sql_table_store(), user, backup_path));
+    qihse_uwp_sql_close_durable(&ctx);
+    qihse_schema_registry_destroy(ctx.schema);
+    qihse_txn_manager_destroy(ctx.txn_manager);
+    assert(qihse_table_store_restore(user, backup_path, restored_path));
+
+    ctx = (qihse_uwp_context_t){0};
+    ctx.sql_engine = &engine;
+    ctx.txn_manager = qihse_txn_manager_create_durable(journal);
+    assert(ctx.txn_manager && qihse_uwp_sql_open_durable(&ctx, restored_path) == 0);
+    peer = (sql_2pc_peer_t){0};
+    participant.engine_ctx = &peer;
+    assert(qihse_txn_register_participant(ctx.txn_manager, participant) == 0);
+    assert(qihse_uwp_sql_txn_register_durable_participant(ctx.txn_manager, 81) == 0);
+    assert(qihse_txn_manager_recover(ctx.txn_manager) == 0);
+    table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "bridge_items");
+    assert(table && qihse_table_row_count(table) == 2 && peer.commits == 1);
+    qihse_uwp_sql_close_durable(&ctx);
+    qihse_schema_registry_destroy(ctx.schema);
+    qihse_txn_manager_destroy(ctx.txn_manager);
+
+    /* Restored terminal receipts outlive the original coordinator journal.
+     * A different empty journal must start above those IDs, not collide with
+     * the receipt for the next SQL participant commit. */
+    ctx = (qihse_uwp_context_t){0};
+    ctx.sql_engine = &engine;
+    ctx.txn_manager = qihse_txn_manager_create_durable(fresh_journal);
+    assert(ctx.txn_manager && qihse_uwp_sql_open_durable(&ctx, restored_path) == 0);
+    assert(qihse_uwp_sql_txn_register_durable_participant(ctx.txn_manager, 81) == 0);
+    assert(qihse_txn_manager_recover(ctx.txn_manager) == 0);
+    table = qihse_table_store_find_table(qihse_uwp_sql_table_store(), "bridge_items");
+    assert(table && qihse_table_row_count(table) == 2);
+    txn = NULL;
+    assert(run_sql_txn(&ctx, user, "BEGIN", &txn, &out) == UWP_STS_OK);
+    assert(txn && txn->id > 3);
+    assert(run_sql_txn(&ctx, user,
+        "INSERT INTO bridge_items VALUES (4, 'fresh-journal')", &txn, &out) == UWP_STS_OK);
+    assert(qihse_uwp_sql_txn_enlist_durable(ctx.txn_manager, txn, 81) == 0);
+    assert(qihse_txn_prepare(ctx.txn_manager, txn) == 0);
+    assert(qihse_txn_commit_prepared(ctx.txn_manager, txn) == 0);
+    assert(qihse_txn_release(ctx.txn_manager, txn) == 0);
+    assert(qihse_table_row_count(table) == 3);
+    qihse_uwp_sql_close_durable(&ctx);
+    qihse_schema_registry_destroy(ctx.schema);
+    qihse_txn_manager_destroy(ctx.txn_manager);
+
+    const char* stores[] = {path, backup_path, restored_path};
+    for (size_t i = 0; i < sizeof stores / sizeof *stores; ++i) {
+        for (uint64_t id = 1; id <= 3; ++id) {
+            assert(snprintf(decision, sizeof decision, "%s.decision.%016llx",
+                            stores[i], (unsigned long long)id) < (int)sizeof decision);
+            assert(unlink(decision) == 0);
+        }
+    }
+    assert(snprintf(decision, sizeof decision, "%s.decision.%016llx",
+                     restored_path, (unsigned long long)4) < (int)sizeof decision);
+    assert(unlink(decision) == 0);
+    assert(unlink(path) == 0 && unlink(lock) == 0 &&
+           unlink(backup_path) == 0 && unlink(backup_lock) == 0 &&
+           unlink(restored_path) == 0 && unlink(restored_lock) == 0 &&
+           unlink(journal) == 0 && unlink(fresh_journal) == 0 &&
+           rmdir(dir) == 0);
+}
+
 static void test_create_constraint_boundary(qihse_uwp_context_t* ctx,
                                             qihse_user_t* user) {
     uwp_reply_buf_t out;
@@ -1705,6 +1905,7 @@ int main(void) {
     assert(no_txn == NULL);
 
     test_durable_keys(operator_user);
+    test_durable_sql_2pc_bridge(operator_user);
     test_update_executes(&ctx, operator_user);
     test_update_qualified_and_quoted(&ctx, operator_user);
     test_update_refusals(&ctx, operator_user);

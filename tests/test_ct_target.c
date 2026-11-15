@@ -5,6 +5,7 @@
 #include "qihse_kv_store.h"
 
 #include <assert.h>
+#include <dirent.h>
 #include <errno.h>
 #include <openssl/evp.h>
 #include <stdio.h>
@@ -81,6 +82,22 @@ static const unsigned char source_image[] = "QFS test classified row bytes";
 static unsigned char image_sha[32];
 static struct qihse_resp_ct_abort_request abort_request;
 static char stage_root[256];
+
+static bool has_raw_stage(void) {
+    DIR *directory = opendir(stage_root);
+    assert(directory);
+    bool found = false;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (length >= 4u && !strcmp(entry->d_name + length - 4u, ".qfs")) {
+            found = true;
+            break;
+        }
+    }
+    assert(closedir(directory) == 0);
+    return found;
+}
 
 bool qihse_auth_user_is_active(const qihse_user_t *u) { return u && u->active; }
 uint16_t qihse_user_get_role(const qihse_user_t *u) { return u->role; }
@@ -275,14 +292,16 @@ int main(void) {
         sizeof(source_image) + 1u, image_sha, seal_sha,
         &target_lsn, checksum, err, sizeof(err)) && import_calls == 0);
 
+    assert(has_raw_stage());
     assert(qihse_ct_target_cleanup_aborted(target, &data, "qkp-a", &abort_request,
         err, sizeof(err)));
+    assert(!has_raw_stage());
     assert(!qihse_ct_target_status(target, &data, "qkp-a", txn.transfer_id,
         NULL, 0, NULL, NULL, 0, &status_offset, &status_total,
         &state, err, sizeof(err)));
     assert(qihse_ct_target_begin(target, &data, "qkp-a", &txn,
         sizeof(source_image), image_sha, seal_sha, 2, &offset, err, sizeof(err)));
-    assert(offset == 0);
+    assert(offset == 0 && has_raw_stage());
     assert(qihse_ct_target_chunk(target, &data, "qkp-a", txn.transfer_id,
         0, sizeof(source_image), image_sha, source_image, sizeof(source_image),
         &next, err, sizeof(err)));
@@ -299,6 +318,7 @@ int main(void) {
     journal_finalized = true;
     assert(qihse_ct_target_finalize(target, &data, "qkp-a", &activation_request,
         err, sizeof(err)));
+    assert(!has_raw_stage());
     assert(qihse_ct_target_status(target, &data, "qkp-a", txn.transfer_id,
         &txn, sizeof(source_image), image_sha, seal_sha, 2,
         &status_offset, &status_total, &state, err, sizeof(err)));
@@ -306,7 +326,7 @@ int main(void) {
 
     qihse_ct_target_destroy(target);
     target = qihse_ct_target_create(&ownership, stage_root, "qkp-c", err, sizeof(err));
-    assert(target);
+    assert(target && !has_raw_stage());
     expect_denied(target, "low clearance after restart");
     assert(qihse_ct_target_status(target, &data, "qkp-a", txn.transfer_id,
         &txn, sizeof(source_image), image_sha, seal_sha, 2, &status_offset, &status_total,
@@ -316,6 +336,6 @@ int main(void) {
         sizeof(source_image), image_sha, seal_sha,
         &target_lsn, checksum, err, sizeof(err)) && import_calls == 1);
     qihse_ct_target_destroy(target);
-    puts("CT2 target staging tests passed: auth, source binding, durable duplicate/gap handling, seal, receipt, restart");
+    puts("CT2 target staging tests passed: auth, source binding, abort cleanup/reuse, terminal raw cleanup, seal, receipt, restart");
     return 0;
 }

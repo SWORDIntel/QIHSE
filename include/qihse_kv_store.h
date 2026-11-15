@@ -98,6 +98,15 @@ typedef struct {
 } qihse_kv_ct_lane_status_t;
 
 typedef struct {
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char lane_id[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t reserve_index;
+    uint64_t source_cut;
+    bool source_cut_known;
+} qihse_kv_ct_lane_staging_candidate_t;
+
+typedef struct {
     bool active;
     uint8_t phase; /* 0 none, 1 reserved, 2 imported, 3 finalized intent */
     bool source_fenced;
@@ -511,6 +520,8 @@ bool qihse_kv_ct_lane_transfer_target_import_begin(qihse_kv_store_t* store,
 bool qihse_kv_ct_lane_transfer_status(qihse_kv_store_t* store,
     qihse_user_t* control_principal,
     qihse_kv_ct_lane_transfer_status_t* out_status);
+/* An identical live receiver image is reused without row replacement. A
+ * differing occupied image is refused: common ABORT has no durable undo image. */
 bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_user_t* replication_principal,
     qihse_user_t* data_principal,
@@ -561,6 +572,14 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
     const qihse_kv_ct_proof_t* reserved_proof,
     qihse_kv_ct_lane_authority_verify_fn verify_reserved, void* verify_context,
     unsigned char out_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Operator-only hints, not cleanup authority. Start cursor at zero; returns
+ * 1 for a marked, non-admitted, non-promoting receiver, 0 at end, -1 on error.
+ * Unknown cuts must not be inferred. Output is cleared at end/on error; errors
+ * leave cursor unchanged. Revalidate the full common ABORT before cleanup.
+ * This is not a snapshot; native mutation rechecks current provenance/token. */
+int qihse_kv_ct_lane_staging_next_user(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, size_t* cursor,
+    qihse_kv_ct_lane_staging_candidate_t* out_candidate);
 /* Metadata-only reduction of a non-owner replica's assigned slots. This
  * cannot add slots, turn a receiver into a source, or admit ordinary reads. */
 bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
@@ -1051,6 +1070,20 @@ typedef struct {
     uint64_t expire_time_ms;
     bool tombstone;
 } qihse_kv_delta_record_t;
+
+/* Authenticated same-handle checkpoint for a local CT-disabled durable source.
+ * Only the active bootstrap Operator (id0, tenant0) may observe this whole-store
+ * fence. Refuses busy/bulk/batch, recovery-pending, replica, inherited and view
+ * handles; output is unchanged on failure. Restore/GC may advance the epoch
+ * without changing sequence; retain the instance and compare ALL three fields.
+ * This alone is not a shared cross-store backup or a logical-TTL freeze. */
+typedef struct {
+    uint64_t instance_id;
+    uint64_t change_seq;
+    uint64_t projection_epoch;
+} qihse_kv_snapshot_checkpoint_t;
+bool qihse_kv_snapshot_checkpoint_user(qihse_kv_store_t* store,
+    const qihse_user_t* user, qihse_kv_snapshot_checkpoint_t* checkpoint);
 
 void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count);
 

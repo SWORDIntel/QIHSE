@@ -64,6 +64,7 @@ extern char **environ;
 #define CG_MAX_OUT 100000u
 #define CG_MAX_FILES 64u
 #define CG_REQUEST_MAX 65536u
+#define CG_UNTRACKED_FILE_MAX (64u << 20)
 
 typedef cg_projection_node cg_node;
 
@@ -223,7 +224,8 @@ static bool sha256_file(const char *path, char out[65], double deadline) {
     if (fd < 0)
         return false;
     struct stat info;
-    if (fstat(fd, &info) || !S_ISREG(info.st_mode)) {
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < 0 ||
+        (uint64_t)info.st_size > CG_UNTRACKED_FILE_MAX) {
         close(fd);
         return false;
     }

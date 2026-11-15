@@ -11,8 +11,9 @@
 >    shadow per table; COMMIT publishes up to 16 table shadows atomically behind
 >    generation fences and ROLLBACK discards them. Autocommit UWP SQL SELECT
 >    now supports a bounded one-table projection/filter path behind READ ACLs;
->    Cross-model transactions, savepoint data restoration and cross-model
->    durability remain outside this bounded slice.
+>    Transparent cross-model enlistment and savepoint data restoration remain
+>    outside this bounded slice. Explicit native SQL/blob durable participants
+>    are supported separately, as described below.
 >    Transactional SELECT supports one-table projections and simple predicates
 >    from a transaction-private shadow, with commit-time READ revalidation. The
 >    source-required auth aggregates and ordered top-1 query now execute; general
@@ -39,8 +40,9 @@
 >    extended writes share a private transaction until Sync; pipeline failure
 >    rolls it back. Completed portals do not repeat writes. Experimental retry
 >    identity still covers simple DML only and refuses typed writes.
->    Pgwire has an isolated TLS-required listener; its legacy cleartext listener
->    remains loopback-only. Neither listener is a production SQL replacement.
+>    The standalone pgwire service refuses listener startup until persistent
+>    authentication and verified TLS deployment policy are integrated. The local
+>    protocol/TLS fixtures do not satisfy this deployment gate.
 >    No production cutover has occurred. This work prepares for a possible later
 >    DIRECTEYE migration; it does not run that migration or change a DSN. No
 >    consumer should be redirected until source migrations and queries pass with
@@ -110,6 +112,9 @@ source and target not to be open elsewhere. Both refuse an existing destination;
 use fresh paths in private owner-only directories, not a live ledger path.
 Files are checked for ownership, private permissions, symlinks/hardlinks,
 checksum and schema/row validity; exclusion locks remain part of the contract.
+Backup/restore also transfer validated terminal 2PC decision receipts; they
+publish the snapshot only after those receipts are durable. Unresolved prepared
+state is not transferable, and backup refuses while a prepare is pending.
 
 A transfer failure after publication/directory sync can leave a destination
 image. Preserve and inspect it rather than deleting it or assuming no write
@@ -126,14 +131,64 @@ KV, document, columnar, vector and event engines. The transaction manager now
 retains committed point-key write sets for every active SERIALIZABLE snapshot,
 so an already-committed concurrent transaction cannot disappear from OCC
 validation. A caller receives that guarantee only when it records all reads and
-writes. Predicate/range conflicts, durable 2PC coordinator recovery and the
-SQL limits stated above remain outside this component's current contract.
+writes. Predicate/range conflicts and the SQL limits stated above remain outside
+this component's current contract. An opt-in durable 2PC journal records the
+participant IDs fixed at PREPARE and the irreversible COMMIT/ABORT decision; it
+does not persist participant prepare payloads (`src/tractable/qihse_txn.c`,
+`journal_parse()` and `qihse_txn_manager_recover()`). Recovery therefore depends
+on participant callbacks that can find durable state by transaction ID and
+idempotently finish or abort it. The SQL table store now durably stages table
+shadows in a validated `.prepared` snapshot, fences writes while unresolved,
+and deduplicates terminal decisions using durable receipts. SQL registration
+and enlistment remain opt-in; DDL and retry-key resources are rejected. Blob
+PREPARE durably stages content and binding metadata without publishing a new
+object; common-decision replay publishes or aborts it idempotently. Public
+transaction and participant layouts remain unchanged.
+
+`tests/test_sql_blob_txn_2pc.c` exercises actual SQL and blob participants under
+one durable manager: restart after the common COMMIT decision, undecided PREPARE
+recovery to ABORT, duplicate-CAS abort preservation, and receipt-based ID floors
+before fresh-coordinator recovery. This is bounded native integration, not
+transparent enlistment by ordinary UWP COMMIT, which still uses the one-phase
+path. Blob archive v2 preserves terminal receipts without replaying their
+historical reference-count changes; it keeps deleted objects deleted and carries
+the ID floor into a fresh coordinator. Export rejects unresolved prepares before
+emitting bytes. V1 import remains supported, and the archive is authenticated,
+not encrypted (`tests/test_blob_archive.c`). A bounded local shared package now
+couples KV, SQL, blob and coordinator snapshots with authenticated checkpoints
+and receipts; see [shared backup v1](../contracts/shared-backup-v1.md). Its native
+fresh-process restore/replay fixture is not the full failure/restore/scale matrix
+or deployment acceptance. W11.1 is not complete.
+
+The bootstrap Operator can capture a quiescent durable journal with
+`qihse_txn_backup_checkpoint_user()` and `qihse_txn_backup_export_user()`. The
+export validates without tail repair, runs callbacks unlocked and rejects source
+or principal-generation changes. Its captured next-ID floor must accompany the
+journal in the authenticated shared-package manifest. Append/sync failure either
+durably rolls back the attempted suffix or poisons the manager until reopen; uncertain
+COMMIT cannot be followed by ABORT. ID exhaustion fails closed rather than
+wrapping to transaction ID zero. The shared exporter brackets these checkpoints
+with all other native exports to establish its bounded local consistency point;
+it does not establish distributed snapshots or production restore readiness.
+
 Terminal state transitions recheck state under the manager mutex, so concurrent
 commit/commit and commit/rollback calls on one handle have exactly one winner.
 
 ## 2. Transaction Manager
 
 **Files**: `include/qihse_txn.h`, `src/tractable/qihse_txn.c`
+
+Managers belong to their creating PID. Manager-backed APIs reject inherited
+handles before acquiring locks or mutating state; the focused durable test
+exercises 13 APIs with and without an inherited held mutex (26 child cases),
+followed by parent use and recovery. Transaction-only helpers without a manager
+pointer cannot enforce this boundary. Inherited manager destroy is a no-op:
+it does not free copied resources, invoke callbacks or close journal FDs.
+Exec/exit must discard inherited descriptors; a fresh durable owner must still
+acquire the journal lease after the prior owner releases it. This is not
+arbitrary non-exec fork handoff. Participant callbacks execute under the manager
+mutex and must not re-enter manager APIs on that thread. See
+[`qihse_txn.h`](../../include/qihse_txn.h) for the API contract.
 
 ### Transaction Lifecycle
 
@@ -146,8 +201,10 @@ BEGIN ──> ACTIVE ──> PREPARED (2PC) ──> COMMITTED
 ### API
 
 ```c
-// Create / destroy a transaction manager
+// Volatile default manager, or opt-in durable 2PC coordinator
 qihse_txn_manager_t* qihse_txn_manager_create(void);
+qihse_txn_manager_t* qihse_txn_manager_create_durable(const char* journal_path);
+int qihse_txn_manager_recover(qihse_txn_manager_t* mgr);
 void qihse_txn_manager_destroy(qihse_txn_manager_t* mgr);
 
 // Begin a transaction with specified isolation level
@@ -250,7 +307,17 @@ Each engine implements the participant interface:
 - `abort()`: Discard changes, release locks
 
 A participant whose `prepare()` fails aborts the whole transaction; the
-participant callback sequencing is covered by `tests/test_txn.c`.
+participant callback sequencing is covered by `tests/test_txn.c`. For a durable
+manager, register each stable `engine_id` once before recovery. The private,
+owner-only journal persists participant membership before prepare and the
+irrevocable COMMIT/ABORT decision before phase-two callbacks. Recovery must run
+before new transactions: it replays decided work and resolves an undecided
+prepare as ABORT. Callbacks must durably deduplicate decisions by transaction ID
+and tolerate retries. `tests/test_txn_durable_2pc.c` covers coordinator restart,
+commit/abort replay, callback retry, and undecided-prepare resolution using
+mock file-backed participants. Actual SQL/blob enlistment is covered separately
+by `tests/test_sql_blob_txn_2pc.c`; neither test establishes arbitrary application
+model integration or the outstanding W11 acceptance gates.
 
 The manager also accepts one atomic local resource for ordinary one-phase
 commit. Its callbacks run while the manager lock is held and must not call back

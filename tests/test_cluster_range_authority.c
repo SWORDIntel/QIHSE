@@ -23,6 +23,7 @@ static uint8_t evidence[32];
 static unsigned state_calls, reserve_calls, finalize_calls, resolve_calls;
 static unsigned abort_calls;
 static bool resolver_available = true;
+static bool target_group_available = true;
 static qihse_cluster_ownership_txn_t local_abort;
 static uint16_t local_node_index = 1;
 static uint16_t common_owner[16384], cached_owner[16384];
@@ -216,7 +217,9 @@ static bool resolve(void* ctx, const qihse_user_t* principal,
     resolve_calls++;
     assert(role == (!strcmp(node, "node-a") ? QIHSE_CLUSTER_RANGE_SOURCE_GROUP :
         QIHSE_CLUSTER_RANGE_TARGET_GROUP));
-    if (!resolver_available) return false;
+    if (!resolver_available ||
+        (!strcmp(node, "node-b") && role == QIHSE_CLUSTER_RANGE_TARGET_GROUP &&
+         !target_group_available)) return false;
     memset(group, !strcmp(node, "node-a") ? '1' : '2', 64);
     group[64] = 0;
     memset(generation, !strcmp(node, "node-a") ? 'a' : 'b', 32);
@@ -254,6 +257,12 @@ int main(void) {
     assert(!qihse_cluster_range_authority_reserve(&a, NULL, &transaction, NULL, 0));
     assert(!qihse_cluster_range_authority_reserve(&a, low, &transaction, NULL, 0));
     assert(!state_calls && !reserve_calls && !resolve_calls);
+    /* A recovered physical node with no admitted SOURCE group is not a
+     * transfer destination. Reject before reading/reserving quorum state. */
+    target_group_available = false;
+    assert(!qihse_cluster_range_authority_reserve(&a, op, &transaction, NULL, 0));
+    assert(!state_calls && !reserve_calls && resolve_calls == 2);
+    target_group_available = true;
     assert(qihse_cluster_range_authority_reserve(&a, op, &transaction, NULL, 0));
     assert(transaction.config_epoch == 101 && reserve_calls == 1 && state_calls == 1);
     unsigned resolutions = resolve_calls;

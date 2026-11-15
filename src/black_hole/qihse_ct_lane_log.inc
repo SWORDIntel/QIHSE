@@ -499,7 +499,7 @@ static bool ct_lane_log_append_fd(
     uint64_t position, qihse_user_t *principal,
     qihse_kv_ct_tenant_policy_t policy, uint32_t tenant, int wal_fd,
     off_t frame_offset, size_t frame_len, uint64_t retained_limit,
-    uint64_t *out_retained_bytes) {
+    uint64_t *out_retained_bytes, bool recovery) {
     if (out_retained_bytes) *out_retained_bytes = 0u;
     if (!store || !principal || !position || wal_fd < 0 || frame_offset < 0 ||
         !out_retained_bytes || !ct_id_valid(source_id) ||
@@ -554,7 +554,11 @@ static bool ct_lane_log_append_fd(
             int saved = errno ? errno : EINVAL;
             close(fd); free(frame); errno = saved; return false;
         }
-        if (h.acknowledged != acknowledged_position) {
+        /* ACK metadata precedes data sync and sidecar GC. Recovery retains
+         * the sidecar ACK for exact duplicates and contiguous WAL rebuilding;
+         * only post-WAL reconciliation may advance ACK and collect frames. */
+        if (h.acknowledged > acknowledged_position ||
+            (!recovery && h.acknowledged != acknowledged_position)) {
             close(fd); free(frame); errno = EINVAL; return false;
         }
         if ((uint64_t)st.st_size != CTLL_FILE_HEADER_BYTES + h.retained_bytes) {

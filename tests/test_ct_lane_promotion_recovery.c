@@ -52,8 +52,9 @@ const char* qihse_kv_store_data_directory(qihse_kv_store_t* store) {
 
 bool qihse_kv_ct_lane_status(qihse_kv_store_t* store, qihse_user_t* user,
     const char* lane, qihse_kv_ct_lane_status_t* out) {
-    assert(store == (qihse_kv_store_t*)(uintptr_t)1 && user == fixture.op);
+    assert(store == (qihse_kv_store_t*)(uintptr_t)1);
     assert(!strcmp(lane, lane_id) && out);
+    if (user != fixture.op) return false;
     fixture.status_calls++;
     *out = fixture.lane;
     return true;

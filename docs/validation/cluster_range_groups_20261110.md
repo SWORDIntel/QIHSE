@@ -238,14 +238,34 @@ staging. Bounded control-message priority prevents payload starvation. The
 focused consensus mesh target passes, including its existing durability,
 quorum, snapshot/resume and lost-ACK cases plus the scheduling regression.
 
+## Later bounded local follow-up (not another rolling deployment)
+
+Newly marked temporary RECEIVER staging can now be retired on an exact common
+ABORT using durable reservation/token-bound provenance, without deleting rows or
+retiring unmarked replicas. Native disjoint reuse, publication/unlink faults,
+reopen, legacy metadata and retained completed receipts have focused normal and
+sanitizer evidence. Preparation-time cuts in private metadata also support
+bounded automatic discovery of already-ABORTed pre-import staging after reopen;
+older cut-unknown/unmarked records remain conservative. The historical
+live-deployment claims above are unchanged.
+
+The later promotion drill also exposed a legal interrupted SOURCE ACK:
+metadata ACK 2 preceded sidecar ACK 1/last 2 collection. Recovery-only WAL replay
+now permits that lag while checking exact duplicates and contiguous suffixes;
+after replay, ordinary reconciliation performs GC. A precise SIGKILL witness and
+valid-checksum negative fixtures cover the boundary. See the
+[current contract](../plans/ct_range_group_contract.md) for scope and evidence.
+These results do not close physical fault, cluster-image or full CT gates.
+
 ## Remaining work and limits
 
 - Source validation and the six-daemon native rollout above are complete for
   this repair batch. Investigate the live owner BACKUP creation failure above.
-- A cancelled temporary incoming receiver can retain its staging bitmap.
-  Reuse for a different range after ABORT needs proof-driven retirement that
-  preserves a legitimate pre-existing replica. Completed empty staging reuse
-  is covered; cancelled nonempty staging reuse is not closed.
+- Unmarked historical incoming receivers can retain their staging bitmap:
+  without durable provenance, ABORT alone still cannot establish disposability.
+  Newly marked nonempty staging has bounded native retirement/reuse evidence
+  above; cut-unknown historical discovery and broader fault acceptance remain
+  open. This is not retroactive cleanup of live deployment state.
 - Raw peer staging files need terminal-decision garbage collection. Immutable
   QKV7 recovery images must remain until their WAL references are checkpointed.
 - Rebalancing a recovered physical node with no current SOURCE group needs

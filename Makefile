@@ -195,7 +195,7 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/frieze/qihse_column_store.c src/frieze/qihse_btree.c src/frieze/qihse_hash_index.c src/frieze/qihse_index_manager.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
             src/network_intelligence/bgp_route_probe.cpp src/network_intelligence/bgp_update_decoder.cpp src/network_intelligence/rpki_rtr_probe.cpp src/network_intelligence/rdap_probe.cpp src/network_intelligence/ptr_probe.cpp src/network_intelligence/route_helper.cpp \
             src/tractable/qihse_bytecode.c src/tractable/qihse_bytecode_compiler.c src/tractable/qihse_index_scan.c src/tractable/qihse_txn.c src/tractable/qihse_mvcc.c src/tractable/qihse_wal.c src/tractable/qihse_recovery.c src/broad_oak/qihse_graph_store.c src/broad_oak/qihse_graph_ingest.c src/tractable/qihse_cypher_parser.c src/tractable/qihse_cypher_executor.c src/broad_oak/qihse_graph_algo.c src/broad_oak/qihse_graph_vector.c \
-            src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/controller/qihse_controller.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/federation/qihse_consensus.c src/federation/qihse_consensus_snapshot_stage.c src/federation/qihse_federation_snapshot_xfer.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
+            src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_shared_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/controller/qihse_controller.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/federation/qihse_consensus.c src/federation/qihse_consensus_snapshot_stage.c src/federation/qihse_federation_snapshot_xfer.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
             vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c src/tractable/qihse_dist_planner.c src/tractable/qihse_join_executor.c src/tractable/qihse_aggregate_executor.c src/tractable/qihse_sort_executor.c src/tractable/qihse_window_executor.c src/tractable/qihse_table_store.c src/tractable/qihse_schema.c src/tractable/qihse_optimizer.c src/tractable/qihse_optimizer_governance.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c persistence/qihse_container.c persistence/qihse_pqc_crypto.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
@@ -578,15 +578,24 @@ test-ct-lane-baseline: lib
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_baseline
 
 # The executable owns a fault-enabled KV implementation; production shared
-# objects never expose the crash-injection environment switches.
+# objects never expose the crash-injection environment switches. Fixture-only
+# rename/fsync interposers witness durable ACK publication before sidecar GC.
 test-ct-lane-log: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
 	    -o tests/test_ct_lane_log tests/test_ct_lane_log.c src/black_hole/qihse_kv_store.c \
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_log
 
+.PHONY: test-ct-lane-log-sanitize
+test-ct-lane-log-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o build/test_ct_lane_log_sanitize tests/test_ct_lane_log.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_ct_lane_log_sanitize
+
 test-ct-lane-transfer: lib
-	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_transfer tests/test_ct_lane_transfer.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_ct_lane_transfer tests/test_ct_lane_transfer.c \
+	    src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_transfer
 
 test-serial: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer test-ct-lane-lifecycle
@@ -683,19 +692,44 @@ test-ownership-lane-abort: lib
 	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ownership_lane_abort tests/test_ownership_lane_abort.c src/spinnaker/qihse_cluster_ownership.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_lane_abort
 
+.PHONY: test-ownership-lane-abort-sanitize
+test-ownership-lane-abort-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_ownership_lane_abort_sanitize tests/test_ownership_lane_abort.c src/spinnaker/qihse_cluster_ownership.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_ownership_lane_abort_sanitize
+
 test-serial: test-ownership-lane-abort
 
-.PHONY: test-ct-lane-promotion-recovery test-ct-multigroup-promotion
+.PHONY: test-ownership-staging-discovery test-ownership-staging-discovery-sanitize
+test-ownership-staging-discovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ownership_staging_discovery tests/test_ownership_staging_discovery.c src/spinnaker/qihse_cluster_ownership.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ownership_staging_discovery
+
+test-ownership-staging-discovery-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_ownership_staging_discovery_sanitize tests/test_ownership_staging_discovery.c src/spinnaker/qihse_cluster_ownership.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_ownership_staging_discovery_sanitize
+
+test-serial: test-ownership-staging-discovery
+
+.PHONY: test-ct-lane-promotion-recovery test-ct-group-failover-tick test-ct-multigroup-promotion
 test-ct-lane-promotion-recovery: lib
 	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ct_lane_promotion_recovery tests/test_ct_lane_promotion_recovery.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_promotion_recovery
 
+test-ct-group-failover-tick: lib
+	$(CC) $(CFLAGS) -UNDEBUG -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,--export-dynamic \
+	    -Wl,--wrap=qihse_cluster_failover_promote_lane -o tests/test_ct_group_failover_tick tests/test_ct_group_failover_tick.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_group_failover_tick
+
 test-ct-multigroup-promotion: cluster-daemon keygen
 	LD_LIBRARY_PATH=. python3 tests/ct_multigroup_promotion_drill.py
 
-test-serial: test-ct-lane-promotion-recovery test-ct-multigroup-promotion
+test-serial: test-ct-lane-promotion-recovery test-ct-group-failover-tick test-ct-multigroup-promotion
 
-.PHONY: test-ct-group-config test-ct-lane-commands test-ct-multigroup
+.PHONY: test-ct-group-config test-ct-lane-commands test-ct-multigroup test-ct-group-admission-recovery
+test-ct-group-admission-recovery: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/ct_group_admission_recovery_drill.py
 test-ct-group-config:
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_group_config \
 	    tests/test_ct_group_config.c src/spinnaker/qihse_ct_group_config.c
@@ -708,7 +742,7 @@ test-ct-lane-commands: lib
 test-ct-multigroup: cluster-daemon keygen
 	LD_LIBRARY_PATH=. python3 tests/ct_multigroup_drill.py
 
-test-serial: test-ct-group-config test-ct-lane-commands test-ct-multigroup
+test-serial: test-ct-group-config test-ct-lane-commands test-ct-multigroup test-ct-group-admission-recovery
 
 .PHONY: test-consensus-authority-forward test-consensus-authority-auth
 test-consensus-authority-forward: lib
@@ -1191,6 +1225,14 @@ test-consensus-mesh: lib
 	$(CC) $(CFLAGS) -DQIHSE_CONSENSUS_MESH_TESTING -o tests/test_consensus_mesh tests/test_consensus_mesh.c src/federation/qihse_consensus_mesh.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_consensus_mesh
 
+.PHONY: test-blob-archive
+test-blob-archive: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_blob_archive tests/test_blob_archive.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_blob_archive
+
+test-serial: test-blob-archive
+
 test-consensus-blob-channel: lib
 	$(CC) $(CFLAGS) -o tests/test_consensus_blob_channel tests/test_consensus_blob_channel.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_consensus_blob_channel
@@ -1202,6 +1244,50 @@ test-fed-sim: lib
 test-incremental-export: lib
 	$(CC) $(CFLAGS) -o tests/test_incremental_export tests/test_incremental_export.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_incremental_export
+
+.PHONY: test-kv-snapshot-checkpoint
+test-kv-snapshot-checkpoint: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_kv_snapshot_checkpoint tests/test_kv_snapshot_checkpoint.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_snapshot_checkpoint
+
+test-serial: test-kv-snapshot-checkpoint
+
+.PHONY: test-shared-backup
+test-shared-backup: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_shared_backup tests/test_shared_backup.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_shared_backup
+
+test-serial: test-shared-backup
+
+.PHONY: test-shared-backup-enospc
+test-shared-backup-enospc: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o build/test_shared_backup_enospc tests/test_shared_backup.c -L. -lqihse $(LDFLAGS)
+	bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc
+	bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc --capacity-export
+
+test-serial: test-shared-backup-enospc
+
+.PHONY: test-shared-backup-enospc-sanitize
+test-shared-backup-enospc-sanitize: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_shared_backup_enospc_sanitize tests/test_shared_backup.c src/tractable/qihse_shared_backup.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc_sanitize
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc_sanitize --capacity-export
+
+.PHONY: test-shared-backup-sanitize
+test-shared-backup-sanitize: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_shared_backup_sanitize tests/test_shared_backup.c src/tractable/qihse_shared_backup.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_shared_backup_sanitize
+
+.PHONY: check-shared-backup-stack
+check-shared-backup-stack:
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 -c src/tractable/qihse_shared_backup.c -o build/shared_backup_stack.o
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 -c tests/test_shared_backup.c -o build/shared_backup_test_stack.o
 
 test-replica-security: lib
 	$(CC) $(CFLAGS) -o tests/test_replica_security_regression tests/test_replica_security_regression.c -L. -lqihse $(LDFLAGS)
@@ -1297,7 +1383,7 @@ test-aimem-qh05-08: lib
 	LD_LIBRARY_PATH=. ./tests/test_aimem_qh05_08
 
 test-aimem-qh08: lib
-	$(CC) $(CFLAGS) -o tests/test_aimem_qh08 tests/test_aimem_qh08.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_aimem_qh08 tests/test_aimem_qh08.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_qh08
 
 test-aimem-qh08-resp: lib
@@ -1555,6 +1641,55 @@ tests/gold/workloads/%: tests/gold/workloads/%.c libqihse.so
 test-txn: lib
 	$(CC) $(CFLAGS) -o tests/test_txn tests/test_txn.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_txn
+
+test-txn-durable-2pc: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_txn_durable_2pc tests/test_txn_durable_2pc.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_txn_durable_2pc
+
+.PHONY: test-sql-blob-txn-2pc
+test-sql-blob-txn-2pc: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_sql_blob_txn_2pc tests/test_sql_blob_txn_2pc.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_sql_blob_txn_2pc
+
+.PHONY: test-sql-receipt-recovery test-sql-receipt-recovery-sanitize check-sql-receipt-stack
+test-sql-receipt-recovery: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o build/test_sql_receipt_recovery tests/test_sql_blob_txn_2pc.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_sql_receipt_recovery --receipt-suite
+
+test-sql-receipt-recovery-sanitize: lib
+	mkdir -p build
+	$(CC) $(filter-out -O3,$(CFLAGS)) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_sql_receipt_recovery_sanitize tests/test_sql_blob_txn_2pc.c src/tractable/qihse_table_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_sql_receipt_recovery_sanitize --receipt-suite
+
+test-serial: test-sql-receipt-recovery
+
+check-sql-receipt-stack:
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 -c -o build/test_sql_receipt_recovery_stack.o tests/test_sql_blob_txn_2pc.c
+
+.PHONY: test-w11-order-recovery
+test-w11-order-recovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_w11_order_recovery tests/test_w11_order_recovery.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_w11_order_recovery
+
+test-serial: test-w11-order-recovery
+
+.PHONY: test-w11-order-recovery-sanitize check-w11-order-stack
+test-w11-order-recovery-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer \
+	    -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic \
+	    -o build/test_w11_order_recovery_sanitize tests/test_w11_order_recovery.c \
+	    -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_w11_order_recovery_sanitize
+
+check-w11-order-stack:
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 \
+	    -c -o build/test_w11_order_recovery_stack.o tests/test_w11_order_recovery.c
 
 # WAL durability error propagation uses a syscall shim to inject fdatasync
 # failures deterministically; this standalone test links the WAL implementation
@@ -2641,6 +2776,14 @@ test-serial: test-w12-shadow-gate
 test-w11-combined-early: lib
 	bash benchmarks/w11_combined_early.sh 8 7 > build/w11_combined_early_ci.json
 	python3 -m json.tool build/w11_combined_early_ci.json > /dev/null
+
+.PHONY: test-w11-combined-recovery
+test-w11-combined-recovery: lib
+	bash benchmarks/w11_combined_recovery.sh
+
+.PHONY: test-w11-combined-recovery-sanitize
+test-w11-combined-recovery-sanitize: lib
+	bash benchmarks/w11_combined_recovery.sh --sanitize
 
 test-serial: test-w11-combined-early
 

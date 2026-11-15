@@ -182,9 +182,50 @@ int main(void) {
         "22222222-2222-4222-8222-222222222222", "bad/id", "UPSERT", "0", "{}"};
     expect_error(writer, 6u, invalid_id);
 
+    const char* typed_json =
+        "{\"schema_version\":2,\"record_type\":\"dataset\",\"record_version\":1,"
+        "\"identity\":{\"provider_id\":\"fixture\",\"catalog_id\":\"catalog\","
+        "\"native_id\":\"typed/key\"},\"data\":{\"title\":\"typed fixture\"},"
+        "\"links\":[],\"provenance\":{\"source_ref\":\"fixture:typed\","
+        "\"retrieved_at\":\"2026-11-12T00:00:00Z\",\"mapping_version\":\"1\","
+        "\"input_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"evidence\":\"fixture\"},\"extensions\":[]}";
+    const char* typed_upsert[] = {"DIRECTEYE.RECORD.MUTATE",
+        "66666666-6666-4666-8666-666666666666",
+        "dq2_dataset_4ffdc3a9cc180905b8c056f5ae5cd2aaaf91caa551b6382de6d0fa9463ce600a",
+        "UPSERT", "0", typed_json};
+    reply = call_text(writer, 6u, typed_upsert);
+    cursor_text = strstr(reply, "\r\n") + 2;
+    uint64_t typed_generation = bulk_number(&cursor_text);
+    uint64_t typed_cursor = bulk_number(&cursor_text);
+    assert(typed_generation > replacement_generation && typed_cursor == typed_generation + 1u);
+    free(reply);
+    reply = call_text(writer, 6u, typed_upsert);
+    cursor_text = strstr(reply, "\r\n") + 2;
+    assert(bulk_number(&cursor_text) == typed_generation);
+    assert(bulk_number(&cursor_text) == typed_cursor);
+    free(reply);
+    const char* typed_conflict[] = {"DIRECTEYE.RECORD.MUTATE",
+        "66666666-6666-4666-8666-666666666666",
+        "dq2_dataset_4ffdc3a9cc180905b8c056f5ae5cd2aaaf91caa551b6382de6d0fa9463ce600a",
+        "UPSERT", "0", "{\"conflict\":true}"};
+    expect_error(writer, 6u, typed_conflict);
+    const char* typed_get[] = {"DIRECTEYE.RECORD.GET",
+        "dq2_dataset_4ffdc3a9cc180905b8c056f5ae5cd2aaaf91caa551b6382de6d0fa9463ce600a"};
+    reply = call_text(writer, 2u, typed_get);
+    assert(strstr(reply, "typed fixture") && strstr(reply, "schema_version") &&
+           strstr(reply, "\r\n0\r\n$"));
+    free(reply);
+    reply = call_text(low_indexer, 2u, typed_get);
+    assert(strstr(reply, "\r\n$-1\r\n") && !strstr(reply, "typed fixture"));
+    free(reply);
+
     const char* read[] = {"DIRECTEYE.FEED.READ", "0", "16"};
     reply = call_text(indexer, 3u, read);
-    assert(reply[0] == '*' && strstr(reply, "record-1") && strstr(reply, "committed_at_ms"));
+    assert(reply[0] == '*' && strstr(reply, "record-1") && strstr(reply, "committed_at_ms") &&
+           strstr(reply, "dq2_dataset_4ffdc3a9cc180905b8c056f5ae5cd2aaaf91caa551b6382de6d0fa9463ce600a") &&
+           strstr(reply, "\"tenant\":77") && strstr(reply, "\"classification\":4") &&
+           strstr(reply, "\"sci\":2"));
     free(reply);
     expect_error(writer, 3u, read);
     char* filtered = call_text(low_indexer, 3u, read);

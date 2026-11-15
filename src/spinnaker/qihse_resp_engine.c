@@ -425,6 +425,8 @@ struct qihse_resp_server {
     /* R4c QKP1: caller-owned handshake config (identity, trust anchors,
      * require flag). NULL/zeroed = opportunistic cleartext-only server. */
     qihse_qkp_config_t pqc;
+    char* admin_peer_node_id_2;
+    char* admin_peer_dsa_pub_path_2;
     qihse_user_t* replication_service_principal;
     _Atomic(const char*) ct_role;
     pthread_mutex_t ct_config_lock;
@@ -13829,7 +13831,7 @@ static bool qihse_resp_ct_group_cursor(qihse_resp_session_t* s,
         qihse_kv_ct_lane_status(s->server->store, s->user,
             claim.target_group_id, &status);
     if (ok && !strcmp(s->server->pqc.node_id, claim.target_qkp_id)) {
-        ok = status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+        ok = status.mode == QIHSE_KV_CT_LANE_SOURCE && status.admitted &&
             strcmp(status.source_id, claim.target_qkp_id) == 0 &&
             strcmp(status.peer_id, claim.successor_qkp_id) == 0 &&
             strcmp(status.generation, claim.target_generation) == 0;
@@ -13876,6 +13878,7 @@ static bool qihse_resp_ct_group_stage_begin(qihse_resp_session_t* s,
         s->server->store, s->user, claim.target_group_id, &target_status);
     if (target_cursor_ready && !strcmp(s->server->pqc.node_id, claim.target_qkp_id))
         target_cursor_ready = target_status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+            target_status.admitted &&
             target_status.acknowledged_position >= claim.target_cursor;
     else if (target_cursor_ready)
         target_cursor_ready = target_status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
@@ -21309,11 +21312,21 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
          * configured with --admin-peer-node-id/--admin-peer-dsa-pub maps to
          * the system operator. Mirrors the replication pin; grants full
          * command scope (QIHSE_RESP_AUTH_QKP_ADMIN). */
-        if (!replication_peer && !session.user && server->pqc.admin_peer_node_id &&
-            server->pqc.admin_peer_dsa_pub_path &&
-            qihse_qkp_session_is_replication_peer(
-                qkp, server->pqc.admin_peer_node_id,
-                server->pqc.admin_peer_dsa_pub_path)) {
+        bool admin_peer = false;
+        if (!replication_peer && !session.user) {
+            admin_peer = server->pqc.admin_peer_node_id &&
+                server->pqc.admin_peer_dsa_pub_path &&
+                qihse_qkp_session_is_replication_peer(
+                    qkp, server->pqc.admin_peer_node_id,
+                    server->pqc.admin_peer_dsa_pub_path);
+            if (!admin_peer && server->admin_peer_node_id_2 &&
+                server->admin_peer_dsa_pub_path_2) {
+                admin_peer = qihse_qkp_session_is_replication_peer(
+                    qkp, server->admin_peer_node_id_2,
+                    server->admin_peer_dsa_pub_path_2);
+            }
+        }
+        if (admin_peer) {
             qihse_user_t* op = qihse_auth_get_user(0u);
             bool op_active = false;
             uint32_t op_tenant = QIHSE_TENANT_INVALID;
@@ -22495,6 +22508,59 @@ static EVP_PKEY* qihse_resp_replication_pub(const char* path) {
     return key;
 }
 
+bool qihse_resp_server_add_admin_peer(
+        qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
+        const qihse_user_t* authenticated_grantor) {
+    if (!server || !node_id || !*node_id ||
+        strlen(node_id) > QIHSE_QKP_NODE_ID_LEN || !dsa_pub_path ||
+        !*dsa_pub_path || strlen(dsa_pub_path) >= PATH_MAX) return false;
+    pthread_mutex_lock(&server->state_lock);
+    bool ok = false;
+    EVP_PKEY* key = NULL;
+    char* owned_id = NULL;
+    char* owned_path = NULL;
+    bool replication_identity = server->pqc.replication_peer_node_id &&
+        strcmp(node_id, server->pqc.replication_peer_node_id) == 0;
+    for (size_t i = 0; !replication_identity && i < server->replication_peer_count; ++i)
+        replication_identity = strcmp(node_id, server->replication_peers[i].node_id) == 0;
+    if (server->replication_peers_frozen || server->running ||
+        server->listen_fd >= 0 || server->accept_thread_started ||
+        server->stopping || server->active_clients || replication_identity ||
+        server->admin_peer_node_id_2 || server->admin_peer_dsa_pub_path_2 ||
+        !authenticated_grantor ||
+        !qihse_auth_user_is_active(authenticated_grantor) ||
+        qihse_user_get_tenant_id(authenticated_grantor) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(authenticated_grantor) != QIHSE_ROLE_OPERATOR ||
+        (server->pqc.admin_peer_node_id &&
+         strcmp(node_id, server->pqc.admin_peer_node_id) == 0)) goto done;
+    key = qihse_resp_replication_pub(dsa_pub_path);
+    if (!key || !server->pqc.trusted_pubs || server->pqc.trusted_count == 0u)
+        goto done;
+    bool trusted = false;
+    for (size_t i = 0; i < server->pqc.trusted_count; ++i) {
+        EVP_PKEY* anchor = server->pqc.trusted_pubs[i]
+            ? qihse_resp_replication_pub(server->pqc.trusted_pubs[i]) : NULL;
+        if (anchor && EVP_PKEY_eq(key, anchor) == 1) trusted = true;
+        EVP_PKEY_free(anchor);
+        if (trusted) break;
+    }
+    if (!trusted) goto done;
+    owned_id = strdup(node_id);
+    owned_path = strdup(dsa_pub_path);
+    if (!owned_id || !owned_path) goto done;
+    server->admin_peer_node_id_2 = owned_id;
+    server->admin_peer_dsa_pub_path_2 = owned_path;
+    owned_id = NULL;
+    owned_path = NULL;
+    ok = true;
+done:
+    free(owned_id);
+    free(owned_path);
+    EVP_PKEY_free(key);
+    pthread_mutex_unlock(&server->state_lock);
+    return ok;
+}
+
 bool qihse_resp_server_add_replication_peer(
         qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
         const qihse_user_t* authenticated_grantor) {
@@ -22785,6 +22851,8 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
         free((char*)server->replication_peers[i].node_id);
         free((char*)server->replication_peers[i].dsa_pub_path);
     }
+    free(server->admin_peer_node_id_2);
+    free(server->admin_peer_dsa_pub_path_2);
     /* R5 §13: watches die with their sessions; the detach in the session
      * teardown guarantees the registry is empty by the time clients drain. */
     free(server->watch_entries);

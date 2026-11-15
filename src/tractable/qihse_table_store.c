@@ -32,6 +32,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -46,6 +47,9 @@ typedef struct {
 /* -------------------------------------------------------------------------
  * Internal structures
  * ------------------------------------------------------------------------- */
+typedef struct ts_decision_receipt ts_decision_receipt_t;
+static bool ts_decisions_read(const char* store_path,
+                              ts_decision_receipt_t** out, size_t* out_count);
 
 struct qihse_table {
     qihse_table_store_t* owner;        /* borrowed */
@@ -89,6 +93,8 @@ struct qihse_table_store {
     int                 lock_fd;      /* lifetime writer exclusion */
     pid_t               owner_pid;    /* inherited handles cannot write after fork */
     bool                poisoned;     /* ambiguous post-rename I/O error */
+    uint64_t            pending_txn_id; /* durable 2PC prepare fences writers */
+    uint64_t            snapshot_epoch; /* runtime-only saturated publication fence */
     unsigned char*      schema_image; /* committed with rows */
     size_t              schema_len;
     ts_retry_entry_t*   retries;
@@ -99,6 +105,12 @@ struct qihse_table_store {
 /* -------------------------------------------------------------------------
  * Helpers
  * ------------------------------------------------------------------------- */
+
+/* All callers hold the store mutex. Count publication even when a subsequent
+ * durability step fails: resolution may later make the handle healthy again. */
+static void ts_snapshot_epoch_advance(qihse_table_store_t* s) {
+    if (s->snapshot_epoch != UINT64_MAX) ++s->snapshot_epoch;
+}
 
 static bool ts_string_type(qihse_ts_type_t type) {
     return type == QIHSE_TS_STRING || type == QIHSE_TS_UUID ||
@@ -627,6 +639,7 @@ static bool ts_persist(qihse_table_store_t* s, ts_group_item_t* items,
             if (close(fd) != 0) ok = false;
         }
         if (ok && rename(tmp, s->path) == 0) {
+            ts_snapshot_epoch_advance(s);
             /* A failure after rename is ambiguous: refuse further writes. */
             s->poisoned = true;
             char* slash = strrchr(dir, '/');
@@ -767,6 +780,197 @@ static bool ts_decode(qihse_table_store_t* s, ts_buf_t* b, bool catalog,
     return b->pos == b->n;
 }
 
+static bool ts_sync_parent(const char* path) {
+    char* dir = strdup(path);
+    if (!dir) return false;
+    char* slash = strrchr(dir, '/');
+    if (slash) { if (slash == dir) slash[1] = 0; else *slash = 0; }
+    else strcpy(dir, ".");
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    bool ok = fd >= 0 && fsync(fd) == 0;
+    if (fd >= 0 && close(fd) != 0) ok = false;
+    free(dir);
+    return ok;
+}
+
+/* Publish a private byte image in the target directory. With replace=false,
+ * link() provides no-replace semantics for the one unresolved prepare slot. */
+static bool ts_atomic_file(const char* path, const void* bytes, size_t len,
+                           bool replace, bool* published) {
+    if (published) *published = false;
+    size_t n = strlen(path);
+    static const char suffix[] = ".tmp.XXXXXX";
+    if (n > SIZE_MAX - sizeof(suffix)) return false;
+    char* tmp = malloc(n + sizeof(suffix));
+    if (!tmp) return false;
+    memcpy(tmp, path, n);
+    memcpy(tmp + n, suffix, sizeof(suffix));
+    int fd = mkstemp(tmp);
+    bool ok = fd >= 0;
+    if (ok) ok = ts_write_all(fd, bytes, len) && fsync(fd) == 0;
+    if (fd >= 0 && close(fd) != 0) ok = false;
+    if (ok) {
+        if (replace) ok = rename(tmp, path) == 0;
+        else ok = link(tmp, path) == 0;
+        if (ok && published) *published = true;
+    }
+    if (ok && !replace) ok = unlink(tmp) == 0;
+    if (ok) ok = ts_sync_parent(path);
+    if (!ok) (void)unlink(tmp);
+    free(tmp);
+    return ok;
+}
+
+static bool ts_read_private_file(const char* path, unsigned char** bytes,
+                                size_t* len, size_t min_len, size_t max_len) {
+    *bytes = NULL; *len = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_uid == geteuid() && (st.st_mode & 077) == 0 &&
+        st.st_nlink == 1 && st.st_size >= (off_t)min_len &&
+        st.st_size <= (off_t)max_len;
+    unsigned char* data = ok ? malloc((size_t)st.st_size) : NULL;
+    if (!data) ok = false;
+    size_t pos = 0;
+    while (ok && pos < (size_t)st.st_size) {
+        ssize_t got = read(fd, data + pos, (size_t)st.st_size - pos);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) { ok = false; break; }
+        pos += (size_t)got;
+    }
+    if (close(fd) != 0) ok = false;
+    if (!ok) { free(data); return false; }
+    *bytes = data; *len = pos;
+    return true;
+}
+
+static bool ts_store_matches_snapshot(const qihse_table_store_t* live,
+                                      const qihse_table_store_t* candidate) {
+    if (live->num_tables != candidate->num_tables ||
+        live->schema_len != candidate->schema_len ||
+        (live->schema_len && memcmp(live->schema_image,
+                                    candidate->schema_image,
+                                    live->schema_len) != 0)) return false;
+    for (size_t i = 0; i < live->num_tables; ++i) {
+        const qihse_table_t* a = live->tables[i];
+        const qihse_table_t* b = candidate->tables[i];
+        if (strcmp(a->name, b->name) || a->num_cols != b->num_cols) return false;
+        for (size_t c = 0; c < a->num_cols; ++c)
+            if (strcmp(a->cols[c].name, b->cols[c].name) ||
+                a->cols[c].type != b->cols[c].type) return false;
+    }
+    return true;
+}
+
+static bool ts_snapshot_decode(qihse_table_store_t* out,
+                               const unsigned char* bytes, size_t len) {
+    if (len < 24 || len > TS_LIMIT + 24) return false;
+    unsigned version = memcmp(bytes, ts_magic, 8) == 0 ? 1 :
+        memcmp(bytes, ts_magic_v2, 8) == 0 ? 2 :
+        memcmp(bytes, ts_magic_v3, 8) == 0 ? 3 :
+        memcmp(bytes, ts_magic_v4, 8) == 0 ? 4 :
+        memcmp(bytes, ts_magic_v5, 8) == 0 ? 5 : 0;
+    if (!version) return false;
+    ts_buf_t b = {.p = (unsigned char*)bytes, .n = len, .pos = 8};
+    uint64_t size, hash;
+    if (!ts_read_u64(&b, &size) || !ts_read_u64(&b, &hash) ||
+        size != len - 24 || hash != ts_hash(bytes + 24, len - 24)) return false;
+    b.pos = 24;
+    return ts_decode(out, &b, version >= 2, version) &&
+        (!out->schema_len || ts_validate_catalog(out, NULL, 0));
+}
+
+static char* ts_prepared_path(const char* path) {
+    size_t n = strlen(path);
+    if (n > SIZE_MAX - sizeof(".prepared")) return NULL;
+    char* out = malloc(n + sizeof(".prepared"));
+    if (out) { memcpy(out, path, n); memcpy(out + n, ".prepared", sizeof(".prepared")); }
+    return out;
+}
+
+static char* ts_decision_path(const char* path, uint64_t txn_id) {
+    char suffix[48];
+    int n = snprintf(suffix, sizeof suffix, ".decision.%016llx",
+                     (unsigned long long)txn_id);
+    size_t base = strlen(path);
+    if (n < 0 || (size_t)n >= sizeof suffix || base > SIZE_MAX - (size_t)n - 1)
+        return NULL;
+    char* out = malloc(base + (size_t)n + 1);
+    if (out) { memcpy(out, path, base); memcpy(out + base, suffix, (size_t)n + 1); }
+    return out;
+}
+
+static bool ts_prepared_read(const char* path, uint64_t* txn_id,
+                             unsigned char** snapshot, size_t* snapshot_len) {
+    unsigned char* data = NULL; size_t len = 0;
+    if (!ts_read_private_file(path, &data, &len, 32, TS_LIMIT + 56)) return false;
+    ts_buf_t b = {.p = data, .n = len, .pos = 8};
+    uint64_t id, size, hash;
+    static const unsigned char magic[8] = {'Q','T','S','P','R','E','P',1};
+    bool ok = !memcmp(data, magic, 8) && ts_read_u64(&b, &id) && id &&
+        ts_read_u64(&b, &size) && ts_read_u64(&b, &hash) &&
+        size == b.n - b.pos && hash == ts_hash(data + b.pos, (size_t)size);
+    unsigned char* image = ok ? malloc((size_t)size) : NULL;
+    if (ok && !image) ok = false;
+    if (ok) memcpy(image, data + b.pos, (size_t)size);
+    free(data);
+    if (!ok) { free(image); return false; }
+    *txn_id = id; *snapshot = image; *snapshot_len = (size_t)size;
+    return true;
+}
+
+static bool ts_decision_check(const char* path, uint64_t txn_id,
+                              bool commit, bool* exists) {
+    *exists = false;
+    char* name = ts_decision_path(path, txn_id);
+    if (!name) return false;
+    unsigned char* data = NULL; size_t len = 0;
+    errno = 0;
+    if (!ts_read_private_file(name, &data, &len, 32, 32)) {
+        bool missing = errno == ENOENT;
+        free(name);
+        return missing;
+    }
+    static const unsigned char magic[8] = {'Q','T','S','D','E','C',1,0};
+    ts_buf_t b = {.p = data, .n = len, .pos = 8};
+    uint64_t id, decision, hash;
+    bool ok = !memcmp(data, magic, 8) && ts_read_u64(&b, &id) &&
+        ts_read_u64(&b, &decision) && ts_read_u64(&b, &hash) &&
+        id == txn_id && decision <= 1 && hash == ts_hash(data, 24) &&
+        (decision != 0) == commit;
+    free(data); free(name);
+    if (!ok) return false;
+    *exists = true;
+    return true;
+}
+
+static bool ts_decision_write(qihse_table_store_t* store, uint64_t txn_id,
+                               bool commit) {
+    const char* path = store->path;
+    char* name = ts_decision_path(path, txn_id);
+    if (!name) return false;
+    unsigned char data[32] = {0};
+    static const unsigned char magic[8] = {'Q','T','S','D','E','C',1,0};
+    memcpy(data, magic, 8);
+    for (int i = 0; i < 8; ++i) data[8 + i] = (unsigned char)(txn_id >> (8*i));
+    uint64_t decision = commit ? 1 : 0;
+    for (int i = 0; i < 8; ++i) data[16 + i] = (unsigned char)(decision >> (8*i));
+    uint64_t hash = ts_hash(data, 24);
+    for (int i = 0; i < 8; ++i) data[24 + i] = (unsigned char)(hash >> (8*i));
+    bool published = false;
+    bool ok = ts_atomic_file(name, data, sizeof data, false, &published);
+    if (published) ts_snapshot_epoch_advance(store);
+    if (!ok && published) store->poisoned = true;
+    if (!ok && !published) {
+        bool exists = false;
+        ok = ts_decision_check(path, txn_id, commit, &exists) && exists;
+    }
+    free(name);
+    return ok;
+}
+
 qihse_table_store_t* qihse_table_store_open_durable(const char* path) {
     if (!path || !*path || strlen(path) > SIZE_MAX - 6) return NULL;
     char* parent = strdup(path);
@@ -836,6 +1040,21 @@ qihse_table_store_t* qihse_table_store_open_durable(const char* path) {
         free(b.p);
         if (!valid) goto fail;
     }
+    char* prepared = ts_prepared_path(path);
+    if (!prepared) goto fail;
+    if (access(prepared, F_OK) == 0) {
+        uint64_t txn_id = 0; unsigned char* image = NULL; size_t image_len = 0;
+        qihse_table_store_t* candidate = qihse_table_store_create();
+        bool valid = candidate && ts_prepared_read(prepared, &txn_id, &image,
+                                                    &image_len) &&
+            ts_snapshot_decode(candidate, image, image_len) &&
+            ts_store_matches_snapshot(s, candidate);
+        free(image);
+        qihse_table_store_destroy(candidate);
+        if (!valid || !txn_id) { free(prepared); goto fail; }
+        s->pending_txn_id = txn_id;
+    } else if (errno != ENOENT) { free(prepared); goto fail; }
+    free(prepared);
     s->path = strdup(path);
     if (!s->path) goto fail;
     s->owner_pid = getpid();
@@ -845,9 +1064,166 @@ fail:
     return NULL;
 }
 
-/* Transfer only already-committed images; never serialize a live shadow or
- * remove an existing destination's receipts. The destination lock is held
- * throughout the atomic no-replace publication. */
+struct ts_decision_receipt {
+    uint64_t txn_id;
+    unsigned char bytes[32];
+};
+
+static bool ts_decision_record_read(const char* path, uint64_t txn_id,
+                                    ts_decision_receipt_t* out) {
+    unsigned char* data = NULL;
+    size_t len = 0;
+    if (!ts_read_private_file(path, &data, &len, 32, 32)) return false;
+    static const unsigned char magic[8] = {'Q','T','S','D','E','C',1,0};
+    ts_buf_t b = {.p = data, .n = len, .pos = 8};
+    uint64_t id = 0, decision = 0, hash = 0;
+    bool ok = !memcmp(data, magic, 8) && ts_read_u64(&b, &id) &&
+        ts_read_u64(&b, &decision) && ts_read_u64(&b, &hash) &&
+        id == txn_id && decision <= 1 && hash == ts_hash(data, 24);
+    if (ok) {
+        out->txn_id = id;
+        memcpy(out->bytes, data, sizeof out->bytes);
+    }
+    free(data);
+    return ok;
+}
+
+/* Enumerate and validate every decision receipt adjacent to a store image.
+ * Any malformed file using the reserved prefix makes transfer fail closed. */
+static bool ts_decisions_read(const char* store_path,
+                              ts_decision_receipt_t** out, size_t* out_count) {
+    *out = NULL;
+    *out_count = 0;
+    char* parent = strdup(store_path);
+    if (!parent) return false;
+    char* slash = strrchr(parent, '/');
+    const char* base = store_path;
+    if (slash) {
+        base = slash + 1;
+        if (slash == parent) slash[1] = 0;
+        else *slash = 0;
+    } else strcpy(parent, ".");
+    if (!*base) { free(parent); return false; }
+    size_t base_len = strlen(base);
+    if (base_len > SIZE_MAX - sizeof(".decision.")) { free(parent); return false; }
+    size_t prefix_len = base_len + sizeof(".decision.") - 1;
+    char* prefix = malloc(prefix_len + 1);
+    if (!prefix) { free(parent); return false; }
+    memcpy(prefix, base, base_len);
+    memcpy(prefix + base_len, ".decision.", sizeof(".decision."));
+    DIR* dir = opendir(parent);
+    free(parent);
+    if (!dir) { free(prefix); return false; }
+    ts_decision_receipt_t* items = NULL;
+    size_t count = 0, capacity = 0;
+    bool ok = true;
+    struct dirent* ent;
+    while (ok && (ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, prefix, prefix_len) != 0) continue;
+        const char* hex = ent->d_name + prefix_len;
+        if (strlen(hex) != 16) { ok = false; break; }
+        uint64_t id = 0;
+        for (size_t i = 0; i < 16; ++i) {
+            unsigned char c = (unsigned char)hex[i];
+            unsigned digit;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else { ok = false; break; }
+            id = (id << 4) | digit;
+        }
+        if (!ok || !id || count == 65536) { ok = false; break; }
+        char* path = ts_decision_path(store_path, id);
+        ts_decision_receipt_t receipt;
+        ok = path && ts_decision_record_read(path, id, &receipt);
+        free(path);
+        if (!ok) break;
+        if (count == capacity) {
+            size_t grown_capacity = capacity ? capacity * 2 : 16;
+            if (grown_capacity > 65536) grown_capacity = 65536;
+            ts_decision_receipt_t* grown = realloc(items,
+                grown_capacity * sizeof(*items));
+            if (!grown) { ok = false; break; }
+            items = grown;
+            capacity = grown_capacity;
+        }
+        items[count++] = receipt;
+    }
+    if (closedir(dir) != 0) ok = false;
+    free(prefix);
+    if (!ok) { free(items); return false; }
+    *out = items;
+    *out_count = count;
+    return true;
+}
+
+static int ts_decision_receipt_cmp(const void* lhs, const void* rhs) {
+    const ts_decision_receipt_t* a = lhs;
+    const ts_decision_receipt_t* b = rhs;
+    return a->txn_id < b->txn_id ? -1 : a->txn_id > b->txn_id ? 1 : 0;
+}
+
+static bool ts_decisions_copy(const char* source, const char* destination) {
+    ts_decision_receipt_t *src = NULL, *dst = NULL;
+    size_t src_count = 0, dst_count = 0;
+    bool ok = ts_decisions_read(source, &src, &src_count) &&
+        ts_decisions_read(destination, &dst, &dst_count);
+    if (ok) {
+        if (src_count > 1) qsort(src, src_count, sizeof(*src), ts_decision_receipt_cmp);
+        if (dst_count > 1) qsort(dst, dst_count, sizeof(*dst), ts_decision_receipt_cmp);
+        size_t si = 0;
+        for (size_t di = 0; di < dst_count; ++di) {
+            while (si < src_count && src[si].txn_id < dst[di].txn_id) ++si;
+            if (si == src_count || src[si].txn_id != dst[di].txn_id ||
+                memcmp(src[si].bytes, dst[di].bytes, sizeof src[si].bytes) != 0) {
+                ok = false; break;
+            }
+        }
+    }
+    for (size_t i = 0; ok && i < src_count; ++i) {
+        char* path = ts_decision_path(destination, src[i].txn_id);
+        if (!path) { ok = false; break; }
+        bool exists = false;
+        if (access(path, F_OK) == 0) {
+            ts_decision_receipt_t found;
+            exists = true;
+            ok = ts_decision_record_read(path, src[i].txn_id, &found) &&
+                memcmp(found.bytes, src[i].bytes, sizeof found.bytes) == 0;
+        } else if (errno != ENOENT) ok = false;
+        if (ok && !exists) {
+            size_t n = strlen(destination);
+            static const char suffix[] = ".receipt-tmp.XXXXXX";
+            char* tmp = n <= SIZE_MAX - sizeof suffix ? malloc(n + sizeof suffix) : NULL;
+            if (!tmp) ok = false;
+            else {
+                memcpy(tmp, destination, n);
+                memcpy(tmp + n, suffix, sizeof suffix);
+                int fd = mkstemp(tmp);
+                if (fd < 0) ok = false;
+                else {
+                    ok = ts_write_all(fd, src[i].bytes, sizeof src[i].bytes) &&
+                        fsync(fd) == 0;
+                    if (close(fd) != 0) ok = false;
+                    if (ok && link(tmp, path) != 0) {
+                        if (errno == EEXIST) {
+                            ts_decision_receipt_t found;
+                            ok = ts_decision_record_read(path, src[i].txn_id, &found) &&
+                                memcmp(found.bytes, src[i].bytes, sizeof found.bytes) == 0;
+                        } else ok = false;
+                    }
+                    if (unlink(tmp) != 0 && errno != ENOENT) ok = false;
+                }
+                free(tmp);
+            }
+        }
+        free(path);
+    }
+    if (ok) ok = ts_sync_parent(destination);
+    free(src); free(dst);
+    return ok;
+}
+
+/* Transfer only already-committed images. Decision receipts are published
+ * first; the snapshot is the final marker that makes the transfer usable. */
 static bool ts_copy_snapshot(const char* source, const char* destination) {
     int fd = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return false;
@@ -924,17 +1300,32 @@ static bool ts_backup_authorized(const qihse_user_t* user) {
         qihse_user_get_id(user) == 0 && qihse_user_get_tenant_id(user) == 0;
 }
 
+bool qihse_table_store_snapshot_epoch_user(qihse_table_store_t* s,
+    const qihse_user_t* user, uint64_t* epoch) {
+    /* Reject inherited handles before touching a possibly inherited mutex. */
+    if (!s || !epoch || s->owner_pid != getpid() ||
+        !ts_backup_authorized(user)) return false;
+    pthread_mutex_lock(&s->mutex);
+    bool ok = s->path && !s->poisoned && !s->pending_txn_id &&
+        s->schema_len && s->snapshot_epoch != UINT64_MAX;
+    if (ok) *epoch = s->snapshot_epoch;
+    pthread_mutex_unlock(&s->mutex);
+    return ok;
+}
+
 bool qihse_table_store_backup(qihse_table_store_t* s,
                               const qihse_user_t* user, const char* backup_path) {
     if (!s || !backup_path || !ts_backup_authorized(user)) return false;
     pthread_mutex_lock(&s->mutex);
-    bool ok = s->path && !s->poisoned && s->owner_pid == getpid() &&
-        s->schema_len && strcmp(s->path, backup_path) != 0;
+    bool ok = s->path && !s->poisoned && !s->pending_txn_id &&
+        s->owner_pid == getpid() && s->schema_len &&
+        strcmp(s->path, backup_path) != 0;
     /* open_durable validates the destination's private directory and takes
      * the same lifetime exclusion lock used by all store writers. */
     qihse_table_store_t* dest = ok ? qihse_table_store_open_durable(backup_path) : NULL;
     ok = dest && !dest->schema_len && !dest->num_tables &&
         access(backup_path, F_OK) != 0 && errno == ENOENT &&
+        ts_decisions_copy(s->path, backup_path) &&
         ts_copy_snapshot(s->path, backup_path);
     qihse_table_store_destroy(dest);
     pthread_mutex_unlock(&s->mutex);
@@ -951,6 +1342,7 @@ bool qihse_table_store_restore(const qihse_user_t* user,
     qihse_table_store_t* dest = ok ? qihse_table_store_open_durable(target_path) : NULL;
     ok = dest && !dest->schema_len && !dest->num_tables &&
         access(target_path, F_OK) != 0 && errno == ENOENT &&
+        ts_decisions_copy(backup_path, target_path) &&
         ts_copy_snapshot(backup_path, target_path);
     qihse_table_store_destroy(dest);
     qihse_table_store_destroy(source);
@@ -964,7 +1356,7 @@ bool qihse_table_store_set_schema_image(qihse_table_store_t* s,
     if (!s || !s->path || !image || !len || len > 1024u * 1024u ||
         s->owner_pid != getpid()) return false;
     pthread_mutex_lock(&s->mutex);
-    bool ok = !s->poisoned && !s->schema_len && !s->num_tables;
+    bool ok = !s->poisoned && !s->pending_txn_id && !s->schema_len && !s->num_tables;
     unsigned char* copy = ok ? malloc(len) : NULL;
     if (copy) {
         memcpy(copy, image, len);
@@ -991,7 +1383,7 @@ bool qihse_table_store_replace_schema_image(qihse_table_store_t* s,
     if (!replacement) return false;
     memcpy(replacement, image, image_len);
     pthread_mutex_lock(&s->mutex);
-    bool ok = !s->poisoned && s->schema_len == expected_len &&
+    bool ok = !s->poisoned && !s->pending_txn_id && s->schema_len == expected_len &&
         memcmp(s->schema_image, expected, expected_len) == 0;
     unsigned char* previous = NULL;
     size_t previous_len = 0;
@@ -1025,6 +1417,25 @@ bool qihse_table_store_schema_image(const qihse_table_store_t* s,
 bool qihse_table_store_is_durable(const qihse_table_store_t* s) {
     return s && s->path && !s->poisoned && s->owner_pid == getpid() &&
            s->schema_len != 0;
+}
+
+bool qihse_table_store_decision_next_id(qihse_table_store_t* s,
+                                        uint64_t* next_id) {
+    if (!s || !next_id) return false;
+    pthread_mutex_lock(&s->mutex);
+    ts_decision_receipt_t* receipts = NULL;
+    size_t count = 0;
+    bool ok = s->path && !s->poisoned && s->owner_pid == getpid() &&
+        ts_decisions_read(s->path, &receipts, &count);
+    uint64_t next = 1;
+    for (size_t i = 0; ok && i < count; ++i) {
+        if (receipts[i].txn_id == UINT64_MAX) ok = false;
+        else if (receipts[i].txn_id >= next) next = receipts[i].txn_id + 1;
+    }
+    free(receipts);
+    if (ok) *next_id = next;
+    pthread_mutex_unlock(&s->mutex);
+    return ok;
 }
 
 size_t qihse_table_store_table_count(const qihse_table_store_t* s) {
@@ -1091,7 +1502,8 @@ static qihse_table_t* ts_create_table(qihse_table_store_t* store,
             !ts_value_type_valid(cols[i].type)) return NULL;
 
     pthread_mutex_lock(&store->mutex);
-    if (store->poisoned || (store->path && store->owner_pid != getpid())) {
+    if (store->poisoned || store->pending_txn_id ||
+        (store->path && store->owner_pid != getpid())) {
         pthread_mutex_unlock(&store->mutex);
         return NULL;
     }
@@ -1290,7 +1702,8 @@ bool qihse_table_store_create_tables_seeded_with_schema(qihse_table_store_t* sto
             if (source->rows[r] && !ts_transform_row_allowed(user,
                     source->rows[r], tenant_col, class_col, sci_col)) ok = false;
     }
-    ok = ok && !store->poisoned && store->schema_len == expected_len &&
+    ok = ok && !store->poisoned && !store->pending_txn_id &&
+         store->schema_len == expected_len &&
          memcmp(store->schema_image, expected, expected_len) == 0 &&
          count <= SIZE_MAX - store->num_tables &&
          store->num_tables + count <= 100000;
@@ -1917,8 +2330,16 @@ bool qihse_table_txn_delete(qihse_table_txn_t* txn,
 }
 
 #ifdef QIHSE_TABLE_STORE_TESTING
-/* Private fault-injection seam for deterministic generation-overflow tests.
- * It is absent from production builds and intentionally not in public headers. */
+/* Private fault-injection seams for deterministic overflow tests.
+ * They are absent from production builds and intentionally not in public headers. */
+void qihse_table_store_test_set_snapshot_epoch(qihse_table_store_t* store,
+                                               uint64_t epoch) {
+    if (!store) return;
+    pthread_mutex_lock(&store->mutex);
+    store->snapshot_epoch = epoch;
+    pthread_mutex_unlock(&store->mutex);
+}
+
 void qihse_table_txn_test_set_generation(qihse_table_txn_t* txn,
                                          uint64_t generation) {
     if (txn) txn->shadow.generation = generation;
@@ -2080,7 +2501,7 @@ static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
         free(items);
         return QIHSE_TS_RETRY_ERROR;
     }
-    if (durable && store->owner_pid != getpid()) {
+    if (durable && (store->owner_pid != getpid() || store->pending_txn_id)) {
         ts_group_destroy_unique(txns, count);
         free(items);
         return QIHSE_TS_RETRY_ERROR;
@@ -2090,6 +2511,14 @@ static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
         pthread_rwlock_wrlock(&items[i].table->lock);
     /* Schema creation holds mutex but never waits on table locks. */
     if (durable) pthread_mutex_lock(&store->mutex);
+    if (durable && (store->poisoned || store->pending_txn_id)) {
+        for (size_t j = count; j > 0; --j)
+            pthread_rwlock_unlock(&items[j - 1].table->lock);
+        pthread_mutex_unlock(&store->mutex);
+        ts_group_destroy_unique(txns, count);
+        free(items);
+        return QIHSE_TS_RETRY_ERROR;
+    }
     qihse_ts_retry_status_t existing = QIHSE_TS_RETRY_ABSENT;
     if (id && !store->poisoned) existing = ts_retry_find(store, user, id, outcome);
     if (id && (store->poisoned || existing != QIHSE_TS_RETRY_ABSENT)) {
@@ -2199,6 +2628,247 @@ static qihse_ts_retry_status_t ts_commit_group(qihse_table_txn_t** txns,
     }
     free(items);
     return QIHSE_TS_RETRY_COMMITTED;
+}
+
+static bool ts_make_snapshot(ts_buf_t* payload, unsigned char** bytes,
+                             size_t* len) {
+    if (payload->n > TS_LIMIT) return false;
+    unsigned char* out = malloc(payload->n + 24);
+    if (!out) return false;
+    memcpy(out, ts_magic_v5, 8);
+    uint64_t fields[2] = {payload->n, ts_hash(payload->p, payload->n)};
+    for (int j = 0; j < 2; ++j)
+        for (int k = 0; k < 8; ++k)
+            out[8 + 8*j + k] = (unsigned char)(fields[j] >> (k*8));
+    memcpy(out + 24, payload->p, payload->n);
+    *bytes = out; *len = payload->n + 24;
+    return true;
+}
+
+static bool ts_stage_snapshot(qihse_table_store_t* store, uint64_t txn_id,
+                              const unsigned char* snapshot, size_t snapshot_len,
+                              bool* published) {
+    if (snapshot_len > SIZE_MAX - 32) return false;
+    size_t frame_len = snapshot_len + 32;
+    unsigned char* frame = malloc(frame_len);
+    char* prepared = ts_prepared_path(store->path);
+    if (!frame || !prepared) { free(frame); free(prepared); return false; }
+    static const unsigned char magic[8] = {'Q','T','S','P','R','E','P',1};
+    memcpy(frame, magic, 8);
+    for (int i = 0; i < 8; ++i) frame[8 + i] = (unsigned char)(txn_id >> (8*i));
+    uint64_t fields[2] = {snapshot_len, ts_hash(snapshot, snapshot_len)};
+    for (int j = 0; j < 2; ++j)
+        for (int i = 0; i < 8; ++i)
+            frame[16 + 8*j + i] = (unsigned char)(fields[j] >> (8*i));
+    memcpy(frame + 32, snapshot, snapshot_len);
+    bool ok = ts_atomic_file(prepared, frame, frame_len, false, published);
+    if (published && *published) ts_snapshot_epoch_advance(store);
+    free(frame); free(prepared);
+    return ok;
+}
+
+bool qihse_table_txn_prepare_group(qihse_table_txn_t** txns, size_t count,
+                                  uint64_t txn_id) {
+    if (!txns || !count || !txn_id || count > SIZE_MAX / sizeof(ts_group_item_t)) {
+        if (txns && count) ts_group_destroy_unique(txns, count);
+        return false;
+    }
+    ts_group_item_t* items = calloc(count, sizeof(*items));
+    if (!items) { ts_group_destroy_unique(txns, count); return false; }
+    bool valid = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (!txns[i] || !txns[i]->table) { valid = false; break; }
+        items[i].txn = txns[i];
+        items[i].table = txns[i]->table;
+        for (size_t j = 0; j < i; ++j)
+            if (txns[i] == txns[j] || items[i].table == items[j].table)
+                valid = false;
+        if (!valid) break;
+    }
+    qihse_table_store_t* store = valid ? items[0].table->owner : NULL;
+    if (!valid || !store || !store->path || store->owner_pid != getpid()) {
+        ts_group_destroy_unique(txns, count); free(items); return false;
+    }
+    for (size_t i = 1; i < count; ++i)
+        if (items[i].table->owner != store) valid = false;
+    if (!valid) { ts_group_destroy_unique(txns, count); free(items); return false; }
+    qsort(items, count, sizeof(*items), ts_group_item_cmp);
+    for (size_t i = 0; i < count; ++i)
+        pthread_rwlock_wrlock(&items[i].table->lock);
+    pthread_mutex_lock(&store->mutex);
+    valid = !store->poisoned && !store->pending_txn_id &&
+            store->owner_pid == getpid();
+    bool decided_commit = false, decided_abort = false;
+    if (valid) valid = ts_decision_check(store->path, txn_id, true,
+                                          &decided_commit) &&
+                       ts_decision_check(store->path, txn_id, false,
+                                          &decided_abort) &&
+                       !decided_commit && !decided_abort;
+    for (size_t i = 0; valid && i < count; ++i)
+        valid = items[i].table->generation == items[i].txn->base_generation &&
+                items[i].table->generation != UINT64_MAX;
+    ts_buf_t payload = {0};
+    unsigned char* snapshot = NULL; size_t snapshot_len = 0;
+    if (valid) valid = ts_validate_catalog(store, items, count) &&
+        ts_encode(store, &payload, items, count, NULL) &&
+        ts_make_snapshot(&payload, &snapshot, &snapshot_len);
+    bool published = false;
+    if (valid) {
+        valid = ts_stage_snapshot(store, txn_id, snapshot, snapshot_len,
+                                  &published);
+        if (published) store->pending_txn_id = txn_id;
+        if (!valid && published) store->poisoned = true;
+    }
+    free(snapshot); free(payload.p);
+    pthread_mutex_unlock(&store->mutex);
+    for (size_t i = count; i > 0; --i)
+        pthread_rwlock_unlock(&items[i - 1].table->lock);
+    ts_group_destroy_unique(txns, count);
+    free(items);
+    return valid;
+}
+
+bool qihse_table_store_prepare_noop(qihse_table_store_t* store,
+                                    uint64_t txn_id) {
+    if (!store || !store->path || !txn_id || store->owner_pid != getpid())
+        return false;
+    pthread_mutex_lock(&store->mutex);
+    size_t count = store->num_tables;
+    qihse_table_t** original = count ? malloc(count * sizeof(*original)) : NULL;
+    if (count && original) memcpy(original, store->tables, count * sizeof(*original));
+    pthread_mutex_unlock(&store->mutex);
+    if (count && !original) return false;
+    qihse_table_t** order = count ? malloc(count * sizeof(*order)) : NULL;
+    if (count && !order) { free(original); return false; }
+    if (count) memcpy(order, original, count * sizeof(*order));
+    for (size_t i = 0; i < count; ++i)
+        for (size_t j = i + 1; j < count; ++j)
+            if ((uintptr_t)order[j] < (uintptr_t)order[i]) {
+                qihse_table_t* tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+    for (size_t i = 0; i < count; ++i) pthread_rwlock_wrlock(&order[i]->lock);
+    pthread_mutex_lock(&store->mutex);
+    bool valid = !store->poisoned && !store->pending_txn_id &&
+        store->owner_pid == getpid() && store->num_tables == count;
+    for (size_t i = 0; valid && i < count; ++i)
+        valid = store->tables[i] == original[i];
+    bool decided_commit = false, decided_abort = false;
+    if (valid) valid = ts_decision_check(store->path, txn_id, true,
+                                          &decided_commit) &&
+                       ts_decision_check(store->path, txn_id, false,
+                                          &decided_abort) &&
+                       !decided_commit && !decided_abort;
+    ts_buf_t payload = {0};
+    unsigned char* snapshot = NULL; size_t snapshot_len = 0;
+    if (valid) valid = ts_validate_catalog(store, NULL, 0) &&
+        ts_encode(store, &payload, NULL, 0, NULL) &&
+        ts_make_snapshot(&payload, &snapshot, &snapshot_len);
+    bool published = false;
+    if (valid) {
+        valid = ts_stage_snapshot(store, txn_id, snapshot, snapshot_len,
+                                  &published);
+        if (published) store->pending_txn_id = txn_id;
+        if (!valid && published) store->poisoned = true;
+    }
+    free(snapshot); free(payload.p);
+    pthread_mutex_unlock(&store->mutex);
+    for (size_t i = count; i > 0; --i) pthread_rwlock_unlock(&order[i - 1]->lock);
+    free(order); free(original);
+    return valid;
+}
+
+static bool ts_install_snapshot(qihse_table_store_t* store,
+                                const unsigned char* image, size_t image_len) {
+    qihse_table_store_t* candidate = qihse_table_store_create();
+    if (!candidate) return false;
+    bool ok = ts_snapshot_decode(candidate, image, image_len) &&
+        ts_store_matches_snapshot(store, candidate);
+    if (ok) {
+        for (size_t i = 0; i < store->num_tables; ++i) {
+            qihse_table_t* dst = store->tables[i];
+            qihse_table_t* src = candidate->tables[i];
+            ts_free_rows(dst->rows, dst->num_rows, dst->num_cols);
+            dst->rows = src->rows; dst->num_rows = src->num_rows;
+            dst->cap_rows = src->cap_rows; dst->num_tomb = src->num_tomb;
+            dst->generation = src->generation;
+            src->rows = NULL; src->num_rows = src->cap_rows = src->num_tomb = 0;
+        }
+    }
+    qihse_table_store_destroy(candidate);
+    return ok;
+}
+
+bool qihse_table_store_resolve_prepared(qihse_table_store_t* store,
+                                       uint64_t txn_id, bool commit) {
+    if (!store || !store->path || !txn_id || store->owner_pid != getpid())
+        return false;
+    pthread_mutex_lock(&store->mutex);
+    uint64_t pending = store->pending_txn_id;
+    bool decided = false;
+    bool ok = ts_decision_check(store->path, txn_id, commit, &decided);
+    if (ok && decided && pending != txn_id) {
+        pthread_mutex_unlock(&store->mutex);
+        return true;
+    }
+    if (ok && !pending && !commit)
+        ok = ts_decision_write(store, txn_id, false);
+    pthread_mutex_unlock(&store->mutex);
+    if (!ok || (pending && pending != txn_id) || (!pending && !commit))
+        return ok && !pending && !commit;
+    if (!pending) return false;
+    qihse_table_t** order = store->num_tables ?
+        malloc(store->num_tables * sizeof(*order)) : NULL;
+    if (store->num_tables && !order) return false;
+    size_t count = store->num_tables;
+    for (size_t i = 0; i < count; ++i) order[i] = store->tables[i];
+    for (size_t i = 0; i < count; ++i)
+        for (size_t j = i + 1; j < count; ++j)
+            if ((uintptr_t)order[j] < (uintptr_t)order[i]) {
+                qihse_table_t* tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+    for (size_t i = 0; i < count; ++i) pthread_rwlock_wrlock(&order[i]->lock);
+    pthread_mutex_lock(&store->mutex);
+    bool exists = false;
+    ok = ts_decision_check(store->path, txn_id, commit, &exists);
+    char* prepared = ts_prepared_path(store->path);
+    unsigned char* image = NULL; size_t image_len = 0; uint64_t stored_id = 0;
+    qihse_table_store_t* candidate = NULL;
+    if (ok && !exists && commit) {
+        candidate = qihse_table_store_create();
+        ok = !store->poisoned && store->pending_txn_id == txn_id &&
+            prepared && candidate &&
+            ts_prepared_read(prepared, &stored_id, &image, &image_len) &&
+            stored_id == txn_id && ts_snapshot_decode(candidate, image, image_len) &&
+            ts_store_matches_snapshot(store, candidate);
+    }
+    if (store->pending_txn_id && store->pending_txn_id != txn_id) ok = false;
+    if (ok && !exists && !commit) {
+        ok = ts_decision_write(store, txn_id, false);
+    } else if (ok && !exists && commit) {
+        bool published = false;
+        ok = ts_atomic_file(store->path, image, image_len, true, &published);
+        if (published) ts_snapshot_epoch_advance(store);
+        if (!ok && published) store->poisoned = true;
+        if (ok) ok = ts_install_snapshot(store, image, image_len);
+        if (ok) ok = ts_decision_write(store, txn_id, true);
+        if (!ok && published) store->poisoned = true;
+    }
+    if (ok && prepared && (exists || pending == txn_id)) {
+        if (unlink(prepared) == 0) ts_snapshot_epoch_advance(store);
+        else if (errno != ENOENT) ok = false;
+        if (ok) ok = ts_sync_parent(prepared);
+    }
+    if (ok) {
+        if (store->pending_txn_id || store->poisoned)
+            ts_snapshot_epoch_advance(store);
+        store->pending_txn_id = 0; store->poisoned = false;
+    }
+    qihse_table_store_destroy(candidate);
+    free(prepared); free(image);
+    pthread_mutex_unlock(&store->mutex);
+    for (size_t i = count; i > 0; --i) pthread_rwlock_unlock(&order[i - 1]->lock);
+    free(order);
+    return ok;
 }
 
 bool qihse_table_txn_commit_group(qihse_table_txn_t** txns, size_t count) {

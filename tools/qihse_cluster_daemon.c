@@ -2945,6 +2945,65 @@ static bool ct_group_failover_successor(const qihse_cluster_topology_t* topology
     return found;
 }
 
+typedef struct {
+    bool valid, found;
+    char path[PATH_MAX];
+    struct stat stamp;
+    qihse_cluster_ownership_txn_t txn;
+} ct_group_promotion_cache_t;
+
+static bool ct_group_promotion_stamp_equal(const struct stat* a, const struct stat* b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_size == b->st_size && a->st_mode == b->st_mode &&
+        a->st_uid == b->st_uid && a->st_gid == b->st_gid && a->st_nlink == b->st_nlink &&
+        a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+        a->st_ctim.tv_sec == b->st_ctim.tv_sec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+static bool ct_group_promotion_replay(const qihse_cluster_ownership_txn_t* txn,
+                                     void* opaque) {
+    ct_group_promotion_cache_t* cache = opaque;
+    if (!txn || !cache) return false;
+    /* The validated journal permits one globally unresolved transaction. */
+    cache->found = txn->next_generation[0] &&
+        (txn->phase == QIHSE_OWNERSHIP_PREPARED || txn->phase == QIHSE_OWNERSHIP_COMMITTED);
+    if (cache->found) cache->txn = *txn;
+    else OPENSSL_cleanse(&cache->txn, sizeof(cache->txn));
+    return true;
+}
+static bool ct_group_promotion_cache_load(ct_group_promotion_cache_t* cache,
+                                         const char* data_dir) {
+    char path[PATH_MAX]; struct stat before, after; bool unresolved = false;
+    int n = snprintf(path, sizeof(path), "%s/slot-ownership.journal", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) { errno = ENAMETOOLONG; goto invalid; }
+    if (lstat(path, &before) != 0) goto invalid;
+    if (!S_ISREG(before.st_mode)) { errno = EINVAL; goto invalid; }
+    if (cache->valid && !strcmp(cache->path, path) &&
+        ct_group_promotion_stamp_equal(&cache->stamp, &before)) return true;
+    cache->valid = false; cache->found = false;
+    OPENSSL_cleanse(&cache->txn, sizeof(cache->txn));
+    if (qihse_cluster_ownership_journal_replay_txn(data_dir,
+            ct_group_promotion_replay, cache, &unresolved) < 0) goto invalid;
+    if (lstat(path, &after) != 0) goto invalid;
+    if (!ct_group_promotion_stamp_equal(&before, &after)) { errno = EAGAIN; goto invalid; }
+    cache->found = cache->found && unresolved;
+    cache->stamp = after;
+    memcpy(cache->path, path, (size_t)n + 1u);
+    cache->valid = true;
+    return true;
+invalid:
+    cache->valid = false; cache->found = false;
+    OPENSSL_cleanse(&cache->txn, sizeof(cache->txn));
+    return false;
+}
+
+static bool ct_group_map_retry_due(uint64_t committed, uint64_t applied,
+    bool pending, bool staged, unsigned* ticks) {
+    if (committed > applied) { *ticks = 0u; return true; }
+    if (++*ticks < 5u) return false;
+    *ticks = 0u;
+    return pending || staged;
+}
+
 static void ct_group_failover_tick(qihse_kv_store_t* store,
         qihse_cluster_ownership_context_t* ownership,
         qihse_cluster_topology_t* topology,
@@ -2952,9 +3011,10 @@ static void ct_group_failover_tick(qihse_kv_store_t* store,
         const ct_identity_map_set_t* maps,
         const qihse_qkp_replication_peer_t* allowed_peers, size_t allowed_count,
         const qihse_ct_group_config_t* groups, size_t group_count,
-        uint16_t local_index, const char* local_qkp_id) {
+        uint16_t local_index, const char* local_qkp_id,
+        ct_group_promotion_cache_t* promotion_cache) {
     if (!store || !ownership || !topology || !mesh || !maps || !groups || !group_count ||
-        !local_qkp_id || !*local_qkp_id) return;
+        !local_qkp_id || !*local_qkp_id || !promotion_cache) return;
     for (size_t i = 0; i < group_count; ++i) {
         qihse_kv_ct_lane_status_t lane;
         memset(&lane, 0, sizeof(lane));
@@ -2993,13 +3053,29 @@ static void ct_group_failover_tick(qihse_kv_store_t* store,
             OPENSSL_cleanse(successor_topology, sizeof(successor_topology));
             OPENSSL_cleanse(successor_qkp, sizeof(successor_qkp));
         } else if (lane.mode == QIHSE_KV_CT_LANE_SOURCE &&
-                   lane.promotion_pending &&
                    strcmp(lane.source_id, local_qkp_id) == 0) {
-            qihse_cluster_node_t successor;
-            should_promote = ct_group_index_for_qkp(topology, maps,
-                lane.peer_id, &successor_index) && successor_index != local_index &&
-                qihse_cluster_topology_get_node(topology, successor_index,
-                    &successor) && successor.healthy;
+            /* Common FINAL can clear promotion_pending before routing refresh
+             * or FINALIZED is durable. Retry the recorded promotion independently
+             * of mutable admission/health; the resolver still verifies authority. */
+            const char* data_dir = qihse_kv_store_data_directory(store);
+            const qihse_cluster_ownership_txn_t* txn = &promotion_cache->txn;
+            qihse_cluster_node_t local, successor;
+            should_promote = data_dir &&
+                ct_group_promotion_cache_load(promotion_cache, data_dir) &&
+                promotion_cache->found && !strcmp(txn->lane_id, groups[i].lane_id) &&
+                !strcmp(lane.lane_id, groups[i].lane_id) &&
+                qihse_cluster_topology_get_node(topology, local_index, &local) &&
+                !strcmp(txn->target_id, local.id) &&
+                !strcmp(txn->target_qkp_id, local_qkp_id) &&
+                !strcmp(txn->next_generation, lane.generation) &&
+                CRYPTO_memcmp(txn->slot_bitmap, lane.slot_bitmap,
+                    sizeof(lane.slot_bitmap)) == 0 &&
+                ct_group_index_for_qkp(topology, maps, lane.peer_id, &successor_index) &&
+                successor_index != local_index &&
+                qihse_cluster_topology_get_node(topology, successor_index, &successor) &&
+                !strcmp(txn->owner_id, successor.id) &&
+                ct_group_replication_pin(allowed_peers, allowed_count, lane.peer_id);
+            OPENSSL_cleanse(&local, sizeof(local));
             OPENSSL_cleanse(&successor, sizeof(successor));
         }
         if (should_promote) {
@@ -3204,6 +3280,8 @@ int main(int argc, char** argv) {
     uint32_t machine_principal_tenant = 0u;
     const char* admin_peer_node_id = NULL;
     const char* admin_peer_dsa_pub = NULL;
+    const char* admin_peer_node_id_2 = NULL;
+    const char* admin_peer_dsa_pub_2 = NULL;
     const char* migration_peer_node_ids[16];
     const char* migration_peer_dsa_pub_paths[16];
     size_t migration_peer_count = 0u;
@@ -3425,6 +3503,13 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--admin-peer-dsa-pub") == 0 && i + 1 < argc) {
             admin_peer_dsa_pub = argv[++i];
             if (!*admin_peer_dsa_pub) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--admin-peer-node-id-2") == 0 && i + 1 < argc) {
+            admin_peer_node_id_2 = argv[++i];
+            if (!*admin_peer_node_id_2 || strlen(admin_peer_node_id_2) > QIHSE_QKP_NODE_ID_LEN)
+                return usage(argv[0]), 2;
+        } else if (strcmp(a, "--admin-peer-dsa-pub-2") == 0 && i + 1 < argc) {
+            admin_peer_dsa_pub_2 = argv[++i];
+            if (!*admin_peer_dsa_pub_2) return usage(argv[0]), 2;
         } else if (strcmp(a, "--migration-peer") == 0 && i + 2 < argc) {
             if (migration_peer_count >= 16u) return usage(argv[0]), 2;
             const char* nid = argv[++i];
@@ -3726,13 +3811,18 @@ int main(int argc, char** argv) {
         replication_peer_node_id != NULL || replication_peer_dsa_pub != NULL ||
         replication_allowed_peer_count != 0u;
     const bool admin_peer_configured = admin_peer_node_id != NULL ||
-        admin_peer_dsa_pub != NULL;
+        admin_peer_dsa_pub != NULL || admin_peer_node_id_2 != NULL ||
+        admin_peer_dsa_pub_2 != NULL;
     if (admin_peer_node_id != NULL && admin_peer_dsa_pub == NULL) {
         fprintf(stderr, "qihse-cluster-daemon: --admin-peer-node-id requires --admin-peer-dsa-pub\n");
         return 2;
     }
     if (admin_peer_dsa_pub != NULL && admin_peer_node_id == NULL) {
         fprintf(stderr, "qihse-cluster-daemon: --admin-peer-dsa-pub requires --admin-peer-node-id\n");
+        return 2;
+    }
+    if ((admin_peer_node_id_2 != NULL) != (admin_peer_dsa_pub_2 != NULL)) {
+        fprintf(stderr, "qihse-cluster-daemon: --admin-peer-node-id-2 and --admin-peer-dsa-pub-2 must be configured together\n");
         return 2;
     }
     if ((replication_source_host != NULL) != (replication_source_port != 0u)) {
@@ -4670,7 +4760,7 @@ int main(int argc, char** argv) {
      * required by anti-entropy. pqc.dsa_key_path points at a static buffer
      * and is always non-NULL, so it cannot be the opt-in condition. */
     if ((pqc_identity_dir != NULL || pqc_require || replication_configured ||
-         (repl_glob_count > 0u && repl_interval > 0u)) && pqc.dsa_key_path) {
+         admin_peer_configured || (repl_glob_count > 0u && repl_interval > 0u)) && pqc.dsa_key_path) {
         config.pqc = pqc; /* opportunistic default: PQC on QKP1 probe, cleartext allowed */
     }
     /* BM25 full-text search surface (FTS.*): unlike VECHYBRID, which expects
@@ -4740,6 +4830,13 @@ int main(int argc, char** argv) {
         if (consensus_mesh) qihse_consensus_mesh_destroy(consensus_mesh);
         if (consensus_blobs) qihse_blob_store_destroy(consensus_blobs);
         return 1;
+    }
+    if (admin_peer_node_id_2 &&
+        !qihse_resp_server_add_admin_peer(server, admin_peer_node_id_2,
+                                          admin_peer_dsa_pub_2, startup_operator)) {
+        fprintf(stderr, "qihse-cluster-daemon: second administrator pin requires a valid exact QKP identity and active system Operator before listen\n");
+        qihse_resp_server_destroy(server);
+        return 2;
     }
     if (ct_group_mode && !ct_group_bus_bind_identity(store, startup_operator,
             qihse_resp_server_bus(server), qihse_resp_server_topology(server),
@@ -5057,7 +5154,9 @@ int main(int argc, char** argv) {
         bool gc_pending = replayed_journal_entries > 0;
         bool gc_defer_reported = false;
         size_t gc_ticks = 0u;
-        unsigned ct_failover_ticks = 0u;
+        ct_group_promotion_cache_t ct_promotion_cache = {0};
+        unsigned ct_failover_ticks = 0u, ct_map_retry_ticks = 0u;
+        bool ct_map_retry_pending = ownership_recovery_pending;
         uint64_t ct_map_commit_index = consensus_mesh
             ? qihse_consensus_mesh_commit_index(consensus_mesh) : 0u;
         struct timespec wait = {0, 100000000L};
@@ -5087,7 +5186,16 @@ int main(int argc, char** argv) {
                 ct_failover_ticks = 0u;
                 uint64_t committed = consensus_mesh
                     ? qihse_consensus_mesh_commit_index(consensus_mesh) : 0u;
-                if (committed > ct_map_commit_index && ct_ownership.range_refresh) {
+                /* Local publication can lag a common decision without a new
+                 * commit. Candidate discovery is local; retry authority work
+                 * only every five seconds while actual work remains. */
+                size_t staging_cursor = 0u;
+                qihse_kv_ct_lane_staging_candidate_t staging_candidate;
+                bool staged = qihse_kv_ct_lane_staging_next_user(store, startup_operator,
+                    &staging_cursor, &staging_candidate) != 0;
+                if (ct_group_map_retry_due(committed, ct_map_commit_index,
+                        ct_map_retry_pending, staged, &ct_map_retry_ticks) &&
+                    ct_ownership.range_refresh) {
                     uint8_t all_slots[QIHSE_CONSENSUS_RANGE_BITMAP_BYTES];
                     char refresh_error[256] = {0};
                     memset(all_slots, 0xff, sizeof(all_slots));
@@ -5100,9 +5208,12 @@ int main(int argc, char** argv) {
                         ct_group_reconcile_local(consensus_mesh, store,
                             startup_operator, ct_groups, ct_group_count)) {
                         ct_map_commit_index = committed;
-                    } else if (refresh_error[0]) {
-                        fprintf(stderr, "qihse-cluster-daemon: committed CT routing refresh deferred: %s\n",
-                                refresh_error);
+                        ct_map_retry_pending = false;
+                    } else {
+                        ct_map_retry_pending = true;
+                        if (refresh_error[0])
+                            fprintf(stderr, "qihse-cluster-daemon: committed CT routing refresh deferred: %s\n",
+                                    refresh_error);
                     }
                     OPENSSL_cleanse(all_slots, sizeof(all_slots));
                 }
@@ -5115,7 +5226,7 @@ int main(int argc, char** argv) {
                         consensus_mesh,
                         &ct_identity_maps, replication_allowed_peers,
                         replication_allowed_peer_count, ct_groups,
-                        ct_group_count, indexes[self_index], pqc_node_id);
+                        ct_group_count, indexes[self_index], pqc_node_id, &ct_promotion_cache);
             }
             if (ownership_recovery_pending && !g_stop && ++ownership_retry_ticks >= 10u) {
                 ownership_retry_ticks = 0u;

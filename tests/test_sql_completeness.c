@@ -385,6 +385,28 @@ static void test_dml_and_ddl_parsing(void) {
     assert(ast->insert_quoted[0][0] == 0 && ast->insert_quoted[0][1] == 1);
     qihse_sql_ast_free(ast);
 
+    /* The first row grows twice; later rows allocate the known width directly. */
+    ast = qihse_parse_sql_to_ast(
+        "INSERT INTO t VALUES "
+        "(1,2,3,4,5,6,7,8,9,'ten',11,NULL,13,14,15,16,17,$1,'2020-01-01'::timestamp),"
+        "(1,2,3,4,5,6,7,8,9,'ten',11,'NULL',13,14,15,16,17,$1,'2020-01-02'::timestamptz)");
+    assert(ast && ast->num_insert_rows == 2u);
+    for (size_t r = 0; r < 2u; ++r) {
+        assert(ast->insert_rows[r][19] == NULL);
+        for (size_t c = 0; c < 19u; ++c) {
+            assert(ast->insert_rows[r][c]);
+            assert(ast->insert_quoted[r][c] ==
+                (c == 9u || c == 18u || (r == 1u && c == 11u)));
+            assert(ast->insert_parameter_indexes[r][c] == (c == 17u ? 1u : 0u));
+            assert(ast->insert_cast_types[r][c] == (c == 18u ?
+                (r == 0u ? QIHSE_TYPE_TIMESTAMP : QIHSE_TYPE_TIMESTAMPTZ) :
+                QIHSE_TYPE_UNKNOWN));
+        }
+        assert(!strcmp(ast->insert_rows[r][9], "ten"));
+        assert(!strcmp(ast->insert_rows[r][11], "NULL"));
+    }
+    qihse_sql_ast_free(ast);
+
     /* psycopg2 mogrify emits timestamp values with a PostgreSQL suffix cast. */
     ast = qihse_parse_sql_to_ast(
         "INSERT INTO osint_records(source,record_type,identifier,data,updated_at) "

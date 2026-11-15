@@ -12,6 +12,7 @@ import ctypes
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -350,8 +351,8 @@ class IsolatedCluster:
     def __init__(self, prefix: str = "ct-transport-"):
         build = ROOT / "build"
         build.mkdir(mode=0o700, exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(prefix=prefix, dir=build)
-        self.root = Path(self.temp.name)
+        # No finalizer: a failed or interrupted drill must retain its evidence.
+        self.root = Path(tempfile.mkdtemp(prefix=prefix, dir=build))
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith("QIHSE_") and key != "LD_PRELOAD"
@@ -425,7 +426,10 @@ class IsolatedCluster:
         prior_log = self.logs.get(name)
         if prior_log is not None:
             prior_log.close()
-        logfile = (self.root / f"{name}.log").open("w+b")
+        logfile = (self.root / f"{name}.log").open("a+b")
+        if prior_log is not None:
+            logfile.write(b"\n--- fixture daemon restart ---\n")
+            logfile.flush()
         self.logs[name] = logfile
         identity = self.root / name / "identity"
         command = [
@@ -611,7 +615,7 @@ class IsolatedCluster:
         detail = log.read().decode(errors="replace")[-12000:]
         raise AssertionError(f"{message}; {name} daemon log tail:\n{detail}")
 
-    def close(self) -> None:
+    def close(self, *, preserve: bool = False) -> None:
         for session in self.sessions:
             try:
                 session.close()
@@ -634,10 +638,13 @@ class IsolatedCluster:
                 process.kill()
         for log in self.logs.values():
             log.close()
-        self.temp.cleanup()
+        if preserve:
+            print(f"preserving failed CT fixture at {self.root}", file=sys.stderr)
+        else:
+            shutil.rmtree(self.root)
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *_exc):
-        self.close()
+    def __exit__(self, exc_type, _exc, _traceback):
+        self.close(preserve=exc_type is not None)

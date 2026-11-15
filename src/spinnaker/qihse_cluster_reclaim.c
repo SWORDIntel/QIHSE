@@ -50,6 +50,10 @@ bool qihse_cluster_key_is_node_local(const char* key) {
         "aimem-idem:",
         "fabric:",
         "fednode:",
+        /* Gossip session statements and replay windows are local trust state,
+         * not user shard data to transfer or reclaim with slot ownership. */
+        "fedstmt:",
+        "fedreplay:",
         "federation/node/",
         "snapshot/manifest:",
         "rejoin/state:",

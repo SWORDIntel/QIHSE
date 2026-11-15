@@ -48,6 +48,18 @@
 
 #define AIMEM_PREFIX "aimem:"
 #define AIMEM_PREFIX_LEN (sizeof(AIMEM_PREFIX) - 1u)
+
+/* Optional test-executable hook. Production builds have no implementation and
+ * therefore cannot trigger destructive crash injection via environment. */
+extern void qihse_aimem_test_rebuild_entry_hook(qihse_kv_store_t* store,
+                                                 size_t entry_index)
+    __attribute__((weak));
+extern bool qihse_aimem_test_failpoint(const char* name) __attribute__((weak));
+
+static bool aimem_index_test_failpoint(const char* name) {
+    return qihse_aimem_test_failpoint &&
+        qihse_aimem_test_failpoint(name);
+}
 #define AIMEM_MAX_TEXT (256u * 1024u)
 
 static qihse_fts_index_t* g_aimem_index = NULL;
@@ -5709,7 +5721,7 @@ static void aimem_index_audit(qihse_user_t* user, uint32_t event,
     /* Fault-injection children intentionally terminate without audit-thread
      * teardown. Their durable QHI2 audit counter is recovered by the parent;
      * never touch inherited asynchronous audit state in that crash window. */
-    if (getenv("QIHSE_AIMEM_QH08_FAIL_AT")) return;
+    if (aimem_index_test_failpoint("suppress-audit")) return;
     const char* action = event == AIMEM_INDEX_AUDIT_STARTED ? "AIMEM_INDEX_BUILDING" :
         event == AIMEM_INDEX_AUDIT_READY ? "AIMEM_INDEX_READY" :
         event == AIMEM_INDEX_AUDIT_RECOVERED ? "AIMEM_INDEX_RECOVERED" :
@@ -5999,8 +6011,7 @@ static bool aimem_index_rebuild_inner(qihse_resp_server_t* server,
     free(prior_raw);
     if (!ok) { free(building_raw); return false; }
     aimem_index_audit(user, AIMEM_INDEX_AUDIT_STARTED, state.candidate_generation);
-    const char* fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
-    if (fail_at && strcmp(fail_at, "after-building") == 0) {
+    if (aimem_index_test_failpoint("after-building")) {
         free(building_raw); return false;
     }
 
@@ -6038,10 +6049,11 @@ static bool aimem_index_rebuild_inner(qihse_resp_server_t* server,
                 build.entries[i].classification, build.entries[i].sci, user)) {
             ok = false; break;
         }
+        if (qihse_aimem_test_rebuild_entry_hook)
+            qihse_aimem_test_rebuild_entry_hook(store, i);
     }
     if (ok) ok = qihse_kv_sync_store(store);
-    fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
-    if (ok && fail_at && strcmp(fail_at, "after-entries") == 0) {
+    if (ok && aimem_index_test_failpoint("after-entries")) {
         aimem_index_entries_free(&build); free(building_raw); return false;
     }
     state.indexed_records = build.count;
@@ -6063,8 +6075,7 @@ static bool aimem_index_rebuild_inner(qihse_resp_server_t* server,
     state.audit_events++; state.last_event = AIMEM_INDEX_AUDIT_READY;
     ok = aimem_index_state_cas(store, user, scope, building_raw, &state, NULL);
     if (control && ok) control->committed = true;
-    fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
-    if (ok && fail_at && strcmp(fail_at, "after-private-ready") == 0) {
+    if (ok && aimem_index_test_failpoint("after-private-ready")) {
         if (control) pthread_mutex_unlock(&control->mutex);
         free(building_raw);
         return false;

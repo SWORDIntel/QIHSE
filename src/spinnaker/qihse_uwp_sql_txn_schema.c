@@ -1764,6 +1764,96 @@ static void uwp_sql_txn_rollback(void* opaque) {
     uwp_sql_txn_cleanup(resource);
 }
 
+static int uwp_sql_2pc_prepare(void* opaque, uint64_t txn_id) {
+    qihse_table_store_t* store = opaque;
+    return qihse_table_store_prepare_noop(store, txn_id) ? 0 : -1;
+}
+
+static int uwp_sql_2pc_commit(void* opaque, uint64_t txn_id) {
+    return qihse_table_store_resolve_prepared(opaque, txn_id, true) ? 0 : -1;
+}
+
+static int uwp_sql_2pc_abort(void* opaque, uint64_t txn_id) {
+    return qihse_table_store_resolve_prepared(opaque, txn_id, false) ? 0 : -1;
+}
+
+static int uwp_sql_2pc_prepare_resource(void* opaque, uint64_t txn_id,
+                                        void* resource_ctx) {
+    qihse_table_store_t* store = opaque;
+    uwp_sql_txn_resource_t* resource = resource_ctx;
+    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC) return -1;
+    size_t table_count = resource->table_count;
+    bool count_valid = table_count <= UWP_SQL_TXN_MAX_TABLES;
+    if (!count_valid) table_count = UWP_SQL_TXN_MAX_TABLES;
+    bool valid = store && qihse_table_store_is_durable(store) &&
+        store == uwp_sql_row_store && resource->table_count > 0 &&
+        count_valid && !resource->ddl_changed && !resource->retry_enabled &&
+        resource->schema;
+    uint64_t principal_generation = 0;
+    qihse_user_t* principal = valid ? qihse_auth_borrow_principal_scoped(
+        resource->principal_id, &principal_generation) : NULL;
+    valid = valid && principal && qihse_auth_user_is_active(principal) &&
+        qihse_user_get_tenant_id(principal) == resource->principal_tenant_id;
+    qihse_table_txn_t* txns[UWP_SQL_TXN_MAX_TABLES] = {0};
+    for (size_t i = 0; valid && i < table_count; ++i) {
+        txns[i] = resource->tables[i].table_txn;
+        valid = txns[i] && qihse_auth_can_access_object(principal, 0,
+            (uint64_t)uwp_fnv1a(resource->tables[i].table_name),
+            resource->tables[i].write_observed ? QIHSE_ACL_WRITE : QIHSE_ACL_READ) &&
+            uwp_sql_validate_keys(qihse_schema_get_table(resource->schema,
+                resource->tables[i].table_name),
+                qihse_table_store_find_table(store,
+                    resource->tables[i].table_name), txns[i]);
+    }
+    if (valid) valid = qihse_auth_validate_handle_generation(
+        principal, principal_generation);
+    if (principal) qihse_auth_release_principal_scoped(principal);
+
+    bool prepared = false;
+    if (valid) {
+        prepared = qihse_table_txn_prepare_group(txns, table_count, txn_id);
+        for (size_t i = 0; i < table_count; ++i)
+            resource->tables[i].table_txn = NULL;
+    } else {
+        for (size_t i = 0; i < table_count; ++i) {
+            qihse_table_txn_rollback(resource->tables[i].table_txn);
+            resource->tables[i].table_txn = NULL;
+        }
+    }
+    for (size_t i = 0; i < table_count; ++i) {
+        free(resource->tables[i].table_name);
+        resource->tables[i].table_name = NULL;
+    }
+    uwp_sql_txn_cleanup(resource);
+    return prepared ? 0 : -1;
+}
+
+int qihse_uwp_sql_txn_register_durable_participant(
+    qihse_txn_manager_t* manager, uint8_t engine_id) {
+    qihse_table_store_t* store = uwp_sql_row_store;
+    if (!manager || !store || !qihse_table_store_is_durable(store)) return -1;
+    uint64_t next_id = 1;
+    if (!qihse_table_store_decision_next_id(store, &next_id) ||
+        qihse_txn_advance_next_id(manager, next_id) != 0) return -1;
+    qihse_txn_participant_t participant = {
+        .engine_id = engine_id, .engine_ctx = store,
+        .prepare = uwp_sql_2pc_prepare,
+        .commit = uwp_sql_2pc_commit,
+        .abort = uwp_sql_2pc_abort,
+    };
+    return qihse_txn_register_resource_participant(manager, participant,
+                                                    uwp_sql_2pc_prepare_resource);
+}
+
+int qihse_uwp_sql_txn_enlist_durable(qihse_txn_manager_t* manager,
+    qihse_txn_t* txn, uint8_t engine_id) {
+    uwp_sql_txn_resource_t* resource = txn ? txn->resource_ctx : NULL;
+    if (!resource || resource->magic != UWP_SQL_TXN_MAGIC ||
+        resource->ddl_changed || resource->retry_enabled ||
+        !resource->table_count) return -1;
+    return qihse_txn_enlist_attached_resource(manager, txn, engine_id);
+}
+
 qihse_table_store_t* qihse_uwp_sql_table_store(void) {
     pthread_mutex_lock(&uwp_sql_row_store_mutex);
     if (!uwp_sql_row_store)
