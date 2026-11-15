@@ -110,6 +110,7 @@ lib/
 
 # Rust build output
 /rust/qihse-rs/target/
+/rust/ct1-recovery/target/
 /sdks/rust/target/
 
 # Generated runtime test data

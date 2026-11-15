@@ -548,6 +548,10 @@ test-ownership-abort-replay: lib
 	$(CC) $(CFLAGS) -o tests/test_ownership_abort_replay tests/test_ownership_abort_replay.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_abort_replay
 
+.PHONY: test-ct-recovery-rust
+test-ct-recovery-rust:
+	cargo test --locked --offline --manifest-path rust/ct1-recovery/Cargo.toml
+
 # Exact-history transport serialization, real registry authorization, and
 # durable mutation/cursor recovery. Keep the fault-injected KV implementation
 # local to its test executable; production library fault hooks stay disabled.
