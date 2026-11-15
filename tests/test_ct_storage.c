@@ -83,10 +83,12 @@ int main(int argc, char** argv) {
     if (argc == 7 && (strcmp(argv[1], "receiver") == 0 ||
                       strcmp(argv[1], "receiver-mismatch") == 0 ||
                       strcmp(argv[1], "receiver-expired") == 0 ||
-                      strcmp(argv[1], "receiver-stale") == 0)) {
+                      strcmp(argv[1], "receiver-stale") == 0 ||
+                      strcmp(argv[1], "receiver-stale-expired") == 0)) {
         bool mismatch = strcmp(argv[1], "receiver-mismatch") == 0;
         bool expired = strcmp(argv[1], "receiver-expired") == 0;
-        bool stale = strcmp(argv[1], "receiver-stale") == 0;
+        bool stale_expired = strcmp(argv[1], "receiver-stale-expired") == 0;
+        bool stale = stale_expired || strcmp(argv[1], "receiver-stale") == 0;
         assert(qihse_auth_init());
         assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
         qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
@@ -138,10 +140,14 @@ int main(int argc, char** argv) {
              * over an earlier source-authored deletion. */
             assert(group.count == 1u && group2.count == 1u &&
                    !group.records[0].tombstone && !group2.records[0].tombstone);
-            free(group.records[0].value);
-            group.records[0].value = NULL;
-            group.records[0].tombstone = true;
-            group.records[0].expire_time_ms = 0u;
+            if (stale_expired) {
+                group.records[0].expire_time_ms = 1u;
+            } else {
+                free(group.records[0].value);
+                group.records[0].value = NULL;
+                group.records[0].tombstone = true;
+                group.records[0].expire_time_ms = 0u;
+            }
             group.first_seq = group.last_seq =
                 group.records[0].change_seq = baseline_seq + 3u;
             free(group2.records[0].key);
@@ -167,6 +173,39 @@ int main(int argc, char** argv) {
                    cursor == 0u);
             assert(qihse_kv_ct_receiver_status(receiver, service, &status) &&
                    status.durable_cursor == 1u);
+            for (unsigned i = 0u; i < 32u; i++) {
+                char key[64];
+                assert(snprintf(key, sizeof(key), "commons/ct-stale-padding-%u", i) > 0);
+                qihse_kv_ct_record_t row = group.records[0];
+                row.key = key;
+                row.value = "padding";
+                row.tombstone = false;
+                row.change_seq = baseline_seq + 4u + i;
+                qihse_kv_ct_group_t padding = group;
+                padding.stream_position = 2u + i;
+                padding.first_seq = padding.last_seq = row.change_seq;
+                padding.records = &row;
+                assert(qihse_kv_ct_receiver_apply(receiver, service, &padding, &cursor) &&
+                       cursor == padding.stream_position);
+                assert(qihse_kv_sync_store(receiver));
+            }
+            qihse_kv_sweep_expired(receiver);
+            assert(qihse_kv_ct_receiver_status(receiver, service, &status) &&
+                   status.durable_cursor == 33u);
+            group2.stream_position = 34u;
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
+                   cursor == 0u);
+            assert(qihse_kv_ct_receiver_status(receiver, service, &status) &&
+                   status.durable_cursor == 33u);
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver);
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            assert(qihse_kv_ct_receiver_status(receiver, service, &status) &&
+                   status.durable_cursor == 33u && status.baseline_sealed);
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
+                   cursor == 0u);
+            assert(qihse_kv_get_user(receiver, group.records[0].key, op) == NULL);
             qihse_ct_codec_clear(&group);
             qihse_ct_codec_clear(&group2);
             qihse_kv_store_destroy(receiver);
@@ -654,6 +693,18 @@ int main(int argc, char** argv) {
     if (child == 0) {
         assert(setenv("QIHSE_DATA_DIR", stale_dir, 1) == 0);
         execl(argv[0], argv[0], "receiver-stale", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    char stale_expired_dir[] = "./ct_receiver_stale_expired_XXXXXX";
+    assert(mkdtemp(stale_expired_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", stale_expired_dir, 1) == 0);
+        execl(argv[0], argv[0], "receiver-stale-expired", snapshot_path, group_path,
               seq_text, digest_hex, range_hex, (char*)NULL);
         _exit(99);
     }

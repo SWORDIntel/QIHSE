@@ -3761,10 +3761,15 @@ static bool tombstone_has_unacked_replica(qihse_kv_store_t* store, const char* k
 static bool compact_emit_cb(const char* key, const kv_disk_record_t* r, void* ud) {
     compact_emit_ctx_t* ctx = (compact_emit_ctx_t*)ud;
     if (!ctx || !ctx->ok || !key || !r) return false;
+    /* A CT1 receiver can still be sent an older row from the same generation.
+     * Its latest dead state is the version guard even after WAL/SST compaction. */
+    bool receiver_history = ctx->store->ct_enabled && !ctx->store->ct_lane_count &&
+        ctx->store->ct_mode == 2u;
     bool unpinned_tombstone = (r->flags & KV_FLAG_TOMBSTONE) != 0u &&
+        !receiver_history &&
         !tombstone_has_unacked_replica(ctx->store, key, r->change_seq);
     if (!ctx->retain_dead && unpinned_tombstone) return true;
-    if (ctx->retain_dead && (unpinned_tombstone ||
+    if (ctx->retain_dead && !receiver_history && (unpinned_tombstone ||
         (r->expire_time_ms != 0u && r->expire_time_ms <= ctx->now)))
         ctx->prunable_dead = true;
     if (!disk_record_write_fields(ctx->f, key, r->val, r->expire_time_ms,
@@ -3804,8 +3809,10 @@ static bool compact_sstables_stream_pass(qihse_kv_store_t* store, bool finish_gc
     char tmp[8192]; FILE* out = NULL;
     if (!atomic_file_begin(new_path, tmp, sizeof(tmp), &out)) return false;
     compact_emit_ctx_t wctx = {
-        .f = out, .ok = true, .retain_dead = inputs > 1u, .store = store,
-        .now = current_time_ms()
+        .f = out, .ok = true,
+        .retain_dead = inputs > 1u || (store->ct_enabled &&
+            !store->ct_lane_count && store->ct_mode == 2u),
+        .store = store, .now = current_time_ms()
     };
     int rc = sst_foreach_newest_ex(store, true, wctx.retain_dead,
                                  true, true, compact_emit_cb, &wctx);

@@ -61,6 +61,16 @@ absent; only the admitted source may durably publish and replicate an expiry.
 A cold reopen replays the existing log; never discard an expired retained row
 or reset CT metadata to clear a recovery fence.
 
+Legacy CT1 successor compaction retains the latest physical tombstone or
+expired row for each key while that receiver generation is bound. Otherwise a
+later-position, lower-version SET could pass the live receiver guard after the
+dead SST record is pruned, even though the same SET was rejected before
+compaction. Older overwritten SST copies still compact; retaining the newest
+dead state uses storage until the receiver generation is retired. The
+compaction/reopen negative cases run with `make test-ct-storage` and
+`make test-ct-storage-crash`. This prevents future pruning, not recovery of an
+already-pruned tombstone or acceptance of an existing conflicting group.
+
 Before a source retires fully ACKed CT1 WAL frames, it durably publishes its
 mutation-sequence floor using the existing `restore-highwater.bin` format.
 Otherwise compaction can later prune the highest-sequence tombstone and a cold
