@@ -561,6 +561,15 @@ test-ct-codec-auth: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_codec_auth tests/test_ct_codec_auth.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_codec_auth
 
+.PHONY: test-ct-legacy-expiry
+test-ct-legacy-expiry: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_ct_legacy_expiry tests/test_ct_legacy_expiry.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_legacy_expiry
+
+test-serial: test-ct-legacy-expiry
+
 test-ct-storage: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_storage tests/test_ct_storage.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_storage

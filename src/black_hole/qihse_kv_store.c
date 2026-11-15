@@ -7857,8 +7857,10 @@ static void tombstone_expired_keys(qihse_kv_store_t* store, char** keys, size_t 
                     }
                     continue;
                 }
-                if (store->ct_mode != 1u || !store->ct_admitted ||
-                    !store->ct_system_principal ||
+                /* Singleton CT1 expiry is source-owned, just like lane expiry.
+                 * Passive receivers and fenced sources retain the row unchanged. */
+                if (store->ct_mode != 1u || !store->ct_admitted) continue;
+                if (!store->ct_system_principal ||
                     !qihse_auth_can_access(store->ct_system_principal, c, s)) {
                     store->recovery_pending = true;
                     return;

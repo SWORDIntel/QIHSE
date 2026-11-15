@@ -49,10 +49,16 @@ In legacy `REPL.CT1 STATUS`, the field after durable position is **oldest LSN**
 with policy zero can mean native receiver status is unavailable (including a
 recovery fence); it does not establish that persisted receiver state was reset.
 
-No stored-data migration or API rebuild is required by this daemon-only fix.
-Rebuild with `make cluster-daemon`, stage a new immutable runtime, and restart
-only the selected primary after preserving its configuration and verifying its
-pinned successor. Validate with
+Legacy CT1 receivers and not-yet-admitted sources also defer physical expiry
+tombstones without poisoning recovery state. Expired values remain logically
+absent; only the admitted source may durably publish and replicate an expiry.
+A cold reopen replays the existing log; never discard an expired retained row
+or reset CT metadata to clear a recovery fence.
+
+No stored-data format migration or public API change is required. Rebuild with
+`make lib cluster-daemon`, stage a new immutable runtime, and restart the selected
+successor and then primary with their retained configuration and pinned peer.
+Validate with `make test-ct-legacy-expiry` and
 `python3 tests/test_ct_transfer.py Ct1RealDaemonTests.test_reopens_primary_with_exact_retained_unacked_successor_tail -v`.
 
 ## Delivery and local service gates
