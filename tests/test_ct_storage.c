@@ -82,9 +82,11 @@ int main(int argc, char** argv) {
     }
     if (argc == 7 && (strcmp(argv[1], "receiver") == 0 ||
                       strcmp(argv[1], "receiver-mismatch") == 0 ||
-                      strcmp(argv[1], "receiver-expired") == 0)) {
+                      strcmp(argv[1], "receiver-expired") == 0 ||
+                      strcmp(argv[1], "receiver-stale") == 0)) {
         bool mismatch = strcmp(argv[1], "receiver-mismatch") == 0;
         bool expired = strcmp(argv[1], "receiver-expired") == 0;
+        bool stale = strcmp(argv[1], "receiver-stale") == 0;
         assert(qihse_auth_init());
         assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
         qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
@@ -131,6 +133,45 @@ int main(int argc, char** argv) {
         fclose(f);
         assert(group2.count == 1u && group2.records[0].value &&
                strlen(group2.records[0].value) == 32768u);
+        if (stale) {
+            /* A later stream position cannot revive a lower-version SET
+             * over an earlier source-authored deletion. */
+            assert(group.count == 1u && group2.count == 1u &&
+                   !group.records[0].tombstone && !group2.records[0].tombstone);
+            free(group.records[0].value);
+            group.records[0].value = NULL;
+            group.records[0].tombstone = true;
+            group.records[0].expire_time_ms = 0u;
+            group.first_seq = group.last_seq =
+                group.records[0].change_seq = baseline_seq + 3u;
+            free(group2.records[0].key);
+            group2.records[0].key = strdup(group.records[0].key);
+            assert(group2.records[0].key);
+            group2.first_seq = group2.last_seq =
+                group2.records[0].change_seq = baseline_seq + 2u;
+            uint64_t cursor = 0u;
+            assert(qihse_kv_ct_receiver_apply(receiver, service, &group, &cursor) &&
+                   cursor == 1u);
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
+                   cursor == 0u);
+            assert(qihse_kv_sync_store(receiver));
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver);
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            qihse_kv_ct_receiver_status_t status = {0};
+            assert(qihse_kv_ct_receiver_status(receiver, service, &status) &&
+                   status.durable_cursor == 1u && status.baseline_sealed);
+            assert(qihse_kv_get_user(receiver, group.records[0].key, op) == NULL);
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
+                   cursor == 0u);
+            assert(qihse_kv_ct_receiver_status(receiver, service, &status) &&
+                   status.durable_cursor == 1u);
+            qihse_ct_codec_clear(&group);
+            qihse_ct_codec_clear(&group2);
+            qihse_kv_store_destroy(receiver);
+            return 0;
+        }
         if (expired) {
             assert(group.count == 1u && !group.records[0].tombstone &&
                    group.records[0].value && group.stream_position == 1u &&
@@ -606,6 +647,18 @@ int main(int argc, char** argv) {
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char stale_dir[] = "./ct_receiver_stale_XXXXXX";
+    assert(mkdtemp(stale_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", stale_dir, 1) == 0);
+        execl(argv[0], argv[0], "receiver-stale", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     s = qihse_kv_store_create_user(op);
     assert(s);
     assert(qihse_kv_ct_fence_finish(s, op, "move:1", false, token));
@@ -628,6 +681,7 @@ int main(int argc, char** argv) {
     aimem_fixture_cleanup(mismatch_dir);
     aimem_fixture_cleanup(expired_dir);
     aimem_fixture_cleanup(highwater_dir);
+    aimem_fixture_cleanup(stale_dir);
     aimem_fixture_cleanup(dir);
     puts("ct storage: PASS");
     return 0;
