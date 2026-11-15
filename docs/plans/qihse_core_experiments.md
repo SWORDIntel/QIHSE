@@ -1,10 +1,54 @@
 # Core feature experiments
 
-These are research candidates, not promotion claims. [ROADMAP.md](../../ROADMAP.md)
-remains the delivery-status authority. Establish a correct typed exact-search
-baseline before evaluating feature transforms. The existing VectorDB routes are
-separate from the original scalar Hilbert search, and TurboQuant remains an
-experimental numeric/sidecar implementation.
+The selectable core methods below are implemented; the later experiments are
+research candidates. [ROADMAP.md](../../ROADMAP.md) remains the delivery-status
+authority. Compare each change with typed exact search before adopting it. The
+existing VectorDB routes are separate from scalar Hilbert lookup, and TurboQuant
+remains an experimental numeric/sidecar implementation.
+
+## Available method comparison
+
+`qihse_batch_search_ex` now selects direct exact scan, phase-cosine RFF, or paired
+sine/cosine RFF. Its options also select tiles of 1–64 queries; each tile shares
+one streamed row projection. A batch builds one basis and retains O(tile*D)
+scratch. Exact mode allocates no projection scratch. Existing calls keep the
+phase-cosine map, with legacy batches using tiles of 16. There is no automatic
+selection based on a benchmark winner.
+
+Run the actual core implementation, with an independent typed equality oracle:
+
+```sh
+scripts/run-core-methods-bench.sh > core-methods.jsonl
+scripts/run-core-methods-bench.sh --method phase --dimensions 128 --tile 1,16 --dataset present --repeats 9 --format csv > phase-tiles.csv
+scripts/run-core-methods-bench.sh --method paired --dimensions 128 --tile 16 --dataset nearby_double --seed 0 > paired-nearby.jsonl
+```
+
+The default is a quick 45-case sweep: 512 records, 32 queries, 64/128 real
+coordinates, tiles 1/16, five datasets, seed 42, gamma 1, one warmup and three
+timed repeats. Datasets include present, absent, duplicate, adjacent
+representable-double and large-integer queries. Non-exact method selections
+still include exact scan. Every measured call validates original-type equality;
+any mismatch makes the command fail. Equal duplicate indices are all valid.
+
+JSONL or CSV records actual process CPU and wall batch times, setup/scoring/
+verification times, candidate hits, fallback work, comparisons, projections,
+basis builds and scratch bytes. Counts sum timed repeats; scratch is their peak.
+Fixture construction, the independent oracle and result checking are outside
+timing. Basis construction and metrics collection are inside each timed call.
+Data and queries remain resident and are reused after warmup. The amortized
+ns/query field does not measure individual-request latency, and three repeats
+do not establish p99 behavior. Sanitizer builds are correctness checks only.
+
+The projection-count benefit is testable without a timing claim: for finite
+inputs, n=512 and Q=32, tile 16 needs 1,024 row projections per batch instead
+of 16,384 at tile 1. The remaining nQD dot products still run. This benefit
+does not imply that either RFF method beats direct scalar equality search.
+
+The checked-in [2026-11-15 reference](../../benchmarks/results/core_methods/README.md)
+contains the 45-case JSONL run and its exact source/header hash manifest. On that
+unpinned, instrumented synthetic run, direct scan was fastest in every fixture;
+tiling reduced RFF projections as predicted. Treat those timings as observations
+for that build and workload, not promotion thresholds.
 
 ## Small experiments first
 
@@ -14,22 +58,21 @@ experimental numeric/sidecar implementation.
    semantics. Include source generation, preprocessing, gamma, seed/matrix and
    dimensions in profile identity. Report setup cost separately and calculate
    query-count break-even; reject a cache whose refresh cost outweighs savings.
-   A smaller first step is a tiled batch: reuse one kernel and each streamed
-   row projection across, for example, 16 query feature vectors. Compare it with
-   the current repeated scalar calls and a direct typed batch baseline; measure
-   p50/p99, scratch bytes and batch-size break-even. This can avoid a persistent
-   n-by-D cache, but has no measured engine speedup yet and needs no new public
-   API until the experiment establishes a useful contract.
+   Tiled reuse is now implemented above; retaining features across calls remains
+   a separate experiment. A persistent cache needs explicit source-generation
+   invalidation and a measured break-even against both tiled and direct search.
 
-2. **Pair sine and cosine.** For m frequencies use
+2. **Evaluate the implemented paired map on real workloads.** For m frequencies use
    `z(x)=(cos(w1.x),sin(w1.x),...,cos(wm.x),sin(wm.x))/sqrt(m)`.
    Its dot product is `mean(cos(wj.(x-y)))`; its self-kernel is one, and common
    translation preserves the finite map up to rounding. This removes the
    random-phase cosine map's extra diagonal noise. Compare **2m real output
    coordinates against 2m real coordinates**, not unequal storage budgets.
    [Sutherland and Schneider](https://www.cs.cmu.edu/~dsutherl/papers/rff_uai15.pdf)
-   analyze the lower Gaussian-kernel variance. A different map needs an explicit
-   versioned profile; do not silently change persisted features or their queries.
+   analyze the lower Gaussian-kernel variance. The new opaque map API exposes a
+   versioned descriptor for this reason; do not silently mix maps in persisted
+   features and queries. Lower kernel-estimation error does not establish better
+   exact-equality candidate recall for nearly indistinguishable scalar values.
 
    The portable synthetic probe requires NumPy:
 
@@ -51,6 +94,16 @@ experimental numeric/sidecar implementation.
    supplies an adaptive-computation starting point. Record candidate recall,
    fallback rate and p99 latency; confidence-based pruning belongs to an
    approximate mode unless a valid bound establishes exactness.
+
+4. **Center before phase evaluation.** The paired map's ideal score depends on
+   x−y, but evaluating very large phases or resolving adjacent doubles can lose
+   useful precision. Experiment with a shared, versioned center and scale before
+   projection. For integers above 2^53, subtract in a checked original integer
+   representation before conversion; converting both operands first can already
+   discard the difference. Measure candidate hits and range-reduction cost on
+   the large-integer and nearby-double fixtures, preserving exact fallback. The
+   transform belongs in feature identity and must not silently change the target
+   kernel or equality semantics.
 
 ## More unusual, bounded trials
 

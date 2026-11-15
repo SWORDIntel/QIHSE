@@ -1,6 +1,6 @@
 # QIHSE Core Search: Engineering Reference
 
-> **Status: source contract with targeted regression checks (2026-11-14).**
+> **Status: source contract with targeted regression checks (2026-11-15).**
 > This page replaces the earlier core-search examples and complexity claims.
 > The authoritative API inventory is [docs/API_REFERENCE.md](../../API_REFERENCE.md),
 > including its separately labelled core-math addendum (§8.14). An earlier
@@ -119,9 +119,47 @@ size_t qihse_batch_search(
 
 `queries` contains fixed-width records using the same descriptor stride as
 `data`; `results` has at least `num_queries` entries. The return value is the
-number of queries found. The implementation currently calls the scalar search
-for each query. It does not share an embedded data matrix or promise SIMD
-batching or parallel execution. Missing queries retain the not-found sentinel.
+number of queries found. A batch now creates one phase-cosine basis and shares
+streamed row projections across tiles of up to 16 queries. Missing queries
+retain the not-found sentinel. This does not retain an n-by-D feature matrix or
+dispatch parallel devices.
+
+### Choose the methodology explicitly
+
+Use `qihse_search_ex` or `qihse_batch_search_ex` for versioned method options and
+per-call measurements. They return 0 on success, including absence, or -1 with
+`errno` on failure. Results carry the matching index or not-found sentinel.
+
+| Method | Meaning |
+|---|---|
+| `QIHSE_SEARCH_EXACT` | Direct original-record equality scan with no feature allocation. |
+| `QIHSE_SEARCH_RFF_COSINE` | Existing random-phase cosine map, with D real coordinates. |
+| `QIHSE_SEARCH_RFF_PAIRED` | D/2 frequencies and interleaved cosine/sine pairs, with D real coordinates. D must be even. |
+
+All three preserve original typed equality. The default is phase-cosine RFF;
+method choice is explicit rather than inferred from benchmark results. Initialize
+options and optional metrics with their size-aware helpers:
+
+```c
+qihse_search_options_t options;
+qihse_search_metrics_t metrics;
+if (qihse_search_options_init(&options, sizeof(options)) != 0) return 1;
+if (qihse_search_metrics_init(&metrics, sizeof(metrics)) != 0) return 1;
+config.auto_dimensions = false;
+config.fixed_dimensions = 128; /* Even D, within the initialized 64..2048 bounds. */
+options.method = QIHSE_SEARCH_RFF_PAIRED;
+options.tile_size = 16;
+if (qihse_batch_search_ex(data, n, queries, num_queries, results, NULL,
+                          &config, &options, &metrics) != 0) return 1;
+```
+
+Tile sizes are 1–64. For finite numeric data, Q finite queries and no projection failures,
+row projections fall from `n*Q` at tile 1 to `n*ceil(Q/T)` at tile T. Query
+projections remain Q; dot products remain O(nQD). Scratch is O(TD) and does not
+grow with n. The implementation clamps the active tile size to Q. Exact mode
+reports zero dimensions, tile size 1 and zero owned heap scratch. These counters
+make the computation saved by batching observable without implying a different
+asymptotic lookup bound.
 
 ## Numerical primitives
 
@@ -141,6 +179,20 @@ positive; gamma must be finite. Allocation products are checked before use.
 Kernel-local random state includes a deterministic seed-zero case and does not
 consume the process-global C RNG. Seed reproduction is limited to the same
 implementation/math platform; it is not a cross-version persisted-basis promise.
+
+For a selectable feature method, use the opaque `qihse_rff_map_t` API. The
+`QIHSE_RFF_COSINE_PHASE` method preserves the formula above;
+`QIHSE_RFF_PAIRED_SINCOS` uses D/2 frequencies and
+`[cos(w0.x),sin(w0.x),...]/sqrt(D/2)`. Its ideal self-kernel is one and its ideal
+dot product depends only on x−y; floating-point rounding still matters.
+`qihse_rff_map_project` returns status and rejects nonfinite inputs or a
+nonfinite projection. Do not consume its output after failure.
+
+Use `qihse_rff_map_get_descriptor` to obtain basis version, method, both
+dimensions, gamma and seed. All fields must agree between data and query
+features. Serialize fields explicitly. The old kernel struct and creation API
+retain their phase-cosine meaning; selecting paired features does not reinterpret
+old projected vectors.
 
 AVX2 construction still rounds its output dimension to a multiple of eight and
 casts the canonical basis to float. Compare CPU variants using the actual
@@ -189,13 +241,37 @@ verification result before reuse to release any owned error message.
 
 ## Profiling and evidence
 
-Set `config.enable_profiling=true` to collect timings from the streaming core,
-then call `qihse_get_performance_stats`. Timing fields for stages that do not run
+Prefer a per-call `qihse_search_metrics_t` with the `_ex` APIs. It records actual
+candidate hits, fallback queries/hits, direct queries, unprojected queries,
+successful query/row projections, projection failures, original-record
+comparisons, basis builds, tiles and peak owned heap scratch. Stage timings
+include instrumentation overhead. Caller buffers, stack and allocator metadata
+are excluded from scratch bytes.
+
+For the legacy global report, set `config.enable_profiling=true`, then call
+`qihse_get_performance_stats`. Timing fields for stages that do not run
 must not be treated as evidence of executed amplification or device work.
 No recorded score or hardcoded hit-rate value establishes an algorithmic speedup.
-`avg_confidence` is a verified-hit indicator (zero or one), while
-`classical_fallbacks` and `total_operations` remain uninstrumented compatibility
-fields. Their zero values do not establish that no fallback or work occurred.
+`avg_confidence` is the verified-match fraction, not a probability estimate;
+`classical_fallbacks` now counts actual fallback queries. `total_operations`
+remains an uninstrumented compatibility field.
+
+Run the actual core benchmark with an exact baseline:
+
+```sh
+scripts/run-core-methods-bench.sh > core-methods.jsonl
+scripts/run-core-methods-bench.sh --method paired --tile 1,16 --dimensions 128 --dataset nearby_double --format csv > paired-nearby.csv
+```
+
+The quick default compares all three methods on present, absent, duplicate,
+nearby-double and large-integer fixtures. It runs one warmup and three timed
+repeats, at 512 records, 32 queries, 64/128 real coordinates, tiles 1/16, seed 42
+and gamma 1. Flags select each of these choices. JSONL/CSV records actual CPU
+and wall batch times, per-call stage times, correctness and counters. Validation
+against a separate original-type oracle is outside the timed region; any
+mismatch makes the command fail. The amortized ns/query field is batch time
+divided by Q, not a single-request latency distribution. Setup is included in
+each timed public call.
 
 Compare against an independent exact baseline and record source revision,
 compiler flags, input/query distributions, setup cost, steady-state latency,

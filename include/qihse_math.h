@@ -19,6 +19,35 @@ void qihse_rff_destroy(qihse_rff_kernel_t* kernel);
 void qihse_rff_project(const qihse_rff_kernel_t* kernel, const double* input,
                       double* output);
 
+/* Additive, immutable feature maps own their method. The legacy kernel APIs
+ * above retain random-phase cosine semantics and their existing layout.
+ * PAIRED_SINCOS requires even output_dims D: m=D/2 frequencies produce
+ * [cos(w0.x), sin(w0.x), ...] / sqrt(m), with no random phase offsets.
+ * Gamma must be finite and positive, and dimensions nonzero. Creation returns
+ * NULL with errno EINVAL, EOVERFLOW, or ENOMEM on failure. Seed zero is valid. */
+qihse_rff_map_t* qihse_rff_map_create(size_t input_dims, size_t output_dims,
+                                     double gamma, uint64_t seed,
+                                     qihse_rff_method_t method);
+void qihse_rff_map_destroy(qihse_rff_map_t* map);
+/* Input/output hold input_dims/output_dims doubles and must not overlap.
+ * Returns 0 on success, -1 with errno on failure. Null pointers or overlap fail
+ * EINVAL without writing output. Nonfinite input fails EDOM; finite input whose
+ * projection overflows fails ERANGE. Both numeric failures fill output with NaN.
+ * Concurrent projections of an immutable map into separate buffers are safe. */
+int qihse_rff_map_project(const qihse_rff_map_t* map, const double* input,
+                          double* output);
+size_t qihse_rff_map_input_dims(const qihse_rff_map_t* map);
+size_t qihse_rff_map_output_dims(const qihse_rff_map_t* map);
+/* Requested owned allocation bytes, including metadata and kernel arrays;
+ * excludes allocator overhead and the caller's projected-vector buffers. */
+size_t qihse_rff_map_storage_bytes(const qihse_rff_map_t* map);
+/* descriptor_bytes must be >= sizeof(qihse_rff_map_descriptor_t). Cache
+ * identity includes every descriptor field. Serialize fields explicitly,
+ * never the raw struct/padding. Reproduction is within a compatible libm/build. */
+int qihse_rff_map_get_descriptor(const qihse_rff_map_t* map,
+                                 qihse_rff_map_descriptor_t* descriptor,
+                                 size_t descriptor_bytes);
+
 /* ============================================================================
  * SUPERPOSITION STATE ENCODING
  * ============================================================================ */

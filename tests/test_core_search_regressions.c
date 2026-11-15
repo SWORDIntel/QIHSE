@@ -113,7 +113,11 @@ static void test_bounds_and_memory(void) {
     assert(qihse_search(data, 4096, &data[4000], NULL, &config) == 4000);
     assert(qihse_get_performance_stats(&large) == 0);
     assert(small.peak_memory_bytes == large.peak_memory_bytes);
-    assert(large.peak_memory_bytes == 4 * 64 * sizeof(double) + sizeof(qihse_rff_kernel_t));
+    qihse_rff_map_t* map = qihse_rff_map_create(1, 64, config.rff_gamma,
+        config.random_seed, QIHSE_RFF_COSINE_PHASE);
+    assert(map);
+    assert(large.peak_memory_bytes == qihse_rff_map_storage_bytes(map) + 2 * 64 * sizeof(double));
+    qihse_rff_map_destroy(map);
     errno = 0;
     assert(qihse_search(data, SIZE_MAX, data, NULL, &config) == NOT_STISLA_NOT_FOUND);
     assert(errno == EOVERFLOW);

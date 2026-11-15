@@ -1714,7 +1714,7 @@ V2 files are not addressable through the legacy topic-name APIs.
 | `void qihse_event_stream_batch_free(qihse_es_read_record_t*, size_t)` | Free payloads returned by the batch reader. | n/a |
 | `bool qihse_event_stream_archive_id(..., const char* scan_version, uint32_t schema_id, uint8_t out_id[48])` / `bool qihse_event_stream_member_id(...)` | Domain-separated stable identities bind archive/member content, exact member name, scan version and schema version. | `false` |
 
-### 8.14 Core search and numerical contracts — source/test addendum (2026-11-14)
+### 8.14 Core search and numerical contracts — source/test addendum (2026-11-15)
 
 **Status: implemented in source; targeted regression checks.** This subsection
 records the core correction, not a new full-library ABI certification. It is
@@ -1748,10 +1748,12 @@ STRING uses NUL-terminated slots, BINARY/STRUCT use byte equality, and CUSTOM
 requires `compare_fn`. Callers supply the non-numeric record width.
 
 `qihse_batch_search` uses the descriptor's element stride for both records and
-queries and currently invokes the scalar search for each query. It does not
-promise shared feature caching, parallel queries or a device speedup. The
-streaming core does not dispatch the experimental amplification, GPU/NPU or
-multi-pipeline functions; related configuration fields remain for compatibility.
+queries. It now shares one basis and streamed row projections across a tile of
+queries, using the phase-cosine method with a default tile size of 16. This is
+bounded CPU reuse within one call, not a persistent feature cache or parallel
+device execution. The streaming core does not dispatch the experimental
+amplification, GPU/NPU or multi-pipeline functions; related configuration fields
+remain for compatibility.
 The anchor-table argument is retained but is not consumed by this path.
 `timeout_ms` and `verification.max_verification_time_us` are not enforced by
 the scalar core; they are not operation deadlines.
@@ -1770,6 +1772,52 @@ non-numeric cases supported by `qihse_search`. A caller-provided candidate index
 alone is insufficient. Non-default modes can return a false
 negative when exhaustive fallback is disabled, but cannot return an unchecked
 false match. Use the default exact configuration when lookup completeness matters.
+
+#### Selectable methods and per-call measurements
+
+The additive `qihse_search_ex` and `qihse_batch_search_ex` interfaces separate
+status from lookup results: return 0 includes an ordinary absent result; return
+-1 sets `errno` for an argument/resource failure. Every successful returned
+index still passes original-record equality. Existing search signatures and
+`qihse_config_t` layouts are unchanged.
+
+Initialize `qihse_search_options_t` with
+`qihse_search_options_init(&options, sizeof(options))` and optional
+`qihse_search_metrics_t` with
+`qihse_search_metrics_init(&metrics, sizeof(metrics))`. Both carry a size and
+version; undersized initialization buffers are rejected without writes. Options
+default to phase-cosine RFF and `tile_size=16`; valid explicit tile sizes are
+1–64. A supplied metrics object is reusable across calls. `NULL` options select
+defaults, while `NULL` metrics disables the per-call report.
+
+| `options.method` | Work and feature budget |
+|---|---|
+| `QIHSE_SEARCH_EXACT` | Direct typed equality scan, no projections and no owned heap scratch. Ignores projection settings; metrics report dimensions 0 and tile size 1. |
+| `QIHSE_SEARCH_RFF_COSINE` | D random-phase cosine coordinates followed by original-record verification. |
+| `QIHSE_SEARCH_RFF_PAIRED` | D/2 frequencies produce D interleaved sine/cosine coordinates, followed by the same verification. Requires an even resolved D. |
+
+For finite numeric records, Q finite queries and tile size T, one basis is built
+per call and each row is projected once per active tile. With no projection errors,
+the row count is `n*ceil(Q/T)` rather than `n*Q`; query projections remain Q.
+Dot-product work remains O(nQD), and owned scratch is O(TD), independent of n.
+Tile size 1 supplies the streaming comparison. Larger tiles trade scratch for
+fewer repeated projections; this does not select a different similarity method.
+
+Metrics report actual candidate hits, fallback queries/hits, direct queries,
+unprojected queries, successful query/row projections, projection failures,
+original-record comparisons, kernel builds, active tiles and peak owned scratch.
+Scratch excludes caller buffers, stack and allocator bookkeeping. Setup,
+scoring, verification and total times include instrumentation overhead. These
+per-call counters supersede guesses based on a feature score or global last-call
+statistics. They do not choose an automatic winner.
+
+`benchmarks/qihse_core_methods_bench.c` exercises these public methods on
+synthetic scalar fixtures. Build and run with
+`scripts/run-core-methods-bench.sh`; `--help` lists method, tile, dimensions,
+dataset, size, repeat, seed, gamma and JSONL/CSV selectors. Each comparison
+includes the exact baseline and validates against an independent typed oracle.
+The benchmark times complete batches, including basis construction. Its
+per-query timing is amortized batch time, not individual-request tail latency.
 
 The legacy `qihse_adaptive_amplify` entry returns `-ENOTSUP`, and the void
 `qihse_apply_oracle` entry sets `errno=ENOTSUP` without mutating the state: their
@@ -1794,6 +1842,21 @@ kernel creation neither calls `srand` nor consumes global `rand` state. Exact
 bit reproduction is limited to the same implementation/math platform. Persisted
 or cached features must use the same actual basis as queries and must be rebuilt
 when that basis changes; a seed is not a cross-version file-format guarantee.
+
+The new opaque `qihse_rff_map_t` owns an explicit feature method.
+`qihse_rff_map_create(..., QIHSE_RFF_PAIRED_SINCOS)` constructs
+`[cos(w0.x), sin(w0.x), ...] / sqrt(D/2)` using D/2 frequencies and no phase
+offsets. `QIHSE_RFF_COSINE_PHASE` preserves the original cosine map. Projection
+through `qihse_rff_map_project` returns 0 or -1/`errno`; nonfinite inputs or
+overflowed projections fail, and failed output must not be consumed.
+
+`qihse_rff_map_get_descriptor` exposes basis version, method, input/output
+dimensions, gamma and seed. Every field belongs in cached-feature identity;
+serialize fields explicitly rather than raw struct padding. Sine/cosine and
+phase-cosine vectors are not interchangeable even at the same dimension and
+seed. Legacy `qihse_rff_kernel_t` and `qihse_rff_create` retain their layouts and
+phase-cosine semantics. Map reproduction remains limited to compatible builds
+and math libraries.
 
 AVX2 kernel creation retains eight-coordinate output rounding and converts the
 canonical basis to float. Compare against the scalar kernel using the **actual
@@ -1859,10 +1922,11 @@ and together as C and C++. The new public candidate regression lives in
 `tests/test_vector_candidate_rerank.c`; executing its real-principal fixture
 requires the library-backed test target and is distinct from the isolated
 numerical selector checks.
-The paired-feature script in
+The C method benchmark measures the actual core on synthetic workloads. The
+separate paired-feature script in
 `benchmarks/scripts/qihse_rff_pairing_experiment.py` is a **synthetic formula
-experiment**, not an engine throughput or production recall benchmark. Proposed
-feature-map changes remain explicit research work in
+experiment**, not an engine throughput or production recall benchmark. Remaining
+feature-map research is described in
 [Core feature experiments](plans/qihse_core_experiments.md).
 
 #### Migration note
@@ -1875,6 +1939,13 @@ caller can supply explicit target indices. The typed state-fidelity function is
 available. The old untyped export stubs have no compatible operational contract;
 use typed `qihse_create_superposition`/`qihse_destroy_superposition` and the explicit
 RFF/state APIs in the current headers.
+
+To select exact scan or paired features, use the additive `_ex` search APIs and
+initialized versioned options; existing calls retain phase-cosine semantics.
+Legacy batches now reuse a basis and row projections in tiles of 16. This changes
+their execution strategy without changing original-record equality or their
+return-count signature. No benchmark-derived automatic method selection is
+enabled.
 
 Installed public layouts are preserved. Code that included the former duplicate
 `algorithms/` structs must rebuild: their extra internal-state and amplification

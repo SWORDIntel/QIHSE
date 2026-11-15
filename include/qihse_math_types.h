@@ -5,6 +5,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Feature layouts are part of cached-vector identity. Do not compare or reuse
+ * projected vectors across different descriptor tuples. */
+#define QIHSE_RFF_BASIS_VERSION UINT32_C(1)
+
+typedef enum qihse_rff_method_e {
+    QIHSE_RFF_COSINE_PHASE = 0,
+    QIHSE_RFF_PAIRED_SINCOS = 1
+} qihse_rff_method_t;
+
+typedef struct qihse_rff_map_s qihse_rff_map_t;
+
+typedef struct qihse_rff_map_descriptor_s {
+    uint32_t basis_version;
+    qihse_rff_method_t method;
+    size_t input_dims;
+    size_t output_dims;
+    double gamma;
+    uint64_t seed;
+} qihse_rff_map_descriptor_t;
+
 /* Shared by installed APIs and algorithm translation units. Preserve these
  * public layouts; algorithm-specific state must not extend them privately. */
 typedef struct qihse_rff_kernel_s {

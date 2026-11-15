@@ -55,6 +55,18 @@ static double qihse_rff_uniform(uint64_t* state) {
     return (double)(qihse_rff_random_u64(state) >> 11) * 0x1.0p-53;
 }
 
+/* Basis version 1 uses the same draw order as the legacy cosine constructor. */
+static void qihse_rff_fill_frequencies(double* omega, size_t count, double gamma,
+                                      uint64_t* random_state) {
+    double sigma = sqrt(gamma) * sqrt(2.0);
+    for (size_t i = 0; i < count; ++i) {
+        double u1 = 1.0 - qihse_rff_uniform(random_state);
+        double u2 = qihse_rff_uniform(random_state);
+        double z0 = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+        omega[i] = z0 * sigma;
+    }
+}
+
 qihse_rff_kernel_t* qihse_rff_create(
     size_t input_dims,
     size_t output_dims,
@@ -91,19 +103,7 @@ qihse_rff_kernel_t* qihse_rff_create(
 
     uint64_t random_state = seed;
 
-    /* Generate random frequencies from Gaussian distribution */
-    /* Multiplying gamma by 2 first can overflow for a valid finite bandwidth. */
-    double sigma = sqrt(gamma) * sqrt(2.0);
-
-    for (size_t i = 0; i < frequency_count; i++) {
-        /* Box-Muller transform for Gaussian random variables */
-        /* u1 is in (0, 1], so log(0) is impossible. */
-        double u1 = 1.0 - qihse_rff_uniform(&random_state);
-        double u2 = qihse_rff_uniform(&random_state);
-
-        double z0 = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
-        kernel->omega[i] = z0 * sigma;
-    }
+    qihse_rff_fill_frequencies(kernel->omega, frequency_count, gamma, &random_state);
 
     /* Generate random biases */
     for (size_t i = 0; i < output_dims; i++) {
@@ -145,6 +145,137 @@ void qihse_rff_project(
         /* Apply cos transform: z(x) = sqrt(2/D) * cos(ω·x + b) */
         output[d] = scale * cos(dot_product);
     }
+}
+
+/* The method belongs to the map, so a caller cannot accidentally project a
+ * paired basis through the legacy cosine ABI. No legacy struct is extended. */
+struct qihse_rff_map_s {
+    qihse_rff_map_descriptor_t descriptor;
+    qihse_rff_kernel_t* kernel;
+    size_t storage_bytes;
+};
+
+qihse_rff_map_t* qihse_rff_map_create(size_t input_dims, size_t output_dims,
+                                     double gamma, uint64_t seed,
+                                     qihse_rff_method_t method) {
+    if (!input_dims || !output_dims || !isfinite(gamma) || gamma <= 0.0 ||
+        (method != QIHSE_RFF_COSINE_PHASE && method != QIHSE_RFF_PAIRED_SINCOS) ||
+        (method == QIHSE_RFF_PAIRED_SINCOS && output_dims % 2 != 0)) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t frequencies = method == QIHSE_RFF_PAIRED_SINCOS ? output_dims / 2 : output_dims;
+    if (output_dims > SIZE_MAX / sizeof(double) ||
+        input_dims > SIZE_MAX / sizeof(double) / frequencies) {
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    size_t omega_bytes = frequencies * input_dims * sizeof(double);
+    size_t bias_bytes = method == QIHSE_RFF_COSINE_PHASE ? frequencies * sizeof(double) : 0;
+    size_t metadata_bytes = sizeof(qihse_rff_map_t) + sizeof(qihse_rff_kernel_t);
+    if (omega_bytes > SIZE_MAX - bias_bytes || omega_bytes + bias_bytes > SIZE_MAX - metadata_bytes) {
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    qihse_rff_map_t* map = calloc(1, sizeof(*map));
+    if (!map) { errno = ENOMEM; return NULL; }
+    map->descriptor.basis_version = QIHSE_RFF_BASIS_VERSION;
+    map->descriptor.method = method;
+    map->descriptor.input_dims = input_dims;
+    map->descriptor.output_dims = output_dims;
+    map->descriptor.gamma = gamma;
+    map->descriptor.seed = seed;
+    map->storage_bytes = metadata_bytes + omega_bytes + bias_bytes;
+    if (method == QIHSE_RFF_COSINE_PHASE) {
+        /* The phase method shares the exact legacy basis and projection. */
+        map->kernel = qihse_rff_create(input_dims, output_dims, gamma, seed);
+    } else {
+        map->kernel = calloc(1, sizeof(*map->kernel));
+        if (map->kernel) {
+            map->kernel->input_dims = input_dims;
+            /* This private kernel contains m frequencies, not D output slots. */
+            map->kernel->output_dims = frequencies;
+            map->kernel->gamma = gamma;
+            map->kernel->seed = seed;
+            map->kernel->omega = malloc(omega_bytes);
+            if (map->kernel->omega) {
+                uint64_t random_state = seed;
+                qihse_rff_fill_frequencies(map->kernel->omega,
+                    frequencies * input_dims, gamma, &random_state);
+            }
+        }
+    }
+    if (!map->kernel || !map->kernel->omega) {
+        int error = errno ? errno : ENOMEM;
+        qihse_rff_map_destroy(map);
+        errno = error;
+        return NULL;
+    }
+    return map;
+}
+
+void qihse_rff_map_destroy(qihse_rff_map_t* map) {
+    if (!map) return;
+    qihse_rff_destroy(map->kernel);
+    free(map);
+}
+
+static int qihse_rff_map_projection_error(const qihse_rff_map_t* map, double* output,
+                                          int error) {
+    for (size_t i = 0; i < map->descriptor.output_dims; ++i) output[i] = NAN;
+    errno = error;
+    return -1;
+}
+
+int qihse_rff_map_project(const qihse_rff_map_t* map, const double* input, double* output) {
+    if (!map || !input || !output) { errno = EINVAL; return -1; }
+    size_t input_bytes = map->descriptor.input_dims * sizeof(double);
+    size_t output_bytes = map->descriptor.output_dims * sizeof(double);
+    uintptr_t input_start = (uintptr_t)input, output_start = (uintptr_t)output;
+    if ((input_start <= output_start && output_start - input_start < input_bytes) ||
+        (output_start < input_start && input_start - output_start < output_bytes)) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; i < map->descriptor.input_dims; ++i)
+        if (!isfinite(input[i])) return qihse_rff_map_projection_error(map, output, EDOM);
+    if (map->descriptor.method == QIHSE_RFF_COSINE_PHASE) {
+        qihse_rff_project(map->kernel, input, output);
+        for (size_t i = 0; i < map->descriptor.output_dims; ++i)
+            if (!isfinite(output[i])) return qihse_rff_map_projection_error(map, output, ERANGE);
+    } else {
+        size_t frequencies = map->descriptor.output_dims / 2;
+        double scale = 1.0 / sqrt((double)frequencies);
+        for (size_t row = 0; row < frequencies; ++row) {
+            double phase = 0.0;
+            for (size_t i = 0; i < map->descriptor.input_dims; ++i)
+                phase += map->kernel->omega[row * map->descriptor.input_dims + i] * input[i];
+            if (!isfinite(phase)) return qihse_rff_map_projection_error(map, output, ERANGE);
+            output[2 * row] = scale * cos(phase);
+            output[2 * row + 1] = scale * sin(phase);
+        }
+    }
+    return 0;
+}
+
+size_t qihse_rff_map_input_dims(const qihse_rff_map_t* map) {
+    return map ? map->descriptor.input_dims : 0;
+}
+size_t qihse_rff_map_output_dims(const qihse_rff_map_t* map) {
+    return map ? map->descriptor.output_dims : 0;
+}
+size_t qihse_rff_map_storage_bytes(const qihse_rff_map_t* map) {
+    return map ? map->storage_bytes : 0;
+}
+int qihse_rff_map_get_descriptor(const qihse_rff_map_t* map,
+                                 qihse_rff_map_descriptor_t* descriptor,
+                                 size_t descriptor_bytes) {
+    if (!map || !descriptor || descriptor_bytes < sizeof(*descriptor)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(descriptor, &map->descriptor, sizeof(*descriptor));
+    return 0;
 }
 
 /* ============================================================================

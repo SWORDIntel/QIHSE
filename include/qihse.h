@@ -315,6 +315,77 @@ int qihse_config_init(
  * CORE QIHSE SEARCH API
  * ============================================================================ */
 
+#define QIHSE_SEARCH_OPTIONS_VERSION 1u
+#define QIHSE_SEARCH_MAX_TILE_SIZE 64u
+
+typedef enum {
+    QIHSE_SEARCH_EXACT = 0,
+    QIHSE_SEARCH_RFF_COSINE = 1,
+    QIHSE_SEARCH_RFF_PAIRED = 2
+} qihse_search_method_t;
+
+/* Additive options: existing qihse_config_t and kernel layouts are unchanged. */
+typedef struct {
+    size_t struct_size;
+    uint32_t version;
+    qihse_search_method_t method;
+    size_t tile_size; /* 1..64 queries sharing each streamed row projection */
+} qihse_search_options_t;
+
+/* Per-call measurements, independent of the legacy global last-operation stats.
+ * Projection counts include successful projections only; failures are separate.
+ * Scratch counts owned heap allocations, excluding inputs, outputs and stack.
+ * Timings include instrumentation overhead; intervals with failed clock reads
+ * contribute zero. Counters saturate at SIZE_MAX when necessary. */
+typedef struct {
+    size_t struct_size;
+    uint32_t version;
+    qihse_search_method_t method;
+    size_t dimensions;
+    size_t tile_size;
+    size_t queries;
+    size_t matches;
+    size_t candidate_hits;
+    size_t fallback_queries; /* Window/full scans after a candidate did not match */
+    size_t fallback_hits;
+    size_t direct_queries; /* Explicit EXACT method */
+    size_t unprojected_queries; /* RFF query had no usable numeric features */
+    size_t query_projections;
+    size_t row_projections;
+    size_t projection_failures;
+    size_t comparisons; /* Actual original-record equality comparisons */
+    size_t kernel_builds;
+    size_t tiles; /* Tiles containing at least one successfully projected query */
+    size_t peak_scratch_bytes;
+    double setup_time_ns;
+    double scoring_time_ns;
+    double verification_time_ns;
+    double total_time_ns;
+} qihse_search_metrics_t;
+
+/* Initialize with the caller's sizeof(object). Undersized buffers are rejected
+ * without writes. Defaults are cosine RFF and tile_size=16. */
+int qihse_search_options_init(qihse_search_options_t* options, size_t bytes);
+int qihse_search_metrics_init(qihse_search_metrics_t* metrics, size_t bytes);
+
+/* Status-returning variants: 0 includes an ordinary absent result; -1 sets errno
+ * for invalid arguments/resources. NULL options selects defaults; NULL metrics
+ * disables per-call reporting. Initialize supplied metrics before first use.
+ * EXACT ignores projection settings and always performs typed equality lookup.
+ * PAIRED requires an even resolved output dimension. A batch constructs one
+ * basis and shares each row projection within a tile; tile_size=1 is streaming.
+ * Valid output arrays are filled with NOT_FOUND before resource allocation, so
+ * allocation failure cannot leave a partially completed batch. Argument errors
+ * need not modify outputs. Input and output buffers must not overlap. */
+int qihse_search_ex(const void* data, size_t n, const void* query,
+    not_stisla_anchor_table_t* table, const qihse_config_t* config,
+    const qihse_search_options_t* options, not_stisla_result_t* result,
+    qihse_search_metrics_t* metrics);
+int qihse_batch_search_ex(const void* data, size_t n, const void* queries,
+    size_t num_queries, not_stisla_result_t* results,
+    not_stisla_anchor_table_t* table, const qihse_config_t* config,
+    const qihse_search_options_t* options, qihse_search_metrics_t* metrics);
+
 /**
  * @brief Quantum-Inspired Hilbert Space Expansion Search
  *
@@ -342,15 +413,15 @@ not_stisla_result_t qihse_search(
 /**
  * @brief Batch QIHSE search for multiple queries
  *
- * Searches for multiple queries in a single operation, maximizing
- * learning and parallelization benefits.
+ * Uses one cosine-RFF basis and tiles of up to 16 queries, sharing streamed row
+ * projections. Use qihse_batch_search_ex to select a method and tile size.
  *
- * @param data Sorted array to search in
+ * @param data Array of fixed-width records; need not be sorted
  * @param n Number of elements in array
  * @param queries Array of query values
  * @param num_queries Number of queries
  * @param results Output array for results (must be sized for num_queries)
- * @param table Anchor table for learning (can be NULL)
+ * @param table Reserved on this path (can be NULL)
  * @param config QIHSE configuration
  * @return Number of queries found
  */
@@ -371,7 +442,7 @@ size_t qihse_batch_search(
 typedef struct {
     /* Execution timing */
     double total_time_ns;       /* Total execution time */
-    double dim_calc_time_ns;    /* Dimension calculation time */
+    double dim_calc_time_ns;    /* Core setup: dimensions, basis and scratch allocation */
     double rff_time_ns;         /* RFF embedding time */
     double superposition_time_ns; /* Superposition creation time */
     double amplification_time_ns; /* Grover amplification time */
@@ -383,9 +454,9 @@ typedef struct {
     double device_time_ns[QIHSE_DEV_COUNT]; /* Time spent per device */
 
     /* Quality metrics */
-    double avg_confidence;      /* Scalar search: verified hit=1, no hit=0 */
+    double avg_confidence;      /* Fraction of queries with verified hits */
     double verification_rate;   /* Scalar search: 1, every candidate is checked */
-    size_t classical_fallbacks; /* Reserved/uninstrumented by scalar search */
+    size_t classical_fallbacks; /* Queries scanned beyond the RFF candidate */
 
     /* QIHSE native anchor learning metrics */
     size_t anchors_learned;     /* New anchors learned */

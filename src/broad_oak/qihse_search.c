@@ -193,10 +193,19 @@ static bool qihse_record_equals(const void* element, const void* query,
     }
 }
 
-not_stisla_result_t qihse_verify_result_with_descriptor(
+static bool qihse_record_equals_counted(const void* element, const void* query,
+    qihse_data_type_t type, const qihse_type_descriptor_t* descriptor,
+    qihse_verification_work_t* work) {
+    if (work && work->comparisons != SIZE_MAX) ++work->comparisons;
+    return qihse_record_equals(element, query, type, descriptor);
+}
+
+not_stisla_result_t qihse_verify_result_with_work(
     const void* data, size_t n, const void* query, qihse_data_type_t type,
     const qihse_type_descriptor_t* descriptor,
-    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config) {
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config,
+    qihse_verification_work_t* work) {
+    if (work) memset(work, 0, sizeof(*work));
     if (!data || !query || !descriptor || !collapse || !config ||
         !descriptor->element_size || type < QIHSE_TYPE_INT64 || type > QIHSE_TYPE_CUSTOM ||
         config->mode < QIHSE_VERIFY_NONE || config->mode > QIHSE_VERIFY_EXACT ||
@@ -212,24 +221,37 @@ not_stisla_result_t qihse_verify_result_with_descriptor(
     const unsigned char* rows = data;
     size_t width = descriptor->element_size;
     size_t candidate = collapse->predicted_index;
-    if (candidate < n && qihse_record_equals(rows + candidate * width, query, type, descriptor))
+    if (candidate < n && qihse_record_equals_counted(rows + candidate * width,
+                                                   query, type, descriptor, work)) {
+        if (work) work->candidate_matched = true;
         return candidate;
+    }
 
     if ((config->mode == QIHSE_VERIFY_WINDOW || config->mode == QIHSE_VERIFY_FALLBACK) && candidate < n) {
         size_t half = config->window_size / 2;
         size_t start = candidate > half ? candidate - half : 0;
         size_t length = config->window_size < n - start ? config->window_size : n - start;
+        if (work && length) work->scanned = true;
         for (size_t i = start; i < start + length; ++i)
-            if (qihse_record_equals(rows + i * width, query, type, descriptor)) return i;
+            if (qihse_record_equals_counted(rows + i * width, query, type, descriptor, work)) return i;
     }
     if (config->mode == QIHSE_VERIFY_EXACT || config->mode == QIHSE_VERIFY_FALLBACK ||
         config->fallback_to_classical) {
         /* This bounded scan is valid for unsorted records and every comparator.
          * RFF collisions (including int64 -> double) cannot become false hits. */
+        if (work && n) work->scanned = true;
         for (size_t i = 0; i < n; ++i)
-            if (qihse_record_equals(rows + i * width, query, type, descriptor)) return i;
+            if (qihse_record_equals_counted(rows + i * width, query, type, descriptor, work)) return i;
     }
     return NOT_STISLA_NOT_FOUND;
+}
+
+not_stisla_result_t qihse_verify_result_with_descriptor(
+    const void* data, size_t n, const void* query, qihse_data_type_t type,
+    const qihse_type_descriptor_t* descriptor,
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config) {
+    return qihse_verify_result_with_work(data, n, query, type, descriptor,
+                                         collapse, config, NULL);
 }
 
 not_stisla_result_t qihse_verify_result(

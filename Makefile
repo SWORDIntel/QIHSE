@@ -946,6 +946,18 @@ test-vector-candidate-rerank: lib
 
 test-serial: test-core-search-regressions test-core-math-regressions test-runtime-math-regressions test-vector-candidate-rerank
 
+.PHONY: test-core-methodologies test-rff-maps bench-core-methods
+test-core-methodologies:
+	bash scripts/run-core-methodology-regressions.sh
+
+test-rff-maps:
+	bash scripts/run-rff-map-regressions.sh
+
+bench-core-methods:
+	bash scripts/run-core-methods-bench.sh $(BENCH_ARGS)
+
+test-serial: test-core-methodologies test-rff-maps
+
 .PHONY: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
 test-container-lifecycle: lib
