@@ -84,7 +84,9 @@ int main(int argc, char** argv) {
                       strcmp(argv[1], "receiver-mismatch") == 0 ||
                       strcmp(argv[1], "receiver-expired") == 0 ||
                       strcmp(argv[1], "receiver-stale") == 0 ||
-                      strcmp(argv[1], "receiver-stale-expired") == 0)) {
+                      strcmp(argv[1], "receiver-stale-expired") == 0 ||
+                      strcmp(argv[1], "receiver-history") == 0 ||
+                      strcmp(argv[1], "receiver-history-set") == 0)) {
         bool mismatch = strcmp(argv[1], "receiver-mismatch") == 0;
         bool expired = strcmp(argv[1], "receiver-expired") == 0;
         bool stale_expired = strcmp(argv[1], "receiver-stale-expired") == 0;
@@ -135,6 +137,154 @@ int main(int argc, char** argv) {
         fclose(f);
         assert(group2.count == 1u && group2.records[0].value &&
                strlen(group2.records[0].value) == 32768u);
+        if (strcmp(argv[1], "receiver-history") == 0 ||
+            strcmp(argv[1], "receiver-history-set") == 0) {
+            assert(group.count == 1u && group.records[0].classification == 4u &&
+                   group.records[0].sci_compartment == 2u);
+            char* key = group.records[0].key;
+            free(group.records[0].value);
+            group.records[0].value = NULL;
+            group.records[0].tombstone = true;
+            group.records[0].expire_time_ms = 0u;
+            uint64_t cursor = 0u;
+            assert(qihse_kv_ct_receiver_apply(receiver, service, &group, &cursor) &&
+                   cursor == 1u);
+            qihse_kv_ct_receiver_history_request_t req = {
+                .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1,
+                .size = sizeof(req), .source_id = "source:1", .target_id = "target:1",
+                .generation = "gen:1", .baseline_row_seq = baseline_seq,
+                .durable_cursor = 1u, .key = key, .resource_tenant_id = 0u,
+                .classification = 4u, .sci_compartment = 2u};
+            memcpy(req.baseline_digest, digest, 32u);
+            qihse_kv_ct_receiver_history_result_t proof = {0};
+            assert(qihse_kv_ct_receiver_history_v1(receiver, op, &req, &proof) &&
+                   proof.stream_position == 1u &&
+                   proof.row_change_seq == group.records[0].change_seq &&
+                   proof.durable_cursor == 1u &&
+                   proof.row_seq_high_water >= proof.row_change_seq);
+#define DENIED(principal) do { \
+    memset(&proof, 0xa5, sizeof(proof)); \
+    assert(!qihse_kv_ct_receiver_history_v1(receiver, principal, &req, &proof)); \
+    qihse_kv_ct_receiver_history_result_t zero = {0}; \
+    assert(memcmp(&proof, &zero, sizeof(proof)) == 0); \
+} while (0)
+            DENIED(low);
+            DENIED(NULL);
+            if (strcmp(argv[1], "receiver-history-set") == 0) {
+                free(group2.records[0].key);
+                group2.records[0].key = strdup(key);
+                assert(group2.records[0].key);
+                group2.first_seq = group2.last_seq =
+                    group2.records[0].change_seq = group.records[0].change_seq + 1u;
+                group2.records[0].classification = 6u;
+                assert(qihse_kv_ct_receiver_apply(receiver, op, &group2, &cursor) &&
+                       cursor == 2u);
+                req.durable_cursor = 2u;
+                DENIED(service);
+                DENIED(op);
+                assert(qihse_kv_sync_store(receiver));
+                qihse_kv_store_destroy(receiver);
+                receiver = qihse_kv_store_create_user(op);
+                assert(receiver);
+                qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+                DENIED(service);
+                DENIED(op);
+                qihse_ct_codec_clear(&group);
+                qihse_ct_codec_clear(&group2);
+                qihse_kv_store_destroy(receiver);
+                return 0;
+            }
+            req.classification = 0u; DENIED(op); req.classification = 4u;
+            req.sci_compartment = 0u; DENIED(op); req.sci_compartment = 2u;
+            req.resource_tenant_id = 12u; DENIED(op); req.resource_tenant_id = 0u;
+            req.baseline_row_seq++; DENIED(op); req.baseline_row_seq--;
+            req.baseline_digest[0] ^= 1u; DENIED(op); req.baseline_digest[0] ^= 1u;
+            req.durable_cursor++; DENIED(op); req.durable_cursor--;
+            req.generation = "gen:wrong"; DENIED(op); req.generation = "gen:1";
+            req.source_id = "source:wrong"; DENIED(op); req.source_id = "source:1";
+            req.target_id = "target:wrong"; DENIED(op); req.target_id = "target:1";
+            req.version++; DENIED(op); req.version--;
+            /* The protected unrelated frame must fail for a lower-clearance
+             * replication principal, even though the requested key is readable. */
+            free(group2.records[0].key);
+            group2.records[0].key = strdup("commons/history-other");
+            assert(group2.records[0].key);
+            group2.records[0].classification = 6u;
+            group2.records[0].sci_compartment = 2u;
+            assert(qihse_kv_ct_receiver_apply(receiver, op, &group2, &cursor) &&
+                   cursor == 2u);
+            req.durable_cursor = 2u;
+            assert(qihse_kv_ct_receiver_history_v1(receiver, op, &req, &proof) &&
+                   proof.stream_position == 1u && proof.durable_cursor == 2u &&
+                   proof.row_seq_high_water >= group2.records[0].change_seq);
+            DENIED(service);
+            assert(qihse_kv_sync_store(receiver));
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver);
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            assert(qihse_kv_ct_receiver_history_v1(receiver, op, &req, &proof) &&
+                   proof.stream_position == 1u && proof.durable_cursor == 2u);
+            DENIED(service);
+            for (unsigned i = 0u; i < 32u; ++i) {
+                char padding_key[64];
+                assert(snprintf(padding_key, sizeof(padding_key),
+                                "commons/history-padding-%u", i) > 0);
+                qihse_kv_ct_record_t row = group.records[0];
+                row.key = padding_key;
+                row.tombstone = false;
+                row.value = "padding";
+                row.change_seq = group2.records[0].change_seq + 1u + i;
+                qihse_kv_ct_group_t padding = group;
+                padding.records = &row;
+                padding.stream_position = 3u + i;
+                padding.first_seq = padding.last_seq = row.change_seq;
+                assert(qihse_kv_ct_receiver_apply(receiver, op, &padding, &cursor) &&
+                       cursor == padding.stream_position);
+                assert(qihse_kv_sync_store(receiver));
+            }
+            qihse_kv_sweep_expired(receiver);
+            req.durable_cursor = 34u;
+            assert(qihse_kv_ct_receiver_history_v1(receiver, op, &req, &proof) &&
+                   proof.stream_position == 1u && proof.durable_cursor == 34u &&
+                   proof.row_seq_high_water >= group2.records[0].change_seq + 32u);
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver);
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            assert(qihse_kv_ct_receiver_history_v1(receiver, op, &req, &proof) &&
+                   proof.stream_position == 1u && proof.durable_cursor == 34u);
+            DENIED(service);
+            char wal_path[512];
+            assert(snprintf(wal_path, sizeof(wal_path), "%s/wal.log",
+                            getenv("QIHSE_DATA_DIR")) > 0);
+            int wal_fd = open(wal_path, O_RDWR | O_CLOEXEC);
+            assert(wal_fd >= 0);
+            struct stat wal_st;
+            assert(fstat(wal_fd, &wal_st) == 0 && wal_st.st_size > 64);
+            unsigned char saved = 0u, flipped;
+            assert(pread(wal_fd, &saved, 1u, 64u) == 1);
+            flipped = saved ^ 1u;
+            assert(pwrite(wal_fd, &flipped, 1u, 64u) == 1); /* checksum */
+            DENIED(op);
+            assert(pwrite(wal_fd, &saved, 1u, 64u) == 1);
+            assert(pread(wal_fd, &saved, 1u, 8u) == 1);
+            flipped = saved ^ 1u;
+            assert(pwrite(wal_fd, &flipped, 1u, 8u) == 1); /* mode */
+            DENIED(op);
+            assert(pwrite(wal_fd, &saved, 1u, 8u) == 1);
+            assert(pwrite(wal_fd, "x", 1u, wal_st.st_size) == 1);
+            DENIED(op);
+            assert(ftruncate(wal_fd, wal_st.st_size) == 0);
+            assert(ftruncate(wal_fd, wal_st.st_size - 1) == 0);
+            DENIED(op);
+            assert(close(wal_fd) == 0);
+            qihse_ct_codec_clear(&group);
+            qihse_ct_codec_clear(&group2);
+            qihse_kv_store_destroy(receiver);
+#undef DENIED
+            return 0;
+        }
         if (stale) {
             /* A later stream position cannot revive a lower-version SET
              * over an earlier source-authored deletion. */
@@ -651,6 +801,30 @@ int main(int argc, char** argv) {
     int status = 0;
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char history_dir[] = "./ct_receiver_history_XXXXXX";
+    assert(mkdtemp(history_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", history_dir, 1) == 0);
+        execl(argv[0], argv[0], "receiver-history", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    char history_set_dir[] = "./ct_receiver_history_set_XXXXXX";
+    assert(mkdtemp(history_set_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", history_set_dir, 1) == 0);
+        execl(argv[0], argv[0], "receiver-history-set", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     char mismatch_dir[] = "./ct_receiver_mismatch_XXXXXX";
     assert(mkdtemp(mismatch_dir));
     child = fork();
@@ -729,6 +903,8 @@ int main(int argc, char** argv) {
     assert(unlink(snapshot_path) == 0);
     assert(unlink(group_path) == 0);
     aimem_fixture_cleanup(receiver_dir);
+    aimem_fixture_cleanup(history_dir);
+    aimem_fixture_cleanup(history_set_dir);
     aimem_fixture_cleanup(mismatch_dir);
     aimem_fixture_cleanup(expired_dir);
     aimem_fixture_cleanup(highwater_dir);

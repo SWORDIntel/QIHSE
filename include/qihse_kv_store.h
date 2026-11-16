@@ -335,6 +335,36 @@ bool qihse_kv_ct_receiver_apply(qihse_kv_store_t* store, qihse_user_t* principal
 bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
     qihse_user_t* principal, qihse_kv_ct_receiver_status_t* out);
 
+/* Read-only legacy (non-lane) receiver-history check. The caller must supply
+ * an active principal; this result attests neither QKP peer identity nor any
+ * source pending frame and confers no mutation/ACK capability. */
+#define QIHSE_KV_CT_RECEIVER_HISTORY_V1 1u
+typedef struct {
+    uint32_t version; /* QIHSE_KV_CT_RECEIVER_HISTORY_V1 */
+    uint32_t size;    /* sizeof(qihse_kv_ct_receiver_history_request_t) */
+    const char* source_id;
+    const char* target_id;
+    const char* generation;
+    uint64_t baseline_row_seq;
+    unsigned char baseline_digest[32];
+    uint64_t durable_cursor;
+    const char* key;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+} qihse_kv_ct_receiver_history_request_t;
+typedef struct {
+    uint32_t version;
+    uint32_t size;
+    uint64_t stream_position;
+    uint64_t row_change_seq;
+    uint64_t durable_cursor;
+    uint64_t row_seq_high_water;
+} qihse_kv_ct_receiver_history_result_t;
+bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_receiver_history_request_t* request,
+    qihse_kv_ct_receiver_history_result_t* out);
+
 /* Store-level durable fences and locally minted, opaque ownership evidence.
  * QKP peer pinning remains a transport responsibility. A proof is only valid
  * against the same live store and its current persisted generation/cursor. */

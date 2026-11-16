@@ -5587,6 +5587,164 @@ bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
     return ok;
 }
 
+bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_receiver_history_request_t* request,
+    qihse_kv_ct_receiver_history_result_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!store || !out || !request ||
+        request->version != QIHSE_KV_CT_RECEIVER_HISTORY_V1 ||
+        request->size != sizeof(*request) ||
+        !ct_id_valid(request->source_id) || !ct_id_valid(request->target_id) ||
+        !ct_id_valid(request->generation) || !request->key ||
+        !*request->key || strnlen(request->key, KV_MAX_KEY_LEN + 1u) > KV_MAX_KEY_LEN ||
+        !request->durable_cursor ||
+        !ct_replication_principal(store, principal) ||
+        !qihse_auth_can_access(principal, request->classification,
+                               request->sci_compartment)) return false;
+
+    kv_store_rdlock(store);
+    bool ok = false;
+    if (!store->ct_enabled || store->ct_mode != 2u || store->ct_lane_count ||
+        !store->ct_baseline_sealed || store->recovery_pending || store->memory_snapshot ||
+        strcmp(store->ct_source_id, request->source_id) ||
+        strcmp(store->ct_target_id, request->target_id) ||
+        strcmp(store->ct_generation, request->generation) ||
+        store->ct_baseline_lsn != request->baseline_row_seq ||
+        memcmp(store->ct_baseline_digest, request->baseline_digest, 32u) ||
+        store->ct_durable_lsn != request->durable_cursor ||
+        (store->ct_tenant_policy == QIHSE_KV_CT_TENANT_EXACT &&
+         store->ct_tenant_id != request->resource_tenant_id)) goto done;
+
+    /* Require the persisted state, not just an in-memory STATUS, to agree. */
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "ct-state.bin")) goto done;
+    int fd = open_secure_read(path);
+    if (fd < 0) goto done;
+    struct stat st;
+    kv_ct_disk_t disk;
+    bool state_ok = fstat(fd, &st) == 0 && st.st_size == (off_t)sizeof(disk) &&
+        st.st_uid == geteuid() && !(st.st_mode & 077) && st.st_nlink == 1 &&
+        read(fd, &disk, sizeof(disk)) == (ssize_t)sizeof(disk);
+    close(fd);
+    if (!state_ok || memcmp(disk.magic, "QCTST003", 8u) || disk.mode != 2u ||
+        disk.baseline_sealed != 1u || disk.baseline_lsn != request->baseline_row_seq ||
+        memcmp(disk.baseline_digest, request->baseline_digest, 32u) ||
+        disk.durable_lsn != request->durable_cursor ||
+        disk.tenant_policy != (uint32_t)store->ct_tenant_policy ||
+        disk.tenant_id != store->ct_tenant_id ||
+        memcmp(disk.source_id, store->ct_source_id, sizeof(disk.source_id)) ||
+        memcmp(disk.target_id, store->ct_target_id, sizeof(disk.target_id)) ||
+        memcmp(disk.generation, store->ct_generation, sizeof(disk.generation)) ||
+        disk.retained_bytes != store->ct_retained_bytes ||
+        disk.checksum != fnv1a64_update(14695981039346656037ULL, &disk,
+                                        offsetof(kv_ct_disk_t, checksum))) goto done;
+
+    uint64_t latest_seq = 0u;
+    size_t payload_size = 0u;
+    kv_payload_t* payload = (kv_payload_t*)qihse_trinary_trie_search(
+        store->trie, request->key, &payload_size);
+    if (payload) {
+        if (payload_size < sizeof(*payload) ||
+            !qihse_auth_can_access(principal, payload->classification,
+                                   payload->sci_compartment) ||
+            !(payload->flags & KV_FLAG_TOMBSTONE) || payload->expire_time_ms != 0u ||
+            payload->classification != request->classification ||
+            payload->sci_compartment != request->sci_compartment) goto done;
+        latest_seq = payload->change_seq;
+    } else {
+        if (!store->sst_meta || store->sst_meta->degraded) goto done;
+        int32_t sid = -1;
+        uint64_t offset = 0u;
+        if (!sst_meta_index_lookup(store->sst_meta, request->key, NULL, NULL,
+                                   NULL, NULL, &sid, &offset) || sid < 0 ||
+            offset > (uint64_t)INT64_MAX) goto done;
+        char name[64];
+        int n = snprintf(name, sizeof(name), "sstable_%d.db", sid);
+        if (n < 0 || (size_t)n >= sizeof(name) ||
+            !build_data_path(path, sizeof(path), name)) goto done;
+        fd = open_secure_read(path);
+        if (fd < 0) goto done;
+        FILE* sst = fdopen(fd, "rb");
+        if (!sst) { close(fd); goto done; }
+        kv_disk_record_t row;
+        const kv_read_context_t context = { .user = principal };
+        int rc = fseeko(sst, (off_t)offset, SEEK_SET) == 0 ?
+            disk_record_read_header(sst, &row, &context) : -1;
+        if (rc == 1) {
+            if (strcmp(row.key, request->key) == 0 &&
+                (row.flags & KV_FLAG_TOMBSTONE) && row.expire_time_ms == 0u &&
+                row.classification == request->classification &&
+                row.sci_compartment == request->sci_compartment)
+                latest_seq = row.change_seq;
+            disk_record_free(&row);
+        }
+        fclose(sst);
+    }
+    if (!latest_seq) goto done;
+
+    if (!build_data_path(path, sizeof(path), "wal.log")) goto done;
+    fd = open_secure_read(path);
+    if (fd < 0) goto done;
+    state_ok = fstat(fd, &st) == 0 && st.st_size > 0 &&
+        (uint64_t)st.st_size == store->ct_retained_bytes &&
+        st.st_uid == geteuid() && !(st.st_mode & 077) && st.st_nlink == 1;
+    if (!state_ok) { close(fd); goto done; }
+    FILE* input = fdopen(fd, "rb");
+    if (!input) { close(fd); goto done; }
+    uint64_t position = 0u, matched_position = 0u, matched_seq = 0u;
+    bool valid = true;
+    while (position < request->durable_cursor) {
+        qihse_kv_ct_group_t group = {0};
+        uint8_t mode = 0u;
+        size_t frame_bytes = 0u;
+        int rc = qihse_ct_codec_read(input, principal, store->ct_tenant_policy,
+            store->ct_tenant_id, QIHSE_CT_CODEC_MAX_FRAME, &group, &mode, &frame_bytes);
+        if (rc != 1 || mode != QIHSE_CT_CODEC_MODE_RECEIVER ||
+            group.stream_position != position + 1u ||
+            strcmp(group.source_id, request->source_id) ||
+            strcmp(group.generation, request->generation)) valid = false;
+        if (valid) {
+            for (size_t i = 0u; i < group.count; ++i) {
+                const qihse_kv_ct_record_t* row = &group.records[i];
+                if (strcmp(row->key, request->key) != 0) continue;
+                /* Any later same-key row supersedes the candidate, even SET. */
+                matched_position = 0u;
+                matched_seq = 0u;
+                if (row->tombstone && row->actor_kind != QIHSE_KV_CT_ACTOR_REPLICA &&
+                    row->resource_tenant_id == request->resource_tenant_id &&
+                    row->classification == request->classification &&
+                    row->sci_compartment == request->sci_compartment &&
+                    row->change_seq == latest_seq) {
+                    matched_position = group.stream_position;
+                    matched_seq = row->change_seq;
+                }
+            }
+        }
+        qihse_ct_codec_clear(&group);
+        if (!valid) break;
+        position++;
+    }
+    if (valid) {
+        int trailing = fgetc(input);
+        valid = trailing == EOF && !ferror(input) &&
+            (uint64_t)ftello(input) == store->ct_retained_bytes &&
+            matched_position != 0u && matched_seq <=
+                __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
+    }
+    fclose(input);
+    if (valid) {
+        *out = (qihse_kv_ct_receiver_history_result_t){
+            .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1, .size = sizeof(*out),
+            .stream_position = matched_position, .row_change_seq = matched_seq,
+            .durable_cursor = position,
+            .row_seq_high_water = __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE)};
+        ok = true;
+    }
+done:
+    kv_store_unlock(store);
+    return ok;
+}
+
 bool qihse_kv_ct_fence_range(qihse_kv_store_t* store, qihse_user_t* principal,
     const char* transfer_id, uint16_t first_slot, uint16_t last_slot,
     const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],

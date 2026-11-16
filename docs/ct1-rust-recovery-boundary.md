@@ -1,7 +1,8 @@
 # Rust-first CT1 recovery boundary (design, not a recovery procedure)
 
-Status: design with a Rust-only structural comparison slice in
-`rust/ct1-recovery`. B's legacy CT1 source remains stopped with original
+Status: design with a Rust structural comparison slice in `rust/ct1-recovery`
+and a read-only native C receiver-history check described below. B's legacy
+CT1 source remains stopped with original
 pending position 11111; its successor is sealed at 11110. This crate neither
 authenticates evidence nor has a C ABI or production call site. No operation
 described here is implemented or authorized to advance that cursor. Do not
@@ -62,6 +63,40 @@ floor. No FFI panic may unwind into C. The present public `Comparison` is
 only a structural input, not an attestation: callers can fill every field.
 Before any production call site exists, a verified-authority handle must be
 unforgeable across the ABI, and C must recheck it under the lock.
+
+## Legacy receiver-history read API (first slice)
+
+`qihse_kv_ct_receiver_history_v1` in `include/qihse_kv_store.h` is a local,
+read-only native C query, not a Rust recovery control or production endpoint.
+It requires an active explicit replication/Operator principal, a versioned
+request, exact current legacy receiver source/target/generation, sealed baseline
+sequence and digest, current durable cursor, and one key, resource tenant and
+classification/SCI pair. With the store read lock, it checks persisted CT state,
+verifies the latest physical same-key tombstone via authorization-aware,
+metadata-only row lookup, and decodes **all** retained receiver QKV6 frames
+from position 1 to the current cursor with that principal and the receiver's
+own tenant policy. Inaccessible frames, noncontiguous
+positions, bad frames, wrong policy/mode/identity and trailing bytes fail closed.
+A successful result contains only the tombstone's actual group position and row
+version, receiver cursor and target row-sequence high-water; failures zero it.
+A later same-key SET or changed latest version/labels invalidates the result.
+
+The QKV6 SHA-256 checks frame bytes, **not** QKP peer identity or source
+provenance. The group source ID and non-replica actor kind are persisted
+metadata, not cryptographic peer attestation. A future remote caller must
+still authenticate and pin QKP and separately verify the source's original
+pending frame. This result is neither a mutation authorization nor
+suppression, ACK, recovery admission or a way to advance the source or
+receiver cursor. It must be rechecked at any future
+transition under the store lock; no such transition is supplied here.
+
+Migration note: this is an additive native C ABI (version 1); existing callers
+need no changes and stored data needs no migration or reindex. Consumers must
+rebuild against the updated header and library (`make lib`), construct the
+version/size-tagged request and check the boolean result before using any output.
+Only the isolated `make test-ct-storage` target validates this slice; Rust ABI,
+authenticated remote QKP tests, recovery crash cuts and deployment gates remain
+unmet.
 
 ## Release gates
 
