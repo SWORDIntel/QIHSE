@@ -35,6 +35,36 @@ checks and repeat scans. It does not authenticate an issuer, exclude writers,
 prove historical authorship or freeze two nodes atomically; its result is not a
 recovery authorization.
 
+## Structural receipt storage (opt-in, not approval)
+
+`qihse_ct1_recovery_create/load/spend` in the standalone manifest target
+require a caller-owned mode-0700 private parent under non-writable trusted
+ancestors; every component is opened by directory descriptor without following
+symlinks. Receipt and sidecar must be single-link, owner-owned, mode-0600
+regular files; FIFO/special files, invalid sizes, checksums and swapped names
+are denied. Creation durably installs a persistent `receipt.lock` sidecar:
+`1` means pending/uncertain, `0` means unspent. A spent operation takes an
+exclusive cross-process lock on this stable inode, fsyncs `1` first, writes a
+complete spent record to an exclusive `.receipt.pending`, fsyncs it, renames
+under the directory fd and fsyncs the directory. The sidecar stays `1`:
+a crash or I/O failure before publication leaves an unspent receipt unusable;
+a crash after publication leaves a spent receipt, never a second success.
+No automatic deletion/recovery of orphaned sidecars or pending files is safe.
+Existing receipts without sidecars cannot be loaded or spent; recreate only
+fresh, disposable receipts under a new basename after independent evidence
+review. Stored KV data needs no migration. Rebuild the standalone consumer
+with `make test-ct-recovery-manifest`; do not install it in the running daemon.
+These synthetic tests do not simulate actual power-loss/fsync fault injection.
+
+This only serializes cooperating processes using a stable sidecar on a trusted
+local filesystem with durable fsync/rename semantics. A same-UID actor who
+replaces the whole trusted directory (or removes/recreates the lock) can roll
+back the record; directory identity rechecks narrow swaps but cannot prevent
+that adversary. A local spent bit does **not** authenticate the configured QKP
+Operator, provide a distributed replay ledger or authorize a target mutation.
+`qihse_ct1_recovery_issuer_authorized()` remains false; no recovery RESP
+endpoint or target mutation is introduced.
+
 ## Existing split
 
 The legacy CT1 store, QKV6 codec, SST compaction, persistence, RESP dispatch,

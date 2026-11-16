@@ -80,15 +80,19 @@ bool qihse_ct1_recovery_decode(const unsigned char* data, size_t length,
  * This is only a structural comparison, never QKP authorization. */
 bool qihse_ct1_recovery_matches(const qihse_ct1_recovery_manifest_t* actual,
     const qihse_ct1_recovery_manifest_t* expected, uint64_t now_ms, bool spent);
-/* Exclusive new file creation, fd fsync and parent directory fsync. Does not
- * replace a preexisting receipt; a partial or failed write remains unusable. */
+/* Exclusive new file creation under a private caller-owned directory, with
+ * trusted non-writable, non-symlink ancestors. Receipts require a persistent
+ * basename.lock sidecar; existing receipts without it fail closed. */
 bool qihse_ct1_recovery_create(const char* path,
     const qihse_ct1_recovery_manifest_t* manifest, bool receipt);
 bool qihse_ct1_recovery_load(const char* path, bool receipt,
     qihse_ct1_recovery_manifest_t* out, bool* out_spent);
-/* Bookkeeping ONLY: marks a receipt spent with an fsynced write, failing
- * closed on torn records or I/O errors. Does not authorize recovery or mint a
- * token. Caller must not perform protected work based on this return value. */
+/* Bookkeeping ONLY: serializes cross-process spend on basename.lock; fsyncs
+ * irreversible intent then a complete replacement and parent directory.
+ * An uncertain spend cannot be retried; an unspent receipt with intent denies
+ * load/spend. No protection against same-UID rollback of the trusted directory.
+ * Does not authorize recovery or mint a token; never perform protected work
+ * based on this return value. */
 bool qihse_ct1_recovery_spend(const char* path,
     const qihse_ct1_recovery_manifest_t* expected, uint64_t now_ms);
 /* Structural evidence only: independently stream-hash the complete source or

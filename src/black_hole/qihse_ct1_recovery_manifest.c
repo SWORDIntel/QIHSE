@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -276,12 +277,48 @@ static bool write_all(int fd, const unsigned char* data, size_t n) {
     }
     return true;
 }
-static bool read_record(int fd, bool receipt, qihse_ct1_recovery_manifest_t* out,
-    bool* spent) {
-    struct stat st;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
-        st.st_size != QIHSE_CT1_RECOVERY_WIRE_SIZE || lseek(fd, 0, SEEK_SET) < 0)
-        return false;
+static int frozen_open_dir(const char* path);
+static bool frozen_same(const struct stat* a, const struct stat* b);
+/* Only a single basename beneath a descriptor-confined private directory. */
+static int receipt_dir(const char* path, char name[256], char parent[4097]) {
+    if (!path || !*path || strnlen(path, 4097) > 4096) return -1;
+    const char* slash = strrchr(path, '/');
+    const char* base = slash ? slash + 1 : path;
+    size_t n = strlen(base), plen = slash ? (size_t)(slash - path) : 1;
+    if (!n || n > 230 || (n == 1 && base[0] == '.') ||
+        (n == 2 && base[0] == '.' && base[1] == '.')) return -1;
+    if (!slash) parent[0] = '.';
+    else if (!plen) { parent[0] = '/'; plen = 1; }
+    else memcpy(parent, path, plen);
+    parent[plen] = 0;
+    memcpy(name, base, n + 1);
+    return frozen_open_dir(parent);
+}
+static bool receipt_stat(int dir, const char* name, int fd,
+    off_t size, struct stat* saved) {
+    struct stat st, named;
+    if (fstat(fd, &st) || fstatat(dir, name, &named, AT_SYMLINK_NOFOLLOW) ||
+        !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & 07777) != 0600 || st.st_nlink != 1 ||
+        st.st_size != size || !frozen_same(&st, &named)) return false;
+    if (saved) *saved = st;
+    return true;
+}
+static bool receipt_parent_same(int dir, const char* parent) {
+    struct stat a, b;
+    int again = frozen_open_dir(parent);
+    bool ok = again >= 0 && fstat(dir, &a) == 0 &&
+        fstat(again, &b) == 0 && a.st_dev == b.st_dev &&
+        a.st_ino == b.st_ino && a.st_uid == b.st_uid &&
+        a.st_mode == b.st_mode;
+    if (again >= 0 && close(again)) ok = false;
+    return ok;
+}
+static bool read_record(int dir, const char* name, int fd, bool receipt,
+    qihse_ct1_recovery_manifest_t* out, bool* spent) {
+    struct stat before, after;
+    if (!receipt_stat(dir, name, fd, QIHSE_CT1_RECOVERY_WIRE_SIZE, &before) ||
+        lseek(fd, 0, SEEK_SET) < 0) return false;
     unsigned char data[QIHSE_CT1_RECOVERY_WIRE_SIZE];
     size_t done = 0;
     while (done < sizeof(data)) {
@@ -290,61 +327,152 @@ static bool read_record(int fd, bool receipt, qihse_ct1_recovery_manifest_t* out
         if (n <= 0) return false;
         done += (size_t)n;
     }
-    return qihse_ct1_recovery_decode(data, sizeof(data), receipt, out, spent);
+    return receipt_stat(dir, name, fd, sizeof(data), &after) &&
+        frozen_same(&before, &after) &&
+        qihse_ct1_recovery_decode(data, sizeof(data), receipt, out, spent);
 }
-static bool sync_parent(const char* path) {
-    const char* slash = strrchr(path, '/');
-    char dir[4096];
-    size_t len = slash ? (size_t)(slash - path) : 1;
-    if (!slash) dir[0] = '.';
-    else if (!len) { dir[0] = '/'; len = 1; }
-    else if (len < sizeof(dir)) memcpy(dir, path, len);
-    if (!len || len >= sizeof(dir)) return false;
-    dir[len] = 0;
-    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) return false;
-    bool ok = fsync(fd) == 0;
-    close(fd);
-    return ok;
+static bool lock_state(int dir, const char* name, int fd, char* state) {
+    struct stat before, after;
+    char byte;
+    if (!receipt_stat(dir, name, fd, 1, &before) ||
+        pread(fd, &byte, 1, 0) != 1 ||
+        !receipt_stat(dir, name, fd, 1, &after) ||
+        !frozen_same(&before, &after) || (byte != '0' && byte != '1'))
+        return false;
+    *state = byte;
+    return true;
 }
 bool qihse_ct1_recovery_create(const char* path,
     const qihse_ct1_recovery_manifest_t* manifest, bool receipt) {
     unsigned char data[QIHSE_CT1_RECOVERY_WIRE_SIZE];
-    if (!path || !*path || !qihse_ct1_recovery_encode(manifest, receipt, false, data))
-        return false;
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return false;
-    bool ok = write_all(fd, data, sizeof(data)) && fsync(fd) == 0;
+    if (!qihse_ct1_recovery_encode(manifest, receipt, false, data)) return false;
+    char name[256], parent[4097], lockname[266];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    int lock = -1;
+    bool ok = false;
+    struct stat existing;
+    if (fstatat(dir, name, &existing, AT_SYMLINK_NOFOLLOW) == 0 ||
+        errno != ENOENT) goto done;
+    if (receipt) {
+        snprintf(lockname, sizeof(lockname), "%s.lock", name);
+        lock = openat(dir, lockname, O_RDWR | O_CREAT | O_EXCL |
+            O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+        if (lock < 0) goto done;
+        /* An incomplete creation retains '1' and cannot be spent. */
+        if (flock(lock, LOCK_EX) || write(lock, "1", 1) != 1 ||
+            fsync(lock) || fsync(dir)) goto done;
+    }
+    int fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL |
+        O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+    if (fd < 0) goto done;
+    ok = receipt_stat(dir, name, fd, 0, NULL) &&
+        write_all(fd, data, sizeof(data)) && fsync(fd) == 0;
     if (close(fd)) ok = false;
-    return ok && sync_parent(path);
+    if (ok) ok = fsync(dir) == 0;
+    if (ok && receipt) {
+        ok = receipt_stat(dir, lockname, lock, 1, NULL) &&
+            pwrite(lock, "0", 1, 0) == 1 && fsync(lock) == 0 &&
+            receipt_stat(dir, lockname, lock, 1, NULL);
+    }
+    if (ok) ok = receipt_parent_same(dir, parent);
+done:
+    if (lock >= 0 && close(lock)) ok = false;
+    if (close(dir)) ok = false;
+    return ok;
 }
 bool qihse_ct1_recovery_load(const char* path, bool receipt,
     qihse_ct1_recovery_manifest_t* out, bool* out_spent) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     if (out_spent) *out_spent = false;
-    if (!path || !*path) return false;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return false;
-    bool ok = read_record(fd, receipt, out, out_spent);
-    close(fd);
+    char name[256], parent[4097], lockname[266];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    int lock = -1;
+    bool ok = false, spent = false;
+    char state = 0, again = 0;
+    if (receipt) {
+        snprintf(lockname, sizeof(lockname), "%s.lock", name);
+        lock = openat(dir, lockname, O_RDONLY | O_NOFOLLOW |
+            O_NONBLOCK | O_CLOEXEC);
+        if (lock < 0 || flock(lock, LOCK_SH) ||
+            !lock_state(dir, lockname, lock, &state)) goto done;
+    }
+    int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) goto done;
+    ok = read_record(dir, name, fd, receipt, out, &spent);
+    if (close(fd)) ok = false;
+    if (receipt) ok = ok && lock_state(dir, lockname, lock, &again) &&
+        again == state && (state == '0' || spent);
+    if (ok) ok = receipt_parent_same(dir, parent);
+    if (ok && out_spent) *out_spent = spent;
+done:
+    if (lock >= 0 && close(lock)) ok = false;
+    if (close(dir)) ok = false;
+    if (!ok) { memset(out, 0, sizeof(*out)); if (out_spent) *out_spent = false; }
     return ok;
 }
 bool qihse_ct1_recovery_spend(const char* path,
     const qihse_ct1_recovery_manifest_t* expected, uint64_t now_ms) {
-    if (!path || !*path || !expected) return false;
-    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) return false;
+    if (!expected) return false;
+    char name[256], parent[4097], lockname[266], pending[266];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    snprintf(lockname, sizeof(lockname), "%s.lock", name);
+    snprintf(pending, sizeof(pending), ".%s.pending", name);
+    int lock = openat(dir, lockname, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     bool ok = false, spent = false;
+    char state;
+    if (lock < 0 || flock(lock, LOCK_EX) ||
+        !lock_state(dir, lockname, lock, &state) || state != '0') goto done;
+    int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) goto done;
     qihse_ct1_recovery_manifest_t actual;
-    if (flock(fd, LOCK_EX) == 0 && read_record(fd, true, &actual, &spent) &&
-        qihse_ct1_recovery_matches(&actual, expected, now_ms, spent)) {
-        unsigned char data[QIHSE_CT1_RECOVERY_WIRE_SIZE];
-        if (qihse_ct1_recovery_encode(&actual, true, true, data) &&
-            lseek(fd, 0, SEEK_SET) == 0 && write_all(fd, data, sizeof(data)) &&
-            fsync(fd) == 0) ok = true;
-    }
+    struct stat original, replacement, named;
+    ok = read_record(dir, name, fd, true, &actual, &spent) &&
+        receipt_stat(dir, name, fd, QIHSE_CT1_RECOVERY_WIRE_SIZE, &original) &&
+        qihse_ct1_recovery_matches(&actual, expected, now_ms, spent);
     if (close(fd)) ok = false;
+    if (!ok) goto done;
+    /* The durable intent is never cleared. Any incomplete/uncertain publish
+     * therefore denies retry even when the old unspent inode survived. */
+    ok = pwrite(lock, "1", 1, 0) == 1 && fsync(lock) == 0 &&
+        lock_state(dir, lockname, lock, &state) && state == '1';
+    if (!ok) goto done;
+    unsigned char data[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (!qihse_ct1_recovery_encode(&actual, true, true, data)) { ok = false; goto done; }
+    int tmp = openat(dir, pending, O_WRONLY | O_CREAT | O_EXCL |
+        O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+    if (tmp < 0) { ok = false; goto done; }
+    ok = receipt_stat(dir, pending, tmp, 0, NULL) &&
+        write_all(tmp, data, sizeof(data)) && fsync(tmp) == 0 &&
+        receipt_stat(dir, pending, tmp, sizeof(data), &replacement);
+    if (close(tmp)) ok = false;
+    if (ok) {
+        /* The name must still point at the verified unspent inode. */
+        fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) ok = false;
+        else {
+            ok = read_record(dir, name, fd, true, &actual, &spent) && !spent &&
+                receipt_stat(dir, name, fd, QIHSE_CT1_RECOVERY_WIRE_SIZE, &named) &&
+                frozen_same(&original, &named) &&
+                qihse_ct1_recovery_matches(&actual, expected, now_ms, false);
+            if (close(fd)) ok = false;
+        }
+    }
+    if (ok) ok = receipt_parent_same(dir, parent) &&
+        renameat(dir, pending, dir, name) == 0 && fsync(dir) == 0 &&
+        fstatat(dir, name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+        replacement.st_dev == named.st_dev && replacement.st_ino == named.st_ino &&
+        named.st_uid == geteuid() && named.st_nlink == 1 &&
+        (named.st_mode & 07777) == 0600 &&
+        named.st_size == QIHSE_CT1_RECOVERY_WIRE_SIZE &&
+        lock_state(dir, lockname, lock, &state) && state == '1' &&
+        receipt_parent_same(dir, parent);
+done:
+    if (lock >= 0 && close(lock)) ok = false;
+    if (close(dir)) ok = false;
     return ok;
 }
 /* A same-inode replacement or in-place write is detected by identity and

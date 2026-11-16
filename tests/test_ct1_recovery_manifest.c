@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define TRAILER (QIHSE_CT1_RECOVERY_WIRE_SIZE - 32u)
@@ -228,6 +229,16 @@ static void check_receipt(const char* path, const char* torn, const char* link) 
     assert(!qihse_ct1_recovery_spend(link, &m, 1500));
     assert(unlink(link) == 0);
     assert(qihse_ct1_recovery_load(path, true, &actual, &spent) && !spent);
+    char other[256];
+    assert(snprintf(other, sizeof(other), "%s-hard", path) > 0);
+    assert(linkat(AT_FDCWD, path, AT_FDCWD, other, 0) == 0);
+    assert(!qihse_ct1_recovery_load(path, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(path, &m, 1500));
+    assert(unlink(other) == 0);
+    assert(chmod(path, 0644) == 0);
+    assert(!qihse_ct1_recovery_load(path, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(path, &m, 1500));
+    assert(chmod(path, 0600) == 0);
     wrong = m; wrong.target_files[4].sha256[0] ^= 1;
     assert(!qihse_ct1_recovery_spend(path, &wrong, 1500));
     assert(!qihse_ct1_recovery_spend(path, &m, 2000));
@@ -247,6 +258,84 @@ static void check_receipt(const char* path, const char* torn, const char* link) 
     assert(fsync(fd) == 0 && close(fd) == 0);
     assert(!qihse_ct1_recovery_load(torn, true, &actual, &spent));
     assert(!qihse_ct1_recovery_spend(torn, &m, 1500));
+}
+static void check_receipt_negatives(const char* dir) {
+    qihse_ct1_recovery_manifest_t m = sample(false), actual;
+    char receipt[256], fifo[256], ancestor[256], via[256], crash[256],
+        concurrent[256], lockpath[266];
+    bool spent;
+    snprintf(receipt, sizeof(receipt), "%s/normal", dir);
+    snprintf(fifo, sizeof(fifo), "%s/fifo", dir);
+    snprintf(ancestor, sizeof(ancestor), "%s/ancestor", dir);
+    snprintf(via, sizeof(via), "%s/ancestor/normal", dir);
+    snprintf(crash, sizeof(crash), "%s/crash", dir);
+    snprintf(concurrent, sizeof(concurrent), "%s/concurrent", dir);
+    assert(qihse_ct1_recovery_create(receipt, &m, true));
+    assert(symlink(".", ancestor) == 0);
+    assert(!qihse_ct1_recovery_create(via, &m, true));
+    assert(!qihse_ct1_recovery_load(via, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(via, &m, 1500));
+    assert(unlink(ancestor) == 0);
+    assert(chmod(dir, 0770) == 0);
+    assert(!qihse_ct1_recovery_load(receipt, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(receipt, &m, 1500));
+    assert(chmod(dir, 0700) == 0);
+    assert(unlink(receipt) == 0 && mkfifo(receipt, 0600) == 0);
+    alarm(3);
+    assert(!qihse_ct1_recovery_load(receipt, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(receipt, &m, 1500));
+    alarm(0);
+    assert(unlink(receipt) == 0);
+    assert(mkfifo(fifo, 0600) == 0);
+    assert(!qihse_ct1_recovery_create(fifo, &m, true));
+    assert(unlink(fifo) == 0);
+    assert(qihse_ct1_recovery_create(crash, &m, true));
+    snprintf(lockpath, sizeof(lockpath), "%s.lock", crash);
+    int fd = open(lockpath, O_RDWR);
+    assert(fd >= 0);
+    /* Crash after durable spend intent but before rename: unspent is denied. */
+    assert(pwrite(fd, "1", 1, 0) == 1 && fsync(fd) == 0);
+    char pending[266];
+    snprintf(pending, sizeof(pending), "%s/.crash.pending", dir);
+    int torn_fd = open(pending, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(torn_fd >= 0 && write(torn_fd, "torn", 4) == 4);
+    assert(fsync(torn_fd) == 0 && close(torn_fd) == 0);
+    assert(!qihse_ct1_recovery_load(crash, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(crash, &m, 1500));
+    assert(pwrite(fd, "X", 1, 0) == 1 && fsync(fd) == 0 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_load(crash, true, &actual, &spent));
+    assert(!qihse_ct1_recovery_spend(crash, &m, 1500));
+    assert(unlink(pending) == 0);
+    assert(qihse_ct1_recovery_create(concurrent, &m, true));
+    int barrier[2]; assert(pipe(barrier) == 0);
+    pid_t children[2];
+    for (int i = 0; i < 2; ++i) {
+        children[i] = fork(); assert(children[i] >= 0);
+        if (!children[i]) {
+            char ready;
+            close(barrier[1]);
+            if (read(barrier[0], &ready, 1) != 1) _exit(2);
+            _exit(qihse_ct1_recovery_spend(concurrent, &m, 1500) ? 0 : 1);
+        }
+    }
+    close(barrier[0]);
+    assert(write(barrier[1], "xx", 2) == 2 && close(barrier[1]) == 0);
+    int successes = 0;
+    for (int i = 0; i < 2; ++i) {
+        int status;
+        assert(waitpid(children[i], &status, 0) == children[i] && WIFEXITED(status));
+        assert(WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 1);
+        successes += WEXITSTATUS(status) == 0;
+    }
+    assert(successes == 1);
+    assert(qihse_ct1_recovery_load(concurrent, true, &actual, &spent) && spent);
+    assert(!qihse_ct1_recovery_spend(concurrent, &m, 1500));
+    const char* paths[] = {receipt, crash, concurrent};
+    for (size_t i = 0; i < 3; ++i) {
+        if (i) assert(unlink(paths[i]) == 0);
+        snprintf(lockpath, sizeof(lockpath), "%s.lock", paths[i]);
+        assert(unlink(lockpath) == 0);
+    }
 }
 static void fixture_file(char* out, size_t capacity, const char* dir,
     const char* name) {
@@ -368,8 +457,15 @@ int main(void) {
     assert(snprintf(receipt, sizeof(receipt), "%s/receipt", dir) > 0);
     assert(snprintf(torn, sizeof(torn), "%s/torn", dir) > 0);
     assert(snprintf(link, sizeof(link), "%s/link", dir) > 0);
-    check_wire(); check_receipt(receipt, torn, link); check_frozen(dir);
-    assert(unlink(receipt) == 0 && unlink(torn) == 0 && rmdir(dir) == 0);
+    check_wire(); check_receipt(receipt, torn, link);
+    check_receipt_negatives(dir); check_frozen(dir);
+    assert(unlink(receipt) == 0 && unlink(torn) == 0);
+    char lockpath[256];
+    snprintf(lockpath, sizeof(lockpath), "%s.lock", receipt);
+    assert(unlink(lockpath) == 0);
+    snprintf(lockpath, sizeof(lockpath), "%s.lock", torn);
+    assert(unlink(lockpath) == 0);
+    assert(rmdir(dir) == 0);
     puts("CT1 B structural receipt checks passed (issuer binding remains denied)");
     return 0;
 }
