@@ -56,6 +56,39 @@ review. Stored KV data needs no migration. Rebuild the standalone consumer
 with `make test-ct-recovery-manifest`; do not install it in the running daemon.
 These synthetic tests do not simulate actual power-loss/fsync fault injection.
 
+The standalone `qihse_ct1_recovery_ledger_bootstrap/consume` API adds **local
+bookkeeping only**. Explicit bootstrap exclusively creates a non-authoritative
+empty ledger for one local node (source or target) and source/target/generation
+under the same descriptor-confined private directory rules. Consume requires
+that existing file and stable `.lock` sidecar, takes the exclusive process
+lock, records the full manifest's canonical SHA-256, checks caller-supplied
+issuance/expiry time, strictly increasing epoch and all prior 32-byte nonces,
+then fsyncs an irreversible sidecar intent before appending a chained-checksum
+record and fsyncing the file and directory. It clears the intent only after
+publication; uncertain intent, missing/partial/torn/bad-checksum records,
+wrong tuple, wrong owner/mode/link count or exhausted capacity deny new consumption. The fixed
+header is 300 bytes; each entry is 104 bytes (epoch, nonce, full manifest
+SHA-256, chained SHA-256 checksum); at most 1024 entries (106796 bytes total).
+The SHA-256 chain detects accidental corruption, not hostile replacement. No
+pruning or automatic recovery is safe. This is local to each node, not an
+atomic two-node commit. A partial pair **cannot be detected from either local
+ledger alone**; both must be independently reconciled against trusted fences
+before any transition. Such fences are not shipped.
+
+**Rollback/clock limit:** a same-UID actor can delete/recreate or restore the
+whole ledger and sidecar, or its parent, including after first use. The API
+cannot distinguish a legitimately new ledger from that rollback: bootstrap
+MUST NOT be called to repair a missing ledger without a separately trusted
+rollback anchor and independent approval. `consume` never bootstraps and
+rejects missing state; its return is not an authorization or one-use approval.
+Caller-provided time is explicitly **not trusted**; caller clock rollback can
+extend expiry. Neither a trusted anti-rollback anchor nor trusted monotonic
+time, authenticated issuer/pin checks, production integration or B admission
+exists. This API must not gate any protected work. Additive standalone API:
+rebuild with `make test-ct-recovery-manifest`; stored KV data requires no
+migration or reindex. Synthetic fork/reopen/intent-cut tests do not constitute
+power-loss/fsync fault injection.
+
 This only serializes cooperating processes using a stable sidecar on a trusted
 local filesystem with durable fsync/rename semantics. A same-UID actor who
 replaces the whole trusted directory (or removes/recreates the lock) can roll

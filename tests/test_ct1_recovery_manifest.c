@@ -450,6 +450,152 @@ static void check_frozen(const char* root) {
     assert(rmdir(source) == 0 && rmdir(target) == 0);
 #undef VERIFY_BOTH
 }
+static void ledger_remove(const char* path) {
+    char lock[256];
+    assert(snprintf(lock, sizeof(lock), "%s.lock", path) > 0);
+    assert(unlink(path) == 0 && unlink(lock) == 0);
+}
+static void check_ledger(const char* dir) {
+    qihse_ct1_recovery_manifest_t m = sample(false), next = m, wrong;
+    char path[256], lock[266], other[256], via[256];
+    fixture_file(path, sizeof(path), dir, "ledger");
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    assert(qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    assert(!qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    assert(!qihse_ct1_recovery_ledger_consume(path, "wrong-node", &m, 1500));
+    assert(!qihse_ct1_recovery_ledger_consume(path, "target", &m, 1500));
+    wrong = m; strcpy(wrong.generation, "generation-2");
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &wrong, 1500));
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 2000));
+    assert(qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    unsigned char wire[QIHSE_CT1_RECOVERY_WIRE_SIZE], digest[32], recorded[32];
+    assert(qihse_ct1_recovery_encode(&m, false, false, wire));
+    assert(SHA256(wire, sizeof(wire), digest));
+    int ledger_fd = open(path, O_RDONLY); assert(ledger_fd >= 0);
+    assert(pread(ledger_fd, recorded, sizeof(recorded), 300 + 8 + 32) ==
+        (ssize_t)sizeof(recorded));
+    assert(close(ledger_fd) == 0 && memcmp(recorded, digest, sizeof(digest)) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    fixture_file(other, sizeof(other), dir, "target-ledger");
+    assert(qihse_ct1_recovery_ledger_bootstrap(other, "target", &m));
+    assert(qihse_ct1_recovery_ledger_consume(other, "target", &m, 1500));
+    assert(!qihse_ct1_recovery_ledger_consume(other, "target", &m, 1500));
+    assert(!qihse_ct1_recovery_ledger_consume(other, "source", &m, 1500));
+    ledger_remove(other);
+    next.epoch++; next.nonce[0]++;
+    wrong = next; wrong.epoch = m.epoch;
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &wrong, 1500));
+    wrong = next; wrong.nonce[0] = m.nonce[0];
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &wrong, 1500));
+    wrong = m; wrong.frame_sha256[0] ^= 1;
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &wrong, 1500));
+    assert(qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    /* Reopen via separate process: historical nonce and high-water persist. */
+    pid_t pid = fork(); assert(pid >= 0);
+    if (!pid) _exit(qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500) ? 1 : 0);
+    int status;
+    assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    snprintf(lock, sizeof(lock), "%s.lock", path);
+    fixture_file(other, sizeof(other), dir, "alias");
+    assert(link(path, other) == 0);
+    next.epoch++; next.nonce[0]++;
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    assert(unlink(other) == 0);
+    assert(chmod(path, 0644) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    assert(chmod(path, 0600) == 0);
+    assert(chmod(lock, 0644) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    assert(chmod(lock, 0600) == 0);
+    if (geteuid() == 0) {
+        assert(chown(path, 65534, (gid_t)-1) == 0);
+        assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+        assert(chown(path, 0, (gid_t)-1) == 0);
+    }
+    assert(qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    /* Intent cut: an uncertain append cannot admit another epoch after reopen. */
+    int fd = open(lock, O_RDWR); assert(fd >= 0);
+    assert(pwrite(fd, "1", 1, 0) == 1 && fsync(fd) == 0 && close(fd) == 0);
+    next.epoch++; next.nonce[0]++;
+    pid = fork(); assert(pid >= 0);
+    if (!pid) _exit(qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500) ? 1 : 0);
+    assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    ledger_remove(path);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    /* Re-bootstrap is explicitly non-authoritative and cannot detect rollback. */
+    assert(qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    fd = open(path, O_RDWR); assert(fd >= 0);
+    assert(pwrite(fd, "X", 1, 0) == 1 && fsync(fd) == 0 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    ledger_remove(path);
+    assert(qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    assert(qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    fd = open(path, O_RDWR); assert(fd >= 0);
+    assert(pwrite(fd, "X", 1, 300 + 40) == 1 && fsync(fd) == 0 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    fd = open(path, O_RDWR); assert(fd >= 0);
+    assert(ftruncate(fd, 300 + 104 - 1) == 0 && fsync(fd) == 0 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &next, 1500));
+    ledger_remove(path);
+    assert(qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    fd = open(path, O_RDWR); assert(fd >= 0);
+    assert(ftruncate(fd, 299) == 0 && fsync(fd) == 0 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    ledger_remove(path);
+    assert(qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    assert(snprintf(other, sizeof(other), "%s/ancestor", dir) > 0);
+    assert(symlink(".", other) == 0);
+    assert(snprintf(via, sizeof(via), "%s/ancestor/ledger", dir) > 0);
+    assert(!qihse_ct1_recovery_ledger_consume(via, "source", &m, 1500));
+    assert(unlink(other) == 0);
+    assert(chmod(dir, 0770) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    assert(chmod(dir, 0700) == 0);
+    fixture_file(other, sizeof(other), dir, "lock-alias");
+    assert(link(lock, other) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    assert(unlink(other) == 0);
+    assert(unlink(lock) == 0 && symlink("ledger", lock) == 0);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    assert(unlink(lock) == 0 && mkfifo(lock, 0600) == 0);
+    alarm(3);
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    alarm(0);
+    assert(unlink(lock) == 0 && unlink(path) == 0);
+    assert(symlink("missing", path) == 0);
+    assert(!qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    assert(unlink(path) == 0);
+    assert(mkfifo(path, 0600) == 0);
+    alarm(3);
+    assert(!qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    assert(!qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500));
+    alarm(0);
+    assert(unlink(path) == 0);
+    /* Two competing processes can at most commit one identical epoch. */
+    assert(qihse_ct1_recovery_ledger_bootstrap(path, "source", &m));
+    int barrier[2]; assert(pipe(barrier) == 0);
+    pid_t children[2];
+    for (int i = 0; i < 2; ++i) {
+        children[i] = fork(); assert(children[i] >= 0);
+        if (!children[i]) {
+            char ready;
+            close(barrier[1]);
+            if (read(barrier[0], &ready, 1) != 1) _exit(2);
+            _exit(qihse_ct1_recovery_ledger_consume(path, "source", &m, 1500) ? 0 : 1);
+        }
+    }
+    close(barrier[0]);
+    assert(write(barrier[1], "xx", 2) == 2 && close(barrier[1]) == 0);
+    int successes = 0;
+    for (int i = 0; i < 2; ++i) {
+        assert(waitpid(children[i], &status, 0) == children[i] && WIFEXITED(status));
+        assert(WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 1);
+        successes += WEXITSTATUS(status) == 0;
+    }
+    assert(successes == 1);
+    ledger_remove(path);
+}
 int main(void) {
     char dir[] = "./ct1-recovery-test-XXXXXX";
     assert(mkdtemp(dir));
@@ -458,7 +604,7 @@ int main(void) {
     assert(snprintf(torn, sizeof(torn), "%s/torn", dir) > 0);
     assert(snprintf(link, sizeof(link), "%s/link", dir) > 0);
     check_wire(); check_receipt(receipt, torn, link);
-    check_receipt_negatives(dir); check_frozen(dir);
+    check_receipt_negatives(dir); check_frozen(dir); check_ledger(dir);
     assert(unlink(receipt) == 0 && unlink(torn) == 0);
     char lockpath[256];
     snprintf(lockpath, sizeof(lockpath), "%s.lock", receipt);

@@ -95,6 +95,19 @@ bool qihse_ct1_recovery_load(const char* path, bool receipt,
  * based on this return value. */
 bool qihse_ct1_recovery_spend(const char* path,
     const qihse_ct1_recovery_manifest_t* expected, uint64_t now_ms);
+/* Local bookkeeping only, never an approval/authorization. Explicit bootstrap
+ * creates a new, NON-AUTHORITATIVE empty ledger for one local node and one
+ * source/target/generation tuple; it must only be called after an independent
+ * trusted rollback check. Recreating a missing ledger can erase replay history.
+ * consume requires an existing ledger and a separately authenticated manifest;
+ * caller-provided time is NOT trusted here. A successful consume is not an
+ * authorization capability. Both functions require a private trusted directory.
+ * At most 1024 fixed-size entries; failure/uncertain intent denies retry. */
+bool qihse_ct1_recovery_ledger_bootstrap(const char* path,
+    const char* local_node, const qihse_ct1_recovery_manifest_t* manifest);
+bool qihse_ct1_recovery_ledger_consume(const char* path,
+    const char* local_node, const qihse_ct1_recovery_manifest_t* manifest,
+    uint64_t caller_now_ms);
 /* Structural evidence only: independently stream-hash the complete source or
  * target roster in a caller-supplied frozen directory. Never grants access or
  * authenticates an issuer. Requires private, caller-owned regular files and a

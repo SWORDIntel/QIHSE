@@ -475,6 +475,139 @@ done:
     if (close(dir)) ok = false;
     return ok;
 }
+/* Replay bookkeeping is deliberately not an authority anchor. The persistent
+ * sidecar's '1' is an irreversible uncertain intent on any failed append. */
+enum { LEDGER_HEADER = 8 + 4 * ID_BYTES + 32,
+       LEDGER_ENTRY = 8 + 32 + 32 + 32, LEDGER_LIMIT = 1024 };
+static const unsigned char ledger_magic[8] = {'Q','C','T','1','L','R','0','1'};
+static bool read_exact_at(int fd, unsigned char* data, size_t len, off_t offset) {
+    size_t n = 0;
+    while (n < len) {
+        ssize_t got = pread(fd, data + n, len - n, offset + (off_t)n);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return false;
+        n += (size_t)got;
+    }
+    return true;
+}
+static bool ledger_header(unsigned char out[LEDGER_HEADER], const char* local,
+    const qihse_ct1_recovery_manifest_t* m) {
+    if (!shape(m) || !id_ok(local) ||
+        (strcmp(local, m->source_qkp_id) && strcmp(local, m->target_qkp_id)))
+        return false;
+    memset(out, 0, LEDGER_HEADER);
+    memcpy(out, ledger_magic, sizeof(ledger_magic));
+    const char* ids[] = {local, m->source_qkp_id, m->target_qkp_id, m->generation};
+    for (size_t i = 0; i < 4; ++i) put_id(out + 8 + i * ID_BYTES, ids[i]);
+    return SHA256(out, LEDGER_HEADER - 32, out + LEDGER_HEADER - 32) != NULL;
+}
+bool qihse_ct1_recovery_ledger_bootstrap(const char* path,
+    const char* local_node, const qihse_ct1_recovery_manifest_t* manifest) {
+    unsigned char header[LEDGER_HEADER];
+    if (!ledger_header(header, local_node, manifest)) return false;
+    char name[256], parent[4097], lockname[266];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    snprintf(lockname, sizeof(lockname), "%s.lock", name);
+    int lock = -1, fd = -1;
+    bool ok = false;
+    struct stat st;
+    if (fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+        goto done;
+    lock = openat(dir, lockname, O_RDWR | O_CREAT | O_EXCL |
+        O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+    if (lock < 0 || flock(lock, LOCK_EX) ||
+        !receipt_stat(dir, lockname, lock, 0, NULL) ||
+        write(lock, "1", 1) != 1 || fsync(lock) || fsync(dir)) goto done;
+    fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL |
+        O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+    if (fd < 0) goto done;
+    ok = receipt_stat(dir, name, fd, 0, NULL) &&
+        write_all(fd, header, sizeof(header)) && fsync(fd) == 0;
+    if (close(fd)) ok = false;
+    fd = -1;
+    if (ok) ok = fsync(dir) == 0 && receipt_parent_same(dir, parent) &&
+        receipt_stat(dir, lockname, lock, 1, NULL) &&
+        pwrite(lock, "0", 1, 0) == 1 && fsync(lock) == 0 &&
+        receipt_stat(dir, lockname, lock, 1, NULL);
+done:
+    if (fd >= 0 && close(fd)) ok = false;
+    if (lock >= 0 && close(lock)) ok = false;
+    if (close(dir)) ok = false;
+    return ok;
+}
+bool qihse_ct1_recovery_ledger_consume(const char* path,
+    const char* local_node, const qihse_ct1_recovery_manifest_t* manifest,
+    uint64_t caller_now_ms) {
+    unsigned char expected[LEDGER_HEADER], wire[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (!ledger_header(expected, local_node, manifest) ||
+        !qihse_ct1_recovery_encode(manifest, false, false, wire) ||
+        caller_now_ms < manifest->issued_ms || caller_now_ms >= manifest->expires_ms)
+        return false;
+    char name[256], parent[4097], lockname[266];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    snprintf(lockname, sizeof(lockname), "%s.lock", name);
+    int lock = openat(dir, lockname, O_RDWR | O_NOFOLLOW |
+        O_NONBLOCK | O_CLOEXEC);
+    int fd = -1;
+    bool ok = false;
+    char state;
+    struct stat before, after;
+    if (lock < 0 || flock(lock, LOCK_EX) ||
+        !lock_state(dir, lockname, lock, &state) || state != '0') goto done;
+    fd = openat(dir, name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &before) || before.st_size < LEDGER_HEADER ||
+        before.st_size > LEDGER_HEADER + LEDGER_LIMIT * LEDGER_ENTRY ||
+        (before.st_size - LEDGER_HEADER) % LEDGER_ENTRY ||
+        !receipt_stat(dir, name, fd, before.st_size, NULL)) goto done;
+    unsigned char header[LEDGER_HEADER], entry[LEDGER_ENTRY], prev[32];
+    if (!read_exact_at(fd, header, sizeof(header), 0) ||
+        memcmp(header, expected, sizeof(header))) goto done;
+    memcpy(prev, header + LEDGER_HEADER - 32, 32);
+    uint64_t highest = 0;
+    size_t count = (size_t)((before.st_size - LEDGER_HEADER) / LEDGER_ENTRY);
+    for (size_t i = 0; i < count; ++i) {
+        unsigned char hash_input[LEDGER_ENTRY];
+        if (!read_exact_at(fd, entry, sizeof(entry),
+                LEDGER_HEADER + (off_t)i * LEDGER_ENTRY)) goto done;
+        memcpy(hash_input, prev, 32);
+        memcpy(hash_input + 32, entry, LEDGER_ENTRY - 32);
+        unsigned char sum[32];
+        if (!SHA256(hash_input, sizeof(hash_input), sum) ||
+            memcmp(sum, entry + LEDGER_ENTRY - 32, 32) ||
+            get64(entry) <= highest ||
+            memcmp(entry + 8, manifest->nonce, 32) == 0) goto done;
+        highest = get64(entry);
+        memcpy(prev, sum, 32);
+    }
+    if (manifest->epoch <= highest || count == LEDGER_LIMIT ||
+        !receipt_stat(dir, name, fd, before.st_size, &after) ||
+        !frozen_same(&before, &after) || !receipt_parent_same(dir, parent)) goto done;
+    /* From this point a failure consumes the sidecar: no uncertain retry. */
+    if (pwrite(lock, "1", 1, 0) != 1 || fsync(lock) ||
+        !lock_state(dir, lockname, lock, &state) || state != '1') goto done;
+    memset(entry, 0, sizeof(entry));
+    put64(entry, manifest->epoch);
+    memcpy(entry + 8, manifest->nonce, 32);
+    if (!SHA256(wire, sizeof(wire), entry + 40)) goto done;
+    unsigned char hash_input[LEDGER_ENTRY];
+    memcpy(hash_input, prev, 32);
+    memcpy(hash_input + 32, entry, LEDGER_ENTRY - 32);
+    if (!SHA256(hash_input, sizeof(hash_input), entry + LEDGER_ENTRY - 32) ||
+        pwrite(fd, entry, sizeof(entry), before.st_size) != sizeof(entry) ||
+        fsync(fd) || fsync(dir) ||
+        !receipt_stat(dir, name, fd, before.st_size + LEDGER_ENTRY, NULL) ||
+        !receipt_parent_same(dir, parent) ||
+        pwrite(lock, "0", 1, 0) != 1 || fsync(lock) ||
+        !lock_state(dir, lockname, lock, &state) || state != '0') goto done;
+    ok = true;
+done:
+    if (fd >= 0 && close(fd)) ok = false;
+    if (lock >= 0 && close(lock)) ok = false;
+    if (close(dir)) ok = false;
+    return ok;
+}
 /* A same-inode replacement or in-place write is detected by identity and
  * timestamps, in addition to the independently streamed content digest. */
 static bool frozen_same(const struct stat* a, const struct stat* b) {
