@@ -74,7 +74,7 @@ above):
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 17 | 17 |
 | `include/qihse_shared_backup.h` | 3 | 3 |
-| `include/qihse_kv_store.h` | 150 | 147 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 152 | 149 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ### Native upgrade surfaces — current-source contracts
@@ -94,6 +94,7 @@ public transaction/participant layouts or imply SDK/protocol parity.
 | `include/qihse_table_store.h` | `qihse_table_store_backup`, `qihse_table_store_restore`, `qihse_table_store_snapshot_epoch_user` | Bootstrap Operator-only transfer preserves committed v3–v5 image bytes and receipts, without upgrading them. Restore needs closed source/target handles and a fresh destination. Failure can follow publication: inspect/reopen, never blindly overwrite. |
 | `include/qihse_blob.h` | `qihse_blob_snapshot_all_user`, `qihse_blob_snapshot_epoch_user`, `qihse_blob_archive_export_user`, `qihse_blob_archive_restore_user` | Complete authorized live snapshot differs from filtered `list_user`. Recovery uses the authenticated, unencrypted v2 archive with terminal receipts (v1 import supported); unresolved PREPAREs refuse export. Restore never reapplies historical COMMIT effects. |
 | `include/qihse_kv_store.h` | `qihse_kv_snapshot_checkpoint_user` | Same-live-handle CT-disabled durable fence. Compare instance ID, change sequence and projection epoch, not sequence alone. Bootstrap Operator required; not a logical TTL freeze. |
+| `include/qihse_kv_store.h` | `qihse_kv_ct_receiver_history_v1`, `qihse_kv_ct_source_retained_frame_v1` | Local, versioned, read-only legacy CT1 evidence queries. The pinned-QKP RESP adapters do not confer suppression, ACK or recovery admission; see `docs/ct1-rust-recovery-boundary.md`. |
 | `include/qihse_txn.h` | `qihse_txn_backup_checkpoint_user`, `qihse_txn_backup_export_user` | Bootstrap Operator-only idle, healthy, recovered durable coordinator checkpoint/export. Epoch includes unjournaled BEGIN/rollback and allocator changes. Discard all callback bytes on false, even after complete output. |
 | `include/qihse_shared_backup.h` | `qihse_shared_backup_export_user`, `qihse_shared_backup_verify_user`, `qihse_shared_backup_unpack_user` | Local KV/SQL/blob/coordinator package, not live-store restore or a distributed/service image. |
 

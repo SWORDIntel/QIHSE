@@ -1,12 +1,18 @@
 # Rust-first CT1 recovery boundary (design, not a recovery procedure)
 
-Status: design with a Rust structural comparison slice in `rust/ct1-recovery`
-and a read-only native C receiver-history check described below. B's legacy
-CT1 source remains stopped with original
-pending position 11111; its successor is sealed at 11110. This crate neither
-authenticates evidence nor has a C ABI or production call site. No operation
-described here is implemented or authorized to advance that cursor. Do not
-convert installed `--ct-role` pairs to CT group/lane mode.
+Status at `6b04d1f`: **design only** beyond the structural `rust/ct1-recovery`
+`compare()` and the pinned read-only TARGET HISTORY-V1 / SOURCE FRAME-V1 C and
+RESP queries below. B's legacy CT1 source owner remains stopped, with its
+original pending SET group at position 11111; the successor is sealed at cursor
+11110. Its source-authored same-key tombstone is at 11103. The sample row
+sequences in the Rust fixture are pending 5729448, tombstone 5729450, target
+high-water 5729457 and source high-water 5729448; stream positions are **not**
+row sequences. These fixture numbers illustrate the discrepancy, not a live
+read of B. Preserve the original group, both stores, all journals, generation,
+seals and routing. The crate has no C ABI, evidence authentication, executor or
+production call site. No operation described here is implemented or authorized
+to advance either cursor. Do not convert installed `--ct-role` pairs to CT
+group/lane mode.
 
 ## Existing split
 
@@ -140,6 +146,268 @@ independent verified provenance and a fresh locked recheck; there is no
 production recovery call here. Isolated real-daemon transport checks are in
 `tests/test_ct_transfer.py` (`test_source_frame_v1_*`); native storage checks
 are separately owned in `tests/test_ct_storage.c`.
+
+## Proposed next-stage verified-evidence capability ABI (not shipped)
+
+This is an **internal, same-process** Rust/C ABI sketch, not a new RESP command
+or authority for a client SDK. `include/qihse_kv_store.h:312-413` defines only
+read-only V1 queries; `rust/ct1-recovery/src/lib.rs:30-124` defines public,
+caller-manufacturable `Comparison` fields and a structural floor computation.
+No `ct1_recovery_*` symbols below exist at `6b04d1f`. Define an internal C
+factory accessible only after native daemon admission; it, **not Rust or wire
+input**, mints and owns `ct1_recovery_cap_t` in a process-local registry. A C
+pointer is a lookup key, never a serialized token, and is validated against
+registry membership before dereference. No public constructor, pointer
+round-trip through RESP, persisted capability, or authority based solely on a
+`Comparison`/`authenticated` flag. Example ABI shape (names and layout
+proposed, to be reviewed with implementers):
+
+```c
+typedef struct ct1_recovery_cap ct1_recovery_cap_t; /* C-owned, opaque */
+typedef struct {
+    uint32_t version;                 /* exactly 1 */
+    uint32_t size;                    /* exactly sizeof this V1 struct */
+    uint8_t generation[16];          /* decoded 32-hex CT generation */
+    uint8_t baseline_digest[32];
+    uint64_t baseline_row_seq;
+    uint64_t expected_target_cursor; /* 11110 for B; selector, not proof */
+    uint64_t pending_position;        /* 11111 for B; selector, not proof */
+    uint32_t reserved;                /* zero; no unknown flags */
+    uint32_t requested_operation;     /* exactly VERIFY, not APPLY/ACK */
+} ct1_recovery_request_v1;
+typedef struct {
+    uint32_t version;                 /* exactly 1 */
+    uint32_t size;                    /* exactly sizeof this V1 struct */
+    uint32_t outcome;                 /* DENY / REVIEW_REQUIRED / CANDIDATE */
+    uint32_t reserved;                /* zero */
+    uint64_t minimum_next_row_seq;    /* max(target, source high-water)+1 */
+    uint8_t evidence_digest[32];     /* transcript binding, NOT a signature */
+} ct1_recovery_decision_v1;
+/* Internal C admission obtains a live session/manifest and store evidence;
+ * Rust only borrows the minted cap for comparison. */
+int32_t ct1_recovery_evidence_open_v1(const ct1_recovery_request_v1 *,
+                                      ct1_recovery_cap_t **);
+int32_t ct1_recovery_compare_v1(const ct1_recovery_cap_t *,
+                                ct1_recovery_decision_v1 *);
+void ct1_recovery_evidence_close_v1(ct1_recovery_cap_t **);
+```
+
+All scalars crossing the boundary have fixed widths, arrays have fixed extent;
+there is no `size_t`, `bool`, enum layout, `char *` string, host-order serialized
+struct or variable-length unbounded pointer in the evidence payload. The only
+pointers are process-local ABI arguments; no structure is written to disk or
+sent on the wire. An owned, length-bounded copy of exact QKV6 frame bytes and
+key, decoded tenant/labels/actor/expiry, source and target node IDs and pinned
+public-key identities, generation, baseline, WAL extent, cursor, source ACK
+and durable positions, deletion position/version, latest physical row/version
+and both high-waters live **inside C's registry**. C controls frame allocation,
+zeroization and lifetime; Rust borrows a checked, length-bounded view only
+within `compare_v1`, does not store it, and cannot mint/clone an authority.
+C validates the registry entry first, then passes a checked view to Rust; a
+Rust FFI export must not dereference the opaque pointer independently.
+Strict version/size, zero reserved bits, nonnull output, overflow and exact
+key/frame/labels validation precede any access; failure zeros outputs and
+returns a fixed-width error code. Close invalidates the cap and zeroizes its
+protected buffers; invalidate on QKP disconnect/pin or principal change,
+manifest change, generation/baseline or WAL change, cursor/high-water change,
+expiry, store close/reopen, or failed recheck. Old, copied, cross-thread,
+foreign-store or post-close handles fail registry and epoch checks; retire
+handle addresses for the process lifetime (or use a validated generation-bearing
+indirection) so allocator address reuse cannot revive a stale pointer. Rust
+catches panics at the ABI boundary and never unwinds into C. Capability expiry
+and single-use consumption are enforced in C, not by Rust's output.
+
+Each server mints only its **own local** capability: source C verifies the
+source WAL under its lock; target C verifies the receiver under its lock and
+returns only a bounded, pinned-QKP authenticated, fence-epoch-bound receipt.
+Source C validates that remote receipt against its configured target pin and
+manifest before minting its combined local comparison view. B's ordinary owner
+must stay stopped: a separately deployed recovery-only process with exclusive
+ownership of a coherent B working copy may make offline evidence queries, but
+cannot present that copy as the live pinned source. Any later live source
+recovery process must exclusively own the original store and pinned identity,
+boot control-only, and durably fence ordinary writes, ACKs, reads and automatic
+reconciliation before accepting a QKP peer. Never run it alongside the stopped
+owner's original service or expose a working copy on the production route.
+No target pointer crosses a process boundary. Target C independently verifies
+that same binding under its lock at commit; the receipt does not authorize
+target mutation.
+Minting requires **C-only** checks of a live authenticated QKP session: exact
+configured node ID **and public-key pin** in each direction, active configured
+non-Operator replication service principal with tenant/label access, and a
+separately authenticated, scope-limited Operator approval/manifest for this
+specific stopped B recovery. C validates the manifest's trusted issuer,
+anti-replay epoch, source/target IDs and pins, generation, baseline sequence and
+digest, pending group position, exact frame hash, row identity, allowed
+operation and expiry against configuration and persisted local state. Never
+accept these claims merely because a caller supplied them. C reads the
+retained single-SET source WAL group and its **exact** frame under the source
+store lock; C reads receiver history, latest physical tombstone at 11103,
+row version and actual high-water under the target store lock. A locally
+approved manifest and current pinned channel authenticate the **present**
+controller's authority; SHA-256 of QKV6 bytes, persisted actor kind and the
+read-only response cannot prove **historical cryptographic authorship** of
+11111 or 11103. The target's 11103 row sequence 5729450 exceeding the
+source's retained 11111 row sequence 5729448 is not evidence that 11103 is
+present in the source's current WAL: ACK GC retired earlier source groups, and
+the reopened source high-water fell behind the target. The frame query verifies
+only the retained unacked tail; independently bind historical target groups,
+source frozen manifests and prior source-authored deletions before using that
+ordering as recovery evidence. Never relax codec sequence checks to infer
+missing history. If historical cryptographic authorship is required, specify
+an independently signed origin receipt/journal and trust root before permitting
+a `CANDIDATE`; otherwise label the evidence as bounded local-WAL provenance,
+not historical peer attestation. No read-only response or Rust decision grants suppression.
+
+## Proposed crash-safe B transaction and cross-process fence (not shipped)
+
+A single KV lock cannot freeze two server processes. The target's read-locked
+HISTORY-V1 snapshot can be stale before the source publishes a floor, and the
+source's FRAME-V1 result can be stale before target apply. The proposal needs
+**two separately durable, owner-epoch-bound admission fences** and a narrowly
+scoped protocol: while B owner remains stopped, acquire exclusive source
+recovery ownership (normal owner/write admission denied) and persist a source
+intent; acquire a target recovery fence that denies **all target row-sequence
+allocation/writers** (including unrelated keys and background expiry), CT
+apply/rebind, compaction of relevant proof, and ordinary reads for the
+affected key until completion. Only a revalidated, transaction-bound executor
+may make the specified target disposition and compensating apply transitions.
+Fence installation must be durable and checked before any source sequence/floor
+change. Each server takes only its **own** store lock for its transitions,
+rechecking persisted CT state, WAL extent, peer/pin, manifest,
+frame, generation/baseline, row/labels/version, high-water and cursor against
+its capability; network calls happen **outside** either lock. A remote reply
+is a comparison candidate, never a remote lock. The target fence must return
+a fresh monotonically changing recovery epoch and cursor revision; the source
+binds both to its intent. Target verify/apply must revalidate that epoch under
+the target lock; if the cursor or row changed since the read, invalidate the
+snapshot and abort **before** source append, or retain both fences and enter
+read-denying repair after append. A TTL alone is unsafe: on timeout/restart,
+the persisted fence must deny reads/apply until the committed transaction is
+replayed or explicitly proven aborted. Every write path including replay,
+expiry, compaction and snapshot installation must honor the fence/disposition.
+
+Proposed durable ordering, with fsync failure treated as an uncertain commit
+and replay before retry (never proceed on a guessed outcome):
+
+1. Verify both persisted states and manifest through C as above. Target under
+   its write lock durably records `PREPARED` fence/intent keyed by source,
+   target, generation, original position **11111**, exact frame digest, key,
+   labels, baseline, tombstone 11103/version, target cursor **11110** and
+   high-water, then fsyncs WAL/intent and parent directory when creating or
+   replacing files. Source independently records its owner fence/intent with
+   the same binding and target fence epoch, fsyncs file and directory. Never
+   treat an unattested prior HISTORY-V1 query as the prepared fence.
+2. With both persisted fences verified, fetch fresh target high-water **under
+   target lock** via the fenced QKP protocol **outside source lock**; reject if
+   its revision/row or cursor changed. Under source lock, recheck the source
+   fence, its persisted state and the target receipt/epoch; publish a durable
+   sequence floor at least `max(current source high-water, observed target
+   high-water)` (for the fixture at least 5729457), fsync its floor record and
+   directory, and re-read it before allocating. `kv_change_seq_floor()` at
+   `src/black_hole/qihse_kv_store.c:539-549` is **memory-only**; do not mistake
+   it for that publication. Reject overflow/allocator exhaustion.
+3. Under source lock allocate a **new** row sequence strictly above that floor
+   (fixture minimum 5729458), append and fsync a source-authored same-key,
+   same-label tombstone as a **new group after 11111**, with durable source CT
+   position/retained WAL metadata and intent bound to exact frame and target
+   epoch. Fsync the WAL, CT state/intent and required directory metadata in
+   their recoverable commit order before exposing that group. Never rewrite,
+   skip or ACK original 11111 to make room. If either fsync is uncertain,
+   reread WAL/intent on reopen and continue only the same transaction.
+4. Target atomically WAL-commits a `SUPPRESSED_ORIGINAL` disposition for the
+   **exact** 11111 frame plus advancement of its cursor to 11111, with the
+   original frame/provenance retained but **no SET row made visible**. Before
+   ACK permits source GC, persist and verify that exact frame in the target
+   disposition or a separately durable immutable archive, alongside the
+   preserved frozen original source copy; a hash alone cannot retain payload
+   and metadata. Do not rely on SOURCE FRAME-V1 after the final source ACK.
+   Fsync that atomic transaction before acknowledging 11111; reject generic apply
+   and any mismatched duplicate. An intent alone is not suppression. With
+   target lock held, recheck its fence, current cursor, tombstone latest
+   version/labels and high-water before commit. Source ACK for 11111, if sent,
+   reflects only this durable non-visible target outcome, never an invented
+   ACK/ABORT. Ordinary reads stay fenced while compensation is incomplete.
+5. Target then applies the real later source tombstone group via normal
+   sequence/identity checks and WAL-commits row + cursor atomically, fsyncs
+   before ACK; lost replies are resolved from durable cursor, disposition and
+   exact group digest, not by replaying an unsafe SET. Source durably records
+   ACK positions in order; only after target cold-reopen confirms same-key
+   absence and retained disposition (including after compaction/snapshot),
+   target cursor equals source durable and ACK, and both fences still match,
+   durably mark `COMPLETE` and release target read/writer fences only after
+   verifying the disposition/archive. Existing pinned-peer RECONCILE clears
+   primary `ct_control_only` on success; do not invoke it while the B source
+   owner must remain fenced. A separately implemented recovery-only
+   reconciliation must persist ACK/cursor equality without admitting ordinary
+   owner reads or writes; any later admission requires its own explicit
+   authenticated approval and recheck. Never auto-start B owner.
+
+The disposition is a **permanent, generation-scoped negative apply fact**:
+lookup and all replay, checkpoint, SST compaction, expiry scanning, WAL
+retirement, snapshot/export/import, duplicate-apply and cold-open paths must
+preserve and enforce it. If the disposition or its coupling to 11111/cursor is
+missing/corrupt, deny service, not fall back to normal SET. During an
+incomplete transaction the target stays read-denying, even if tombstone
+compaction would remove the physical row; after completion, tombstone
+retention or an equivalent durable absence barrier must prevent old 11111
+from reappearing. `qihse_kv_apply_replica_record()` has an ordinary stale
+source update guard (`src/black_hole/qihse_kv_store.c:8146-8149`), but it is
+not a crash-persistent suppression disposition and does not authorize this
+exception. A reset, ACK loss, snapshot or expired key must never promote the
+stale SET to a visible row. Reconcile/discard of an aborted *uncommitted*
+intent requires proof that neither source append nor target disposition/cursor
+committed; after either commit, recovery must roll forward or fail closed.
+
+| Durable cut | Restart / duplicate outcome (design requirement) |
+| --- | --- |
+| Before either fence, or after target fence but before source floor | No apply; validate/retire uncommitted intent only under both local locks; B stays stopped. |
+| After source floor fsync, before append | Floor survives restart; no reuse of lower sequence; resume same fenced proof or fail closed. |
+| During append / CT state fsync, or lost append reply | Recover exact group and position from source WAL; never append a conflicting compensation or rewrite 11111. |
+| Before target disposition fsync / partial WAL | Cursor remains 11110 and reads fenced; no visibility of 11111; replay truncates/repairs only proven uncommitted tail. |
+| After disposition + 11111 cursor fsync, before ACK or tombstone apply | Duplicate 11111 resolves suppressed, never SET; read fence remains; roll forward actual tombstone. |
+| After tombstone + cursor fsync, before ACK / COMPLETE | Verify exact digest/cursor and same-key absence, retransmit ACK idempotently; keep disposition through compaction. |
+| After COMPLETE / during snapshot, expiry or WAL retirement | Restore/checkpoint includes disposition and absence barrier; reopen must fail closed if either is absent. |
+
+### Required test matrix for a future implementation
+
+- Rust policy/FFI: wrong version/size, null/oversize/invalid-UTF-8 IDs,
+  overflow, forged/reused/cross-store/expired handle, foreign thread and
+  disconnect/rebind, panic containment, changed manifest/pins/principal,
+  multi-row/expired source frame, wrong key/tenant/labels/actor, later SET,
+  stale tombstone or generation/baseline and floor exhaustion. Caller-filled
+  `Comparison` must remain non-authoritative; result cannot drive generic
+  apply, ACK or read admission.
+- Native storage with fault injection at **each** fence, floor file/write/fsync
+  and directory fsync, allocator, source WAL append/CT state fsync, target
+  disposition+cursor WAL append/fsync, tombstone+cursor fsync, source/target
+  ACK and COMPLETE fsync; simulate torn writes, restart and duplicate calls at
+  every row of the crash-cut table. Assert original bytes/group and all
+  journals/generation unchanged except explicitly recorded new transaction
+  artifacts, and the exact original frame retained in frozen evidence and
+  durable disposition/archive even after expected source WAL retirement;
+  verify monotone new row sequence, cursor continuity and permanent absence.
+- Race and lifecycle: interleave target cursor/row/high-water change between
+  V1 read and source floor, between source append and target disposition, QKP
+  disconnect/manifest rotation, competing replica apply, expiry, compaction,
+  snapshot/WAL retirement and ACK loss. Each must invalidate the capability,
+  refuse before append or preserve fences and recover without serving stale
+  data; cold reopen source and target independently under each cut.
+- Real-daemon paired pinned-QKP positive and negative principal tests,
+  authentic source WAL/manifest checks, high-clearance data vs low-clearance
+  callers, B-like working-copy tests with 11103/11111 and an actual target
+  high-water above source; inspect cursor, source group bytes, physical row
+  and read visibility after cold reopen. Never test mutations on the preserved
+  original B stores.
+
+**Unresolved material decisions:** choose the authenticated recovery manifest's
+issuer/trust root, expiry and anti-replay policy and whether historical
+cryptographic origin receipts are mandatory (the existing V1 responses cannot
+supply them). Specify the on-disk disposition/absence-barrier format and
+retention semantics, and a durable cross-process fencing protocol capable of
+blocking all target writers, before any executor or deployment is approved.
+Until these are decided and crash cuts verified, `CANDIDATE` is not permission
+to mutate or unstop B.
 
 ## Release gates
 
