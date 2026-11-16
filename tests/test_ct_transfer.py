@@ -7,9 +7,11 @@ replication stream and survive a successor process restart.
 """
 from __future__ import annotations
 
+import hashlib
 import unittest
 import time
 
+from ct_multigroup_drill import seed_classified_kv
 from ct_transport_drill import (
     IsolatedCluster,
     parse_resp_frame,
@@ -83,6 +85,259 @@ class Ct1RealDaemonTests(unittest.TestCase):
             time.sleep(0.1)
         self.cluster.fail_with_log("successor", "CT1 reconciliation did not admit writes")
         raise AssertionError("unreachable")
+
+    def test_target_history_v1_requires_pinned_peer_and_exact_sealed_history(self):
+        generation = self.start_pair(new_generation())
+        source_before, receiver_before = self.wait_for_pair(generation)
+        key, secret = "ct1:history:deleted", "CT1-HISTORY-PROTECTED-PAYLOAD"
+        self.assertEqual(self.primary_admin.execute_resp("SET", key, secret), b"+OK\r\n")
+        self.assertEqual(self.primary_admin.execute_resp("DEL", key), b":1\r\n")
+
+        def acknowledged():
+            source = ct1_source_status(self.successor_to_primary)
+            receiver = ct1_receiver_status(self.primary_to_successor)
+            if (source["durable_lsn"] >= source_before["durable_lsn"] + 2 and
+                    source["acknowledged_lsn"] == source["durable_lsn"] ==
+                    receiver["durable_cursor"]):
+                return source, receiver
+            return None
+        source, receiver = self.cluster.wait_until(acknowledged, timeout=30.0)
+        self.assertTrue(receiver["baseline_sealed"])
+        self.assertGreater(receiver["durable_cursor"], receiver_before["durable_cursor"])
+        args = [generation, str(source["baseline_row_seq"]),
+                receiver["baseline_digest"], str(receiver["durable_cursor"]),
+                key, "0", "0", "0"]
+
+        def query(peer, fields):
+            return peer.execute_resp("REPL.CT1", "TARGET", "HISTORY-V1", *fields)
+
+        reply = query(self.primary_to_successor, args)
+        self.assertTrue(reply.startswith(b"*4\r\n"), reply)
+        values = parse_resp_frame(reply)
+        self.assertEqual(len(values), 4)
+        self.assertTrue(all(isinstance(field, bytes) and field.isdigit()
+                            for field in values), values)
+        position, row_seq, cursor, high_water = map(int, values)
+        self.assertEqual(position, source["durable_lsn"])
+        self.assertGreater(row_seq, 0)
+        self.assertEqual(cursor, receiver["durable_cursor"])
+        self.assertGreaterEqual(high_water, row_seq)
+        self.assertNotIn(secret.encode(), reply)
+
+        wrong_generation = ("0" if generation[0] != "0" else "1") + generation[1:]
+        invalid = (
+            (0, wrong_generation), (0, generation.upper() if any(c in "abcdef" for c in generation)
+                                   else "g" + generation[1:]),
+            (1, "18446744073709551616"), (2, "0" * 64), (2, "g" * 64),
+            (3, str(receiver["durable_cursor"] - 1)), (3, "18446744073709551616"),
+            (4, "missing:ct1:history"), (4, "k" * 65536), (4, ""),
+            (5, "1"), (5, "4294967296"), (6, "1"), (6, "65536"),
+            (7, "1"), (7, "65536"),
+        )
+        for index, replacement in invalid:
+            with self.subTest(index=index, replacement=replacement[:40]):
+                candidate = args.copy()
+                candidate[index] = replacement
+                denied = query(self.primary_to_successor, candidate)
+                self.assertTrue(denied.startswith(b"-"), denied)
+                self.assertNotIn(secret.encode(), denied)
+        for candidate in (args[:-1], args + ["extra"]):
+            denied = query(self.primary_to_successor, candidate)
+            self.assertTrue(denied.startswith(b"-"), denied)
+            self.assertNotIn(secret.encode(), denied)
+
+        forged = self.cluster.replication_peer_client(
+            identity_name="forged", node_id="ct-forged", target_name="successor")
+        for peer in (forged, self.successor_admin):
+            denied = query(peer, args)
+            self.assertTrue(denied.startswith(b"-"), denied)
+            self.assertNotIn(secret.encode(), denied)
+        self.assertEqual(ct1_receiver_status(self.primary_to_successor)["durable_cursor"],
+                         receiver["durable_cursor"])
+
+    def test_target_history_v1_rejects_inaccessible_classification(self):
+        key, secret = "ct1:history:high-clearance", "CT1-HISTORY-CLASS5-SCI1-PROTECTED"
+        # Seed only the primary through the authenticated native writer. The
+        # successor must receive the protected row through its real baseline.
+        seed_classified_kv(self.cluster, "lead", key, secret, classification=5, sci=1)
+        generation = self.start_pair(new_generation())
+        source, receiver = self.wait_for_pair(generation)
+        self.assertGreater(source["baseline_row_seq"], 0)
+        self.assertEqual(parse_resp_frame(self.primary_admin.execute_resp("GET", key)),
+                         secret.encode())
+        self.assertEqual(self.primary_admin.execute_resp("DEL", key), b":1\r\n")
+
+        def acknowledged():
+            st = ct1_source_status(self.successor_to_primary)
+            target = ct1_receiver_status(self.primary_to_successor)
+            return target if (st["acknowledged_lsn"] == st["durable_lsn"] ==
+                              target["durable_cursor"] and
+                              target["durable_cursor"] > receiver["durable_cursor"]) else None
+        target = self.cluster.wait_until(acknowledged, timeout=30.0)
+        args = [generation, str(source["baseline_row_seq"]), target["baseline_digest"],
+                str(target["durable_cursor"]), key, "0", "5", "1"]
+        allowed = self.primary_to_successor.execute_resp(
+            "REPL.CT1", "TARGET", "HISTORY-V1", *args)
+        self.assertTrue(allowed.startswith(b"*4\r\n"), allowed)
+        position, row_seq, cursor, high_water = map(int, parse_resp_frame(allowed))
+        self.assertEqual(position, target["durable_cursor"])
+        self.assertGreater(row_seq, source["baseline_row_seq"])
+        self.assertEqual(cursor, target["durable_cursor"])
+        self.assertGreaterEqual(high_water, row_seq)
+        self.assertNotIn(secret.encode(), allowed)
+
+        # Reauthenticate the exact pinned service peer after reducing its
+        # local principal's policy, without changing the protected store.
+        for clearance, sci in ((0, 65535), (65535, 0), (65535, 65535)):
+            with self.subTest(clearance=clearance, sci=sci):
+                self.primary_to_successor.close()
+                self.successor_admin.close()
+                self.cluster.kill("successor")
+                self.successor_process, self.successor_admin = self.cluster.start_ct1_node(
+                    "successor", 1, "successor", "lead", "ct-successor", "ct-primary",
+                    generation, service_clearance=clearance, service_sci=sci,
+                    topology_names=self.topology_names)
+                self.primary_to_successor = self.cluster.replication_peer_client(
+                    identity_name="lead", node_id="ct-primary", target_name="successor")
+                self.assertEqual(ct1_receiver_status(self.primary_to_successor), target)
+                reply = self.primary_to_successor.execute_resp(
+                    "REPL.CT1", "TARGET", "HISTORY-V1", *args)
+                self.assertNotIn(secret.encode(), reply)
+                if clearance == sci == 65535:
+                    # Restoring clearance must recover the exact same proof;
+                    # a corrupt or unavailable store is not an auth denial.
+                    self.assertEqual(reply, allowed)
+                else:
+                    self.assertEqual(reply, b"-ERR CT1 target history unavailable or denied\r\n")
+                    # A caller-supplied low label must not bypass stored labels.
+                    denied = self.primary_to_successor.execute_resp(
+                        "REPL.CT1", "TARGET", "HISTORY-V1", *args[:-2], "0", "0")
+                    self.assertEqual(denied, b"-ERR CT1 target history unavailable or denied\r\n")
+                    self.assertNotIn(secret.encode(), denied)
+
+    def test_source_frame_v1_returns_original_pending_frame_only_to_pinned_successor(self):
+        generation = self.start_pair(new_generation(), ack_timeout_ms=500)
+        self.wait_for_pair(generation)
+        self.successor_to_primary.close()
+        self.cluster.kill("successor")
+        key, secret = "ct1:frame:pending", "CT1-SOURCE-FRAME-PROTECTED-PAYLOAD"
+        write = self.primary_admin.execute_resp("SET", key, secret, "PX", "3600000")
+        self.assertIn(b"outcome unresolved", write)
+        peer = self.cluster.replication_peer_client(
+            identity_name="successor", node_id="ct-successor", target_name="lead")
+        self.successor_to_primary = peer
+        status = ct1_source_status(peer)
+        self.assertGreater(status["durable_lsn"], status["acknowledged_lsn"])
+        groups = ct1_read(peer, generation, after_seq=status["acknowledged_lsn"])["groups"]
+        group = next(g for g in groups if any(r["key"] == key.encode()
+                                             for r in g["records"]))
+        self.assertEqual(len(group["records"]), 1)
+        record = group["records"][0]
+        self.assertEqual(record["key"], key.encode())
+        self.assertEqual(record["value"], secret.encode())
+        args = [generation, str(status["baseline_row_seq"]), status["baseline_digest"],
+                str(status["acknowledged_lsn"]), str(status["durable_lsn"]),
+                str(group["position"]), key, "0", "0", "0", str(record["change_seq"])]
+
+        def query(client, fields):
+            return client.execute_resp("REPL.CT1", "SOURCE", "FRAME-V1", *fields)
+
+        reply = query(peer, args)
+        self.assertTrue(reply.startswith(b"*9\r\n"), reply[:100])
+        fields = parse_resp_frame(reply)
+        self.assertEqual(len(fields), 9)
+        frame, digest, returned_key, tenant, cls, sci, position, seq, expiry = fields
+        self.assertEqual(hashlib.sha256(frame).hexdigest().encode(), digest)
+        self.assertEqual(returned_key, key.encode())
+        self.assertEqual([int(tenant), int(cls), int(sci), int(position), int(seq)],
+                         [0, 0, 0, group["position"], record["change_seq"]])
+        self.assertEqual(int(expiry), record["expiry"])
+        self.assertIn(secret.encode(), frame)
+        self.assertEqual(ct1_source_status(peer), status)
+
+        wrong_generation = ("0" if generation[0] != "0" else "1") + generation[1:]
+        for index, replacement in (
+                (0, wrong_generation), (0, "g" + generation[1:]),
+                (1, "18446744073709551616"), (2, "0" * 64), (2, "G" * 64),
+                (3, str(status["acknowledged_lsn"] + 1)),
+                (4, str(status["durable_lsn"] + 1)),
+                (5, str(group["position"] + 1)), (6, "missing:frame"),
+                (6, "k" * 65536), (6, ""), (7, "4294967296"),
+                (8, "65536"), (9, "65536"),
+                (10, str(record["change_seq"] + 1)), (10, "18446744073709551616")):
+            with self.subTest(index=index, replacement=replacement[:40]):
+                invalid = args.copy()
+                invalid[index] = replacement
+                denied = query(peer, invalid)
+                self.assertEqual(denied,
+                    b"-ERR CT1 source frame unavailable or denied\r\n")
+                self.assertNotIn(secret.encode(), denied)
+        for invalid in (args[:-1], args + ["extra"]):
+            self.assertEqual(query(peer, invalid),
+                b"-ERR CT1 source frame unavailable or denied\r\n")
+        forged = self.cluster.replication_peer_client(
+            identity_name="forged", node_id="ct-forged", target_name="lead")
+        for client in (forged, self.primary_admin):
+            denied = query(client, args)
+            self.assertIn(denied, (
+                b"-ERR CT1 source frame unavailable or denied\r\n",
+                b"-NOAUTH Authentication required.\r\n"))
+            self.assertNotIn(secret.encode(), denied)
+        self.assertEqual(ct1_source_status(peer), status)
+
+    def test_source_frame_v1_low_service_clearance_does_not_expose_high_data(self):
+        key, secret = "ct1:frame:high", "CT1-FRAME-CLASS5-SCI1-PROTECTED"
+        seed_classified_kv(self.cluster, "lead", key, secret, classification=5, sci=1)
+        generation = self.start_pair(new_generation(), ack_timeout_ms=500)
+        source, _ = self.wait_for_pair(generation)
+        self.assertGreater(source["baseline_row_seq"], 0)
+        self.assertEqual(parse_resp_frame(self.primary_admin.execute_resp("GET", key)),
+                         secret.encode())
+        self.successor_to_primary.close()
+        self.primary_admin.close()
+        self.cluster.kill("lead")
+        self.primary_process, self.primary_admin = self.cluster.start_ct1_node(
+            "lead", 0, "primary", "successor", "ct-primary", "ct-successor",
+            generation, service_clearance=0, service_sci=0,
+            ack_timeout_ms=500, topology_names=self.topology_names)
+        self.cluster.wait_until(
+            lambda: self.primary_admin.execute_resp("GET", key) ==
+            b"$" + str(len(secret)).encode() + b"\r\n" + secret.encode() + b"\r\n",
+            timeout=30.0)
+        self.cluster.kill("successor")
+        pending_key = "ct1:frame:low-pending"
+        self.assertIn(b"outcome unresolved",
+            self.primary_admin.execute_resp("SET", pending_key, "LOW-PENDING"))
+        peer = self.cluster.replication_peer_client(
+            identity_name="successor", node_id="ct-successor", target_name="lead")
+        status = ct1_source_status(peer)
+        groups = ct1_read(peer, generation, after_seq=status["acknowledged_lsn"])["groups"]
+        group = next(g for g in groups if any(r["key"] == pending_key.encode()
+                                             for r in g["records"]))
+        row_seq = group["records"][0]["change_seq"]
+        self.assertEqual(group["records"][0]["key"], pending_key.encode())
+        self.successor_to_primary = peer
+        args = [generation, str(status["baseline_row_seq"]), status["baseline_digest"],
+                str(status["acknowledged_lsn"]), str(status["durable_lsn"]),
+                str(group["position"]), key, "0", "5", "1", str(row_seq)]
+        low_args = args.copy()
+        low_args[6:10] = [pending_key, "0", "0", "0"]
+        allowed = parse_resp_frame(peer.execute_resp(
+            "REPL.CT1", "SOURCE", "FRAME-V1", *low_args))
+        self.assertEqual(allowed[2], pending_key.encode())
+        self.assertIn(b"LOW-PENDING", allowed[0])
+        self.assertNotIn(secret.encode(), allowed[0])
+        high_labels_on_low_row = low_args.copy()
+        high_labels_on_low_row[8:10] = ["5", "1"]
+        denied = peer.execute_resp(
+            "REPL.CT1", "SOURCE", "FRAME-V1", *high_labels_on_low_row)
+        self.assertEqual(denied, b"-ERR CT1 source frame unavailable or denied\r\n")
+        for labels in (("5", "1"), ("0", "0")):
+            denied = self.successor_to_primary.execute_resp(
+                "REPL.CT1", "SOURCE", "FRAME-V1", *args[:-3], *labels,
+                str(row_seq))
+            self.assertEqual(denied, b"-ERR CT1 source frame unavailable or denied\r\n")
+            self.assertNotIn(secret.encode(), denied)
 
     def test_write_is_acknowledged_only_after_durable_successor_and_survives_restart(self):
         generation = self.start_pair(new_generation())

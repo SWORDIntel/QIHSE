@@ -12935,6 +12935,134 @@ static bool qihse_resp_handle_ct1_target_status(qihse_resp_session_t* s) {
         qihse_resp_ct_bulk_u64(s, bound ? (uint64_t)st.tenant_policy : 0u);
 }
 
+static bool qihse_resp_handle_ct1_target_history_v1(qihse_resp_session_t* s,
+                                                     const qihse_resp_request_t* r) {
+    if (r->argc != 11u)
+        return qihse_resp_error(s, "ERR invalid CT1 target history request");
+    if (!s->server->ct_role || strcmp(s->server->ct_role, "successor") != 0 ||
+        !qihse_resp_repl_data_plane_allowed(s) ||
+        !s->server->pqc.replication_peer_node_id || !s->server->pqc.node_id ||
+        strcmp(qihse_resp_replication_peer_id(s->server, s->qkp),
+               s->server->pqc.replication_peer_node_id) != 0)
+        return qihse_resp_error(s, "NOPERM CT1 target history denied");
+
+    char *generation = NULL, *digest_text = NULL, *key = NULL;
+    uint64_t baseline = 0u, cursor = 0u, tenant = 0u, classification = 0u, sci = 0u;
+    qihse_kv_ct_receiver_history_request_t req = {
+        .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1, .size = sizeof(req),
+        .source_id = s->server->pqc.replication_peer_node_id,
+        .target_id = s->server->pqc.node_id
+    };
+    bool valid = qihse_resp_repl_arg_string(&r->argv[3], 32u, false, &generation) &&
+        strlen(generation) == 32u;
+    for (size_t i = 0u; valid && i < 32u; ++i)
+        valid = (generation[i] >= '0' && generation[i] <= '9') ||
+            (generation[i] >= 'a' && generation[i] <= 'f');
+    valid = valid && strcmp(generation, s->server->ct_generation) == 0 &&
+        qihse_resp_parse_u64_arg(&r->argv[4], &baseline) &&
+        qihse_resp_repl_arg_string(&r->argv[5], 64u, false, &digest_text) &&
+        qihse_resp_ct_hex32_parse(digest_text, req.baseline_digest) &&
+        qihse_resp_parse_u64_arg(&r->argv[6], &cursor) && cursor != 0u &&
+        qihse_resp_repl_arg_string(&r->argv[7], 65535u, false, &key) &&
+        qihse_resp_parse_u64_arg(&r->argv[8], &tenant) && tenant <= UINT32_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[9], &classification) &&
+        classification <= UINT16_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[10], &sci) && sci <= UINT16_MAX;
+    req.generation = generation;
+    req.baseline_row_seq = baseline;
+    req.durable_cursor = cursor;
+    req.key = key;
+    req.resource_tenant_id = (uint32_t)tenant;
+    req.classification = (uint16_t)classification;
+    req.sci_compartment = (uint16_t)sci;
+    qihse_kv_ct_receiver_history_result_t out = {0};
+    bool ok = valid && qihse_kv_ct_receiver_history_v1(s->server->store,
+        s->user, &req, &out);
+    free(generation);
+    free(digest_text);
+    free(key);
+    OPENSSL_cleanse(req.baseline_digest, sizeof(req.baseline_digest));
+    if (!ok) return qihse_resp_error(s, "ERR CT1 target history unavailable or denied");
+    return qihse_resp_array(s, 4u) &&
+        qihse_resp_ct_bulk_u64(s, out.stream_position) &&
+        qihse_resp_ct_bulk_u64(s, out.row_change_seq) &&
+        qihse_resp_ct_bulk_u64(s, out.durable_cursor) &&
+        qihse_resp_ct_bulk_u64(s, out.row_seq_high_water);
+}
+
+static bool qihse_resp_handle_ct1_source_frame_v1(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    if (r->argc != 14u || !qihse_resp_ct_source_allowed(s) ||
+        !s->server->pqc.node_id || !s->server->ct_generation)
+        return qihse_resp_error(s, "ERR CT1 source frame unavailable or denied");
+    char *generation = NULL, *digest_text = NULL, *key = NULL;
+    uint64_t baseline = 0u, ack = 0u, durable = 0u, position = 0u;
+    uint64_t tenant = 0u, classification = 0u, sci = 0u, row_seq = 0u;
+    qihse_kv_ct_source_retained_frame_request_t req = {
+        .version = QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1, .size = sizeof(req),
+        .source_id = s->server->pqc.node_id,
+        .successor_id = s->server->pqc.replication_peer_node_id
+    };
+    bool valid = qihse_resp_repl_arg_string(&r->argv[3], 32u, false, &generation) &&
+        strlen(generation) == 32u;
+    for (size_t i = 0u; valid && i < 32u; ++i)
+        valid = (generation[i] >= '0' && generation[i] <= '9') ||
+            (generation[i] >= 'a' && generation[i] <= 'f');
+    valid = valid && strcmp(generation, s->server->ct_generation) == 0 &&
+        qihse_resp_repl_arg_string(&r->argv[5], 64u, false, &digest_text) &&
+        qihse_resp_ct_hex32_parse(digest_text, req.baseline_digest) &&
+        qihse_resp_repl_arg_string(&r->argv[9], 65535u, false, &key);
+    for (size_t i = 4u; valid && i < 14u; ++i) {
+        if (i == 5u || i == 9u) continue;
+        valid = r->argv[i].len > 0u && r->argv[i].len <= 20u;
+        for (size_t j = 0u; valid && j < r->argv[i].len; ++j)
+            valid = r->argv[i].data[j] >= '0' && r->argv[i].data[j] <= '9';
+    }
+    valid = valid && qihse_resp_parse_u64_arg(&r->argv[4], &baseline) &&
+        qihse_resp_parse_u64_arg(&r->argv[6], &ack) &&
+        qihse_resp_parse_u64_arg(&r->argv[7], &durable) &&
+        qihse_resp_parse_u64_arg(&r->argv[8], &position) &&
+        qihse_resp_parse_u64_arg(&r->argv[10], &tenant) && tenant <= UINT32_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[11], &classification) &&
+        classification <= UINT16_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[12], &sci) && sci <= UINT16_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[13], &row_seq) && row_seq != 0u;
+    req.generation = generation;
+    req.baseline_row_seq = baseline;
+    req.acknowledged_position = ack;
+    req.durable_position = durable;
+    req.stream_position = position;
+    req.key = key;
+    req.resource_tenant_id = (uint32_t)tenant;
+    req.classification = (uint16_t)classification;
+    req.sci_compartment = (uint16_t)sci;
+    req.row_change_seq = row_seq;
+    qihse_kv_ct_source_retained_frame_result_t out = {0};
+    bool ok = valid && qihse_kv_ct_source_retained_frame_v1(s->server->store,
+        s->user, &req, &out);
+    free(generation);
+    free(digest_text);
+    free(key);
+    OPENSSL_cleanse(req.baseline_digest, sizeof(req.baseline_digest));
+    if (!ok) return qihse_resp_error(s, "ERR CT1 source frame unavailable or denied");
+    char digest[65];
+    qihse_resp_ct_hex32(out.frame_sha256, digest);
+    bool sent = qihse_resp_array(s, 9u) &&
+        qihse_resp_bulk(s, out.frame, out.frame_length) &&
+        qihse_resp_bulk_text(s, digest) &&
+        qihse_resp_bulk_text(s, out.key) &&
+        qihse_resp_ct_bulk_u64(s, out.resource_tenant_id) &&
+        qihse_resp_ct_bulk_u64(s, out.classification) &&
+        qihse_resp_ct_bulk_u64(s, out.sci_compartment) &&
+        qihse_resp_ct_bulk_u64(s, out.stream_position) &&
+        qihse_resp_ct_bulk_u64(s, out.row_change_seq) &&
+        qihse_resp_ct_bulk_u64(s, out.expire_time_ms);
+    OPENSSL_cleanse(out.frame, out.frame_length);
+    free(out.frame);
+    free(out.key);
+    return sent;
+}
+
 static bool qihse_resp_handle_ct1_baseline_status(qihse_resp_session_t* s) {
     if (!qihse_resp_ct_source_allowed(s))
         return qihse_resp_error(s, "NOPERM CT1 baseline requires the configured successor QKP pin");
@@ -13630,7 +13758,12 @@ static bool qihse_resp_handle_ct1(qihse_resp_session_t* s,
     if (qihse_resp_arg_equal(&r->argv[1], "TARGET")) {
         if (r->argc == 3u && qihse_resp_arg_equal(&r->argv[2], "STATUS"))
             return qihse_resp_handle_ct1_target_status(s);
+        if (r->argc >= 3u && qihse_resp_arg_equal(&r->argv[2], "HISTORY-V1"))
+            return qihse_resp_handle_ct1_target_history_v1(s, r);
     }
+    if (qihse_resp_arg_equal(&r->argv[1], "SOURCE") && r->argc >= 3u &&
+        qihse_resp_arg_equal(&r->argv[2], "FRAME-V1"))
+        return qihse_resp_handle_ct1_source_frame_v1(s, r);
     if (qihse_resp_arg_equal(&r->argv[1], "BASELINE")) {
         if (r->argc == 3u && qihse_resp_arg_equal(&r->argv[2], "STATUS"))
             return qihse_resp_handle_ct1_baseline_status(s);

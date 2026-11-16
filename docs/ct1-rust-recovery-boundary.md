@@ -66,8 +66,17 @@ unforgeable across the ABI, and C must recheck it under the lock.
 
 ## Legacy receiver-history read API (first slice)
 
-`qihse_kv_ct_receiver_history_v1` in `include/qihse_kv_store.h` is a local,
-read-only native C query, not a Rust recovery control or production endpoint.
+`qihse_kv_ct_receiver_history_v1` in `include/qihse_kv_store.h` is a
+read-only native C query, not a Rust recovery control or production recovery
+endpoint. The legacy RESP transport is `REPL.CT1 TARGET HISTORY-V1 generation
+baseline_row_seq baseline_digest durable_cursor key resource_tenant_id
+classification sci_compartment` (11 RESP arguments including command and
+operation). It accepts only the configured successor's pinned source QKP peer
+mapped to the exact active replication service principal; Operator QKP sessions
+cannot bypass this gate. Source and target IDs come from server configuration,
+not wire arguments. It returns exactly four decimal bulk fields:
+`stream_position`, `row_change_seq`, `durable_cursor`, `row_seq_high_water`,
+with no key, value, protected payload, ACK or state mutation.
 It requires an active explicit replication/Operator principal, a versioned
 request, exact current legacy receiver source/target/generation, sealed baseline
 sequence and digest, current durable cursor, and one key, resource tenant and
@@ -83,20 +92,54 @@ A later same-key SET or changed latest version/labels invalidates the result.
 
 The QKV6 SHA-256 checks frame bytes, **not** QKP peer identity or source
 provenance. The group source ID and non-replica actor kind are persisted
-metadata, not cryptographic peer attestation. A future remote caller must
-still authenticate and pin QKP and separately verify the source's original
-pending frame. This result is neither a mutation authorization nor
-suppression, ACK, recovery admission or a way to advance the source or
-receiver cursor. It must be rechecked at any future
+metadata, not cryptographic peer attestation. The remote adapter pins the
+authenticated source QKP service peer, but does not attest the original pending
+source frame. Any future recovery controller must separately verify that frame
+against trusted source evidence. This result is neither mutation authorization,
+suppression, ACK, recovery admission nor a way to advance the source or receiver
+cursor. It must be rechecked at any future
 transition under the store lock; no such transition is supplied here.
 
 Migration note: this is an additive native C ABI (version 1); existing callers
 need no changes and stored data needs no migration or reindex. Consumers must
 rebuild against the updated header and library (`make lib`), construct the
 version/size-tagged request and check the boolean result before using any output.
-Only the isolated `make test-ct-storage` target validates this slice; Rust ABI,
-authenticated remote QKP tests, recovery crash cuts and deployment gates remain
-unmet.
+Validate storage with `make test-ct-storage` and the pinned-QKP read-only
+adapter with `python3 tests/test_ct_transfer.py Ct1RealDaemonTests -v`.
+Neither check enables Rust FFI or production recovery use; original pending
+frame attestation, recovery crash cuts and deployment gates remain unmet.
+
+## Legacy retained source frame read API (second slice)
+
+`qihse_kv_ct_source_retained_frame_v1` is a local, read-only native C query
+for a currently retained, unacknowledged single-SET source group. Its remote
+transport is `REPL.CT1 SOURCE FRAME-V1 generation baseline_row_seq
+baseline_digest acknowledged_position durable_position stream_position key
+resource_tenant_id classification sci_compartment row_change_seq` (14 RESP
+arguments including command and operation). Only a live, active replication
+service principal on the configured primary, authenticated as its exact pinned
+successor QKP node **and public key**, can call this transport. The primary's
+source and successor IDs come from local server configuration, never the wire;
+Operator/admin sessions and other trusted peers have no access. All wire
+fields are length/range bounded and compared against the current persisted
+source state and retained WAL. Failed requests return one generic denial with
+no frame or protected payload.
+
+A successful reply has nine bulk fields: original bounded QKV6 frame bytes,
+SHA-256 of those **exact bytes**, key, resource tenant ID, classification,
+SCI compartment, stream position, row change sequence and expiry time in
+milliseconds. The frame is captured during authorized decoding, not
+re-serialized. The native query checks the whole retained WAL through clean
+EOF and refuses inaccessible rows, bad identity/bounds, expired or ACKed
+frames, multi-row groups and malformed data. The read does not mutate state,
+ACK a group or establish cross-crash source authorship: QKV6's checksum and
+the frame hash authenticate neither the historical QKP peer nor a recovery
+decision. This endpoint grants no suppression, compensation, cursor advance,
+reconciliation or recovery permission. Any future recovery executor needs
+independent verified provenance and a fresh locked recheck; there is no
+production recovery call here. Isolated real-daemon transport checks are in
+`tests/test_ct_transfer.py` (`test_source_frame_v1_*`); native storage checks
+are separately owned in `tests/test_ct_storage.c`.
 
 ## Release gates
 

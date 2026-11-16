@@ -298,6 +298,53 @@ bool qihse_kv_ct_source_read(qihse_kv_store_t* store, qihse_user_t* principal,
     size_t max_bytes, qihse_kv_ct_group_t** out_groups, size_t* out_count,
     uint64_t* out_resume_seq);
 void qihse_kv_ct_groups_free(qihse_kv_ct_group_t* groups, size_t count);
+
+/* Local read-only legacy (non-lane, QCTST003) retained source query. Requires
+ * an active Operator or configured replication principal authorized for ALL
+ * retained frames. Exact persisted identity/bounds and clean WAL EOF must
+ * agree. Only an unacknowledged, unexpired, single-SET group is returned.
+ * No mutation, admission, ACK, remote peer attestation or recovery authority.
+ * The original QKV6 bytes are captured during authorized decoding, never
+ * reconstructed. Memory is bounded by the codec's per-frame limit, not WAL
+ * size. On success the caller owns frame and key and must free() both; key is
+ * NUL-terminated. Free a previous result before reuse. Failure zeroes out.
+ * SHA256 covers ALL original frame bytes, including its codec checksum. */
+#define QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1 1u
+typedef struct {
+    uint32_t version; /* QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1 */
+    uint32_t size;    /* sizeof(qihse_kv_ct_source_retained_frame_request_t) */
+    const char* source_id;
+    const char* successor_id;
+    const char* generation;
+    uint64_t baseline_row_seq;
+    unsigned char baseline_digest[32];
+    uint64_t acknowledged_position;
+    uint64_t durable_position;
+    uint64_t stream_position;
+    const char* key;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t row_change_seq;
+} qihse_kv_ct_source_retained_frame_request_t;
+typedef struct {
+    uint32_t version;
+    uint32_t size;
+    unsigned char* frame;
+    size_t frame_length;
+    unsigned char frame_sha256[32];
+    char* key;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t stream_position;
+    uint64_t row_change_seq;
+    uint64_t expire_time_ms;
+} qihse_kv_ct_source_retained_frame_result_t;
+bool qihse_kv_ct_source_retained_frame_v1(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    qihse_kv_ct_source_retained_frame_result_t* out);
 bool qihse_kv_ct_source_ack(qihse_kv_store_t* store, qihse_user_t* principal,
     const char* peer_id, const char* generation, uint64_t durable_lsn);
 /* Called only after pinned QKP peer STATUS. Re-arms a reopened or timed-out

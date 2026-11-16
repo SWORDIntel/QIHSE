@@ -5529,6 +5529,216 @@ bool qihse_kv_ct_source_read(qihse_kv_store_t* store, qihse_user_t* principal,
     return true;
 }
 
+/* Tee only bytes requested by the codec. The unbuffered cookie prevents
+ * read-ahead across its label authorization boundary or a frame boundary. */
+typedef struct {
+    FILE* input;
+    unsigned char* bytes;
+    size_t used, capacity;
+    uint64_t total, limit;
+    bool capture;
+} ct_retained_reader_t;
+
+static ssize_t ct_retained_read(void* context, char* buffer, size_t size) {
+    ct_retained_reader_t* reader = context;
+    if (size > reader->limit - reader->total)
+        size = (size_t)(reader->limit - reader->total);
+    if (!size) return 0;
+    if (reader->capture) {
+        if (size > QIHSE_CT_CODEC_MAX_FRAME - reader->used) {
+            errno = EFBIG; return -1;
+        }
+        size_t needed = reader->used + size;
+        if (needed > reader->capacity) {
+            size_t capacity = reader->capacity ? reader->capacity : 256u;
+            while (capacity < needed && capacity < QIHSE_CT_CODEC_MAX_FRAME)
+                capacity = capacity > QIHSE_CT_CODEC_MAX_FRAME / 2u ?
+                    QIHSE_CT_CODEC_MAX_FRAME : capacity * 2u;
+            unsigned char* bytes = realloc(reader->bytes, capacity);
+            if (!bytes) return -1;
+            reader->bytes = bytes;
+            reader->capacity = capacity;
+        }
+    }
+    size_t got = fread(buffer, 1u, size, reader->input);
+    if (!got && ferror(reader->input)) return -1;
+    if (reader->capture) {
+        memcpy(reader->bytes + reader->used, buffer, got);
+        reader->used += got;
+    }
+    reader->total += got;
+    return (ssize_t)got;
+}
+
+static bool ct_retained_state_read(kv_ct_disk_t* disk) {
+    char path[4096], extra;
+    if (!build_data_path(path, sizeof(path), "ct-state.bin")) return false;
+    int fd = open_secure_read(path);
+    if (fd < 0) return false;
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && st.st_size == (off_t)sizeof(*disk) &&
+        st.st_uid == geteuid() && !(st.st_mode & 077) && st.st_nlink == 1 &&
+        read(fd, disk, sizeof(*disk)) == (ssize_t)sizeof(*disk) &&
+        read(fd, &extra, 1u) == 0 && !memcmp(disk->magic, "QCTST003", 8u) &&
+        disk->checksum == fnv1a64_update(14695981039346656037ULL, disk,
+                                         offsetof(kv_ct_disk_t, checksum));
+    if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+bool qihse_kv_ct_source_retained_frame_v1(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    qihse_kv_ct_source_retained_frame_result_t* out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!store || !out || !request ||
+        request->version != QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1 ||
+        request->size != sizeof(*request) ||
+        !ct_id_valid(request->source_id) || !ct_id_valid(request->successor_id) ||
+        !ct_id_valid(request->generation) || !request->key || !*request->key ||
+        strnlen(request->key, KV_MAX_KEY_LEN + 1u) > KV_MAX_KEY_LEN ||
+        !request->row_change_seq ||
+        request->stream_position <= request->acknowledged_position ||
+        request->stream_position > request->durable_position ||
+        !ct_replication_principal(store, principal) ||
+        !qihse_auth_can_access(principal, request->classification,
+                               request->sci_compartment)) return false;
+    kv_store_rdlock(store);
+    bool ok = false;
+    ct_retained_reader_t reader = { .capture = true };
+    qihse_kv_ct_source_retained_frame_result_t result = {0};
+    FILE* input = NULL;
+    if (!store->ct_enabled || store->ct_mode != 1u || store->ct_lane_count ||
+        store->memory_snapshot || store->recovery_pending ||
+        !store->ct_baseline_sealed || store->ct_transfer_phase == 1u ||
+        strcmp(store->ct_source_id, request->source_id) ||
+        strcmp(store->ct_successor_id, request->successor_id) ||
+        strcmp(store->ct_generation, request->generation) ||
+        store->ct_baseline_lsn != request->baseline_row_seq ||
+        memcmp(store->ct_baseline_digest, request->baseline_digest, 32u) ||
+        store->ct_ack_lsn != request->acknowledged_position ||
+        store->ct_durable_lsn != request->durable_position ||
+        !store->ct_retained_bytes ||
+        store->ct_retained_bytes > store->ct_limit_bytes) goto done;
+    kv_ct_disk_t disk, final_disk;
+    if (!ct_retained_state_read(&disk) || disk.mode != 1u ||
+        disk.baseline_sealed != 1u || disk.baseline_lsn != store->ct_baseline_lsn ||
+        memcmp(disk.baseline_digest, store->ct_baseline_digest, 32u) ||
+        disk.ack_lsn != store->ct_ack_lsn || disk.durable_lsn != store->ct_durable_lsn ||
+        disk.retained_bytes != store->ct_retained_bytes ||
+        disk.limit_bytes != store->ct_limit_bytes ||
+        disk.tenant_policy != (uint32_t)store->ct_tenant_policy ||
+        disk.tenant_id != store->ct_tenant_id ||
+        disk.fence_state != store->ct_fence_state ||
+        disk.transfer_phase != store->ct_transfer_phase ||
+        memcmp(disk.source_id, store->ct_source_id, sizeof(disk.source_id)) ||
+        memcmp(disk.successor_id, store->ct_successor_id, sizeof(disk.successor_id)) ||
+        memcmp(disk.generation, store->ct_generation, sizeof(disk.generation)) ||
+        memcmp(disk.owner_token, store->ct_owner_token, sizeof(disk.owner_token)) ||
+        memcmp(disk.last_group_digest, store->ct_last_group_digest, 32u)) goto done;
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "wal.log")) goto done;
+    int fd = open_secure_read(path);
+    if (fd < 0) goto done;
+    struct stat st, final_st;
+    bool valid = fstat(fd, &st) == 0 && st.st_size > 0 &&
+        (uint64_t)st.st_size == store->ct_retained_bytes &&
+        st.st_uid == geteuid() && !(st.st_mode & 077) && st.st_nlink == 1;
+    if (!valid) { close(fd); goto done; }
+    reader.input = fdopen(fd, "rb");
+    if (!reader.input) { close(fd); goto done; }
+    if (setvbuf(reader.input, NULL, _IONBF, 0u) != 0) goto done;
+    reader.limit = store->ct_retained_bytes;
+    cookie_io_functions_t io = { .read = ct_retained_read };
+    input = fopencookie(&reader, "r", io);
+    if (!input || setvbuf(input, NULL, _IONBF, 0u) != 0) goto done;
+    uint64_t position = 0u, row_seq = store->ct_baseline_lsn;
+    while (position < store->ct_durable_lsn) {
+        qihse_kv_ct_group_t group = {0};
+        uint8_t mode = 0u;
+        size_t frame_bytes = 0u;
+        uint64_t before = reader.total;
+        if (reader.capture) reader.used = 0u;
+        int rc = qihse_ct_codec_read(input, principal,
+            QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, QIHSE_CT_CODEC_MAX_FRAME,
+            &group, &mode, &frame_bytes);
+        valid = rc == 1 && mode == QIHSE_CT_CODEC_MODE_SOURCE &&
+            !strcmp(group.source_id, request->source_id) &&
+            !strcmp(group.generation, request->generation) &&
+            group.stream_position <= store->ct_durable_lsn &&
+            (position ? group.stream_position == position + 1u :
+                group.stream_position <= store->ct_ack_lsn + 1u) &&
+            group.first_seq > row_seq &&
+            group.last_seq <= __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE) &&
+            reader.total - before == frame_bytes;
+        if (valid && group.stream_position == request->stream_position) {
+            const qihse_kv_ct_record_t* row = &group.records[0];
+            valid = group.count == 1u && !row->tombstone &&
+                !strcmp(row->key, request->key) &&
+                row->resource_tenant_id == request->resource_tenant_id &&
+                row->classification == request->classification &&
+                row->sci_compartment == request->sci_compartment &&
+                row->change_seq == request->row_change_seq &&
+                (!row->expire_time_ms || row->expire_time_ms > current_time_ms()) &&
+                reader.used == frame_bytes;
+            if (valid) {
+                result.key = group.records[0].key;
+                group.records[0].key = NULL;
+                result.resource_tenant_id = row->resource_tenant_id;
+                result.classification = row->classification;
+                result.sci_compartment = row->sci_compartment;
+                result.row_change_seq = row->change_seq;
+                result.expire_time_ms = row->expire_time_ms;
+                result.stream_position = group.stream_position;
+                result.frame_length = frame_bytes;
+                reader.capture = false;
+            }
+        }
+        position = group.stream_position;
+        row_seq = group.last_seq;
+        qihse_ct_codec_clear(&group);
+        if (!valid) goto done;
+    }
+    /* Do not publish a candidate found before a corrupt/trailing WAL suffix. */
+    if (!result.key || reader.total != reader.limit || ferror(input) ||
+        fgetc(reader.input) != EOF || ferror(reader.input) ||
+        fstat(fd, &final_st) != 0 || st.st_size != final_st.st_size ||
+        st.st_mtim.tv_sec != final_st.st_mtim.tv_sec ||
+        st.st_mtim.tv_nsec != final_st.st_mtim.tv_nsec ||
+        st.st_ctim.tv_sec != final_st.st_ctim.tv_sec ||
+        st.st_ctim.tv_nsec != final_st.st_ctim.tv_nsec ||
+        !ct_retained_state_read(&final_disk) ||
+        memcmp(&disk, &final_disk, sizeof(disk))) goto done;
+    int current_fd = open_secure_read(path);
+    valid = current_fd >= 0 && fstat(current_fd, &final_st) == 0 &&
+        final_st.st_dev == st.st_dev && final_st.st_ino == st.st_ino;
+    if (current_fd >= 0 && close(current_fd) != 0) valid = false;
+    unsigned int digest_len = 0u;
+    if (!valid || EVP_Digest(reader.bytes, reader.used, result.frame_sha256,
+            &digest_len, EVP_sha256(), NULL) != 1 || digest_len != 32u ||
+        !ct_replication_principal(store, principal) ||
+        !qihse_auth_can_access(principal, result.classification, result.sci_compartment) ||
+        (result.expire_time_ms && result.expire_time_ms <= current_time_ms())) goto done;
+    if (reader.capacity > reader.used)
+        OPENSSL_cleanse(reader.bytes + reader.used, reader.capacity - reader.used);
+    result.version = QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1;
+    result.size = sizeof(result);
+    ok = true;
+done:
+    if (input && fclose(input) != 0) ok = false;
+    if (reader.input && fclose(reader.input) != 0) ok = false;
+    kv_store_unlock(store);
+    if (ok) {
+        result.frame = reader.bytes;
+        *out = result;
+    } else {
+        if (reader.bytes) OPENSSL_cleanse(reader.bytes, reader.capacity);
+        free(reader.bytes);
+        free(result.key);
+    }
+    return ok;
+}
+
 bool qihse_kv_ct_receiver_bind(qihse_kv_store_t* store, qihse_user_t* principal,
     const char* source_id, const char* target_id, const char* generation,
     qihse_kv_ct_tenant_policy_t tenant_policy, uint32_t tenant_id,
@@ -5666,6 +5876,10 @@ bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
         if (fd < 0) goto done;
         FILE* sst = fdopen(fd, "rb");
         if (!sst) { close(fd); goto done; }
+        if (setvbuf(sst, NULL, _IONBF, 0u) != 0) {
+            fclose(sst);
+            goto done;
+        }
         kv_disk_record_t row;
         const kv_read_context_t context = { .user = principal };
         int rc = fseeko(sst, (off_t)offset, SEEK_SET) == 0 ?
@@ -5691,6 +5905,10 @@ bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
     if (!state_ok) { close(fd); goto done; }
     FILE* input = fdopen(fd, "rb");
     if (!input) { close(fd); goto done; }
+    if (setvbuf(input, NULL, _IONBF, 0u) != 0) {
+        fclose(input);
+        goto done;
+    }
     uint64_t position = 0u, matched_position = 0u, matched_seq = 0u;
     bool valid = true;
     while (position < request->durable_cursor) {
@@ -5732,7 +5950,9 @@ bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
                 __atomic_load_n(&store->change_seq, __ATOMIC_ACQUIRE);
     }
     fclose(input);
-    if (valid) {
+    if (valid && ct_replication_principal(store, principal) &&
+        qihse_auth_can_access(principal, request->classification,
+                              request->sci_compartment)) {
         *out = (qihse_kv_ct_receiver_history_result_t){
             .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1, .size = sizeof(*out),
             .stream_position = matched_position, .row_change_seq = matched_seq,

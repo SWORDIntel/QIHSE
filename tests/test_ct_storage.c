@@ -3,6 +3,7 @@
 #endif
 #include <assert.h>
 #include <fcntl.h>
+#include <openssl/evp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,207 @@ static char* ct_large_payload(void) {
     return value;
 }
 
+static void ct_retained_frame_fixture(void) {
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+    qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+    assert(op);
+    qihse_user_t* low = qihse_auth_create_user(op, 8301u, QIHSE_ROLE_ANALYST,
+                                                0u, 0u, "CtStorageLow1!", false);
+    qihse_user_t* service = qihse_auth_create_user(op, 8302u, QIHSE_ROLE_ANALYST,
+                                                    5u, 2u, "CtStorageService1!", false);
+    assert(low && service);
+    qihse_kv_store_t* s = qihse_kv_store_create_user(op);
+    assert(s);
+    assert(qihse_kv_ct_source_enable(s, op, "source:frame", "target:frame",
+                                     "gen:frame", NULL, 128u * 1024u * 1024u));
+    qihse_kv_store_set_replication_principal_id(s, 8302u);
+    unsigned char token[QIHSE_KV_CT_TOKEN_BYTES], baseline[32];
+    assert(qihse_kv_ct_owner_token_get(s, op, token));
+    qihse_kv_replica_snapshot_t* snapshot = NULL;
+    uint64_t baseline_seq = 0u;
+    assert(qihse_kv_ct_source_baseline_snapshot_create(s, op, &snapshot,
+        &baseline_seq, baseline) == 0 && snapshot);
+    qihse_kv_replica_snapshot_destroy(snapshot);
+    assert(qihse_kv_ct_source_reconcile_peer(s, op, service, "target:frame",
+                                             "gen:frame", baseline, 0u));
+    qihse_kv_ct_writer_scope_t* scope = NULL;
+    assert(qihse_kv_ct_writer_scope_enter(s, op, token, &scope));
+    assert(qihse_kv_set_user(s, "commons/frame-high", "retained-secret-unique",
+                             6u, 2u, op));
+    qihse_kv_ct_source_status_t status = {0};
+    assert(qihse_kv_ct_source_status(s, op, &status) &&
+           status.durable_lsn == 1u && status.acknowledged_lsn == 0u);
+    qihse_kv_ct_group_t* groups = NULL;
+    size_t count = 0u;
+    uint64_t resume = 0u;
+    assert(qihse_kv_ct_source_read(s, op, "gen:frame", 0u, 1u, 65536u,
+                                   &groups, &count, &resume));
+    assert(count == 1u && resume == 1u && groups[0].count == 1u &&
+           !groups[0].records[0].tombstone &&
+           strcmp(groups[0].records[0].value, "retained-secret-unique") == 0);
+    qihse_kv_ct_source_retained_frame_request_t req = {
+        .version = QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1, .size = sizeof(req),
+        .source_id = "source:frame", .successor_id = "target:frame",
+        .generation = "gen:frame", .baseline_row_seq = baseline_seq,
+        .acknowledged_position = status.acknowledged_lsn,
+        .durable_position = status.durable_lsn, .stream_position = 1u,
+        .key = groups[0].records[0].key,
+        .resource_tenant_id = groups[0].records[0].resource_tenant_id,
+        .classification = groups[0].records[0].classification,
+        .sci_compartment = groups[0].records[0].sci_compartment,
+        .row_change_seq = groups[0].records[0].change_seq};
+    memcpy(req.baseline_digest, baseline, sizeof(baseline));
+    qihse_kv_ct_source_retained_frame_result_t frame = {0};
+#define FRAME_DENIED(principal) do { \
+    memset(&frame, 0xa5, sizeof(frame)); \
+    assert(!qihse_kv_ct_source_retained_frame_v1(s, principal, &req, &frame)); \
+    qihse_kv_ct_source_retained_frame_result_t empty = {0}; \
+    assert(memcmp(&frame, &empty, sizeof(frame)) == 0); \
+} while (0)
+    assert(qihse_kv_ct_source_retained_frame_v1(s, op, &req, &frame));
+    char wal_path[512];
+    assert(snprintf(wal_path, sizeof(wal_path), "%s/wal.log",
+                    getenv("QIHSE_DATA_DIR")) > 0);
+    int fd = open(wal_path, O_RDWR | O_CLOEXEC);
+    assert(fd >= 0);
+    struct stat st;
+    assert(fstat(fd, &st) == 0 && st.st_size > 4 &&
+           (uint64_t)st.st_size == status.retained_bytes &&
+           frame.frame_length == (size_t)st.st_size &&
+           memcmp(frame.frame, "QKV6", 4u) == 0);
+    unsigned char* original = malloc(frame.frame_length);
+    assert(original && pread(fd, original, frame.frame_length, 0) ==
+           (ssize_t)frame.frame_length);
+    unsigned char digest[32];
+    unsigned int digest_length = 0u;
+    assert(memcmp(frame.frame, original, frame.frame_length) == 0 &&
+           EVP_Digest(original, frame.frame_length, digest, &digest_length,
+                      EVP_sha256(), NULL) == 1 && digest_length == 32u &&
+           memcmp(frame.frame_sha256, digest, 32u) == 0 &&
+           frame.version == QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1 &&
+           frame.size == sizeof(frame) &&
+           strcmp(frame.key, req.key) == 0 &&
+           frame.resource_tenant_id == req.resource_tenant_id &&
+           frame.classification == req.classification &&
+           frame.sci_compartment == req.sci_compartment &&
+           frame.stream_position == req.stream_position &&
+           frame.row_change_seq == req.row_change_seq &&
+           frame.expire_time_ms == groups[0].records[0].expire_time_ms);
+    size_t original_length = frame.frame_length;
+    free(frame.frame);
+    free(frame.key);
+    qihse_kv_store_set_replication_principal_id(s, 8301u);
+    FRAME_DENIED(low); /* Authorized replicator, insufficient row clearance. */
+    qihse_kv_store_set_replication_principal_id(s, 8302u);
+    FRAME_DENIED(service);
+    FRAME_DENIED(NULL);
+    req.source_id = "source:wrong"; FRAME_DENIED(op); req.source_id = "source:frame";
+    req.successor_id = "target:wrong"; FRAME_DENIED(op); req.successor_id = "target:frame";
+    req.generation = "gen:wrong"; FRAME_DENIED(op); req.generation = "gen:frame";
+    req.baseline_row_seq++; FRAME_DENIED(op); req.baseline_row_seq--;
+    req.baseline_digest[0] ^= 1u; FRAME_DENIED(op); req.baseline_digest[0] ^= 1u;
+    req.acknowledged_position++; FRAME_DENIED(op); req.acknowledged_position--;
+    req.durable_position++; FRAME_DENIED(op); req.durable_position--;
+    req.stream_position = 0u; FRAME_DENIED(op); req.stream_position = 1u;
+    req.stream_position = 2u; FRAME_DENIED(op); req.stream_position = 1u;
+    req.key = "commons/wrong"; FRAME_DENIED(op); req.key = groups[0].records[0].key;
+    req.resource_tenant_id++; FRAME_DENIED(op); req.resource_tenant_id--;
+    req.classification--; FRAME_DENIED(op); req.classification++;
+    req.sci_compartment = 0u; FRAME_DENIED(op); req.sci_compartment = 2u;
+    req.row_change_seq++; FRAME_DENIED(op); req.row_change_seq--;
+    req.version++; FRAME_DENIED(op); req.version--;
+    req.size--; FRAME_DENIED(op); req.size++;
+    const char* saved_key = groups[0].records[0].key;
+    groups[0].records[0].key = "commons/frame-old!";
+    assert(strlen(saved_key) == strlen(groups[0].records[0].key));
+    FILE* stale_file = tmpfile();
+    size_t stale_length = 0u;
+    assert(stale_file && qihse_ct_codec_write(stale_file, op,
+           QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, 1u, &groups[0], 65536u,
+           &stale_length) && stale_length == original_length &&
+           fflush(stale_file) == 0 && fseek(stale_file, 0, SEEK_SET) == 0);
+    unsigned char* stale_frame = malloc(stale_length);
+    assert(stale_frame && fread(stale_frame, 1u, stale_length, stale_file) ==
+           stale_length && fclose(stale_file) == 0);
+    groups[0].records[0].key = (char*)saved_key;
+    assert(pwrite(fd, stale_frame, stale_length, 0) == (ssize_t)stale_length &&
+           fsync(fd) == 0);
+    FRAME_DENIED(op); /* Valid, same-length frame from a stale row. */
+    assert(pwrite(fd, original, original_length, 0) == (ssize_t)original_length &&
+           fsync(fd) == 0);
+    free(stale_frame);
+    assert(pwrite(fd, "X", 1u, 0) == 1 && fsync(fd) == 0);
+    FRAME_DENIED(op); /* Bad QKV6 magic, even with the expected file length. */
+    assert(pwrite(fd, original, 1u, 0) == 1);
+    unsigned char altered = original[original_length - 1u] ^ 1u;
+    assert(pwrite(fd, &altered, 1u, (off_t)original_length - 1) == 1 &&
+           fsync(fd) == 0);
+    FRAME_DENIED(op); /* Frame checksum mismatch. */
+    assert(pwrite(fd, original + original_length - 1u, 1u,
+                  (off_t)original_length - 1) == 1 && fsync(fd) == 0);
+    assert(pwrite(fd, "QKV6", 4u, (off_t)original_length) == 4 &&
+           fsync(fd) == 0);
+    FRAME_DENIED(op); /* Trailing WAL bytes cannot be ignored. */
+    assert(ftruncate(fd, (off_t)original_length - 1) == 0 && fsync(fd) == 0);
+    FRAME_DENIED(op); /* Incomplete retained frame. */
+    assert(pwrite(fd, original + original_length - 1u, 1u,
+                  (off_t)original_length - 1) == 1 && fsync(fd) == 0);
+    assert(qihse_kv_ct_source_retained_frame_v1(s, op, &req, &frame));
+    free(frame.frame);
+    free(frame.key);
+    free(original);
+    assert(close(fd) == 0);
+    qihse_kv_ct_groups_free(groups, count);
+    assert(qihse_kv_ct_source_ack(s, op, "target:frame", "gen:frame", 1u));
+    FRAME_DENIED(op); /* Stale ACK/durable binding. */
+    assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+    assert(qihse_kv_ct_writer_scope_enter(s, op, token, &scope));
+    assert(qihse_kv_del_user(s, "commons/frame-high", op));
+    assert(qihse_kv_ct_source_status(s, op, &status) && status.durable_lsn == 2u);
+    req.acknowledged_position = 1u; req.durable_position = 2u;
+    req.stream_position = 2u; req.row_change_seq++;
+    FRAME_DENIED(op); /* The retained DEL is not a single SET. */
+    assert(qihse_kv_ct_source_ack(s, op, "target:frame", "gen:frame", 2u));
+    assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+    assert(qihse_kv_ct_writer_scope_enter(s, op, token, &scope));
+    assert(qihse_kv_set_user(s, "commons/frame-ttl", "ttl-value", 0u, 0u, op));
+    assert(qihse_kv_ct_source_ack(s, op, "target:frame", "gen:frame", 3u));
+    assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+    assert(qihse_kv_ct_writer_scope_enter(s, op, token, &scope));
+    assert(qihse_kv_expire(s, "commons/frame-ttl", 60000u, op));
+    assert(qihse_kv_ct_source_status(s, op, &status) && status.durable_lsn == 4u);
+    groups = NULL; count = 0u; resume = 0u;
+    assert(qihse_kv_ct_source_read(s, op, "gen:frame", 3u, 1u, 65536u,
+                                   &groups, &count, &resume) && count == 1u);
+    req.acknowledged_position = 3u; req.durable_position = 4u;
+    req.stream_position = 4u; req.key = groups[0].records[0].key;
+    req.classification = 0u; req.sci_compartment = 0u;
+    req.row_change_seq = groups[0].records[0].change_seq;
+    assert(qihse_kv_ct_source_retained_frame_v1(s, op, &req, &frame) &&
+           frame.expire_time_ms == groups[0].records[0].expire_time_ms &&
+           frame.expire_time_ms > 0u);
+    free(frame.frame);
+    free(frame.key);
+    qihse_kv_ct_groups_free(groups, count);
+    assert(qihse_kv_ct_source_ack(s, op, "target:frame", "gen:frame", 4u));
+    assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
+    assert(qihse_kv_ct_writer_scope_enter(s, op, token, &scope));
+    assert(qihse_kv_expire(s, "commons/frame-ttl", 0u, op));
+    assert(qihse_kv_ct_source_status(s, op, &status) && status.durable_lsn == 5u);
+    req.acknowledged_position = 4u; req.durable_position = 5u;
+    req.stream_position = 5u; req.row_change_seq++;
+    FRAME_DENIED(op); /* A single SET with an expired TTL is not eligible. */
+    qihse_kv_ct_writer_scope_leave(scope);
+    qihse_kv_store_destroy(s);
+#undef FRAME_DENIED
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "retained-frame") == 0) {
+        ct_retained_frame_fixture();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "source-highwater") == 0) {
         assert(qihse_auth_init());
         assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
@@ -849,6 +1050,17 @@ int main(int argc, char** argv) {
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char retained_dir[] = "./ct_source_retained_XXXXXX";
+    assert(mkdtemp(retained_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", retained_dir, 1) == 0);
+        execl(argv[0], argv[0], "retained-frame", (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     char highwater_dir[] = "./ct_source_highwater_XXXXXX";
     assert(mkdtemp(highwater_dir));
     child = fork();
@@ -908,6 +1120,7 @@ int main(int argc, char** argv) {
     aimem_fixture_cleanup(mismatch_dir);
     aimem_fixture_cleanup(expired_dir);
     aimem_fixture_cleanup(highwater_dir);
+    aimem_fixture_cleanup(retained_dir);
     aimem_fixture_cleanup(stale_dir);
     aimem_fixture_cleanup(dir);
     puts("ct storage: PASS");
