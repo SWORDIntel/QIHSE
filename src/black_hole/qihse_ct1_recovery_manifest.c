@@ -2,8 +2,10 @@
 #define _GNU_SOURCE
 #endif
 #include "qihse_ct1_recovery_manifest.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <string.h>
 #include <sys/file.h>
@@ -343,6 +345,141 @@ bool qihse_ct1_recovery_spend(const char* path,
             fsync(fd) == 0) ok = true;
     }
     if (close(fd)) ok = false;
+    return ok;
+}
+/* A same-inode replacement or in-place write is detected by identity and
+ * timestamps, in addition to the independently streamed content digest. */
+static bool frozen_same(const struct stat* a, const struct stat* b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_uid == b->st_uid && a->st_gid == b->st_gid &&
+        a->st_mode == b->st_mode && a->st_nlink == b->st_nlink &&
+        a->st_size == b->st_size &&
+        a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+        a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+        a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+        a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+static bool frozen_dir_ok(const struct stat* st, bool final) {
+    return S_ISDIR(st->st_mode) &&
+        (st->st_uid == 0 || st->st_uid == geteuid()) &&
+        !(st->st_mode & (final ? 077 : 022)) &&
+        (!final || st->st_uid == geteuid());
+}
+/* Reject empty, dot (except a single leading ./), dot-dot and overlong
+ * components; never ask openat to interpret a slash-containing component. */
+static int frozen_open_dir(const char* path) {
+    if (!path || !*path || strnlen(path, 4097) > 4096) return -1;
+    int fd = open(path[0] == '/' ? "/" : ".",
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) || !frozen_dir_ok(&st, false)) goto fail;
+    const char* p = path + (path[0] == '/');
+    if (p[0] == '.' && p[1] == '/') p += 2;
+    if (!*p) goto fail;
+    while (*p) {
+        const char* end = strchr(p, '/');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (!n || n > 255 || (n == 1 && p[0] == '.') ||
+            (n == 2 && p[0] == '.' && p[1] == '.') ||
+            (end && !end[1])) goto fail;
+        char component[256];
+        memcpy(component, p, n); component[n] = 0;
+        int next = openat(fd, component, O_RDONLY | O_DIRECTORY |
+            O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (next < 0) goto fail;
+        close(fd); fd = next;
+        if (fstat(fd, &st) || !frozen_dir_ok(&st, !end)) goto fail;
+        p = end ? end + 1 : p + n;
+    }
+    return fd;
+fail:
+    close(fd);
+    return -1;
+}
+static bool frozen_entries(int fd, const qihse_ct1_recovery_file_t* files,
+    size_t count) {
+    int scan = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+        O_NONBLOCK | O_CLOEXEC);
+    if (scan < 0) return false;
+    DIR* dir = fdopendir(scan);
+    if (!dir) { close(scan); return false; }
+    unsigned seen = 0;
+    bool ok = true;
+    struct dirent* entry;
+    errno = 0;
+    while ((entry = readdir(dir))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        size_t i = 0;
+        for (; i < count; ++i)
+            if (!strcmp(entry->d_name, files[i].filename)) break;
+        if (i == count || (seen & (1u << i))) { ok = false; break; }
+        seen |= 1u << i;
+        errno = 0;
+    }
+    if (!entry && errno) ok = false;
+    if (closedir(dir)) ok = false;
+    return ok && seen == (1u << count) - 1u;
+}
+static bool frozen_file(int dir, const qihse_ct1_recovery_file_t* file) {
+    int fd = openat(dir, file->filename,
+        O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat before, after, named;
+    bool ok = fstat(fd, &before) == 0 && S_ISREG(before.st_mode) &&
+        before.st_uid == geteuid() && before.st_nlink == 1 &&
+        ((before.st_mode & 07777) == 0600 ||
+         (before.st_mode & 07777) == 0400) &&
+        before.st_size >= 0 && (uint64_t)before.st_size == file->size;
+    EVP_MD_CTX* ctx = ok ? EVP_MD_CTX_new() : NULL;
+    if (ok) ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
+    uint64_t total = 0;
+    unsigned char block[16384], digest[32];
+    while (ok) {
+        ssize_t n = read(fd, block, sizeof(block));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 || (uint64_t)n > file->size - total) { ok = false; break; }
+        if (!n) break;
+        total += (uint64_t)n;
+        ok = EVP_DigestUpdate(ctx, block, (size_t)n) == 1;
+    }
+    unsigned digest_len = 0;
+    if (ok) ok = total == file->size &&
+        EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1 &&
+        digest_len == sizeof(digest) &&
+        memcmp(digest, file->sha256, sizeof(digest)) == 0 &&
+        fstat(fd, &after) == 0 && frozen_same(&before, &after) &&
+        fstatat(dir, file->filename, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+        frozen_same(&after, &named);
+    EVP_MD_CTX_free(ctx);
+    if (close(fd)) ok = false;
+    return ok;
+}
+bool qihse_ct1_recovery_verify_frozen(const char* frozen_dir,
+    const qihse_ct1_recovery_manifest_t* manifest, bool source) {
+    if (!shape(manifest)) return false;
+    const qihse_ct1_recovery_file_t* files = source ?
+        manifest->source_files : manifest->target_files;
+    size_t count = source ? QIHSE_CT1_RECOVERY_SOURCE_FILES :
+        QIHSE_CT1_RECOVERY_TARGET_FILES;
+    int dir = frozen_open_dir(frozen_dir);
+    if (dir < 0) return false;
+    struct stat before, after, reopened;
+    bool ok = fstat(dir, &before) == 0 && frozen_entries(dir, files, count);
+    for (size_t i = 0; ok && i < count; ++i)
+        ok = frozen_file(dir, &files[i]);
+    if (ok) ok = frozen_entries(dir, files, count);
+    /* A second full pass catches changes to earlier files while later ones
+     * were being read; this is evidence, not a writer-exclusion lock. */
+    for (size_t i = 0; ok && i < count; ++i)
+        ok = frozen_file(dir, &files[i]);
+    if (ok) ok = frozen_entries(dir, files, count) &&
+        fstat(dir, &after) == 0 && frozen_same(&before, &after);
+    int check = frozen_open_dir(frozen_dir);
+    if (ok) ok = check >= 0 && fstat(check, &reopened) == 0 &&
+        frozen_same(&after, &reopened);
+    if (check >= 0 && close(check)) ok = false;
+    if (close(dir)) ok = false;
     return ok;
 }
 bool qihse_ct1_recovery_issuer_authorized(void) { return false; }

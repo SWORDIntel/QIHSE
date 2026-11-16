@@ -1,9 +1,10 @@
 # Rust-first CT1 recovery boundary (design, not a recovery procedure)
 
 Status: **design only** beyond the structural `rust/ct1-recovery` `compare()`,
-its fixed-width `qihse_ct1_structural_evidence_evaluate_v1` FFI-shaped
-evaluator (not yet built or linked for C callers), and the pinned read-only
-TARGET HISTORY-V1 / SOURCE FRAME-V1 C and RESP queries below. B's legacy CT1
+its fixed-width `qihse_ct1_structural_evidence_evaluate_v1` ABI (linked only
+by an opt-in standalone C/Rust smoke, not by the production library), the
+structural frozen-file verifier, and the pinned read-only TARGET HISTORY-V1 /
+SOURCE FRAME-V1 C and RESP queries below. B's legacy CT1
 source owner remains stopped, with its original pending SET group at position
 11111; the successor is sealed at cursor 11110. Its source-authored same-key
 tombstone is at 11103. The sample row sequences in the Rust fixture are
@@ -27,7 +28,12 @@ tombstone at 11103/5729450, sealed cursor 11110 and high-water 5729457.
 These fixture-principal queries are **offline** checks: they provide neither
 live pinned-QKP evidence nor historical source-authorship attestation. A store
 open can write audit data and repair WAL tails; do not open the frozen evidence
-or verified working copies to repeat the queries.
+or verified working copies to repeat the queries. The opt-in
+`qihse_ct1_recovery_verify_frozen()` streams the complete 8/7 native-file
+roster from a private directory with no-follow path traversal, exact size/hash
+checks and repeat scans. It does not authenticate an issuer, exclude writers,
+prove historical authorship or freeze two nodes atomically; its result is not a
+recovery authorization.
 
 ## Existing split
 

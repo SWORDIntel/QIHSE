@@ -91,6 +91,12 @@ bool qihse_ct1_recovery_load(const char* path, bool receipt,
  * token. Caller must not perform protected work based on this return value. */
 bool qihse_ct1_recovery_spend(const char* path,
     const qihse_ct1_recovery_manifest_t* expected, uint64_t now_ms);
+/* Structural evidence only: independently stream-hash the complete source or
+ * target roster in a caller-supplied frozen directory. Never grants access or
+ * authenticates an issuer. Requires private, caller-owned regular files and a
+ * private final directory under trusted, non-writable directory ancestors. */
+bool qihse_ct1_recovery_verify_frozen(const char* frozen_dir,
+    const qihse_ct1_recovery_manifest_t* manifest, bool source);
 /* Deliberately fail-closed integration hook. Actual approval requires QKP
  * Operator issuer authentication, current pin checks and RESP/core policy. */
 bool qihse_ct1_recovery_issuer_authorized(void);

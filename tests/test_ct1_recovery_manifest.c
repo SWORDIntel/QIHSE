@@ -248,6 +248,119 @@ static void check_receipt(const char* path, const char* torn, const char* link) 
     assert(!qihse_ct1_recovery_load(torn, true, &actual, &spent));
     assert(!qihse_ct1_recovery_spend(torn, &m, 1500));
 }
+static void fixture_file(char* out, size_t capacity, const char* dir,
+    const char* name) {
+    int n = snprintf(out, capacity, "%s/%s", dir, name);
+    assert(n > 0 && (size_t)n < capacity);
+}
+static void fixture_roster(const char* dir, qihse_ct1_recovery_file_t* files,
+    size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        char path[256];
+        fixture_file(path, sizeof(path), dir, files[i].filename);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        assert(fd >= 0);
+        unsigned char bytes[128];
+        memset(bytes, (int)(i + 1), sizeof(bytes));
+        size_t len = files[i].kind == QIHSE_CT1_FILE_SLOT_JOURNAL_LOCK ?
+            0 : 80 + i;
+        assert(write(fd, bytes, len) == (ssize_t)len);
+        assert(close(fd) == 0);
+        files[i].size = len;
+        assert(SHA256(bytes, len, files[i].sha256));
+    }
+}
+static void check_frozen(const char* root) {
+    qihse_ct1_recovery_manifest_t m = sample(false), wrong;
+    char source[256], target[256], link_dir[256], path[256], other[256];
+    fixture_file(source, sizeof(source), root, "frozen-source");
+    fixture_file(target, sizeof(target), root, "frozen-target");
+    fixture_file(link_dir, sizeof(link_dir), root, "frozen-link");
+    assert(mkdir(source, 0700) == 0 && mkdir(target, 0700) == 0);
+    fixture_roster(source, m.source_files, QIHSE_CT1_RECOVERY_SOURCE_FILES);
+    fixture_roster(target, m.target_files, QIHSE_CT1_RECOVERY_TARGET_FILES);
+#define VERIFY_BOTH() do { \
+    assert(qihse_ct1_recovery_verify_frozen(source, &m, true)); \
+    assert(qihse_ct1_recovery_verify_frozen(target, &m, false)); \
+    assert(!qihse_ct1_recovery_issuer_authorized()); \
+} while (0)
+    VERIFY_BOTH();
+    assert(!qihse_ct1_recovery_verify_frozen(source, NULL, true));
+    assert(!qihse_ct1_recovery_verify_frozen(NULL, &m, true));
+    wrong = m; wrong.target_files[0].sha256[0] ^= 1;
+    assert(!qihse_ct1_recovery_verify_frozen(target, &wrong, false));
+    fixture_file(path, sizeof(path), source, m.source_files[0].filename);
+    assert(unlink(path) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(source, &m, true));
+    /* Restore identical bytes, then mutate without changing the file length. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0);
+    unsigned char bytes[128]; memset(bytes, 1, sizeof(bytes));
+    assert(write(fd, bytes, m.source_files[0].size) ==
+        (ssize_t)m.source_files[0].size && close(fd) == 0);
+    VERIFY_BOTH();
+    fd = open(path, O_WRONLY);
+    assert(fd >= 0);
+    unsigned char changed_byte = 42;
+    assert(pwrite(fd, &changed_byte, 1, 0) == 1 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(source, &m, true));
+    fd = open(path, O_WRONLY);
+    assert(fd >= 0 && pwrite(fd, bytes, 1, 0) == 1 && close(fd) == 0);
+    VERIFY_BOTH();
+    fixture_file(other, sizeof(other), target, "unexpected.sidecar");
+    fd = open(other, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && close(fd) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(target, &m, false));
+    assert(unlink(other) == 0);
+    fixture_file(path, sizeof(path), target, m.target_files[1].filename);
+    assert(unlink(path) == 0 && symlink("wal.log", path) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(target, &m, false));
+    assert(unlink(path) == 0 && mkfifo(path, 0600) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(target, &m, false));
+    assert(unlink(path) == 0);
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0);
+    memset(bytes, 2, sizeof(bytes));
+    assert(write(fd, bytes, m.target_files[1].size) ==
+        (ssize_t)m.target_files[1].size && close(fd) == 0);
+    VERIFY_BOTH();
+    fixture_file(other, sizeof(other), root, "hardlink");
+    assert(link(path, other) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(target, &m, false));
+    assert(unlink(other) == 0);
+    assert(chmod(path, 0644) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(target, &m, false));
+    assert(chmod(path, 0600) == 0);
+    VERIFY_BOTH();
+    assert(symlink("frozen-source", link_dir) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(link_dir, &m, true));
+    fixture_file(path, sizeof(path), link_dir, m.source_files[0].filename);
+    assert(!qihse_ct1_recovery_verify_frozen(path, &m, true));
+    assert(!qihse_ct1_recovery_verify_frozen("../frozen-source", &m, true));
+    assert(!qihse_ct1_recovery_verify_frozen("././frozen-source", &m, true));
+    assert(unlink(link_dir) == 0);
+    /* This link is an intermediate component, not the final directory. */
+    int n = snprintf(link_dir, sizeof(link_dir), "%s-link", root);
+    assert(n > 0 && (size_t)n < sizeof(link_dir));
+    assert(symlink(root, link_dir) == 0);
+    fixture_file(path, sizeof(path), link_dir, "frozen-source");
+    assert(!qihse_ct1_recovery_verify_frozen(path, &m, true));
+    assert(unlink(link_dir) == 0);
+    assert(chmod(source, 0750) == 0);
+    assert(!qihse_ct1_recovery_verify_frozen(source, &m, true));
+    assert(chmod(source, 0700) == 0);
+    VERIFY_BOTH();
+    for (size_t i = 0; i < QIHSE_CT1_RECOVERY_SOURCE_FILES; ++i) {
+        fixture_file(path, sizeof(path), source, m.source_files[i].filename);
+        assert(unlink(path) == 0);
+    }
+    for (size_t i = 0; i < QIHSE_CT1_RECOVERY_TARGET_FILES; ++i) {
+        fixture_file(path, sizeof(path), target, m.target_files[i].filename);
+        assert(unlink(path) == 0);
+    }
+    assert(rmdir(source) == 0 && rmdir(target) == 0);
+#undef VERIFY_BOTH
+}
 int main(void) {
     char dir[] = "./ct1-recovery-test-XXXXXX";
     assert(mkdtemp(dir));
@@ -255,7 +368,7 @@ int main(void) {
     assert(snprintf(receipt, sizeof(receipt), "%s/receipt", dir) > 0);
     assert(snprintf(torn, sizeof(torn), "%s/torn", dir) > 0);
     assert(snprintf(link, sizeof(link), "%s/link", dir) > 0);
-    check_wire(); check_receipt(receipt, torn, link);
+    check_wire(); check_receipt(receipt, torn, link); check_frozen(dir);
     assert(unlink(receipt) == 0 && unlink(torn) == 0 && rmdir(dir) == 0);
     puts("CT1 B structural receipt checks passed (issuer binding remains denied)");
     return 0;
