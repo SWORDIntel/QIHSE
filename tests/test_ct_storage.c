@@ -7,10 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "qihse_auth.h"
+#include "qihse_audit.h"
 #include "qihse_ct_codec.h"
 #include "qihse_kv_store.h"
 #include "aimem_fixture_cleanup.h"
@@ -36,6 +38,31 @@ static void seed_recovery_fence(const char* path, const char* generation,
     assert(fd >= 0 && write(fd, record, variant == 2 ? 20u : sizeof(record)) ==
            (ssize_t)(variant == 2 ? 20u : sizeof(record)) &&
            fsync(fd) == 0 && close(fd) == 0);
+}
+
+static bool ct_receipt_value(uint64_t seq, char* out, size_t cap, void* context) {
+    (void)context;
+    int n = snprintf(out, cap, "DONE:%llu", (unsigned long long)seq);
+    return n > 0 && (size_t)n < cap;
+}
+
+static void ct_wal_fingerprint(int fd, off_t* size, unsigned char digest[32]) {
+    struct stat st;
+    assert(fstat(fd, &st) == 0 && st.st_size >= 0);
+    *size = st.st_size;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    assert(ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1);
+    unsigned char bytes[4096];
+    for (off_t offset = 0; offset < st.st_size;) {
+        size_t count = st.st_size - offset < (off_t)sizeof(bytes)
+            ? (size_t)(st.st_size - offset) : sizeof(bytes);
+        assert(pread(fd, bytes, count, offset) == (ssize_t)count &&
+               EVP_DigestUpdate(ctx, bytes, count) == 1);
+        offset += (off_t)count;
+    }
+    unsigned int digest_len = 0u;
+    assert(EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1 && digest_len == 32u);
+    EVP_MD_CTX_free(ctx);
 }
 
 static char* ct_large_payload(void) {
@@ -242,7 +269,233 @@ static void ct_retained_frame_fixture(void) {
 #undef FRAME_DENIED
 }
 
+static bool ct_stale_receipt_builder(uint64_t seq, char* out, size_t capacity,
+                                     void* context) {
+    unsigned* calls = context;
+    (*calls)++;
+    int n = snprintf(out, capacity, "D:%llu", (unsigned long long)seq);
+    return n > 0 && (size_t)n < capacity;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && (strcmp(argv[1], "prebind-delete-receipt") == 0 ||
+                      strcmp(argv[1], "lane-prebind-delete-receipt") == 0)) {
+        bool lane = strcmp(argv[1], "lane-prebind-delete-receipt") == 0;
+        char dir[] = "./ct_prebind_delete_receipt_XXXXXX";
+        umask(0077);
+        assert(mkdtemp(dir));
+        assert(setenv("QIHSE_DATA_DIR", dir, 1) == 0);
+        assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
+        assert(qihse_auth_init());
+        assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+        qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+        assert(op);
+        qihse_kv_store_t* stale = qihse_kv_store_create_user(op);
+        assert(stale);
+        const char* source_key = "commons/prebind-source";
+        const char* receipt_key = "commons/prebind-receipt";
+        uint64_t source_seq = 0u, receipt_seq = 0u;
+        assert(qihse_kv_set_user_with_seq(stale, source_key, "protected", 4u, 2u,
+                                         op, &source_seq) && source_seq != 0u);
+        assert(qihse_kv_set_user_with_seq(stale, receipt_key, "P", 4u, 2u,
+                                         op, &receipt_seq) && receipt_seq != 0u);
+        assert(qihse_kv_sync_store(stale));
+        qihse_kv_ct_transfer_status_t initial = {0};
+        assert(qihse_kv_ct_transfer_status(stale, op, &initial) && initial.mode == 0u);
+        char wal_path[512];
+        assert(snprintf(wal_path, sizeof(wal_path), "%s/wal.log", dir) > 0);
+        int old_wal = open(wal_path, O_RDONLY | O_CLOEXEC);
+        assert(old_wal >= 0);
+        qihse_kv_store_t* peer = qihse_kv_store_create_user(op);
+        assert(peer);
+        char lane_id[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+        memset(lane_id, 'a', sizeof(lane_id) - 1u);
+        lane_id[sizeof(lane_id) - 1u] = '\0';
+        if (lane) {
+            uint8_t slots[QIHSE_KV_CT_SLOT_BITMAP_BYTES];
+            memset(slots, 0xff, sizeof(slots));
+            unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
+            assert(qihse_kv_ct_lane_source_enable(peer, op, lane_id, slots,
+                "source:receipt", "target:receipt", "gen:receipt", token,
+                128u * 1024u * 1024u));
+        } else {
+            assert(qihse_kv_ct_source_enable(peer, op, "source:receipt",
+                "target:receipt", "gen:receipt", NULL, 128u * 1024u * 1024u));
+        }
+        /* The pre-bind handle may still reference a rotated WAL inode. */
+        int active_wal = open(wal_path, O_RDONLY | O_CLOEXEC);
+        assert(active_wal >= 0);
+        off_t old_size, active_size, after_size;
+        unsigned char old_digest[32], active_digest[32], after_digest[32];
+        ct_wal_fingerprint(old_wal, &old_size, old_digest);
+        ct_wal_fingerprint(active_wal, &active_size, active_digest);
+        unsigned calls = 0u;
+        uint64_t delete_seq = 99u;
+        assert(!qihse_kv_del_with_receipt_user(stale, source_key, source_seq,
+            receipt_key, "P", 4u, 2u, ct_stale_receipt_builder, &calls, op,
+            &delete_seq));
+        assert(delete_seq == 0u && calls == 0u);
+        ct_wal_fingerprint(old_wal, &after_size, after_digest);
+        assert(old_size == after_size && memcmp(old_digest, after_digest, 32u) == 0);
+        ct_wal_fingerprint(active_wal, &after_size, after_digest);
+        assert(active_size == after_size && memcmp(active_digest, after_digest, 32u) == 0);
+        qihse_kv_store_destroy(stale);
+        ct_wal_fingerprint(old_wal, &after_size, after_digest);
+        assert(old_size == after_size && memcmp(old_digest, after_digest, 32u) == 0);
+        ct_wal_fingerprint(active_wal, &after_size, after_digest);
+        assert(active_size == after_size && memcmp(active_digest, after_digest, 32u) == 0);
+        assert(close(old_wal) == 0 && close(active_wal) == 0);
+        qihse_kv_store_destroy(peer);
+        peer = qihse_kv_store_create_user(op);
+        assert(peer);
+        qihse_user_t* service = qihse_auth_create_user(op, 8302u, QIHSE_ROLE_ANALYST,
+            5u, 2u, "CtStorageService1!", false);
+        assert(service);
+        qihse_kv_store_set_replication_principal_id(peer, 8302u);
+        qihse_kv_replica_snapshot_t* snapshot = NULL;
+        uint64_t baseline_seq = 0u;
+        unsigned char baseline[32];
+        if (lane) {
+            assert(qihse_kv_ct_lane_source_baseline_snapshot_create(peer, op,
+                lane_id, &snapshot, &baseline_seq, baseline) == 0 && snapshot);
+            assert(qihse_kv_ct_lane_source_reconcile_peer(peer, op, service, lane_id,
+                "target:receipt", "gen:receipt", baseline, 0u));
+        } else {
+            assert(qihse_kv_ct_source_baseline_snapshot_create(peer, op, &snapshot,
+                &baseline_seq, baseline) == 0 && snapshot);
+            assert(qihse_kv_ct_source_reconcile_peer(peer, op, service, "target:receipt",
+                "gen:receipt", baseline, 0u));
+        }
+        qihse_kv_replica_snapshot_destroy(snapshot);
+        char* value = qihse_kv_get_user(peer, source_key, op);
+        assert(value && strcmp(value, "protected") == 0);
+        free(value);
+        value = qihse_kv_get_user(peer, receipt_key, op);
+        assert(value && strcmp(value, "P") == 0);
+        free(value);
+        qihse_kv_record_meta_t meta = {0};
+        assert(qihse_kv_meta_user(peer, source_key, op, &meta) &&
+               meta.change_seq == source_seq);
+        assert(qihse_kv_meta_user(peer, receipt_key, op, &meta) &&
+               meta.change_seq == receipt_seq);
+        qihse_kv_store_destroy(peer);
+        qihse_audit_shutdown();
+        aimem_fixture_cleanup(dir);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "source-stale") == 0) {
+        assert(qihse_auth_init());
+        assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+        qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+        assert(op);
+        qihse_kv_store_t* source = qihse_kv_store_create_user(op);
+        assert(source && qihse_kv_ct_source_enable(source, op, "source:1",
+            "target:1", "gen:1", NULL, 128u * 1024u * 1024u));
+        qihse_kv_store_t* peer = qihse_kv_store_create_user(op);
+        assert(peer);
+        qihse_kv_replica_snapshot_t* snapshot = NULL;
+        uint64_t row_seq = 0u;
+        unsigned char digest[32];
+        assert(qihse_kv_ct_source_baseline_snapshot_create(source, op,
+            &snapshot, &row_seq, digest) == 0 && snapshot);
+        qihse_kv_replica_snapshot_destroy(snapshot);
+        char path[512];
+        assert(snprintf(path, sizeof(path), "%s/ct-baseline.qfs",
+            getenv("QIHSE_DATA_DIR")) > 0);
+        struct stat before, after;
+        assert(stat(path, &before) == 0);
+        snapshot = NULL;
+        assert(qihse_kv_ct_source_baseline_snapshot_create(peer, op,
+            &snapshot, &row_seq, digest) != 0 && snapshot == NULL);
+        assert(stat(path, &after) == 0 && before.st_dev == after.st_dev &&
+               before.st_ino == after.st_ino && before.st_size == after.st_size);
+        qihse_kv_store_destroy(peer);
+        qihse_kv_store_destroy(source);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "lane-stale") == 0) {
+        assert(qihse_auth_init());
+        assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+        qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+        assert(op);
+        qihse_kv_store_t* first = qihse_kv_store_create_user(op);
+        assert(first);
+        uint8_t a[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+        uint8_t b[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+        uint8_t c[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+        a[0] = 1u; b[0] = 2u; c[0] = 4u;
+        char lane_a[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+        char lane_b[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+        char lane_c[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+        memset(lane_a, 'a', sizeof(lane_a) - 1u); lane_a[sizeof(lane_a) - 1u] = '\0';
+        memset(lane_b, 'b', sizeof(lane_b) - 1u); lane_b[sizeof(lane_b) - 1u] = '\0';
+        memset(lane_c, 'c', sizeof(lane_c) - 1u); lane_c[sizeof(lane_c) - 1u] = '\0';
+        unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
+        assert(qihse_kv_ct_lane_source_enable(first, op, lane_a, a,
+            "source:a", "target:a", "gen:a", token, 16u * 1024u * 1024u));
+        qihse_kv_store_t* peer = qihse_kv_store_create_user(op);
+        assert(peer);
+        assert(qihse_kv_ct_lane_source_enable(first, op, lane_b, b,
+            "source:b", "target:b", "gen:b", token, 16u * 1024u * 1024u));
+        char baseline_path[512];
+        assert(snprintf(baseline_path, sizeof(baseline_path), "%s/ct-baseline-%s.bin",
+            getenv("QIHSE_DATA_DIR"), lane_a) > 0);
+        assert(access(baseline_path, F_OK) != 0);
+        qihse_kv_replica_snapshot_t* snapshot = NULL;
+        uint64_t row_seq = 0u;
+        unsigned char digest[32];
+        assert(qihse_kv_ct_lane_source_baseline_snapshot_create(peer, op, lane_a,
+            &snapshot, &row_seq, digest) != 0 && snapshot == NULL);
+        assert(access(baseline_path, F_OK) != 0);
+        assert(!qihse_kv_ct_lane_source_enable(peer, op, lane_c, c,
+            "source:c", "target:c", "gen:c", token, 16u * 1024u * 1024u));
+        qihse_kv_store_destroy(peer);
+        qihse_kv_store_destroy(first);
+        return 0;
+    }
+    if (argc == 5 && strcmp(argv[1], "recovery-fence-held") == 0) {
+        assert(qihse_auth_init());
+        assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+        qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+        assert(op);
+        qihse_user_t* service = qihse_auth_create_user(op, 8302u,
+            QIHSE_ROLE_ANALYST, 5u, 2u, "CtStorageService1!", false);
+        assert(service);
+        qihse_kv_store_t* existing = qihse_kv_store_create_user(op);
+        assert(existing);
+        qihse_kv_store_set_replication_principal_id(existing, 8302u);
+        FILE* f = fopen(argv[2], "rb");
+        assert(f);
+        qihse_kv_ct_group_t group = {0}, next = {0};
+        uint8_t mode = 0u;
+        size_t bytes = 0u;
+        assert(qihse_ct_codec_read(f, op, QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+            65536u, &group, &mode, &bytes) == 1);
+        assert(qihse_ct_codec_read(f, op, QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u,
+            65536u, &next, &mode, &bytes) == 1);
+        fclose(f);
+        int ready = atoi(argv[3]), proceed = atoi(argv[4]);
+        int dirfd = open(getenv("QIHSE_DATA_DIR"), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        assert(dirfd >= 0 && flock(dirfd, LOCK_EX | LOCK_NB) == 0);
+        assert(write(ready, "l", 1u) == 1);
+        char signal;
+        assert(read(proceed, &signal, 1u) == 1 && signal == 'u');
+        assert(flock(dirfd, LOCK_UN) == 0 && close(dirfd) == 0);
+        assert(write(ready, "r", 1u) == 1);
+        assert(read(proceed, &signal, 1u) == 1 && signal == 'g');
+        uint64_t denied_cursor = 99u, cut = 99u;
+        unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
+        assert(qihse_kv_ct_owner_token_get(existing, op, token));
+        assert(!qihse_kv_ct_receiver_apply(existing, service, &next,
+                                            &denied_cursor) && denied_cursor == 0u);
+        assert(!qihse_kv_ct_fence_range(existing, op, "transfer:held", 1u, 1u,
+                                         token, &cut) && cut == 0u);
+        assert(!qihse_kv_replica_cursor_advance(existing, "source:1", "*", 2u, op));
+        assert(!qihse_kv_sync_store(existing));
+        qihse_kv_sweep_expired(existing);
+        qihse_audit_shutdown();
+        _exit(0); /* crash with an already-open store handle */
+    }
     if (argc == 2 && (strcmp(argv[1], "recovery-fence-crash") == 0 ||
                       strcmp(argv[1], "recovery-fence-reopen") == 0)) {
         assert(qihse_auth_init());
@@ -327,6 +580,8 @@ int main(int argc, char** argv) {
                       strcmp(argv[1], "receiver-expired") == 0 ||
                       strcmp(argv[1], "receiver-stale") == 0 ||
                       strcmp(argv[1], "receiver-stale-expired") == 0 ||
+                      strcmp(argv[1], "prebind-stale") == 0 ||
+                      strcmp(argv[1], "prebind-buffered") == 0 ||
                       strcmp(argv[1], "receiver-history") == 0 ||
                       strcmp(argv[1], "receiver-history-set") == 0 ||
                       strcmp(argv[1], "recovery-fence") == 0)) {
@@ -346,6 +601,39 @@ int main(int argc, char** argv) {
         assert(service);
         qihse_kv_store_t* receiver = qihse_kv_store_create_user(op);
         assert(receiver);
+        qihse_kv_store_t* prebind_peer = strcmp(argv[1], "prebind-stale") == 0
+            ? qihse_kv_store_create_user(op) : NULL;
+        uint64_t receipt_source_seq = 0u;
+        int prebind_wal = -1;
+        if (strcmp(argv[1], "prebind-stale") == 0) assert(prebind_peer);
+        if (prebind_peer) {
+            char path[512];
+            assert(snprintf(path, sizeof(path), "%s/wal.log", getenv("QIHSE_DATA_DIR")) > 0);
+            prebind_wal = open(path, O_RDONLY | O_CLOEXEC);
+            assert(prebind_wal >= 0);
+            assert(qihse_kv_set_user_with_seq(prebind_peer, "commons/receipt-source",
+                "source", 0u, 0u, op, &receipt_source_seq));
+            assert(qihse_kv_set_user(prebind_peer, "commons/receipt-prepared", "P",
+                0u, 0u, op));
+        }
+        bool buffered = strcmp(argv[1], "prebind-buffered") == 0;
+        qihse_kv_store_t* pending = buffered ? qihse_kv_store_create_user(op) : NULL;
+        int old_wal = -1;
+        char buffered_wal_path[512];
+        off_t old_size = 0, old_after = 0, active_size = 0, active_after = 0;
+        unsigned char old_digest[32], old_after_digest[32];
+        unsigned char active_digest[32], active_after_digest[32];
+        if (buffered) {
+            assert(pending);
+            assert(snprintf(buffered_wal_path, sizeof(buffered_wal_path), "%s/wal.log",
+                getenv("QIHSE_DATA_DIR")) > 0);
+            old_wal = open(buffered_wal_path, O_RDONLY | O_CLOEXEC);
+            assert(old_wal >= 0);
+            ct_wal_fingerprint(old_wal, &old_size, old_digest);
+            assert(qihse_kv_set_user(pending, "commons/buffered", "prebind", 0u, 0u, op));
+            ct_wal_fingerprint(old_wal, &old_after, old_after_digest);
+            assert(old_size == old_after && memcmp(old_digest, old_after_digest, 32u) == 0);
+        }
         qihse_kv_store_set_replication_principal_id(receiver, 8302u);
         qihse_kv_ct_receiver_status_t denied_status = {0};
         assert(!qihse_kv_ct_receiver_status(receiver, low, &denied_status));
@@ -359,14 +647,133 @@ int main(int argc, char** argv) {
         assert(qihse_kv_ct_receiver_bind(receiver, op, "source:1", "target:1",
                                           "gen:1", QIHSE_KV_CT_TENANT_SYSTEM_ALL,
                                           0u, baseline_seq, NULL));
+        if (prebind_peer) {
+            /* The pre-bind mode-0 handle still holds a valid local pair. No
+             * delete/receipt frame may reach either WAL inode after binding. */
+            char path[512];
+            assert(snprintf(path, sizeof(path), "%s/wal.log", getenv("QIHSE_DATA_DIR")) > 0);
+            int active_wal = open(path, O_RDONLY | O_CLOEXEC);
+            assert(active_wal >= 0);
+            off_t old_size, active_size, after_size;
+            unsigned char old_digest[32], active_digest[32], after_digest[32];
+            ct_wal_fingerprint(prebind_wal, &old_size, old_digest);
+            ct_wal_fingerprint(active_wal, &active_size, active_digest);
+            uint64_t denied_seq = 99u;
+            assert(!qihse_kv_del_with_receipt_user(prebind_peer,
+                "commons/receipt-source", receipt_source_seq,
+                "commons/receipt-prepared", "P", 0u, 0u,
+                ct_receipt_value, NULL, op, &denied_seq) && denied_seq == 0u);
+            ct_wal_fingerprint(prebind_wal, &after_size, after_digest);
+            assert(old_size == after_size && memcmp(old_digest, after_digest, 32u) == 0);
+            ct_wal_fingerprint(active_wal, &after_size, after_digest);
+            assert(active_size == after_size && memcmp(active_digest, after_digest, 32u) == 0);
+            assert(close(prebind_wal) == 0 && close(active_wal) == 0);
+            /* This must fail even before a recovery intent exists on disk. */
+            assert(!qihse_kv_set_user(prebind_peer, "commons/prebind", "bad", 0u, 0u, op));
+            assert(!qihse_kv_ct_receiver_bind(prebind_peer, op, "source:2", "target:2",
+                "gen:2", QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, baseline_seq, NULL));
+            assert(!qihse_kv_ct_source_enable(prebind_peer, op, "source:2", "target:2",
+                "gen:2", NULL, 128u * 1024u * 1024u));
+        }
         unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
         assert(qihse_kv_ct_owner_token_get(receiver, op, token));
         assert(!qihse_kv_ct_receiver_install_baseline(receiver, low, service, "source:1",
             "gen:1", argv[2], baseline_seq, digest, token));
         assert(!qihse_kv_ct_receiver_install_baseline(receiver, op, low, "source:1",
             "gen:1", argv[2], baseline_seq, digest, token));
+        if (strcmp(argv[1], "recovery-fence") == 0) {
+            char unsealed_path[512];
+            assert(snprintf(unsealed_path, sizeof(unsealed_path),
+                "%s/ct1-recovery-fence.bin", getenv("QIHSE_DATA_DIR")) > 0);
+            seed_recovery_fence(unsealed_path, "gen:1", baseline_seq, digest, 0u, 0);
+            assert(!qihse_kv_ct_receiver_install_baseline(receiver, op, service,
+                "source:1", "gen:1", argv[2], baseline_seq, digest, token));
+            qihse_kv_ct_receiver_status_t unsealed = {0};
+            assert(qihse_kv_ct_receiver_status(receiver, op, &unsealed) &&
+                   !unsealed.baseline_sealed && unsealed.durable_cursor == 0u);
+            assert(qihse_kv_store_create_user(op) == NULL);
+            qihse_kv_store_destroy(receiver);
+            assert(unlink(unsealed_path) == 0);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver);
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            assert(qihse_kv_ct_owner_token_get(receiver, op, token));
+        }
         assert(qihse_kv_ct_receiver_install_baseline(receiver, op, service, "source:1",
             "gen:1", argv[2], baseline_seq, digest, token));
+        if (buffered) {
+            char marker_path[512];
+            assert(snprintf(marker_path, sizeof(marker_path),
+                "%s/ct1-recovery-fence.bin", getenv("QIHSE_DATA_DIR")) > 0);
+            assert(qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:1", baseline_seq, digest, 0u));
+            int active_wal = open(buffered_wal_path, O_RDONLY | O_CLOEXEC);
+            assert(active_wal >= 0);
+            ct_wal_fingerprint(active_wal, &active_size, active_digest);
+            qihse_kv_store_destroy(pending);
+            ct_wal_fingerprint(old_wal, &old_after, old_after_digest);
+            ct_wal_fingerprint(active_wal, &active_after, active_after_digest);
+            assert(old_size == old_after && memcmp(old_digest, old_after_digest, 32u) == 0);
+            assert(active_size == active_after &&
+                   memcmp(active_digest, active_after_digest, 32u) == 0);
+            assert(close(old_wal) == 0 && close(active_wal) == 0);
+            assert(unlink(marker_path) == 0);
+            assert(qihse_kv_store_create_user(op) == NULL);
+            assert(!qihse_kv_set_user(receiver, "commons/buffered", "late", 0u, 0u, op));
+            qihse_kv_store_destroy(receiver);
+            return 0;
+        }
+        if (prebind_peer) {
+            char state_path[512], marker_path[512], wal_path[512], export_path[512];
+            assert(snprintf(state_path, sizeof(state_path), "%s/ct-state.bin",
+                getenv("QIHSE_DATA_DIR")) > 0);
+            assert(snprintf(export_path, sizeof(export_path), "%s/stale-export.bin",
+                getenv("QIHSE_DATA_DIR")) > 0);
+            assert(snprintf(marker_path, sizeof(marker_path), "%s/ct1-recovery-fence.bin",
+                getenv("QIHSE_DATA_DIR")) > 0);
+            assert(snprintf(wal_path, sizeof(wal_path), "%s/wal.log",
+                getenv("QIHSE_DATA_DIR")) > 0);
+            assert(qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:1", baseline_seq, digest, 0u));
+            FILE* state = fopen(state_path, "rb");
+            assert(state && fseek(state, 0, SEEK_END) == 0);
+            long length = ftell(state);
+            assert(length > 0 && fseek(state, 0, SEEK_SET) == 0);
+            unsigned char* before = malloc((size_t)length);
+            unsigned char* after = malloc((size_t)length);
+            assert(before && after && fread(before, 1u, (size_t)length, state) == (size_t)length);
+            struct stat wal_before, wal_after;
+            assert(stat(wal_path, &wal_before) == 0);
+            assert(qihse_kv_save_user(prebind_peer, export_path, op) != 0 &&
+                   access(export_path, F_OK) != 0);
+            assert(qihse_kv_save_user(prebind_peer, state_path, op) != 0);
+            assert(!qihse_kv_set_user(prebind_peer, "commons/unauthorized", "bad", 0u, 0u, op));
+            assert(!qihse_kv_del_user(prebind_peer, "commons/unauthorized", op));
+            assert(!qihse_kv_ct_receiver_bind(prebind_peer, op, "source:2", "target:2",
+                "gen:2", QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, baseline_seq, NULL));
+            assert(!qihse_kv_ct_source_enable(prebind_peer, op, "source:2", "target:2",
+                "gen:2", NULL, 128u * 1024u * 1024u));
+            assert(unlink(marker_path) == 0);
+            assert(qihse_kv_save_user(prebind_peer, export_path, op) != 0 &&
+                   access(export_path, F_OK) != 0);
+            assert(qihse_kv_save_user(prebind_peer, state_path, op) != 0);
+            assert(!qihse_kv_set_user(prebind_peer, "commons/unauthorized", "bad", 0u, 0u, op));
+            assert(!qihse_kv_del_user(prebind_peer, "commons/unauthorized", op));
+            assert(!qihse_kv_ct_receiver_bind(prebind_peer, op, "source:2", "target:2",
+                "gen:2", QIHSE_KV_CT_TENANT_SYSTEM_ALL, 0u, baseline_seq, NULL));
+            assert(!qihse_kv_ct_source_enable(prebind_peer, op, "source:2", "target:2",
+                "gen:2", NULL, 128u * 1024u * 1024u));
+            assert(stat(wal_path, &wal_after) == 0 && wal_before.st_size == wal_after.st_size);
+            assert(fclose(state) == 0);
+            state = fopen(state_path, "rb");
+            assert(state && fread(after, 1u, (size_t)length, state) == (size_t)length &&
+                memcmp(before, after, (size_t)length) == 0 &&
+                fgetc(state) == EOF && fclose(state) == 0);
+            free(after); free(before);
+            qihse_kv_store_destroy(prebind_peer);
+            qihse_kv_store_destroy(receiver);
+            return 0;
+        }
         FILE* f = fopen(argv[3], "rb");
         assert(f);
         qihse_kv_ct_group_t group = {0};
@@ -408,10 +815,73 @@ int main(int argc, char** argv) {
             assert(snprintf(held_path, sizeof(held_path), "%s/invalid-symlink",
                             getenv("QIHSE_DATA_DIR")) > 0);
             assert(rename(marker_path, held_path) == 0);
-            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 0);
             receiver = qihse_kv_store_create_user(op);
-            assert(receiver);
+            qihse_kv_store_t* peer = qihse_kv_store_create_user(op);
+            assert(receiver && peer); /* both handles predate the intent */
             qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            qihse_kv_store_set_replication_principal_id(peer, 8302u);
+            /* Audit grants one writer per directory: hand off its lock while
+             * the child independently opens the same receiver directory. */
+            qihse_audit_shutdown();
+            int ready[2], proceed[2];
+            assert(pipe(ready) == 0 && pipe(proceed) == 0);
+            pid_t child = fork();
+            assert(child >= 0);
+            if (child == 0) {
+                close(ready[0]); close(proceed[1]);
+                char ready_text[24], proceed_text[24];
+                assert(snprintf(ready_text, sizeof(ready_text), "%d", ready[1]) > 0);
+                assert(snprintf(proceed_text, sizeof(proceed_text), "%d", proceed[0]) > 0);
+                execl(argv[0], argv[0], "recovery-fence-held", argv[3],
+                      ready_text, proceed_text, (char*)NULL);
+                _exit(99);
+            }
+            close(ready[1]); close(proceed[0]);
+            char signal;
+            assert(read(ready[0], &signal, 1u) == 1 && signal == 'l');
+            assert(qihse_kv_store_create_user(op) == NULL); /* open cannot replay under peer lock */
+            assert(!qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:1", baseline_seq, digest, 1u)); /* bounded lock refusal */
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
+                   cursor == 0u);
+            uint64_t blocked_cut = 99u;
+            assert(!qihse_kv_ct_fence_range(receiver, op, "transfer:held", 1u, 1u,
+                                             token, &blocked_cut) && blocked_cut == 0u);
+            assert(!qihse_kv_replica_cursor_advance(receiver,
+                "source:1", "*", 2u, op));
+            assert(write(proceed[1], "u", 1u) == 1);
+            assert(read(ready[0], &signal, 1u) == 1 && signal == 'r');
+            assert(!qihse_kv_ct_receiver_recovery_fence_install(receiver, low,
+                "gen:1", baseline_seq, digest, 1u));
+            assert(!qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:wrong", baseline_seq, digest, 1u));
+            assert(!qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:1", baseline_seq, digest, 0u));
+            assert(qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:1", baseline_seq, digest, 1u));
+            assert(!qihse_kv_ct_receiver_recovery_fence_install(receiver, op,
+                "gen:1", baseline_seq, digest, 1u));
+            assert(write(proceed[1], "g", 1u) == 1);
+            close(proceed[1]); close(ready[0]);
+            int child_status = 0;
+            assert(waitpid(child, &child_status, 0) == child &&
+                   WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+            qihse_audit_init();
+            assert(!qihse_kv_ct_receiver_apply(peer, service, &group2, &cursor) &&
+                   cursor == 0u);
+            assert(!qihse_kv_ct_fence_range(peer, op, "transfer:peer", 1u, 1u,
+                                             token, &blocked_cut) && blocked_cut == 0u);
+            assert(!qihse_kv_replica_cursor_advance(peer, "source:1", "*", 2u, op));
+            qihse_kv_replica_snapshot_t* denied_peer_snapshot = NULL;
+            assert(qihse_kv_replica_snapshot_create(peer, op, "*",
+                &denied_peer_snapshot) != 0 && denied_peer_snapshot == NULL);
+            assert(unlink(marker_path) == 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* CT-state denial survives removal */
+            assert(!qihse_kv_ct_receiver_apply(peer, service, &group2, &cursor));
+            assert(qihse_kv_replica_snapshot_create(peer, op, "*",
+                &denied_peer_snapshot) != 0 && denied_peer_snapshot == NULL);
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 0);
+            qihse_kv_store_destroy(peer);
             qihse_kv_ct_receiver_status_t fenced = {0};
             assert(qihse_kv_ct_receiver_status(receiver, op, &fenced) &&
                    fenced.durable_cursor == 1u && fenced.baseline_sealed &&
@@ -419,6 +889,14 @@ int main(int argc, char** argv) {
                    memcmp(fenced.baseline_digest, digest, 32u) == 0);
             assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
                    cursor == 0u);
+            qihse_kv_ct_proof_t* promotion = qihse_kv_ct_promotion_proof_create(
+                receiver, op, "source:1", "target:1", "gen:1", 1u);
+            assert(promotion);
+            assert(!qihse_kv_ct_receiver_promote(receiver, op, promotion,
+                "gen:2", "successor:2", token));
+            qihse_kv_ct_proof_destroy(promotion);
+            assert(!qihse_kv_ct_source_reconcile(receiver, op,
+                "target:1", "gen:1", digest, 1u));
             assert(qihse_kv_replica_snapshot_create(receiver, op, "*", &ordinary) != 0 &&
                    ordinary == NULL);
             assert(qihse_kv_get_user(receiver, group.records[0].key, op) == NULL);
@@ -825,6 +1303,18 @@ int main(int argc, char** argv) {
         return 0;
     }
     assert(argc == 1);
+    for (unsigned i = 0u; i < 2u; i++) {
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            execl(argv[0], argv[0], i ? "lane-prebind-delete-receipt" :
+                  "prebind-delete-receipt", (char*)NULL);
+            _exit(99);
+        }
+        int status = 0;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 0);
+    }
     char dir[] = "./ct_storage_XXXXXX";
     umask(0077);
     assert(mkdtemp(dir));
@@ -1169,6 +1659,52 @@ int main(int argc, char** argv) {
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char prebind_dir[] = "./ct_prebind_stale_XXXXXX";
+    assert(mkdtemp(prebind_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", prebind_dir, 1) == 0);
+        execl(argv[0], argv[0], "prebind-stale", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    char buffered_dir[] = "./ct_prebind_buffered_XXXXXX";
+    assert(mkdtemp(buffered_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", buffered_dir, 1) == 0);
+        execl(argv[0], argv[0], "prebind-buffered", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    char source_stale_dir[] = "./ct_source_stale_XXXXXX";
+    assert(mkdtemp(source_stale_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", source_stale_dir, 1) == 0);
+        execl(argv[0], argv[0], "source-stale", (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    char lane_stale_dir[] = "./ct_lane_stale_XXXXXX";
+    assert(mkdtemp(lane_stale_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", lane_stale_dir, 1) == 0);
+        execl(argv[0], argv[0], "lane-stale", (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     char fence_dir[] = "./ct_recovery_fence_XXXXXX";
     assert(mkdtemp(fence_dir));
     child = fork();
@@ -1291,6 +1827,10 @@ int main(int argc, char** argv) {
     aimem_fixture_cleanup(history_dir);
     aimem_fixture_cleanup(history_set_dir);
     aimem_fixture_cleanup(fence_dir);
+    aimem_fixture_cleanup(prebind_dir);
+    aimem_fixture_cleanup(buffered_dir);
+    aimem_fixture_cleanup(source_stale_dir);
+    aimem_fixture_cleanup(lane_stale_dir);
     aimem_fixture_cleanup(mismatch_dir);
     aimem_fixture_cleanup(expired_dir);
     aimem_fixture_cleanup(highwater_dir);

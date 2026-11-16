@@ -450,10 +450,71 @@ static void ack_regression(const char* mutation) {
     assert(!memcmp(before, after, sizeof before));
 }
 
+static int stale_receiver_admission(const char* dir) {
+    assert(setenv("QIHSE_DATA_DIR", dir, 1) == 0);
+    assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0 && qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("CtLaneLogOperator1!"));
+    qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtLaneLogOperator1!");
+    assert(op);
+    qihse_user_t* peer = qihse_auth_create_user(op, 8602u, QIHSE_ROLE_ANALYST,
+        5u, 3u, "CtLaneLogPeerPass1!", false);
+    assert(peer);
+    qihse_kv_store_t* first = qihse_kv_store_create_user(op);
+    assert(first);
+    uint8_t slots_a[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    uint8_t slots_b[QIHSE_KV_CT_SLOT_BITMAP_BYTES] = {0};
+    set_slot(slots_a, 101u);
+    set_slot(slots_b, 14000u);
+    unsigned char token[QIHSE_KV_CT_TOKEN_BYTES], digest[32];
+    assert(qihse_kv_ct_lane_receiver_bind(first, op, LANE_A, slots_a,
+        "peer-a", "node-a", GEN_A, QIHSE_KV_CT_TENANT_SYSTEM_ALL,
+        0u, 0u, token));
+    assert(qihse_kv_ct_lane_receiver_empty_baseline_seal(first, op, LANE_A,
+        token, digest));
+    qihse_kv_store_t* stale = qihse_kv_store_create_user(op);
+    assert(stale);
+    qihse_kv_store_set_replication_principal_id(stale, qihse_user_get_id(peer));
+    assert(qihse_kv_ct_lane_receiver_bind(first, op, LANE_B, slots_b,
+        "peer-b", "node-a", GEN_B, QIHSE_KV_CT_TENANT_SYSTEM_ALL,
+        0u, 0u, token));
+    char wal_path[512];
+    assert(snprintf(wal_path, sizeof(wal_path), "%s/wal.log", dir) > 0);
+    struct stat before, after;
+    assert(stat(wal_path, &before) == 0);
+    char* key = key_for_slot("ct-stale-receiver-", 101u);
+    qihse_kv_ct_record_t row = {
+        .key = key, .value = "stale", .change_seq = 1u,
+        .actor_id = qihse_user_get_id(peer), .classification = 4u,
+        .sci_compartment = 1u, .actor_kind = QIHSE_KV_CT_ACTOR_USER
+    };
+    qihse_kv_ct_group_t group = {0};
+    snprintf(group.source_id, sizeof(group.source_id), "peer-a");
+    snprintf(group.generation, sizeof(group.generation), "%s", GEN_A);
+    group.stream_position = group.first_seq = group.last_seq = 1u;
+    group.records = &row;
+    group.count = 1u;
+    uint64_t cursor = 99u;
+    assert(!qihse_kv_ct_lane_receiver_apply(stale, peer, LANE_A,
+        &group, &cursor) && cursor == 0u);
+    assert(stat(wal_path, &after) == 0 && before.st_dev == after.st_dev &&
+        before.st_ino == after.st_ino && before.st_size == after.st_size);
+    free(key);
+    qihse_kv_store_destroy(stale);
+    qihse_kv_store_destroy(first);
+    qihse_audit_shutdown();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     umask(0077); alarm(120);
+    if (argc == 4 && strcmp(argv[1], "--receiver-stale") == 0)
+        return stale_receiver_admission(argv[2]);
     if (argc == 4) return ack_child(argv[1], argv[2], atoi(argv[3]));
     assert(argc == 1);
+    char stale_dir[] = "./ct_lane_receiver_stale_XXXXXX";
+    assert(mkdtemp(stale_dir));
+    ack_wait(ack_exec("--receiver-stale", stale_dir, -1), false);
+    cleanup(stale_dir);
     ack_regression(NULL);
     ack_regression("--ack-ahead");
     ack_regression("--ack-different");

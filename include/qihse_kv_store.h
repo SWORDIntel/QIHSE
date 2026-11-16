@@ -381,6 +381,16 @@ bool qihse_kv_ct_receiver_apply(qihse_kv_store_t* store, qihse_user_t* principal
     const qihse_kv_ct_group_t* group, uint64_t* out_durable_cursor);
 bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
     qihse_user_t* principal, qihse_kv_ct_receiver_status_t* out);
+/* Operator-only CT1 receiver admission denial for new binaries. Installs a
+ * durable intent bound to the exact persisted generation, baseline and cursor.
+ * The directory-inode lock serializes installation with receiver apply on
+ * already-open upgraded handles. Quiesce old binaries before relying on it.
+ * No ordinary RECONCILE releases it. The CT-state intent bit also denies
+ * startup when the sidecar is missing or damaged. Rebuild with `make lib`;
+ * stored data needs no migration (legacy CT metadata upgrades on first write). */
+bool qihse_kv_ct_receiver_recovery_fence_install(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* generation, uint64_t baseline_row_seq,
+    const unsigned char baseline_digest[32], uint64_t durable_cursor);
 
 /* Read-only legacy (non-lane) receiver-history check. The caller must supply
  * an active principal; this result attests neither QKP peer identity nor any

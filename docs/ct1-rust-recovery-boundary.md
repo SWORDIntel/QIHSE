@@ -18,6 +18,13 @@ executor or production call site. No operation described here is implemented
 or authorized to advance either cursor. Do not convert installed `--ct-role`
 pairs to CT group/lane mode.
 
+**Operator decision (2026-11-16): TPM-backed recovery authority is deferred.**
+The 730xd Dell BIOS reported `TpmSecurity=Off`; a scheduled RACADM change
+reported completion after a graceful reboot but left the setting Off and no
+Linux TPM device. Do not retry firmware changes or treat local receipt/ledger
+state as an alternative trust anchor. Keep the B ordinary owner stopped and
+its successor sealed; no B recovery operation is authorized by this deferral.
+
 On 2026-11-16, the stopped B source's eight frozen native files matched both
 its manifest and original; the successor's seven frozen native files matched
 its manifest, while only five still matched its active, compacted store.
@@ -345,13 +352,20 @@ not historical peer attestation. No read-only response or Rust decision grants s
 
 ## Proposed crash-safe B transaction and cross-process fence (not shipped)
 
-The private `ct1-recovery-fence.bin` startup reader is only an inert, fail-closed
-marker recognizer: it denies operations on a handle opened with a valid marker
-and refuses malformed markers before SST indexing. There is no production
-installer, issuer binding, epoch or release protocol. An already-open handle
-continues admitting operations after marker creation, and removal permits an
-unfenced future open. Do not deploy this marker as B's target fence or use
-ordinary `RECONCILE` as a release shortcut.
+The committed private `ct1-recovery-fence.bin` reader was startup-only. The
+local, **uncommitted upgraded-binary admission-denial candidate** adds an
+installer that persists fail-closed intent in CT state before publishing the
+marker, under a lock on the stable store-directory inode. Already-open
+participating handles revalidate persisted state at admission; startup holds
+the same lock through state/marker validation, SST indexing and WAL replay.
+Marker removal must fail closed: the persisted CT-state intent still denies
+admission, including on reopen; deletion is not a release mechanism.
+
+This is a local candidate, not a production deployment or approval, and it
+does not fence old binaries that ignore the gate. QKP-bound Operator/TPM
+recovery authority remains deferred; there is no trusted epoch/expiry,
+release protocol, suppression disposition or B replay. Do not deploy this
+candidate as B's target fence or use ordinary `RECONCILE` as a release shortcut.
 
 A single KV lock cannot freeze two server processes. The target's read-locked
 HISTORY-V1 snapshot can be stale before the source publishes a floor, and the
