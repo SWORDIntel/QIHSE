@@ -276,6 +276,14 @@ not historical peer attestation. No read-only response or Rust decision grants s
 
 ## Proposed crash-safe B transaction and cross-process fence (not shipped)
 
+The private `ct1-recovery-fence.bin` startup reader is only an inert, fail-closed
+marker recognizer: it denies operations on a handle opened with a valid marker
+and refuses malformed markers before SST indexing. There is no production
+installer, issuer binding, epoch or release protocol. An already-open handle
+continues admitting operations after marker creation, and removal permits an
+unfenced future open. Do not deploy this marker as B's target fence or use
+ordinary `RECONCILE` as a release shortcut.
+
 A single KV lock cannot freeze two server processes. The target's read-locked
 HISTORY-V1 snapshot can be stale before the source publishes a floor, and the
 source's FRAME-V1 result can be stale before target apply. The proposal needs

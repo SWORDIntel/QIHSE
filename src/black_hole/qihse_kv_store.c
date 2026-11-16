@@ -368,6 +368,7 @@ struct qihse_kv_store {
     size_t ct_lane_capacity;
     qihse_kv_ct_lane_transfer_state_t* lane_transfer;
     bool ct_admitted; /* runtime-only: reopened source requires QKP reconcile */
+    bool ct_recovery_fenced; /* startup-loaded denial; not a cross-process fence */
     uint8_t ct_mode; /* 1 source, 2 receiver */
     char ct_source_id[QIHSE_KV_CT_ID_MAX + 1u];
     char ct_target_id[QIHSE_KV_CT_ID_MAX + 1u];
@@ -1141,7 +1142,7 @@ static bool ct_replication_principal(qihse_kv_store_t* store,
 }
 
 static bool ct_state_write(qihse_kv_store_t* store) {
-    if (!store || store->memory_snapshot) return false;
+    if (!store || store->memory_snapshot || store->ct_recovery_fenced) return false;
     if (aimem_durability_test_fail_once("ct-state-before-publish")) {
         errno = EIO;
         return false;
@@ -1334,8 +1335,50 @@ static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
     return true;
 }
 
+/* Private startup denial marker, not recovery authority: magic[8], zero-padded
+ * generation[65], LE baseline sequence[8], baseline digest[32], LE target
+ * cursor[8], SHA-256 checksum[32]. No code path creates/releases/overrides it.
+ * The checksum detects damage, NOT Operator-QKP approval. Invalid bindings
+ * stop open before SST indexing or protected bodies can be fetched. Existing
+ * open handles are unaffected; removal permits an unfenced future open. */
+static bool ct_recovery_fence_read(qihse_kv_store_t* store) {
+    char path[4096];
+    if (!build_data_path(path, sizeof(path), "ct1-recovery-fence.bin")) return false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return errno == ENOENT;
+    struct stat st;
+    unsigned char record[153] = {0}, digest[32];
+    unsigned int digest_len = 0u;
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_uid == geteuid() && !(st.st_mode & 077) && st.st_nlink == 1 &&
+        st.st_size == (off_t)sizeof(record) &&
+        read(fd, record, sizeof(record)) == (ssize_t)sizeof(record) &&
+        memcmp(record, "QCTRF001", 8u) == 0 &&
+        EVP_Digest(record, sizeof(record) - 32u, digest, &digest_len,
+                   EVP_sha256(), NULL) == 1 && digest_len == 32u &&
+        CRYPTO_memcmp(record + sizeof(record) - 32u, digest, 32u) == 0;
+    if (close(fd) != 0) ok = false;
+    uint64_t baseline = 0u, cursor = 0u;
+    for (unsigned i = 0; i < 8u; ++i) {
+        baseline |= (uint64_t)record[73u + i] << (8u * i);
+        cursor |= (uint64_t)record[113u + i] << (8u * i);
+    }
+    size_t gen_len = strnlen((const char*)record + 8u, 65u);
+    ok = ok && store->ct_enabled && store->ct_mode == 2u &&
+        store->ct_baseline_sealed && gen_len > 0u && gen_len <= 64u &&
+        memcmp(record + 8u, store->ct_generation, 65u) == 0 &&
+        baseline == store->ct_baseline_lsn &&
+        memcmp(record + 81u, store->ct_baseline_digest, 32u) == 0 &&
+        cursor == store->ct_durable_lsn;
+    OPENSSL_cleanse(record, sizeof(record));
+    if (!ok) { errno = EINVAL; return false; }
+    store->ct_recovery_fenced = true;
+    return true;
+}
+
 static bool ct_write_allowed(qihse_kv_store_t* store, qihse_user_t* user,
                              const char* key) {
+    if (store->ct_recovery_fenced) { errno = EBUSY; return false; }
     if (!store->ct_enabled) return true;
     if (store->ct_lane_count) {
         if (!user || !qihse_auth_user_is_active(user) || !kv_ct_scope ||
@@ -1390,6 +1433,7 @@ static bool ct_write_allowed(qihse_kv_store_t* store, qihse_user_t* user,
  * not durably acknowledged. A CT receiver serves reads only after a durable
  * promotion transition changes its mode to source and it reconciles. */
 static bool ct_read_ready(qihse_kv_store_t* store) {
+    if (store->ct_recovery_fenced) { errno = EAGAIN; return false; }
     if (!store->ct_enabled) return true;
     if (store->ct_lane_count) {
         bool have_source = false;
@@ -1436,6 +1480,7 @@ static bool ct_key_owned_for_read(qihse_kv_store_t* store, const char* key) {
 }
 
 static bool ct_key_read_ready(qihse_kv_store_t* store, const char* key) {
+    if (store->ct_recovery_fenced) { errno = EAGAIN; return false; }
     if (!store->ct_enabled) return true;
     if (store->ct_lane_count && key && qihse_cluster_key_is_node_local(key))
         return true;
@@ -3124,8 +3169,8 @@ bool qihse_kv_ct_receiver_apply(qihse_kv_store_t* store, qihse_user_t* principal
         group->count > QIHSE_KV_CT_MAX_GROUP_RECORDS) return false;
     kv_store_wrlock(store);
     bool ok = store->ct_enabled && store->ct_mode == 2u &&
-        store->ct_baseline_sealed && !store->recovery_pending &&
-        !store->memory_snapshot &&
+        store->ct_baseline_sealed && !store->ct_recovery_fenced &&
+        !store->recovery_pending && !store->memory_snapshot &&
         strcmp(group->source_id, store->ct_source_id) == 0 &&
         strcmp(group->generation, store->ct_generation) == 0 &&
         group->stream_position != 0u &&
@@ -4633,11 +4678,15 @@ static qihse_kv_store_t* kv_store_create_internal(const kv_read_context_t* conte
     if (!store) return NULL;
     const char* dir = get_qihse_data_dir();
     if (!dir) { qihse_kv_store_destroy(store); return NULL; }
-    if (!ct_state_read(store, user, context->legacy_bootstrap)) {
+    if (!ct_state_read(store, user, context->legacy_bootstrap) ||
+        !ct_recovery_fence_read(store)) {
         qihse_kv_store_destroy(store); return NULL;
     }
     if (!context->legacy_bootstrap && !ct_lanes_state_read(store, user)) {
         qihse_kv_store_destroy(store); return NULL;
+    }
+    if (store->ct_recovery_fenced && store->ct_lane_count) {
+        qihse_kv_store_destroy(store); errno = EINVAL; return NULL;
     }
     if (!replica_install_recover_image(dir, user)) { qihse_kv_store_destroy(store); return NULL; }
     DIR* d = opendir(dir);
@@ -4708,7 +4757,7 @@ qihse_kv_store_t* qihse_kv_store_create(void) {
 bool qihse_kv_store_enable_replica_read_only(qihse_kv_store_t* store) {
     if (!store) return false;
     kv_store_wrlock(store);
-    bool ok = store->trie && !store->recovery_pending;
+    bool ok = store->trie && !store->recovery_pending && !store->ct_recovery_fenced;
     if (ok) __atomic_store_n(&store->replica_read_only, true, __ATOMIC_RELEASE);
     kv_store_unlock(store);
     return ok;
@@ -5815,7 +5864,8 @@ bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
     kv_store_rdlock(store);
     bool ok = false;
     if (!store->ct_enabled || store->ct_mode != 2u || store->ct_lane_count ||
-        !store->ct_baseline_sealed || store->recovery_pending || store->memory_snapshot ||
+        !store->ct_baseline_sealed || store->ct_recovery_fenced ||
+        store->recovery_pending || store->memory_snapshot ||
         strcmp(store->ct_source_id, request->source_id) ||
         strcmp(store->ct_target_id, request->target_id) ||
         strcmp(store->ct_generation, request->generation) ||
@@ -7303,7 +7353,10 @@ qihse_kv_cas_result_t qihse_kv_compare_set_user(
     if (!store || !key || !new_value || !user || !qihse_auth_user_is_active(user))
         return QIHSE_KV_CAS_FAILED;
     kv_store_wrlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || !ct_key_read_ready(store, key)) {
+        kv_store_unlock(store);
+        return QIHSE_KV_CAS_FAILED;
+    }
     char* current = kv_get_user_impl(store, key, user);
     bool matches = expected_value ? current && strcmp(current, expected_value) == 0
                                   : current == NULL;
@@ -8356,7 +8409,9 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
         return;
     }
     kv_store_wrlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return; }
+    if (store->recovery_pending || store->ct_recovery_fenced) {
+        kv_store_unlock(store); return;
+    }
     if (store->bulk_load_mode) { kv_store_unlock(store); return; }
     /* Reads still treat expired values as absent. Defer the physical
      * tombstone/compaction until the frozen CT2 image is no longer needed. */
@@ -8722,7 +8777,8 @@ static bool fsync_dir_path(const char* dir) {
 }
 
 static bool kv_sync_store_locked(qihse_kv_store_t* store) {
-    if (!store || !store->trie || store->memory_snapshot || store->recovery_pending) return false;
+    if (!store || !store->trie || store->memory_snapshot || store->recovery_pending ||
+        store->ct_recovery_fenced) return false;
     /* 1. WAL: stdio buffer to the kernel, then the fd itself. Without the
      * fsync the WAL lives only in the page cache -- fine against process
      * death, lost on power loss; SAVE promises both. */
@@ -8774,7 +8830,9 @@ size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
      * compact — and the internal deletes use kv_del_user_impl so the lock
      * is taken exactly once. */
     kv_store_wrlock(store);
-    if (store->recovery_pending) { kv_store_unlock(store); return 0; }
+    if (store->recovery_pending || store->ct_recovery_fenced) {
+        kv_store_unlock(store); return 0;
+    }
     uint64_t now = current_time_ms();
     clear_collect_ctx_t ctx = { .user = user, .now = now, .ok = true };
     bool fast = store->sst_meta && !store->sst_meta->degraded;
@@ -9034,7 +9092,7 @@ int qihse_kv_replica_snapshot_create(qihse_kv_store_t* store, qihse_user_t* user
     /* save_user() atomically replaces this unique path with the complete
      * authorized snapshot. The name is never sent over the replication wire. */
     kv_store_wrlock(store);
-    int save_rc = store->recovery_pending ? -1 :
+    int save_rc = (store->recovery_pending || store->ct_recovery_fenced) ? -1 :
         qihse_kv_save_replica_snapshot_file(store, path, user, namespace_glob,
                                              false, NULL, NULL);
     /* The data file and this watermark must describe the same locked store

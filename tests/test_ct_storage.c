@@ -15,6 +15,29 @@
 #include "qihse_kv_store.h"
 #include "aimem_fixture_cleanup.h"
 
+/* Test-only hand-seeding; production has no marker installation API. */
+static void seed_recovery_fence(const char* path, const char* generation,
+    uint64_t baseline_seq, const unsigned char baseline_digest[32],
+    uint64_t cursor, int variant) {
+    unsigned char record[153] = {0};
+    assert(strlen(generation) <= 64u);
+    memcpy(record, "QCTRF001", 8u);
+    memcpy(record + 8u, generation, strlen(generation));
+    for (unsigned i = 0; i < 8u; ++i) {
+        record[73u + i] = (unsigned char)(baseline_seq >> (8u * i));
+        record[113u + i] = (unsigned char)(cursor >> (8u * i));
+    }
+    memcpy(record + 81u, baseline_digest, 32u);
+    unsigned int digest_len = 0u;
+    assert(EVP_Digest(record, sizeof(record) - 32u, record + 121u,
+                      &digest_len, EVP_sha256(), NULL) == 1 && digest_len == 32u);
+    if (variant == 1) record[121u] ^= 1u; /* checksum */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    assert(fd >= 0 && write(fd, record, variant == 2 ? 20u : sizeof(record)) ==
+           (ssize_t)(variant == 2 ? 20u : sizeof(record)) &&
+           fsync(fd) == 0 && close(fd) == 0);
+}
+
 static char* ct_large_payload(void) {
     char* value = malloc(32769u);
     assert(value);
@@ -220,6 +243,24 @@ static void ct_retained_frame_fixture(void) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && (strcmp(argv[1], "recovery-fence-crash") == 0 ||
+                      strcmp(argv[1], "recovery-fence-reopen") == 0)) {
+        assert(qihse_auth_init());
+        assert(qihse_auth_bootstrap_operator("CtStorageOperator1!"));
+        qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
+        assert(op);
+        qihse_kv_store_t* receiver = qihse_kv_store_create_user(op);
+        assert(receiver);
+        qihse_kv_ct_receiver_status_t status = {0};
+        assert(qihse_kv_ct_receiver_status(receiver, op, &status) &&
+               status.durable_cursor == 1u && status.baseline_sealed &&
+               strcmp(status.generation, "gen:1") == 0);
+        assert(!qihse_kv_sync_store(receiver));
+        if (strcmp(argv[1], "recovery-fence-crash") == 0)
+            _exit(86); /* no clean shutdown of the fenced handle */
+        qihse_kv_store_destroy(receiver);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "retained-frame") == 0) {
         ct_retained_frame_fixture();
         return 0;
@@ -287,7 +328,8 @@ int main(int argc, char** argv) {
                       strcmp(argv[1], "receiver-stale") == 0 ||
                       strcmp(argv[1], "receiver-stale-expired") == 0 ||
                       strcmp(argv[1], "receiver-history") == 0 ||
-                      strcmp(argv[1], "receiver-history-set") == 0)) {
+                      strcmp(argv[1], "receiver-history-set") == 0 ||
+                      strcmp(argv[1], "recovery-fence") == 0)) {
         bool mismatch = strcmp(argv[1], "receiver-mismatch") == 0;
         bool expired = strcmp(argv[1], "receiver-expired") == 0;
         bool stale_expired = strcmp(argv[1], "receiver-stale-expired") == 0;
@@ -338,6 +380,107 @@ int main(int argc, char** argv) {
         fclose(f);
         assert(group2.count == 1u && group2.records[0].value &&
                strlen(group2.records[0].value) == 32768u);
+        if (strcmp(argv[1], "recovery-fence") == 0) {
+            uint64_t cursor = 0u;
+            assert(qihse_kv_ct_receiver_apply(receiver, service, &group, &cursor) &&
+                   cursor == 1u && qihse_kv_sync_store(receiver));
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver); /* an unmarked receiver retains its old admission */
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            qihse_kv_replica_snapshot_t* ordinary = NULL;
+            assert(qihse_kv_replica_snapshot_create(receiver, op, "*", &ordinary) == 0 &&
+                   ordinary);
+            qihse_kv_replica_snapshot_destroy(ordinary);
+            qihse_kv_store_destroy(receiver);
+            char marker_path[512], held_path[512];
+            assert(snprintf(marker_path, sizeof(marker_path), "%s/ct1-recovery-fence.bin",
+                            getenv("QIHSE_DATA_DIR")) > 0);
+            assert(snprintf(held_path, sizeof(held_path), "%s/invalid-marker",
+                            getenv("QIHSE_DATA_DIR")) > 0);
+            assert(mkfifo(marker_path, 0600) == 0);
+            alarm(3); /* A blocking marker open must terminate this fixture. */
+            assert(qihse_kv_store_create_user(op) == NULL);
+            alarm(0);
+            assert(rename(marker_path, held_path) == 0);
+            assert(symlink("ct-state.bin", marker_path) == 0);
+            assert(qihse_kv_store_create_user(op) == NULL);
+            assert(snprintf(held_path, sizeof(held_path), "%s/invalid-symlink",
+                            getenv("QIHSE_DATA_DIR")) > 0);
+            assert(rename(marker_path, held_path) == 0);
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 0);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver);
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            qihse_kv_ct_receiver_status_t fenced = {0};
+            assert(qihse_kv_ct_receiver_status(receiver, op, &fenced) &&
+                   fenced.durable_cursor == 1u && fenced.baseline_sealed &&
+                   strcmp(fenced.generation, "gen:1") == 0 &&
+                   memcmp(fenced.baseline_digest, digest, 32u) == 0);
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor) &&
+                   cursor == 0u);
+            assert(qihse_kv_replica_snapshot_create(receiver, op, "*", &ordinary) != 0 &&
+                   ordinary == NULL);
+            assert(qihse_kv_get_user(receiver, group.records[0].key, op) == NULL);
+            uint64_t fenced_seq = qihse_kv_change_seq(receiver);
+            assert(group.records[0].value);
+            assert(qihse_kv_compare_set_user(receiver, group.records[0].key,
+                "wrong-expected", "forbidden", 0u, 0u, op) == QIHSE_KV_CAS_FAILED);
+            assert(qihse_kv_compare_set_user(receiver, group.records[0].key,
+                group.records[0].value, "forbidden", 0u, 0u, op) == QIHSE_KV_CAS_FAILED);
+            assert(qihse_kv_compare_set_user(receiver, group.records[0].key,
+                NULL, "forbidden", 0u, 0u, op) == QIHSE_KV_CAS_FAILED);
+            assert(qihse_kv_change_seq(receiver) == fenced_seq);
+            assert(!qihse_kv_sync_store(receiver));
+            assert(qihse_kv_clear_user(receiver, op) == 0u);
+            qihse_kv_sweep_expired(receiver);
+            assert(qihse_kv_ct_receiver_status(receiver, op, &fenced) &&
+                   fenced.durable_cursor == 1u);
+            qihse_kv_store_destroy(receiver);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver); /* crash/cold reopen preserves the denial */
+            qihse_kv_store_set_replication_principal_id(receiver, 8302u);
+            assert(!qihse_kv_ct_receiver_apply(receiver, service, &group2, &cursor));
+            qihse_kv_store_destroy(receiver);
+            assert(chmod(marker_path, 0644) == 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* insecure permissions */
+            assert(chmod(marker_path, 0600) == 0);
+            if (geteuid() == 0) {
+                assert(chown(marker_path, 1, (gid_t)-1) == 0);
+                assert(qihse_kv_store_create_user(op) == NULL); /* incorrect owner */
+                assert(chown(marker_path, 0, (gid_t)-1) == 0);
+            }
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 1);
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+            assert(setenv("QIHSE_AIMEM_FAIL_AT", "sst-index-load", 1) == 0);
+#endif
+            assert(qihse_kv_store_create_user(op) == NULL); /* corrupt checksum */
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* SST fault was not consumed */
+            assert(unsetenv("QIHSE_AIMEM_FAIL_AT") == 0);
+#endif
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 2);
+            assert(qihse_kv_store_create_user(op) == NULL); /* torn sidecar */
+            seed_recovery_fence(marker_path, "gen:wrong", baseline_seq, digest, 1u, 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* generation */
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq + 1u, digest, 1u, 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* baseline sequence */
+            digest[0] ^= 1u;
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* baseline digest */
+            digest[0] ^= 1u;
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 0u, 0);
+            assert(qihse_kv_store_create_user(op) == NULL); /* durable cursor */
+            seed_recovery_fence(marker_path, "gen:1", baseline_seq, digest, 1u, 0);
+            receiver = qihse_kv_store_create_user(op);
+            assert(receiver && !qihse_kv_ct_receiver_apply(receiver, service, &group2,
+                                                              &cursor));
+            qihse_ct_codec_clear(&group);
+            qihse_ct_codec_clear(&group2);
+            qihse_kv_store_destroy(receiver);
+            return 0;
+        }
         if (strcmp(argv[1], "receiver-history") == 0 ||
             strcmp(argv[1], "receiver-history-set") == 0) {
             assert(group.count == 1u && group.records[0].classification == 4u &&
@@ -1026,6 +1169,36 @@ int main(int argc, char** argv) {
     }
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
            WEXITSTATUS(status) == 0);
+    char fence_dir[] = "./ct_recovery_fence_XXXXXX";
+    assert(mkdtemp(fence_dir));
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", fence_dir, 1) == 0);
+        execl(argv[0], argv[0], "recovery-fence", snapshot_path, group_path,
+              seq_text, digest_hex, range_hex, (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", fence_dir, 1) == 0);
+        execl(argv[0], argv[0], "recovery-fence-crash", (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 86);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(setenv("QIHSE_DATA_DIR", fence_dir, 1) == 0);
+        execl(argv[0], argv[0], "recovery-fence-reopen", (char*)NULL);
+        _exit(99);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0);
     char mismatch_dir[] = "./ct_receiver_mismatch_XXXXXX";
     assert(mkdtemp(mismatch_dir));
     child = fork();
@@ -1117,6 +1290,7 @@ int main(int argc, char** argv) {
     aimem_fixture_cleanup(receiver_dir);
     aimem_fixture_cleanup(history_dir);
     aimem_fixture_cleanup(history_set_dir);
+    aimem_fixture_cleanup(fence_dir);
     aimem_fixture_cleanup(mismatch_dir);
     aimem_fixture_cleanup(expired_dir);
     aimem_fixture_cleanup(highwater_dir);
