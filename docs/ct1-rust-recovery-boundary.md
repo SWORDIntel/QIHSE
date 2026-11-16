@@ -1,18 +1,33 @@
 # Rust-first CT1 recovery boundary (design, not a recovery procedure)
 
-Status at `6b04d1f`: **design only** beyond the structural `rust/ct1-recovery`
-`compare()` and the pinned read-only TARGET HISTORY-V1 / SOURCE FRAME-V1 C and
-RESP queries below. B's legacy CT1 source owner remains stopped, with its
-original pending SET group at position 11111; the successor is sealed at cursor
-11110. Its source-authored same-key tombstone is at 11103. The sample row
-sequences in the Rust fixture are pending 5729448, tombstone 5729450, target
-high-water 5729457 and source high-water 5729448; stream positions are **not**
-row sequences. These fixture numbers illustrate the discrepancy, not a live
-read of B. Preserve the original group, both stores, all journals, generation,
-seals and routing. The crate has no C ABI, evidence authentication, executor or
-production call site. No operation described here is implemented or authorized
-to advance either cursor. Do not convert installed `--ct-role` pairs to CT
-group/lane mode.
+Status: **design only** beyond the structural `rust/ct1-recovery` `compare()`,
+its fixed-width `qihse_ct1_structural_evidence_evaluate_v1` FFI-shaped
+evaluator (not yet built or linked for C callers), and the pinned read-only
+TARGET HISTORY-V1 / SOURCE FRAME-V1 C and RESP queries below. B's legacy CT1
+source owner remains stopped, with its original pending SET group at position
+11111; the successor is sealed at cursor 11110. Its source-authored same-key
+tombstone is at 11103. The sample row sequences in the Rust fixture are
+pending 5729448, tombstone 5729450, target high-water 5729457 and source
+high-water 5729448; stream positions are **not** row sequences. These fixture
+numbers illustrate the discrepancy, not a live read of B. Preserve the
+original group, both stores, all journals, generation, seals and routing. The
+structural-only ABI never attests its caller-supplied inputs and always returns
+zero authorized actions; there is no C-minted verified capability, recovery
+executor or production call site. No operation described here is implemented
+or authorized to advance either cursor. Do not convert installed `--ct-role`
+pairs to CT group/lane mode.
+
+On 2026-11-16, the stopped B source's eight frozen native files matched both
+its manifest and original; the successor's seven frozen native files matched
+its manifest, while only five still matched its active, compacted store.
+Manifest-only private working copies were verified before making separate
+disposable clones. Local V1 queries on those disposable clones returned the
+original 1644-byte source frame at 11111/5729448 and the target's physical
+tombstone at 11103/5729450, sealed cursor 11110 and high-water 5729457.
+These fixture-principal queries are **offline** checks: they provide neither
+live pinned-QKP evidence nor historical source-authorship attestation. A store
+open can write audit data and repair WAL tails; do not open the frozen evidence
+or verified working copies to repeat the queries.
 
 ## Existing split
 
