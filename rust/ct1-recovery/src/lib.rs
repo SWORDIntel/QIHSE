@@ -896,6 +896,35 @@ mod tests {
         assert_eq!(core::mem::size_of::<FixedRowIdentityV1>(), 48);
         assert_eq!(core::mem::size_of::<EvidenceEvalRequestV1>(), 448);
         assert_eq!(core::mem::size_of::<EvidenceEvalOutputV1>(), 64);
+        assert_eq!(core::mem::offset_of!(FixedRowIdentityV1, key_digest), 16);
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalRequestV1, source_generation),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalRequestV1, expected_baseline_row_seq),
+            176
+        );
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalRequestV1, pending_record_count),
+            272
+        );
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalRequestV1, pending_row),
+            304
+        );
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalRequestV1, latest_target_row),
+            400
+        );
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalOutputV1, minimum_next_row_seq),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(EvidenceEvalOutputV1, transcript_digest),
+            32
+        );
 
         let req = abi_fixture();
         let out = evaluate_structural_evidence_v1(&req).unwrap();

@@ -168,8 +168,8 @@ This is an **internal, same-process** Rust/C ABI sketch, not a new RESP command
 or authority for a client SDK. `include/qihse_kv_store.h:312-413` defines only
 read-only V1 queries; `rust/ct1-recovery/src/lib.rs:30-124` defines public,
 caller-manufacturable `Comparison` fields and a structural floor computation.
-No `ct1_recovery_*` symbols below exist at `6b04d1f`. Define an internal C
-factory accessible only after native daemon admission; it, **not Rust or wire
+No `ct1_recovery_*` symbols below exist in the current Rust ABI. Define an
+internal C factory accessible only after native daemon admission; it, **not Rust or wire
 input**, mints and owns `ct1_recovery_cap_t` in a process-local registry. A C
 pointer is a lookup key, never a serialized token, and is validated against
 registry membership before dereference. No public constructor, pointer
@@ -414,17 +414,70 @@ committed; after either commit, recovery must roll forward or fail closed.
   high-water above source; inspect cursor, source group bytes, physical row
   and read visibility after cold reopen. Never test mutations on the preserved
   original B stores.
+- Manifest admission: wrong/rotated QKP Operator issuer, changed peer public-key
+  pin or replication service principal, altered frozen hash, expired approval,
+  replayed nonce, stale/rolled-back epoch, clock rollback, and crash between
+  replay-ledger fsync and either process's fence must all deny new admission.
+  A retry of a prepared transaction must preserve its original binding and
+  fences, not spend a second manifest or open a normal apply path.
 
-**Working provenance policy:** operator-verified frozen-manifest evidence plus
-current pinned-QKP peer identity is the bounded basis for this B operation;
-the existing V1 responses cannot supply historical cryptographic origin
-receipts, and this policy must not claim that they do. **Unresolved material
-decisions:** specify the authenticated manifest issuer/trust root, expiry and
-anti-replay policy, the on-disk disposition/absence-barrier format and retention
-semantics, and a durable cross-process fence for all target writers before any
-executor or deployment is approved.
-Until these are decided and crash cuts verified, `CANDIDATE` is not permission
-to mutate or unstop B.
+**Operator decision — proposed manifest admission, not shipped:** retain the
+bounded policy adopted in `ea139d8`: operator-verified frozen-manifest evidence
+plus **current** pinned-QKP peer identity, not a claim of historical peer
+attestation. Use the **existing configured QKP Operator identity** as the
+manifest issuer and trust root; do not generate or require a new offline
+signing key. Approval must be authenticated against that exact configured
+Operator identity through a live pinned QKP session. A copied manifest or a
+caller-supplied Operator name is not a signature or an authenticated session;
+if a detached manifest must be accepted, its integrity/authentication must
+be bound to that existing identity by a verified mechanism, not by inventing
+an offline key or treating SHA-256 as a MAC. The exact serialization,
+authentication mechanism and C admission API remain to be specified and tested.
+
+The one-use, bounded approval must commit to the complete **approved frozen
+source and target manifest file/hash sets**, exact retained original frame
+bytes/hash and row identity, source-authored deletion evidence, configured
+source/target IDs and **current public-key pins in both QKP directions**, the
+exact active non-Operator replication **service principal** (including its
+tenant/label scope), generation, baseline digest/sequence, pending position,
+sealed target cursor, allowed recovery operation, issuance/expiry, unique
+nonce and monotonic approval epoch. C compares these to approved immutable
+copies, current configured pins/principal and fresh locked store state; a
+QKP Operator approval never substitutes for the separate pinned replication
+session or historical authorship proof. Any mismatch, principal/pin rotation
+or missing evidence fails closed. Frozen hash approval authenticates what the
+operator reviewed, not who wrote the historical 11111/11103 records: V1
+responses and QKV6 checksums provide **no historical cryptographic receipts**.
+This is a deliberately bounded local-WAL provenance decision, not a retroactive
+origin signature.
+
+**Proposed replay/expiry defaults:** issue a random, single-use nonce and a
+strictly increasing, per source/target/generation approval epoch; bind both to
+the manifest digest and issuer. C must persist and fsync a replay ledger for
+consumed nonce and highest epoch on **both** servers before any fenced
+transition, reject duplicates or older/equal epochs for *new* admissions even
+after restart, and reject missing/corrupt ledgers instead of resetting them.
+Bind any retry to the same durable intent, nonce, epoch and exact transaction;
+replay of that transaction may only roll forward or fail closed under its
+fences. No distributed atomicity is assumed: an uncertain or one-sided ledger
+commit cannot authorize another transaction, and recovery must reconcile both
+persisted ledgers/fences before proceeding. Default expiry is **15 minutes
+from issuance**, checked against trusted time before admission and every new
+transition; clock rollback or unavailable trusted time denies new admission.
+The short window limits stolen approval reuse but may expire during inspection
+or an outage: revalidate evidence and request a new higher-epoch approval
+rather than extend the old one. Expiry never releases a persisted fence or
+makes a partially committed transaction safe to discard; after expiry only
+fail-closed recovery of that exact durable intent or fresh authenticated
+reapproval can proceed. The 15-minute default and trusted-time/ledger format
+need operational validation before implementation.
+
+**Still unresolved:** the on-disk disposition/absence-barrier format and
+retention semantics, durable cross-process fence for all target writers,
+manifest authentication/ledger mechanics, and the crash-cut tests above must
+be designed and validated before any executor or deployment is approved.
+`CANDIDATE` is not permission to mutate or unstop B. No B restart, durable
+source sequence floor, or target suppression/disposition has shipped.
 
 ## Release gates
 

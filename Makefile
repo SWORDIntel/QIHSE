@@ -2914,3 +2914,25 @@ codegraph-xxh3:
 
 test-codegraph-xxh3:
 	$(MAKE) -C tools/codegraph_xxh3 -j4 test
+
+# Opt-in structural-only C/Rust ABI smoke; no production library dependency.
+.PHONY: test-ct-recovery-abi
+test-ct-recovery-abi:
+	@mkdir -p build/ct1-recovery-abi
+	cargo build --locked --offline --manifest-path rust/ct1-recovery/Cargo.toml \
+	    --target-dir build/ct1-recovery-abi/cargo
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -UNDEBUG -I./include \
+	    -o build/ct1-recovery-abi/test_ct1_evidence_abi \
+	    tests/test_ct1_evidence_abi.c \
+	    build/ct1-recovery-abi/cargo/debug/libqihse_ct1_recovery.a -ldl -lpthread -lm
+	./build/ct1-recovery-abi/test_ct1_evidence_abi
+
+# Opt-in structural-only receipt checks; the issuer hook remains fail-closed.
+.PHONY: test-ct-recovery-manifest
+test-ct-recovery-manifest:
+	@mkdir -p build/ct1-recovery-manifest
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -I./include \
+	    -o build/ct1-recovery-manifest/test_ct1_recovery_manifest \
+	    src/black_hole/qihse_ct1_recovery_manifest.c \
+	    tests/test_ct1_recovery_manifest.c -lcrypto
+	./build/ct1-recovery-manifest/test_ct1_recovery_manifest
