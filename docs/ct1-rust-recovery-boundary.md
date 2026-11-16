@@ -415,12 +415,14 @@ committed; after either commit, recovery must roll forward or fail closed.
   and read visibility after cold reopen. Never test mutations on the preserved
   original B stores.
 
-**Unresolved material decisions:** choose the authenticated recovery manifest's
-issuer/trust root, expiry and anti-replay policy and whether historical
-cryptographic origin receipts are mandatory (the existing V1 responses cannot
-supply them). Specify the on-disk disposition/absence-barrier format and
-retention semantics, and a durable cross-process fencing protocol capable of
-blocking all target writers, before any executor or deployment is approved.
+**Working provenance policy:** operator-verified frozen-manifest evidence plus
+current pinned-QKP peer identity is the bounded basis for this B operation;
+the existing V1 responses cannot supply historical cryptographic origin
+receipts, and this policy must not claim that they do. **Unresolved material
+decisions:** specify the authenticated manifest issuer/trust root, expiry and
+anti-replay policy, the on-disk disposition/absence-barrier format and retention
+semantics, and a durable cross-process fence for all target writers before any
+executor or deployment is approved.
 Until these are decided and crash cuts verified, `CANDIDATE` is not permission
 to mutate or unstop B.
 
