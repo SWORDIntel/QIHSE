@@ -433,6 +433,37 @@ def _local_ip_hint():
 _POOL = QihsePool()
 
 
+def _read_dellfan_sidecar(age=35):
+    """Read dell-fan-control's per-fan/per-core sidecar; (fresh, data) tuple."""
+    base = "/run/dell-fan"
+    obs = os.path.join(base, "observed.json")
+    try:
+        if not os.path.exists(obs) or (time.time() - os.path.getmtime(obs)) > age:
+            return False, {}
+        with open(obs) as f:
+            o = json.load(f)
+        cores, fans = [], {}
+        cf = os.path.join(base, "cores.c")
+        if os.path.exists(cf):
+            with open(cf) as f:
+                cores = [float(x) for x in f.read().split() if x]
+        ff = os.path.join(base, "fans.rpm")
+        if os.path.exists(ff):
+            with open(ff) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line:
+                        n, v = line.rsplit("=", 1)
+                        try:
+                            fans[n.strip()] = int(v)
+                        except ValueError:
+                            pass
+        return True, {"cpu_temps": cores, "fan_rpms": fans,
+                      "inlet_temp": o.get("inlet"), "exhaust_temp": o.get("exhaust")}
+    except Exception:
+        return False, {}
+
+
 def collect_local_telemetry(node_name):
     cfg = NODE_PROFILES.get(node_name, {"tjmax": 86.0})
     tjmax = cfg["tjmax"]
@@ -464,17 +495,30 @@ def collect_local_telemetry(node_name):
         except Exception:
             pass
 
-    # ipmitool sensor reads (15s timeout to handle busy BMCs)
-    prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
-    raw_ipmi = "\n".join(
-        run_cmd(prefix + ["ipmitool", "sdr", "type", kind], timeout=15)
-        for kind in ("temperature", "fan")
-    )
+    # Prefer dell-fan-control's sidecar (single shared IPMI reader); fall back
+    # to the legacy CSV + our own ipmitool read only when the sidecar is stale.
+    sidecar_fresh, _sc = _read_dellfan_sidecar()
 
     cpu_temps = []
     inlet_temp = csv_data.get("inlet_temp")
     exhaust_temp = csv_data.get("exhaust_temp")
     fan_rpms = {}
+
+    if sidecar_fresh:
+        cpu_temps = _sc.get("cpu_temps", [])
+        fan_rpms = _sc.get("fan_rpms", {})
+        if inlet_temp is None:
+            inlet_temp = _sc.get("inlet_temp")
+        if exhaust_temp is None:
+            exhaust_temp = _sc.get("exhaust_temp")
+        raw_ipmi = ""
+    else:
+        # ipmitool sensor reads (15s timeout to handle busy BMCs)
+        prefix = ["sudo", "-n"] if os.geteuid() != 0 else []
+        raw_ipmi = "\n".join(
+            run_cmd(prefix + ["ipmitool", "sdr", "type", kind], timeout=15)
+            for kind in ("temperature", "fan")
+        )
 
     for line in raw_ipmi.splitlines():
         parts = [p.strip() for p in line.split("|")]

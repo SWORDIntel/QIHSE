@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=%E/qihse/machine-principal.env
-ExecStart=/usr/bin/python3 ${QIHSE_PREFIX}/bin/qihse-fan-agent --daemon --interval 5
+ExecStart=/usr/bin/python3 ${QIHSE_PREFIX}/bin/qihse-fan-agent --daemon --interval 30
 Restart=always
 RestartSec=5
 # Share explicit principal, tenant, prefix and token path with the refresh unit.
