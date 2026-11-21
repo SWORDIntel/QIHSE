@@ -352,8 +352,20 @@ static void child_phase(const char* phase, const char* data_dir,
             assert(qihse_kv_ct_writer_scope_enter(store, op, token, &scope));
             assert(qihse_kv_set_user(store, stale_key, "source-ttl", 4u, 2u, op));
             assert(qihse_kv_expire(store, stale_key, 1200u, op));
-            qihse_kv_ct_source_status_t status = {0};
+            qihse_kv_ct_source_status_t status = {0}, after_rejection = {0};
             assert(qihse_kv_ct_source_status(store, op, &status));
+            assert(status.durable_lsn > status.acknowledged_lsn &&
+                   status.retained_bytes > 0u);
+            unsigned char wrong_baseline[32];
+            memcpy(wrong_baseline, status.baseline_digest, sizeof(wrong_baseline));
+            wrong_baseline[0] ^= 1u;
+            assert(!qihse_kv_ct_source_reconcile(store, op, source_peer,
+                source_generation, wrong_baseline, status.durable_lsn));
+            assert(!qihse_kv_ct_source_ack(store, op, source_peer,
+                source_generation, status.durable_lsn + 1u));
+            assert(qihse_kv_ct_source_status(store, op, &after_rejection));
+            assert(after_rejection.acknowledged_lsn == status.acknowledged_lsn &&
+                   after_rejection.retained_bytes == status.retained_bytes);
             assert(qihse_kv_ct_source_ack(store, op, source_peer,
                 source_generation, status.durable_lsn));
             assert(qihse_kv_ct_writer_scope_finish(scope, 1000u, NULL));
@@ -701,6 +713,103 @@ static void child_phase(const char* phase, const char* data_dir,
     qihse_kv_store_destroy(store);
 }
 
+/* This fixture never attempts the exceptional target apply: source custody
+ * cannot be released without independent root-authenticated evidence. */
+static void custody_wal_copy_or_compare(const char* dir, bool copy) {
+    char wal[4096], frozen[4096];
+    path_join(wal, dir, "wal.log");
+    path_join(frozen, dir, "original-source.wal");
+    int source = open(copy ? wal : frozen, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int target = open(copy ? frozen : wal,
+        (copy ? O_WRONLY | O_CREAT | O_EXCL : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    assert(source >= 0 && target >= 0);
+    unsigned char a[4096], b[4096];
+    ssize_t n;
+    while ((n = read(source, a, sizeof(a))) > 0) {
+        if (copy) assert(write(target, a, (size_t)n) == n);
+        else assert(read(target, b, (size_t)n) == n &&
+                    memcmp(a, b, (size_t)n) == 0);
+    }
+    assert(n == 0);
+    if (copy) assert(fsync(target) == 0);
+    else assert(read(target, b, 1u) == 0);
+    assert(close(source) == 0 && close(target) == 0);
+}
+
+static void custody_phase(const char* phase, const char* dir) {
+    assert(setenv("QIHSE_DATA_DIR", dir, 1) == 0);
+    assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
+    assert(qihse_auth_init());
+    assert(qihse_auth_bootstrap_operator("CtTransferOperator1!"));
+    qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtTransferOperator1!");
+    assert(op);
+    qihse_kv_store_t* store = qihse_kv_store_create_user(op);
+    if (!strcmp(phase, "custody-cut-reopen")) {
+        assert(!store); /* committed state bit, absent sidecar: deny startup */
+        custody_wal_copy_or_compare(dir, false);
+        return;
+    }
+    if (!store) fprintf(stderr, "custody %s open failed: errno=%d\n", phase, errno);
+    assert(store);
+    if (!strcmp(phase, "custody-setup") || !strcmp(phase, "custody-cut")) {
+        const char* generation = "custody-gen:1", *peer = "custody-peer:1";
+        assert(qihse_kv_ct_source_enable(store, op, "custody-source:1", peer,
+            generation, NULL, 128u * 1024u * 1024u));
+        qihse_kv_replica_snapshot_t* baseline = NULL;
+        uint64_t baseline_seq = 0u;
+        unsigned char digest[32];
+        assert(qihse_kv_ct_source_baseline_snapshot_create(store, op,
+            &baseline, &baseline_seq, digest) == 0 && baseline);
+        qihse_kv_replica_snapshot_destroy(baseline);
+        assert(qihse_kv_ct_source_reconcile(store, op, peer, generation,
+            digest, 0u));
+        unsigned char token[QIHSE_KV_CT_TOKEN_BYTES];
+        qihse_kv_ct_writer_scope_t* scope = NULL;
+        assert(qihse_kv_ct_owner_token_get(store, op, token));
+        assert(qihse_kv_ct_writer_scope_enter(store, op, token, &scope));
+        assert(qihse_kv_set_user(store, source_key, "exact-original",
+            4u, 2u, op));
+        qihse_kv_ct_writer_scope_leave(scope);
+        qihse_kv_ct_source_status_t status = {0};
+        assert(qihse_kv_ct_source_status(store, op, &status));
+        assert(status.durable_lsn > status.acknowledged_lsn && status.retained_bytes);
+        assert(!qihse_kv_ct_source_custody_hold_install(store, op,
+            "wrong-generation", status.baseline_row_seq, status.baseline_digest,
+            status.durable_lsn));
+        assert(!qihse_kv_ct_source_custody_hold_install(store, op,
+            generation, status.baseline_row_seq, status.baseline_digest,
+            status.durable_lsn + 1u));
+        custody_wal_copy_or_compare(dir, true);
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+        if (!strcmp(phase, "custody-cut")) {
+            assert(setenv("QIHSE_AIMEM_FAIL_AT", "ct-source-custody-after-state", 1) == 0);
+            assert(!qihse_kv_ct_source_custody_hold_install(store, op,
+                generation, status.baseline_row_seq, status.baseline_digest,
+                status.durable_lsn));
+            assert(unsetenv("QIHSE_AIMEM_FAIL_AT") == 0);
+        } else
+#endif
+        assert(qihse_kv_ct_source_custody_hold_install(store, op,
+            generation, status.baseline_row_seq, status.baseline_digest,
+            status.durable_lsn));
+        assert(!qihse_kv_ct_source_ack(store, op, peer, generation,
+            status.durable_lsn));
+        assert(!qihse_kv_ct_source_reconcile(store, op, peer, generation,
+            status.baseline_digest, status.durable_lsn));
+    } else {
+        qihse_kv_ct_source_status_t status = {0};
+        assert(qihse_kv_ct_source_status(store, op, &status));
+        assert(status.retained_bytes && status.durable_lsn > status.acknowledged_lsn);
+        assert(!qihse_kv_ct_source_ack(store, op, status.successor_id,
+            status.generation, status.durable_lsn));
+        assert(!qihse_kv_ct_source_reconcile(store, op, status.successor_id,
+            status.generation, status.baseline_digest, status.durable_lsn));
+    }
+    custody_wal_copy_or_compare(dir, false);
+    qihse_kv_store_destroy(store);
+}
+
 static void run_child(const char* self, const char* phase,
                       const char* data_dir, const char* shared_dir) {
     pid_t pid = fork();
@@ -718,7 +827,9 @@ static void run_child(const char* self, const char* phase,
 
 int main(int argc, char** argv) {
     if (argc == 4) {
-        child_phase(argv[1], argv[2], argv[3]);
+        if (!strncmp(argv[1], "custody-", 8u))
+            custody_phase(argv[1], argv[2]);
+        else child_phase(argv[1], argv[2], argv[3]);
         return 0;
     }
     bool large = argc == 2 && strcmp(argv[1], "--large") == 0;
@@ -732,6 +843,18 @@ int main(int argc, char** argv) {
     path_join(target_dir, base, "target");
     assert(mkdir(source_dir, 0700) == 0);
     assert(mkdir(target_dir, 0700) == 0);
+    if (!large) {
+        char custody_dir[4096], cut_dir[4096];
+        path_join(custody_dir, base, "custody-source");
+        path_join(cut_dir, base, "custody-cut");
+        assert(mkdir(custody_dir, 0700) == 0 && mkdir(cut_dir, 0700) == 0);
+        run_child(argv[0], "custody-setup", custody_dir, base);
+        run_child(argv[0], "custody-reopen", custody_dir, base);
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+        run_child(argv[0], "custody-cut", cut_dir, base);
+        run_child(argv[0], "custody-cut-reopen", cut_dir, base);
+#endif
+    }
     run_child(argv[0], "source-setup", source_dir, base);
     run_child(argv[0], "target-setup", target_dir, base);
     if (!large) {

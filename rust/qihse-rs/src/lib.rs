@@ -12,6 +12,20 @@ pub mod ffi {
 
 pub mod controller;
 
+// Opt-in Python SDK surface; the original crate API remains unchanged.
+#[cfg(feature = "python-port")]
+pub mod python_vector;
+#[cfg(feature = "python-port")]
+pub mod python_storage;
+#[cfg(feature = "python-port")]
+pub mod python_remote;
+#[cfg(feature = "python-port")]
+pub mod python_browser;
+#[cfg(feature = "python-port")]
+pub mod python_peripheral;
+#[cfg(feature = "python-port")]
+pub mod python_port;
+
 pub use controller::{
     CasPrecondition, ControllerClient, ControllerConfig, ControllerError, Credentials, Reply,
     Watch, WatchEvent, DEFAULT_TIMEOUT_MS, MAX_BULK, MAX_DEPTH, MAX_ITEMS,

@@ -80,7 +80,7 @@ static void *negotiate(void *opaque) {
 static void check_session(const qihse_qkp_config_t *cfg,
     const qihse_qkp_replication_peer_t *peers, size_t count,
     const identity_t *source, const identity_t *client,
-    const char *node, bool expected) {
+    const char *node, bool expected, bool expected_admin) {
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     struct timeval timeout = {10, 0};
@@ -99,6 +99,9 @@ static void check_session(const qihse_qkp_config_t *cfg,
     assert(pthread_join(thread, NULL) == 0);
     assert(h.result == QIHSE_QKP_SECURE && h.session);
     assert(qihse_qkp_session_is_replication_peer_any(h.session, peers, count) == expected);
+    assert(qihse_qkp_session_is_admin_peer(h.session, cfg, peers, count) == expected_admin);
+    assert(!qihse_qkp_session_is_admin_peer(session, cfg, peers, count));
+    assert(!qihse_qkp_session_is_admin_peer(NULL, cfg, peers, count));
     assert(!qihse_qkp_session_is_replication_peer_any(session, peers, count));
     assert(!qihse_qkp_session_is_replication_peer_any(NULL, peers, count));
     assert(!qihse_qkp_session_is_replication_peer_any(h.session, NULL, 1u));
@@ -275,6 +278,125 @@ static void deny_protected_data(real_client_t *client) {
     assert(reply[0] == '$' || reply[0] == '-');
     assert(!memmem(reply, n, PAYLOAD, strlen(PAYLOAD)));
     free(reply);
+}
+
+/* Exercise the engine's authenticated session, not the QKP pin predicate alone.
+ * REPL.STATUS and the classified GET establish positive Operator authority. */
+static void admin_wire_access(real_client_t *client, bool operator_expected) {
+    const char *users[] = {"USER", "LIST"};
+    const char *status[] = {"REPL.STATUS"};
+    const char *get[] = {"GET", KEY};
+    size_t length;
+    if (!operator_expected) {
+        const char *const *requests[] = {users, status, get};
+        const size_t counts[] = {2u, 1u, 2u};
+        for (size_t i = 0u; i < 3u; ++i) {
+            char *refusal = command(client, counts[i], requests[i], &length);
+            assert(refusal[0] == '-' &&
+                   !memmem(refusal, length, PAYLOAD, strlen(PAYLOAD)));
+            free(refusal);
+        }
+        return;
+    }
+    char *reply = command(client, 1u, status, &length);
+    assert(length > 0u && reply[0] == '*');
+    free(reply);
+    reply = command(client, 2u, get, &length);
+    assert(reply[0] == '$' && memmem(reply, length, PAYLOAD, strlen(PAYLOAD)));
+    free(reply);
+}
+
+static void real_admin_mapping(const qihse_resp_server_config_t *base,
+    qihse_user_t *op, const identity_t *source, const identity_t *first,
+    const identity_t *second, const identity_t *wrong, const char *root) {
+    identity_t primary, alternate;
+    identity(&primary, root, "admin-primary");
+    identity(&alternate, root, "admin-secondary");
+    const char *trusted[] = {
+        first->pub, second->pub, wrong->pub, primary.pub, alternate.pub
+    };
+    qihse_resp_server_config_t cfg = *base;
+    cfg.pqc.trusted_pubs = trusted;
+    cfg.pqc.trusted_count = sizeof(trusted) / sizeof(trusted[0]);
+    cfg.pqc.admin_peer_node_id = "admin-primary";
+    cfg.pqc.admin_peer_dsa_pub_path = primary.pub;
+    qihse_resp_server_t *server = qihse_resp_server_create(&cfg);
+    assert(server);
+    assert(qihse_resp_server_add_replication_peer(server, "second", second->pub, op));
+    assert(qihse_resp_server_add_admin_peer(server, "admin-secondary", alternate.pub, op));
+    real_client_t *wire = connect_peer(server, &primary, source, "admin-primary");
+    admin_wire_access(wire, true);
+    close_peer(wire);
+    wire = connect_peer(server, &alternate, source, "admin-secondary");
+    admin_wire_access(wire, true);
+    close_peer(wire);
+    const identity_t *bad_keys[] = {wrong, second, &primary, wrong, &alternate};
+    const char *bad_labels[] = {
+        "admin-primary", "admin-primary", "admin-secondary",
+        "admin-secondary", "wrong-label"
+    };
+    for (size_t i = 0u; i < sizeof(bad_keys) / sizeof(bad_keys[0]); ++i) {
+        wire = connect_peer(server, bad_keys[i], source, bad_labels[i]);
+        admin_wire_access(wire, false);
+        close_peer(wire);
+    }
+    wire = connect_peer(server, &primary, source, "wrong-label");
+    admin_wire_access(wire, false);
+    close_peer(wire);
+    wire = connect_peer(server, first, source, "first");
+    admin_wire_access(wire, false);
+    const char *begin[] = {"REPL.SNAPSHOT.BEGIN", GLOB};
+    const char *end[] = {"REPL.SNAPSHOT.END"};
+    char *reply = command(wire, 2u, begin, NULL);
+    assert(reply[0] == '*'); free(reply);
+    reply = command(wire, 1u, end, NULL);
+    assert(strcmp(reply, "+OK\r\n") == 0); free(reply);
+    close_peer(wire);
+    qihse_resp_server_destroy(server);
+
+    /* Even if an admin label points at a registered replication key, the
+     * pin must not turn a service identity into an Operator session. */
+    cfg.pqc.admin_peer_node_id = "admin-alias";
+    cfg.pqc.admin_peer_dsa_pub_path = second->pub;
+    server = qihse_resp_server_create(&cfg);
+    assert(server);
+    assert(qihse_resp_server_add_replication_peer(server, "second", second->pub, op));
+    wire = connect_peer(server, second, source, "admin-alias");
+    admin_wire_access(wire, false);
+    close_peer(wire);
+    qihse_resp_server_destroy(server);
+
+    /* The migration key stays migration-only when an admin pin reuses its
+     * signer under a different node label. Exercise the real sealed RESP path. */
+    const char *migration_labels[] = {"migration-only"};
+    const char *migration_keys[] = {wrong->pub};
+    cfg.pqc.migration_peer_node_ids = migration_labels;
+    cfg.pqc.migration_peer_dsa_pub_paths = migration_keys;
+    cfg.pqc.migration_peer_count = 1u;
+    cfg.pqc.admin_peer_node_id = "admin-migration-alias";
+    cfg.pqc.admin_peer_dsa_pub_path = wrong->pub;
+    server = qihse_resp_server_create(&cfg);
+    assert(server);
+    wire = connect_peer(server, wrong, source, "admin-migration-alias");
+    admin_wire_access(wire, false);
+    close_peer(wire);
+    qihse_resp_server_destroy(server);
+    cfg.pqc.migration_peer_node_ids = NULL;
+    cfg.pqc.migration_peer_dsa_pub_paths = NULL;
+    cfg.pqc.migration_peer_count = 0u;
+
+    const char *labels[] = {NULL, "admin-primary", NULL};
+    const char *keys[] = {NULL, NULL, primary.pub};
+    for (size_t i = 0u; i < 3u; ++i) {
+        cfg.pqc.admin_peer_node_id = labels[i];
+        cfg.pqc.admin_peer_dsa_pub_path = keys[i];
+        server = qihse_resp_server_create(&cfg);
+        assert(server);
+        wire = connect_peer(server, &primary, source, "admin-primary");
+        admin_wire_access(wire, false);
+        close_peer(wire);
+        qihse_resp_server_destroy(server);
+    }
 }
 
 static void auth_root(real_client_t *client) {
@@ -722,16 +844,50 @@ int main(void) {
     cfg.replication_service_principal = service;
     cfg.replicate_globs = globs;
     cfg.replicate_glob_count = 1u;
+    real_admin_mapping(&cfg, op, &source, &first, &second, &wrong, root);
     promotion_prepare_reply_framing(&cfg, op, &source, &first);
     held_wire_manual_failover(&cfg, op, &source, &second);
     embedded_execute_closes_startup(&cfg, op);
     const qihse_qkp_replication_peer_t peers[] = {
         {"first", first.pub}, {"second", second.pub}
     };
-    check_session(&cfg.pqc, peers, 2u, &source, &first, "first", true);
-    check_session(&cfg.pqc, peers, 2u, &source, &second, "second", true);
-    check_session(&cfg.pqc, peers, 2u, &source, &second, "unknown", false);
-    check_session(&cfg.pqc, peers, 2u, &source, &wrong, "second", false);
+    check_session(&cfg.pqc, peers, 2u, &source, &first, "first", true, false);
+    check_session(&cfg.pqc, peers, 2u, &source, &second, "second", true, false);
+    check_session(&cfg.pqc, peers, 2u, &source, &second, "unknown", false, false);
+    check_session(&cfg.pqc, peers, 2u, &source, &wrong, "second", false, false);
+    qihse_qkp_config_t admin_cfg = cfg.pqc;
+    admin_cfg.admin_peer_node_id = "operator";
+    admin_cfg.admin_peer_dsa_pub_path = wrong.pub;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, true);
+    const char *migration_labels[] = {"migration-other", "migration-only"};
+    const char *migration_keys[] = {source.pub, wrong.pub};
+    admin_cfg.migration_peer_node_ids = migration_labels;
+    admin_cfg.migration_peer_dsa_pub_paths = migration_keys;
+    admin_cfg.migration_peer_count = 2u;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, false);
+    migration_keys[1] = NULL;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, false);
+    migration_keys[1] = first_alias;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, true);
+    admin_cfg.migration_peer_dsa_pub_paths = NULL;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, false);
+    admin_cfg.migration_peer_dsa_pub_paths = migration_keys;
+    admin_cfg.migration_peer_node_ids = NULL;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, false);
+    admin_cfg.migration_peer_node_ids = migration_labels;
+    admin_cfg.migration_peer_count = QIHSE_QKP_MAX_REPLICATION_PEERS + 1u;
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, false);
+    admin_cfg.migration_peer_count = 0u;
+    /* Daemon config keeps allocated arrays even when no migration pins exist. */
+    check_session(&admin_cfg, peers, 2u, &source, &wrong, "operator", false, true);
+    admin_cfg.migration_peer_node_ids = NULL;
+    admin_cfg.migration_peer_dsa_pub_paths = NULL;
+    check_session(&admin_cfg, peers, 2u, &source, &second, "operator", false, false);
+    admin_cfg.admin_peer_dsa_pub_path = second.pub;
+    check_session(&admin_cfg, peers, 2u, &source, &second, "operator", false, false);
+    admin_cfg.admin_peer_node_id = "second";
+    admin_cfg.admin_peer_dsa_pub_path = second.pub;
+    check_session(&admin_cfg, peers, 2u, &source, &second, "second", true, false);
     qihse_resp_server_t *server = qihse_resp_server_create(&cfg);
     assert(server);
     /* Pointer identity and current shadow authority, not caller-owned fields,

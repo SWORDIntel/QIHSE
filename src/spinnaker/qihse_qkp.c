@@ -94,6 +94,43 @@ bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
     return match;
 }
 
+bool qihse_qkp_session_is_admin_peer(const qihse_qkp_session_t* s,
+                                     const qihse_qkp_config_t* config,
+                                     const qihse_qkp_replication_peer_t* peers,
+                                     size_t peer_count) {
+    if (!s || !config || s->role != QKP_ROLE_SERVER || !s->has_peer_identity ||
+        s->replication_peer || !config->admin_peer_node_id ||
+        !*config->admin_peer_node_id ||
+        strnlen(config->admin_peer_node_id, QIHSE_QKP_NODE_ID_LEN + 1u) > QIHSE_QKP_NODE_ID_LEN ||
+        peer_count > QIHSE_QKP_MAX_REPLICATION_PEERS || (peer_count && !peers) ||
+        config->migration_peer_count > QIHSE_QKP_MAX_REPLICATION_PEERS ||
+        (config->migration_peer_count &&
+         (!config->migration_peer_node_ids || !config->migration_peer_dsa_pub_paths)))
+        return false;
+    uint8_t expected[32] = {0}, candidate[32] = {0};
+    /* The signed label binds the session to exactly one pin identity: a
+     * session matching the primary replication pin has s->replication_peer
+     * set and was already refused above, so a deployment that shares one
+     * signer between the primary replication label and the admin label
+     * (the single-node dual-label pattern) cannot misattribute authority. */
+    bool match = strcmp(s->peer_node_id, config->admin_peer_node_id) == 0 &&
+        qkp_dsa_pub_fingerprint(config->admin_peer_dsa_pub_path, expected) &&
+        CRYPTO_memcmp(s->peer_dsa_fingerprint, expected, sizeof(expected)) == 0;
+    for (size_t i = 0; match && i < peer_count; i++) {
+        match = peers[i].node_id && *peers[i].node_id &&
+            qkp_dsa_pub_fingerprint(peers[i].dsa_pub_path, candidate) &&
+            CRYPTO_memcmp(candidate, expected, sizeof(expected)) != 0;
+    }
+    for (size_t i = 0; match && i < config->migration_peer_count; i++) {
+        match = config->migration_peer_node_ids[i] && *config->migration_peer_node_ids[i] &&
+            qkp_dsa_pub_fingerprint(config->migration_peer_dsa_pub_paths[i], candidate) &&
+            CRYPTO_memcmp(candidate, expected, sizeof(expected)) != 0;
+    }
+    OPENSSL_cleanse(candidate, sizeof(candidate));
+    OPENSSL_cleanse(expected, sizeof(expected));
+    return match;
+}
+
 static bool qkp_same_replication_pin(const char* first, const char* second) {
     if (strcmp(first, second) == 0) return true;
     uint8_t a[32] = {0}, b[32] = {0};
@@ -176,6 +213,36 @@ static bool qkp_read_exact(int fd, void* buf, size_t len) {
         done += (size_t)r;
     }
     return true;
+}
+
+/* SO_PASSCRED annotates each AF_UNIX stream fragment with the writer's
+ * credentials. Never use plain recv: the socket can change hands. */
+static int qkp_read_exact_uid(int fd, void* buf, size_t len, uid_t uid) {
+    uint8_t* p = buf;
+    size_t done = 0;
+    while (done < len) {
+        char control[CMSG_SPACE(sizeof(struct ucred))];
+        struct iovec iov = {.iov_base = p + done, .iov_len = len - done};
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        ssize_t n = recvmsg(fd, &msg, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        if (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) return -2;
+        struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+        if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+            cmsg->cmsg_type != SCM_CREDENTIALS ||
+            cmsg->cmsg_len != CMSG_LEN(sizeof(struct ucred)) ||
+            CMSG_NXTHDR(&msg, cmsg)) return -2;
+        struct ucred cred;
+        memcpy(&cred, CMSG_DATA(cmsg), sizeof(cred));
+        if (cred.uid != uid) return -2;
+        done += (size_t)n;
+    }
+    return 0;
 }
 
 static bool qkp_send_err(int fd, const char* text) {
@@ -864,11 +931,14 @@ bool qihse_qkp_send_sealed(qihse_qkp_session_t* s, int fd, const void* data, siz
     return true;
 }
 
-ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
-                              uint8_t* out, size_t cap) {
+static ssize_t qkp_recv_sealed_impl(qihse_qkp_session_t* s, int fd,
+                                     uint8_t* out, size_t cap, const uid_t* uid) {
     if (!s) return -1;
     uint8_t head[6];
-    if (!qkp_read_exact(fd, head, 6u)) return -1;
+    if (uid) {
+        int rc = qkp_read_exact_uid(fd, head, sizeof(head), *uid);
+        if (rc) return rc;
+    } else if (!qkp_read_exact(fd, head, sizeof(head))) return -1;
     if (memcmp(head, SEAL_MAGIC, 4u) != 0) return -2;
     uint16_t flen = qihse_load_be16(head + 4);
     /* QIHSE_QKP_MAX_FRAME = 12 + 16384 + 16 = 16412; the old 8+16384 bound
@@ -878,7 +948,10 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
     uint32_t dir = (s->role == QKP_ROLE_SERVER) ? DIR_C2S : DIR_S2C;
     uint64_t expected = s->rx_seq;
     uint8_t* frame = s->rx_scratch;
-    if (!qkp_read_exact(fd, frame, flen)) return -1;
+    if (uid) {
+        int rc = qkp_read_exact_uid(fd, frame, flen, *uid);
+        if (rc) return rc;
+    } else if (!qkp_read_exact(fd, frame, flen)) return -1;
     uint8_t nonce[12];
     qkp_make_nonce(nonce, dir, expected);
     size_t plen = flen - QIHSE_QKP_NONCE_WIRE_LEN - QIHSE_QKP_TAG_LEN;
@@ -896,6 +969,24 @@ ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
     s->rx_seq = expected + 1u;
     g_qkp_counters.frames_unsealed++;
     return (ssize_t)plen;
+}
+
+ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
+                              uint8_t* out, size_t cap) {
+    return qkp_recv_sealed_impl(s, fd, out, cap, NULL);
+}
+
+ssize_t qihse_qkp_recv_sealed_uid_checked(qihse_qkp_session_t* s, int fd,
+                                          uid_t expected_uid,
+                                          uint8_t* out, size_t cap) {
+    int enabled = 0, domain = 0;
+    socklen_t size = sizeof(enabled);
+    if (getsockopt(fd, SOL_SOCKET, SO_PASSCRED, &enabled, &size) ||
+        size != sizeof(enabled) || !enabled) return -2;
+    size = sizeof(domain);
+    if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &size) ||
+        size != sizeof(domain) || domain != AF_UNIX) return -2;
+    return qkp_recv_sealed_impl(s, fd, out, cap, &expected_uid);
 }
 
 void qihse_qkp_session_free(qihse_qkp_session_t* s) {
@@ -1242,10 +1333,12 @@ int qihse_qkp_admin_format(const char* reply, size_t reply_len, bool json,
     return 0;
 }
 
-int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
-                         const char* identity_dir, const char* trusted_pub_path,
-                         unsigned timeout_ms, qihse_qkp_admin_client_t** out,
-                         char* err_buf, size_t err_cap) {
+static int qkp_admin_open_impl(const char* host, uint16_t port, const char* node_id,
+                               const char* identity_dir, const char* trusted_pub_path,
+                               const char* expected_server_node_id,
+                               const char* expected_server_dsa_pub_path,
+                               unsigned timeout_ms, qihse_qkp_admin_client_t** out,
+                               char* err_buf, size_t err_cap) {
     if (out) *out = NULL;
     if (err_buf && err_cap) err_buf[0] = '\0';
     if (!host || !*host || !trusted_pub_path || !*trusted_pub_path ||
@@ -1305,6 +1398,14 @@ int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
         close(fd);
         return 3;
     }
+    if (expected_server_node_id &&
+        !qihse_qkp_client_session_is_replication_peer(session, expected_server_node_id,
+                                                      expected_server_dsa_pub_path)) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "QKP server peer identity mismatch");
+        qihse_qkp_session_free(session);
+        close(fd);
+        return 3;
+    }
 
     qihse_qkp_admin_client_t* client = calloc(1u, sizeof(*client));
     if (!client) {
@@ -1317,6 +1418,32 @@ int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
     client->fd = fd;
     *out = client;
     return 0;
+}
+
+int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
+                         const char* identity_dir, const char* trusted_pub_path,
+                         unsigned timeout_ms, qihse_qkp_admin_client_t** out,
+                         char* err_buf, size_t err_cap) {
+    return qkp_admin_open_impl(host, port, node_id, identity_dir, trusted_pub_path,
+                               NULL, NULL, timeout_ms, out, err_buf, err_cap);
+}
+
+int qihse_qkp_admin_open_strict_peer(const char* host, uint16_t port, const char* node_id,
+                                     const char* identity_dir, const char* trusted_pub_path,
+                                     const char* expected_server_node_id,
+                                     const char* expected_server_dsa_pub_path,
+                                     unsigned timeout_ms, qihse_qkp_admin_client_t** out,
+                                     char* err_buf, size_t err_cap) {
+    if (!expected_server_node_id || !*expected_server_node_id ||
+        strnlen(expected_server_node_id, QIHSE_QKP_NODE_ID_LEN + 1u) > QIHSE_QKP_NODE_ID_LEN ||
+        !expected_server_dsa_pub_path || !*expected_server_dsa_pub_path) {
+        if (out) *out = NULL;
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "invalid server peer pin");
+        return 2;
+    }
+    return qkp_admin_open_impl(host, port, node_id, identity_dir, trusted_pub_path,
+                               expected_server_node_id, expected_server_dsa_pub_path,
+                               timeout_ms, out, err_buf, err_cap);
 }
 
 void qihse_qkp_admin_close(qihse_qkp_admin_client_t* client) {

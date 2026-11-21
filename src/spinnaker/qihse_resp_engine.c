@@ -12,6 +12,8 @@
 #include "qihse_federation.h"
 #include "qihse_federation_mtls.h"
 #include "qihse_qkp.h"
+#include "qihse_ct1_recovery_manifest.h"
+#include "qihse_ct1_node_quote.h"
 #include "qihse_supply_chain.h"
 #include "qihse_runtime_trust.h"
 #include "qihse_security_audit.h"
@@ -445,6 +447,8 @@ struct qihse_resp_server {
     bool ct_control_only;
     bool ct_recovery_ready;
     qihse_user_t* ct_control_principal;
+    /* Startup configuration only; deliberately no reader, signer or RESP getter. */
+    char ct1_recovery_frozen_root[PATH_MAX];
     qihse_cluster_topology_qkp_id_fn ct_topology_qkp_id;
     void* ct_topology_qkp_id_context;
     qihse_kv_replica_snapshot_t* ct_baseline_snapshot;
@@ -9503,7 +9507,10 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         if (scoped_forget_durable) pthread_rwlock_wrlock(&session->server->kv_lock);
         bool removed = qihse_ai_memory_forget_scoped(session->server, session->user,
                                                       id, &scope);
-        bool fenced = !scoped_forget_durable || !removed || qihse_kv_sync_store(store);
+        /* A durable ACK fences the store even when nothing was removed: the
+         * record may be absent because a prior attempt crashed before its
+         * deletion became durable, so the retry must fence it. */
+        bool fenced = !scoped_forget_durable || qihse_kv_sync_store(store);
         if (scoped_forget_durable) pthread_rwlock_unlock(&session->server->kv_lock);
         free(id);
         if (!fenced) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM delete not confirmed durable");
@@ -11104,7 +11111,7 @@ static bool dsp_expireat(qihse_resp_session_t* s, const qihse_resp_request_t* r)
 static bool dsp_pexpireat(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_expireat(s, r, true); }
 /* ── R4 replicated namespaces (REPL.*) — registry, sovereign routing, ops ──
  *
- * A replicated namespace is a glob (e.g. "sabot/*"). Keys matching one are
+ * A replicated namespace is a glob (e.g. "sabot/" followed by "*"). Keys matching one are
  * SOVEREIGN-LOCAL: every node may hold them, so the routing layer never
  * MOVED-redirects or CLUSTERDOWN-gates them (qihse_resp_route exempts a
  * request whose EVERY key is marked). Unmarked keys route exactly as
@@ -12881,6 +12888,324 @@ static void qihse_resp_ct_hex32(const unsigned char in[32], char out[65]) {
     out[64] = '\0';
 }
 
+/* Pin a configured ML-DSA public key as QKP does: SHA256(DER SPKI). */
+static bool qihse_resp_ct1_public_pin(const char* path, unsigned char pin[32]) {
+    if (!path || !*path) return false;
+    FILE* file = fopen(path, "rb");
+    if (!file) return false;
+    EVP_PKEY* key = PEM_read_PUBKEY(file, NULL, NULL, NULL);
+    fclose(file);
+    if (!key) return false;
+    int length = EVP_PKEY_is_a(key, "ML-DSA-87") ? i2d_PUBKEY(key, NULL) : -1;
+    unsigned char* der = length > 0 && length <= 8192 ?
+        OPENSSL_malloc((size_t)length) : NULL;
+    unsigned char* cursor = der;
+    bool ok = der && i2d_PUBKEY(key, &cursor) == length &&
+        SHA256(der, (size_t)length, pin) != NULL;
+    OPENSSL_clear_free(der, der ? (size_t)length : 0u);
+    EVP_PKEY_free(key);
+    return ok;
+}
+
+static bool qihse_resp_handle_ct1_source_quote_v2(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    static const char key_suffix[] = "qihse_dsa_key.pem";
+    static const char pub_suffix[] = "qihse_dsa_pub.pem";
+    qihse_resp_server_t* server = s->server;
+    const qihse_qkp_config_t* pqc = &server->pqc;
+    bool operator_active = false, service_active = false;
+    uint32_t operator_tenant = QIHSE_TENANT_INVALID;
+    uint32_t service_tenant = QIHSE_TENANT_INVALID;
+    const char* key_path = pqc->dsa_key_path;
+    size_t key_len = key_path ? strlen(key_path) : 0u;
+    if (r->argc != 5u || r->argv[3].len != QIHSE_CT1_NODE_QUOTE_NONCE_SIZE ||
+        r->argv[4].len != QIHSE_CT1_RECOVERY_WIRE_SIZE ||
+        s->auth_kind != QIHSE_RESP_AUTH_QKP_ADMIN || !s->qkp ||
+        !s->user || s->user != server->ct_control_principal ||
+        qihse_user_get_id(s->user) != 0u ||
+        qihse_user_get_role(s->user) != QIHSE_ROLE_OPERATOR ||
+        !server->replication_service_principal ||
+        !server->ct_role || strcmp(server->ct_role, "primary") ||
+        server->ct_group_count || !server->ct1_recovery_frozen_root[0] ||
+        !pqc->require || !pqc->node_id || !pqc->replication_peer_node_id ||
+        !pqc->replication_peer_dsa_pub_path || !pqc->admin_peer_node_id ||
+        !pqc->admin_peer_dsa_pub_path || !server->ct_generation[0] ||
+        !key_path || key_len < sizeof(key_suffix) - 1u ||
+        strcmp(key_path + key_len - (sizeof(key_suffix) - 1u), key_suffix) ||
+        key_len - (sizeof(key_suffix) - 1u) + sizeof(pub_suffix) > PATH_MAX ||
+        !qihse_qkp_session_is_admin_peer(s->qkp, pqc,
+            server->replication_peers, server->replication_peer_count))
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+    qihse_auth_user_active_and_tenant(s->user, &operator_active, &operator_tenant);
+    qihse_auth_user_active_and_tenant(server->replication_service_principal,
+        &service_active, &service_tenant);
+    qihse_user_t* service = server->replication_service_principal;
+    if (!operator_active || operator_tenant != QIHSE_TENANT_SYSTEM ||
+        !service_active || service_tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(service) == QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_classification(service) != UINT16_MAX ||
+        qihse_user_get_sci(service) != UINT16_MAX)
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+
+    char own_pub[PATH_MAX], principal_id[32];
+    memcpy(own_pub, key_path, key_len - (sizeof(key_suffix) - 1u));
+    memcpy(own_pub + key_len - (sizeof(key_suffix) - 1u),
+        pub_suffix, sizeof(pub_suffix));
+    int n = snprintf(principal_id, sizeof(principal_id), "%u",
+        qihse_user_get_id(service));
+    unsigned char own_pin[32], peer_pin[32], issuer_pin[32];
+    qihse_ct1_recovery_manifest_t manifest;
+    unsigned char canonical[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (n <= 0 || (size_t)n >= sizeof(principal_id) ||
+        !qihse_resp_ct1_public_pin(own_pub, own_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->replication_peer_dsa_pub_path, peer_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->admin_peer_dsa_pub_path, issuer_pin) ||
+        !CRYPTO_memcmp(own_pin, peer_pin, 32u) ||
+        !qihse_ct1_recovery_decode(r->argv[4].data, r->argv[4].len,
+            false, &manifest, NULL) ||
+        !qihse_ct1_recovery_encode(&manifest, false, false, canonical) ||
+        CRYPTO_memcmp(canonical, r->argv[4].data, sizeof(canonical)) ||
+        CRYPTO_memcmp(manifest.nonce, r->argv[3].data, 32u) ||
+        strcmp(manifest.issuer_qkp_id, pqc->admin_peer_node_id) ||
+        CRYPTO_memcmp(manifest.issuer_operator_pin, issuer_pin, 32u) ||
+        strcmp(manifest.source_qkp_id, pqc->node_id) ||
+        strcmp(manifest.target_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.source_store_id, pqc->node_id) ||
+        strcmp(manifest.target_store_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.source_peer_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.target_peer_qkp_id, pqc->node_id) ||
+        CRYPTO_memcmp(manifest.source_peer_pin, peer_pin, 32u) ||
+        CRYPTO_memcmp(manifest.target_peer_pin, own_pin, 32u) ||
+        strcmp(manifest.replication_principal_id, principal_id) ||
+        strcmp(manifest.generation, server->ct_generation) ||
+        manifest.principal_tenant_id != service_tenant ||
+        manifest.principal_classification != qihse_user_get_classification(service) ||
+        manifest.principal_sci != qihse_user_get_sci(service) ||
+        !qihse_ct1_recovery_verify_frozen(service,
+            server->ct1_recovery_frozen_root, &manifest, true))
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+
+    qihse_kv_ct_source_retained_frame_request_t request = {
+        .version = QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1,
+        .size = sizeof(request), .source_id = pqc->node_id,
+        .successor_id = pqc->replication_peer_node_id,
+        .generation = server->ct_generation,
+        .baseline_row_seq = manifest.baseline_row_seq,
+        .acknowledged_position = manifest.frame_position - 1u,
+        .durable_position = manifest.frame_position,
+        .stream_position = manifest.frame_position,
+        .key = manifest.row_key,
+        .resource_tenant_id = manifest.row_tenant_id,
+        .classification = manifest.classification,
+        .sci_compartment = manifest.sci,
+        .row_change_seq = manifest.row_change_seq
+    };
+    memcpy(request.baseline_digest, manifest.baseline_sha256, 32u);
+    qihse_kv_ct_source_quote_snapshot_t snapshot = {0};
+    bool measured = manifest.frame_position > 0u &&
+        manifest.frame_length == QIHSE_CT1_RECOVERY_FRAME_BYTES &&
+        manifest.source_high_water != 0u;
+    if (measured) {
+        pthread_rwlock_rdlock(&server->kv_lock);
+        measured = qihse_kv_ct_source_quote_snapshot_v1(server->store,
+            s->user, service, &request, manifest.source_high_water, &snapshot);
+        pthread_rwlock_unlock(&server->kv_lock);
+    }
+    if (measured) measured = snapshot.frame_offset == manifest.frame_offset &&
+        snapshot.retained.frame_length == manifest.frame_length &&
+        snapshot.retained.stream_position == manifest.frame_position &&
+        snapshot.retained.row_change_seq == manifest.row_change_seq &&
+        snapshot.retained.resource_tenant_id == manifest.row_tenant_id &&
+        snapshot.retained.classification == manifest.classification &&
+        snapshot.retained.sci_compartment == manifest.sci &&
+        snapshot.row_seq_high_water == manifest.source_high_water &&
+        snapshot.retained.key && !strcmp(snapshot.retained.key, manifest.row_key) &&
+        !CRYPTO_memcmp(snapshot.retained.frame_sha256, manifest.frame_sha256, 32u);
+    unsigned char quote[QIHSE_CT1_NODE_QUOTE_SIZE];
+    bool signed_quote = false;
+    if (measured) {
+        /* Target cursor/high-water remain host commitments, never source measurements. */
+        qihse_ct1_node_quote_expected_t expected = {0};
+        snprintf(expected.source_qkp_id, sizeof(expected.source_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.target_qkp_id, sizeof(expected.target_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.source_peer_qkp_id, sizeof(expected.source_peer_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.target_peer_qkp_id, sizeof(expected.target_peer_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.replication_principal_id, sizeof(expected.replication_principal_id),
+            "%s", principal_id);
+        snprintf(expected.generation, sizeof(expected.generation), "%s", server->ct_generation);
+        memcpy(expected.source_signer_pin, own_pin, 32u);
+        memcpy(expected.target_signer_pin, peer_pin, 32u);
+        memcpy(expected.source_peer_pin, peer_pin, 32u);
+        memcpy(expected.target_peer_pin, own_pin, 32u);
+        memcpy(expected.baseline_sha256, request.baseline_digest, 32u);
+        expected.source_high_water = snapshot.row_seq_high_water;
+        expected.target_cursor = manifest.target_cursor;
+        expected.target_high_water = manifest.target_high_water;
+        qihse_ct1_recovery_manifest_t verified = manifest;
+        qihse_ct1_node_quote_signing_evidence_t evidence = {
+            .manifest_wire = canonical, .manifest_len = sizeof(canonical),
+            .verified_manifest = &verified, .expected = &expected,
+            .role = QIHSE_CT1_NODE_QUOTE_SOURCE, .now_ms = qihse_resp_now_ms(),
+            .host_nonce = r->argv[3].data, .own_private_key_path = key_path,
+            .own_public_key_path = own_pub
+        };
+        signed_quote = qihse_ct1_node_quote_sign_verified(&evidence, quote);
+    }
+    if (snapshot.retained.frame) {
+        OPENSSL_cleanse(snapshot.retained.frame, snapshot.retained.frame_length);
+        free(snapshot.retained.frame);
+    }
+    free(snapshot.retained.key);
+    if (!signed_quote)
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+    bool sent = qihse_resp_bulk(s, quote, sizeof(quote));
+    OPENSSL_cleanse(quote, sizeof(quote));
+    return sent;
+}
+
+static bool qihse_resp_handle_ct1_target_quote_v2(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    static const char key_suffix[] = "qihse_dsa_key.pem";
+    static const char pub_suffix[] = "qihse_dsa_pub.pem";
+    qihse_resp_server_t* server = s->server;
+    const qihse_qkp_config_t* pqc = &server->pqc;
+    bool operator_active = false, service_active = false;
+    uint32_t operator_tenant = QIHSE_TENANT_INVALID;
+    uint32_t service_tenant = QIHSE_TENANT_INVALID;
+    const char* key_path = pqc->dsa_key_path;
+    size_t key_len = key_path ? strlen(key_path) : 0u;
+    if (r->argc != 5u || r->argv[3].len != QIHSE_CT1_NODE_QUOTE_NONCE_SIZE ||
+        r->argv[4].len != QIHSE_CT1_RECOVERY_WIRE_SIZE ||
+        s->auth_kind != QIHSE_RESP_AUTH_QKP_ADMIN || !s->qkp ||
+        !s->user || s->user != server->ct_control_principal ||
+        qihse_user_get_id(s->user) != 0u ||
+        qihse_user_get_role(s->user) != QIHSE_ROLE_OPERATOR ||
+        !server->replication_service_principal ||
+        !server->ct_role || strcmp(server->ct_role, "successor") ||
+        server->ct_group_count || !server->ct1_recovery_frozen_root[0] ||
+        !pqc->require || !pqc->node_id || !pqc->replication_peer_node_id ||
+        !pqc->replication_peer_dsa_pub_path || !pqc->admin_peer_node_id ||
+        !pqc->admin_peer_dsa_pub_path || !server->ct_generation[0] ||
+        !key_path || key_len < sizeof(key_suffix) - 1u ||
+        strcmp(key_path + key_len - (sizeof(key_suffix) - 1u), key_suffix) ||
+        key_len - (sizeof(key_suffix) - 1u) + sizeof(pub_suffix) > PATH_MAX ||
+        !qihse_qkp_session_is_admin_peer(s->qkp, pqc,
+            server->replication_peers, server->replication_peer_count))
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+    qihse_auth_user_active_and_tenant(s->user, &operator_active, &operator_tenant);
+    qihse_auth_user_active_and_tenant(server->replication_service_principal,
+        &service_active, &service_tenant);
+    qihse_user_t* service = server->replication_service_principal;
+    if (!operator_active || operator_tenant != QIHSE_TENANT_SYSTEM ||
+        !service_active || service_tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(service) == QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_classification(service) != UINT16_MAX ||
+        qihse_user_get_sci(service) != UINT16_MAX)
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+
+    char own_pub[PATH_MAX], principal_id[32];
+    memcpy(own_pub, key_path, key_len - (sizeof(key_suffix) - 1u));
+    memcpy(own_pub + key_len - (sizeof(key_suffix) - 1u),
+        pub_suffix, sizeof(pub_suffix));
+    int n = snprintf(principal_id, sizeof(principal_id), "%u",
+        qihse_user_get_id(service));
+    unsigned char own_pin[32], peer_pin[32], issuer_pin[32];
+    qihse_ct1_recovery_manifest_t manifest;
+    unsigned char canonical[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (n <= 0 || (size_t)n >= sizeof(principal_id) ||
+        !qihse_resp_ct1_public_pin(own_pub, own_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->replication_peer_dsa_pub_path, peer_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->admin_peer_dsa_pub_path, issuer_pin) ||
+        !CRYPTO_memcmp(own_pin, peer_pin, 32u) ||
+        !qihse_ct1_recovery_decode(r->argv[4].data, r->argv[4].len,
+            false, &manifest, NULL) ||
+        !qihse_ct1_recovery_encode(&manifest, false, false, canonical) ||
+        CRYPTO_memcmp(canonical, r->argv[4].data, sizeof(canonical)) ||
+        CRYPTO_memcmp(manifest.nonce, r->argv[3].data, 32u) ||
+        strcmp(manifest.issuer_qkp_id, pqc->admin_peer_node_id) ||
+        CRYPTO_memcmp(manifest.issuer_operator_pin, issuer_pin, 32u) ||
+        strcmp(manifest.target_qkp_id, pqc->node_id) ||
+        strcmp(manifest.source_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.target_store_id, pqc->node_id) ||
+        strcmp(manifest.source_store_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.target_peer_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.source_peer_qkp_id, pqc->node_id) ||
+        CRYPTO_memcmp(manifest.target_peer_pin, peer_pin, 32u) ||
+        CRYPTO_memcmp(manifest.source_peer_pin, own_pin, 32u) ||
+        strcmp(manifest.replication_principal_id, principal_id) ||
+        strcmp(manifest.generation, server->ct_generation) ||
+        manifest.principal_tenant_id != service_tenant ||
+        manifest.principal_classification != qihse_user_get_classification(service) ||
+        manifest.principal_sci != qihse_user_get_sci(service) ||
+        !qihse_ct1_recovery_verify_frozen(service,
+            server->ct1_recovery_frozen_root, &manifest, false))
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+
+    qihse_kv_ct_receiver_history_request_t request = {
+        .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1,
+        .size = sizeof(request), .source_id = pqc->replication_peer_node_id,
+        .target_id = pqc->node_id, .generation = server->ct_generation,
+        .baseline_row_seq = manifest.baseline_row_seq,
+        .durable_cursor = manifest.target_cursor,
+        .key = manifest.row_key,
+        .resource_tenant_id = manifest.row_tenant_id,
+        .classification = manifest.classification,
+        .sci_compartment = manifest.sci
+    };
+    memcpy(request.baseline_digest, manifest.baseline_sha256, 32u);
+    qihse_kv_ct_receiver_history_result_t snapshot = {0};
+    bool measured = manifest.target_cursor != 0u &&
+        manifest.target_high_water != 0u && manifest.tombstone_position != 0u;
+    if (measured) {
+        pthread_rwlock_rdlock(&server->kv_lock);
+        measured = qihse_kv_ct_target_quote_snapshot_v1(server->store,
+            s->user, service, &request, manifest.target_high_water, &snapshot);
+        pthread_rwlock_unlock(&server->kv_lock);
+    }
+    measured = measured && snapshot.stream_position == manifest.tombstone_position &&
+        snapshot.row_change_seq == manifest.tombstone_row_seq &&
+        snapshot.durable_cursor == manifest.target_cursor &&
+        snapshot.row_seq_high_water == manifest.target_high_water;
+    unsigned char quote[QIHSE_CT1_NODE_QUOTE_SIZE];
+    bool signed_quote = false;
+    if (measured) {
+        /* Source frame and high-water remain host commitments, not target measurements. */
+        qihse_ct1_node_quote_expected_t expected = {0};
+        snprintf(expected.source_qkp_id, sizeof(expected.source_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.target_qkp_id, sizeof(expected.target_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.source_peer_qkp_id, sizeof(expected.source_peer_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.target_peer_qkp_id, sizeof(expected.target_peer_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.replication_principal_id, sizeof(expected.replication_principal_id),
+            "%s", principal_id);
+        snprintf(expected.generation, sizeof(expected.generation), "%s", server->ct_generation);
+        memcpy(expected.source_signer_pin, peer_pin, 32u);
+        memcpy(expected.target_signer_pin, own_pin, 32u);
+        memcpy(expected.source_peer_pin, own_pin, 32u);
+        memcpy(expected.target_peer_pin, peer_pin, 32u);
+        memcpy(expected.baseline_sha256, request.baseline_digest, 32u);
+        expected.source_high_water = manifest.source_high_water;
+        expected.target_cursor = snapshot.durable_cursor;
+        expected.target_high_water = snapshot.row_seq_high_water;
+        qihse_ct1_node_quote_signing_evidence_t evidence = {
+            .manifest_wire = canonical, .manifest_len = sizeof(canonical),
+            .verified_manifest = &manifest, .expected = &expected,
+            .role = QIHSE_CT1_NODE_QUOTE_TARGET, .now_ms = qihse_resp_now_ms(),
+            .host_nonce = r->argv[3].data, .own_private_key_path = key_path,
+            .own_public_key_path = own_pub
+        };
+        signed_quote = qihse_ct1_node_quote_sign_verified(&evidence, quote);
+    }
+    if (!signed_quote)
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+    bool sent = qihse_resp_bulk(s, quote, sizeof(quote));
+    OPENSSL_cleanse(quote, sizeof(quote));
+    return sent;
+}
+
 static bool qihse_resp_handle_ct1_status(qihse_resp_session_t* s) {
     if (!qihse_resp_ct_source_allowed(s))
         return qihse_resp_error(s, "NOPERM CT1 status requires the configured successor QKP pin");
@@ -12993,7 +13318,7 @@ static bool qihse_resp_handle_ct1_target_history_v1(qihse_resp_session_t* s,
 static bool qihse_resp_handle_ct1_source_frame_v1(qihse_resp_session_t* s,
                                                    const qihse_resp_request_t* r) {
     if (r->argc != 14u || !qihse_resp_ct_source_allowed(s) ||
-        !s->server->pqc.node_id || !s->server->ct_generation)
+        !s->server->pqc.node_id || !s->server->ct_generation[0])
         return qihse_resp_error(s, "ERR CT1 source frame unavailable or denied");
     char *generation = NULL, *digest_text = NULL, *key = NULL;
     uint64_t baseline = 0u, ack = 0u, durable = 0u, position = 0u;
@@ -13761,6 +14086,12 @@ static bool qihse_resp_handle_ct1(qihse_resp_session_t* s,
         if (r->argc >= 3u && qihse_resp_arg_equal(&r->argv[2], "HISTORY-V1"))
             return qihse_resp_handle_ct1_target_history_v1(s, r);
     }
+    if (qihse_resp_arg_equal(&r->argv[1], "SOURCE") && r->argc >= 3u &&
+        qihse_resp_arg_equal(&r->argv[2], "QUOTE-V2"))
+        return qihse_resp_handle_ct1_source_quote_v2(s, r);
+    if (qihse_resp_arg_equal(&r->argv[1], "TARGET") && r->argc >= 3u &&
+        qihse_resp_arg_equal(&r->argv[2], "QUOTE-V2"))
+        return qihse_resp_handle_ct1_target_quote_v2(s, r);
     if (qihse_resp_arg_equal(&r->argv[1], "SOURCE") && r->argc >= 3u &&
         qihse_resp_arg_equal(&r->argv[2], "FRAME-V1"))
         return qihse_resp_handle_ct1_source_frame_v1(s, r);
@@ -15035,7 +15366,20 @@ static bool qihse_resp_ct2_receipt(qihse_resp_session_t* s,
             OPENSSL_cleanse(composite, sizeof(composite));
             OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
         } else {
-            qihse_kv_ct_proof_t* seal = qihse_kv_ct_target_seal_create(
+            /* The KV seal proof only needs the import plus the target's CT1
+             * successor ACK, which can land after SEAL refused the stage. A
+             * receipt authorizes COMMIT and ACTIVATE, and finalization
+             * requires a SEALED stage, so the stage itself must be SEALED. */
+            uint64_t stage_offset = 0, stage_total = 0;
+            qihse_ct_target_state_t stage_state = QIHSE_CT_TARGET_ABSENT;
+            char stage_err[192] = {0};
+            bool stage_sealed = s->server->ct_target &&
+                qihse_ct_target_status(s->server->ct_target, s->user, caller_qkp,
+                    transfer, NULL, 0, NULL, NULL, 0, &stage_offset, &stage_total,
+                    &stage_state, stage_err, sizeof(stage_err)) &&
+                (stage_state == QIHSE_CT_TARGET_SEALED ||
+                 stage_state == QIHSE_CT_TARGET_FINALIZED);
+            qihse_kv_ct_proof_t* seal = !stage_sealed ? NULL : qihse_kv_ct_target_seal_create(
                 s->server->store, s->server->ct_ownership_context->principal,
                 s->user, t->transfer_id, t->source_qkp_id, t->target_qkp_id,
                 t->generation, t->start, t->end, t->source_lsn);
@@ -20803,6 +21147,19 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             qihse_resp_command_is(request, "REPL.CT1") ||
             qihse_resp_command_is(request, "REPL.CT2") ||
             qihse_resp_command_is(request, "CT.RECEIPT");
+        /* The pinned successor needs REPL.CT1 RECONCILE/ACK/READ/STATUS/
+         * BASELINE while replay is in progress, but signed quotes, retained
+         * frames and history are data-serving. They must stay fenced until
+         * recovery completes instead of racing a still-recovering store. */
+        if (control && qihse_resp_command_is(request, "REPL.CT1") &&
+            request->argc >= 3u &&
+            ((qihse_resp_arg_equal(&request->argv[1], "SOURCE") &&
+              (qihse_resp_arg_equal(&request->argv[2], "QUOTE-V2") ||
+               qihse_resp_arg_equal(&request->argv[2], "FRAME-V1"))) ||
+             (qihse_resp_arg_equal(&request->argv[1], "TARGET") &&
+              (qihse_resp_arg_equal(&request->argv[2], "QUOTE-V2") ||
+               qihse_resp_arg_equal(&request->argv[2], "HISTORY-V1")))))
+            control = false;
         if (!control && request->argc >= 3u &&
             qihse_resp_command_is(request, "CLUSTER") &&
             qihse_resp_session_is_system_operator(session) &&
@@ -21337,6 +21694,7 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
                 qihse_resp_command_is(request, "SCHEDULE")) {
                 return qihse_resp_handle_schedule(session, request);
             }
+            break;
         case QIHSE_SWAR4('A', 'R', 'T', 'I'):
             if (request->argv[0].len >= 9u &&
                 strncasecmp((const char*)request->argv[0].data, "ARTIFACT.", 9u) == 0)
@@ -21447,16 +21805,15 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
          * command scope (QIHSE_RESP_AUTH_QKP_ADMIN). */
         bool admin_peer = false;
         if (!replication_peer && !session.user) {
-            admin_peer = server->pqc.admin_peer_node_id &&
-                server->pqc.admin_peer_dsa_pub_path &&
-                qihse_qkp_session_is_replication_peer(
-                    qkp, server->pqc.admin_peer_node_id,
-                    server->pqc.admin_peer_dsa_pub_path);
+            admin_peer = qihse_qkp_session_is_admin_peer(qkp, &server->pqc,
+                server->replication_peers, server->replication_peer_count);
             if (!admin_peer && server->admin_peer_node_id_2 &&
                 server->admin_peer_dsa_pub_path_2) {
-                admin_peer = qihse_qkp_session_is_replication_peer(
-                    qkp, server->admin_peer_node_id_2,
-                    server->admin_peer_dsa_pub_path_2);
+                qihse_qkp_config_t alternate_admin = server->pqc;
+                alternate_admin.admin_peer_node_id = server->admin_peer_node_id_2;
+                alternate_admin.admin_peer_dsa_pub_path = server->admin_peer_dsa_pub_path_2;
+                admin_peer = qihse_qkp_session_is_admin_peer(qkp, &alternate_admin,
+                    server->replication_peers, server->replication_peer_count);
             }
         }
         if (admin_peer) {
@@ -21830,6 +22187,42 @@ static int qihse_resp_failback_cb(void* user_data, uint16_t first, uint16_t last
                                        target_index, &moved, &collected, err, err_cap);
 }
 
+bool qihse_resp_ct1_frozen_root_valid(const char* path) {
+    if (!path || path[0] != '/' || path[1] == '\0' ||
+        strlen(path) >= PATH_MAX) return false;
+    int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dir < 0) return false;
+    bool ok = false;
+    const char* part = path + 1;
+    while (*part) {
+        const char* slash = strchr(part, '/');
+        size_t len = slash ? (size_t)(slash - part) : strlen(part);
+        struct stat parent;
+        if (!len || len > NAME_MAX ||
+            (len == 1u && part[0] == '.') ||
+            (len == 2u && part[0] == '.' && part[1] == '.') ||
+            fstat(dir, &parent) != 0 || !S_ISDIR(parent.st_mode) ||
+            (parent.st_uid != 0 && parent.st_uid != geteuid()) ||
+            (parent.st_mode & 022u) != 0u) break;
+        char name[NAME_MAX + 1u];
+        memcpy(name, part, len);
+        name[len] = '\0';
+        int next = openat(dir, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next < 0) break;
+        close(dir);
+        dir = next;
+        if (!slash) {
+            struct stat root;
+            ok = fstat(dir, &root) == 0 && S_ISDIR(root.st_mode) &&
+                root.st_uid == geteuid() && (root.st_mode & 077u) == 0u;
+            break;
+        }
+        part = slash + 1;
+    }
+    close(dir);
+    return ok;
+}
+
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
     if (!supplied || supplied->max_request_bytes < 64u || supplied->max_request_bytes > (size_t)INT_MAX || supplied->max_clients == 0) {
         errno = EINVAL;
@@ -21929,6 +22322,24 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             return NULL;
         }
     }
+    if (supplied->ct1_recovery_frozen_root &&
+        (!ct_enabled || ct_group_enabled || !supplied->auth_required ||
+         !supplied->pqc.require || !supplied->pqc.admin_peer_node_id ||
+         !*supplied->pqc.admin_peer_node_id ||
+         !supplied->pqc.admin_peer_dsa_pub_path ||
+         !*supplied->pqc.admin_peer_dsa_pub_path ||
+         !supplied->pqc.replication_peer_node_id ||
+         !supplied->pqc.replication_peer_dsa_pub_path ||
+         !strcmp(supplied->pqc.admin_peer_node_id,
+                 supplied->pqc.replication_peer_node_id) ||
+         !supplied->replication_service_principal ||
+         !supplied->ct1_recovery_replication_principal_id ||
+         qihse_user_get_id(supplied->replication_service_principal) !=
+             supplied->ct1_recovery_replication_principal_id ||
+         !qihse_resp_ct1_frozen_root_valid(supplied->ct1_recovery_frozen_root))) {
+        errno = EACCES;
+        return NULL;
+    }
     if (supplied->enable_artifact_uploads) {
         struct stat staging;
         if (!supplied->auth_required || !supplied->blobs ||
@@ -22008,6 +22419,9 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->ct_log_limit_bytes = supplied->ct_log_limit_bytes;
     server->ct_ack_timeout_ms = supplied->ct_ack_timeout_ms;
     server->ct_control_principal = supplied->ct_control_principal;
+    if (supplied->ct1_recovery_frozen_root)
+        memcpy(server->ct1_recovery_frozen_root, supplied->ct1_recovery_frozen_root,
+               strlen(supplied->ct1_recovery_frozen_root) + 1u);
     server->ct_topology_qkp_id = supplied->ct_topology_qkp_id;
     server->ct_topology_qkp_id_context = supplied->ct_topology_qkp_id_context;
     if (ct_group_enabled) {

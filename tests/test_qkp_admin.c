@@ -120,6 +120,25 @@ int main(void) {
                           client, server_pub);
     assert_admin_identity(qihse_resp_server_port(server), "admin-test-client-new",
                           client_new, server_pub);
+    uint16_t peer_port = qihse_resp_server_port(server);
+    qihse_qkp_admin_client_t* pinned_client = NULL;
+    char peer_error[256];
+    assert(qihse_qkp_admin_open_strict_peer("127.0.0.1", peer_port,
+        "admin-test-client", client, server_pub, "admin-test-server", server_pub,
+        30000u, &pinned_client, peer_error, sizeof(peer_error)) == 0);
+    assert(pinned_client);
+    qihse_qkp_admin_close(pinned_client);
+    pinned_client = NULL;
+    /* Both negatives complete a real trusted-key handshake; the strict
+     * session check then rejects the signed server label or exact key pin. */
+    assert(qihse_qkp_admin_open_strict_peer("127.0.0.1", peer_port,
+        "admin-test-client", client, server_pub, "wrong-server", server_pub,
+        30000u, &pinned_client, peer_error, sizeof(peer_error)) == 3);
+    assert(!pinned_client && strstr(peer_error, "peer identity mismatch"));
+    assert(qihse_qkp_admin_open_strict_peer("127.0.0.1", peer_port,
+        "admin-test-client", client, server_pub, "admin-test-server", client_new_pub,
+        30000u, &pinned_client, peer_error, sizeof(peer_error)) == 3);
+    assert(!pinned_client && strstr(peer_error, "peer identity mismatch"));
     const char* get_secret[] = {"GET", "admin-test:secret"};
     char* reply = NULL;
     char error[256];

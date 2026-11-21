@@ -3,8 +3,10 @@
 Status: **design only** beyond the structural `rust/ct1-recovery` `compare()`,
 its fixed-width `qihse_ct1_structural_evidence_evaluate_v1` ABI (linked only
 by an opt-in standalone C/Rust smoke, not by the production library), the
-structural frozen-file verifier, and the pinned read-only TARGET HISTORY-V1 /
-SOURCE FRAME-V1 C and RESP queries below. B's legacy CT1
+structural frozen-file verifier, the pinned read-only TARGET HISTORY-V1 /
+SOURCE FRAME-V1 queries, and the SOURCE/TARGET QUOTE-V2 evidence-only
+endpoints below. Approval issuance/consumption, suppression and recovery
+execution remain disabled. B's legacy CT1
 source owner remains stopped, with its original pending SET group at position
 11111; the successor is sealed at cursor 11110. Its source-authored same-key
 tombstone is at 11103. The sample row sequences in the Rust fixture are
@@ -18,12 +20,40 @@ executor or production call site. No operation described here is implemented
 or authorized to advance either cursor. Do not convert installed `--ct-role`
 pairs to CT group/lane mode.
 
-**Operator decision (2026-11-16): TPM-backed recovery authority is deferred.**
-The 730xd Dell BIOS reported `TpmSecurity=Off`; a scheduled RACADM change
-reported completion after a graceful reboot but left the setting Off and no
-Linux TPM device. Do not retry firmware changes or treat local receipt/ledger
-state as an alternative trust anchor. Keep the B ordinary owner stopped and
-its successor sealed; no B recovery operation is authorized by this deferral.
+**Operator decision (2026-11-16): proceed without the 730xd TPM.**
+After the earlier deferral was lifted, the operator set TPM Security On and
+saved it in F2, but the rebooted firmware still reports `TpmSecurity=Off`;
+ACPI TPM status remains 0 and Linux has no TPM device. The operator stopped
+further reboot troubleshooting. Dell's 13th-generation TPM modules bind to
+the motherboard after activation: a used module from another system would be
+unsuitable even if physically identical, though this module's history has not
+been independently verified. This is an operational decision, not hardware
+fault isolation or approval to recover B. Any replacement must be confirmed
+new and compatible by Service Tag; until a trusted, independently
+verified QKP Operator one-use authority/rollback anchor is designed, do not
+substitute a same-UID local receipt, manifest or ledger for it. Keep the B
+ordinary owner stopped and its successor sealed.
+
+### TPM-free approval path (design only)
+
+A TPM is not a CT1 protocol requirement. Keep the configured QKP Operator
+identity as the issuer: authenticate its active pinned peer in a dedicated
+recovery session, separately from local RESP `AUTH`, and bind approval to the
+exact canonical frozen roster, source frame, current source/target QKP pins,
+active replication-service principal, generation, baseline, cursor, sequence
+high-water and proposed operation. Do not add a second offline signer.
+
+Before any protected mutation, an independently administered durable authority
+outside B's writable trust domain must atomically check and consume a one-use
+nonce and monotonically increasing epoch for that exact manifest, with its own
+trusted expiry clock (maximum 900,000 ms), and return an authenticated
+confirmation. On missing, rolled-back, uncertain or unreachable authority,
+fail closed. A same-UID B receipt, archive, local ledger, caller clock or a
+separate directory on B cannot provide that guarantee. Existing consensus
+range authority is not automatically a CT1 approval service; deployment and
+trust separation must be established independently. No TPM-free authority
+endpoint, verified witness, target suppression or recovery transaction is
+implemented by this design, and no B transition is approved.
 
 On 2026-11-16, the stopped B source's eight frozen native files matched both
 its manifest and original; the successor's seven frozen native files matched
@@ -36,11 +66,20 @@ These fixture-principal queries are **offline** checks: they provide neither
 live pinned-QKP evidence nor historical source-authorship attestation. A store
 open can write audit data and repair WAL tails; do not open the frozen evidence
 or verified working copies to repeat the queries. The opt-in
-`qihse_ct1_recovery_verify_frozen()` streams the complete 8/7 native-file
-roster from a private directory with no-follow path traversal, exact size/hash
-checks and repeat scans. It does not authenticate an issuer, exclude writers,
-prove historical authorship or freeze two nodes atomically; its result is not a
-recovery authorization.
+`qihse_ct1_recovery_verify_frozen(principal, frozen_dir, manifest, source)`
+streams the complete 8/7 native-file roster from a private directory with
+no-follow path traversal, exact size/hash checks and repeat scans. The WAL,
+SSTables and baseline can contain mixed tenants and every uint16_t label:
+the live principal must be active, system-tenant, maximum classification/SCI,
+and authorized by core for (UINT16_MAX, UINT16_MAX) before any directory/file
+access and again on completion. The single-row manifest label cannot narrow
+that requirement. NULL, low-clearance, tenant-scoped, inactive or MFA-denied
+principals fail closed; the boolean verifier discloses no file bytes. This is
+not issuer authentication, writer exclusion, historical authorship, an atomic
+two-node freeze or recovery authorization. Existing callers must pass an
+independently authenticated system principal and rebuild with `make lib`; no
+stored data migration or reindex is needed. Check with
+`make test-ct-recovery-manifest`.
 
 ## Structural receipt storage (opt-in, not approval)
 
@@ -62,6 +101,43 @@ fresh, disposable receipts under a new basename after independent evidence
 review. Stored KV data needs no migration. Rebuild the standalone consumer
 with `make test-ct-recovery-manifest`; do not install it in the running daemon.
 These synthetic tests do not simulate actual power-loss/fsync fault injection.
+
+## Local exact-frame archive (insecure development-only fixture)
+
+The context-free archive API and implementation are compiled only with
+`QIHSE_CT1_INSECURE_DEV_ARCHIVE`, defined exclusively by the opt-in standalone
+`make test-ct-recovery-manifest` fixture target. Without that flag, neither
+archive symbol nor declaration exists. Never enable the flag in a production
+build or use this fixture with classified frame bytes: it has no authenticated
+security context and cannot satisfy QIHSE's classified-read invariant. A
+production archive would require a separate context-propagating, authorization-
+checked design and negative access tests.
+
+`qihse_ct1_recovery_archive_create/verify` use the same private, descriptor-
+confined parent rules. An exclusive mode-0600, owner-owned, single-link regular
+file contains one canonical B manifest wire record (2624 bytes) followed by
+exactly 1644 frame bytes; no existing artifact is replaced or removed on error.
+Create hashes the caller-supplied frame, fsyncs the file, reads back its exact
+size, complete wire identity and frame digest under stable inode/name checks,
+then fsyncs the parent. Cold verify reopens by name with `O_NOFOLLOW` and checks
+that same identity, size, SHA-256 and stable parent/inode. A mismatched identity,
+frame digest, size, symlink, hardlink, non-private mode or path/directory swap
+denies verification. This development-only structural fixture is **not an
+access-control API**: neither call accepts a user context or checks clearance/
+SCI. Verify internally reads the frame bytes to hash them but never returns
+the frame. File privacy depends on
+OS ownership and mode, not clearance/SCI. No ordinary CT group is archived
+automatically. This preserves local bytes only: neither return authorizes
+recovery, ACK, suppression or target apply, nor proves historical QKP authorship,
+approval or rollback protection. Same-UID rollback, concurrent writers and
+power loss are not excluded by this check.
+
+Upgrade: archive fixture callers must remove the former opaque `qihse_user_t*`
+argument from create/verify; rebuild the isolated fixture with
+`make test-ct-recovery-manifest`. Do not define the development flag for a
+production consumer. No production binary integration, reindex or stored-data
+migration is required.
+The archive format is new and has no legacy records to convert.
 
 The standalone `qihse_ct1_recovery_ledger_bootstrap/consume` API adds **local
 bookkeeping only**. Explicit bootstrap exclusively creates a non-authoritative
@@ -102,8 +178,9 @@ replaces the whole trusted directory (or removes/recreates the lock) can roll
 back the record; directory identity rechecks narrow swaps but cannot prevent
 that adversary. A local spent bit does **not** authenticate the configured QKP
 Operator, provide a distributed replay ledger or authorize a target mutation.
-`qihse_ct1_recovery_issuer_authorized()` remains false; no recovery RESP
-endpoint or target mutation is introduced.
+`qihse_ct1_recovery_issuer_authorized()` remains false; the live QUOTE-V2
+RESP evidence endpoints do not issue or consume approval, suppress a group,
+or authorize target mutation.
 
 ## Existing split
 
@@ -238,6 +315,220 @@ production recovery call here. Isolated real-daemon transport checks are in
 `tests/test_ct_transfer.py` (`test_source_frame_v1_*`); native storage checks
 are separately owned in `tests/test_ct_storage.c`.
 
+## Local authority challenge ledger (not a grant)
+
+`qihse_ct1_authority_store_initialize()` explicitly provisions a new, empty,
+private host directory. Runtime `qihse_ct1_authority_store_open()` requires its
+existing lock and complete hash-chained log; it never recreates missing state.
+The host clock supplies issuance time, challenges have at most 900,000 ms of
+validity, and retirement is one-use across process restarts. The focused
+`test-ct1-authority-store` exercises reopen, fork races, torn records and
+missing-state denial. Its distinct-UID fixture is skipped when this local
+runner cannot change UID. Neither hash chaining nor explicit provisioning
+detects restoration of an intact earlier log by the host owner, or subsequent
+administrator reinitialization after deleting both files. This legacy mode has
+no Operator authentication, independent rollback checkpoint, node attestations
+or approval API. Its nonce and epoch cannot authorize a recovery operation.
+Production t420 provisioning remains unimplemented.
+
+The additive strict-root-checkpoint-only `qihse_ct1_authority_store_bind()`
+accepts an existing outstanding challenge and the exact 2624-byte canonical,
+non-receipt B wire record. It uses the shared recovery manifest decoder and
+encoder (no alternate parser), requires the record's epoch, nonce, issuance and
+expiry to equal that challenge, and commits SHA-256 of all canonical wire bytes
+as a one-use binding record in the root ledger. The independent root checkpoint
+must match the full hash-chain head before each operation; ledger and directory
+fsync precede checkpoint and directory fsync before `bind` reports success.
+`qihse_ct1_authority_store_retire_bound()` requires that exact persisted B,
+current unexpired challenge and checkpoint, then durably retires it. Duplicate
+binding/retirement, altered B, wrong challenge, receipt wire, rollback of
+one domain, clock rollback and torn/uncertain state deny further use. The old
+`retire()` cannot spend a bound challenge; old strict fixtures without binding
+cannot use `retire_bound()`. The legacy ABI and legacy on-disk data are unchanged;
+no migration or reindex is needed. Rebuild standalone consumers with
+`make test-ct1-authority-store`; the root fixture also runs with
+`sudo -n make test-ct1-authority-store` in disposable distinct-UID domains.
+
+`qihse_ct1_authority_store_check_bound()` adds a strict-root-only read-only
+observation: under the store's one ledger lock it replays the complete chained
+ledger, compares the root-owned independent checkpoint image (including its
+ledger head and clock low-water), checks the host wall clock is not below the
+low-water, and requires the exact canonical non-receipt B wire digest and
+challenge to remain bound, outstanding, unretired and unexpired. It neither
+appends a clock record nor changes the checkpoint or challenge. Legacy handles,
+missing/mismatched heads and inherited handles used by B's distinct UID deny.
+An intact rollback of **both** independently controlled domains, or root clock
+compromise, remains outside this local guarantee. Repeated read-only checks
+can succeed until retirement or expiry; they do not consume a nonce.
+
+This is local bookkeeping, **not** a grant or proof of who approved B: any
+canonical B can be bound *before* the first binding, and a digest is not a
+signature. `issue()` still exposes a challenge before binding and its legacy
+unbound retirement path remains a non-authoritative fixture. The root-controlled
+wall clock is not independently trusted against root compromise; checkpoint
+retention must remain separately administered. A crash after durable ledger
+fsync but before checkpoint fsync denies reopen and requires independent
+investigation, not automatic reconciliation. Tests simulate restored/torn files,
+not power-loss/fsync faults. Service authorize/consume and production B remain
+disabled/unchanged.
+
+## Node quote boundary (verification only)
+
+`qihse_ct1_node_quote_verify_strict()` accepts a canonical B manifest, a
+host-provided one-use nonce and trusted public-key path, and an independently
+obtained `qihse_ct1_node_quote_expected_t` from t420 configuration/live evidence.
+Before cryptographic verification it compares **both** own QKP labels and
+SHA256(DER SubjectPublicKeyInfo) signer pins, both role-specific configured
+peer labels/pins, exact replication service principal, generation, baseline,
+target cursor and both row-sequence high-waters to canonical B. Missing fields,
+zero pins and same-role signer/peer aliases fail closed. A configured peer may
+legitimately be the other role's own signer. The role's own public key is
+loaded once: its DER pin and ML-DSA-87 signature use the same `EVP_PKEY`.
+The existing `qihse_ct1_node_quote_verify()` remains compatible but does **not**
+check independently supplied peer/state expectations; use the strict entry point
+where such comparisons are required. Never populate expectations from the quote,
+manifest or caller-supplied `verified` boolean. The manifest's complete frozen
+roster and issuer epoch remain **host assertions**, not verified local live state;
+a matching signature cannot upgrade them to node attestation. The trusted host
+must independently verify the configured t420 Operator, nonce freshness/one-use
+provenance and complete rosters and recheck live locked state on both nodes.
+The disposable legacy CT1 primary and successor now expose `REPL.CT1 SOURCE
+QUOTE-V2` and `REPL.CT1 TARGET QUOTE-V2` to independently configured pinned
+QKP_ADMIN Operator sessions. With a canonical 2624-byte manifest, the same
+32-byte nonce and separate private frozen roots, each signs only its own
+locked, role-specific evidence under its current ML-DSA-87 identity. The
+real-daemon paired fixture in `tests/test_ct_transfer.py` verifies both quotes
+against distinct current public keys using the native `quote`/`quote-target`
+checks and denies altered-manifest or nonce requests. The canonical B record
+requires nonzero `tombstone_row_seq`, the native matching-key target tombstone
+`change_seq` at `tombstone_position`; TARGET QUOTE-V2 compares it to
+`qihse_kv_ct_target_quote_snapshot_v1`'s locked `row_change_seq` before signing.
+The signed quote hash binds this manifest field, but SOURCE QUOTE-V2 only signs
+it as a remote commitment: it cannot measure the target WAL. Its pending SET has
+a **newer** row sequence than the target tombstone, so it does **not** reproduce
+B's stale-version ordering; role quoting deliberately does not enforce ordering.
+The additive native `qihse_ct1_node_quote_verify_paired_stale()` checks both
+strict role signatures over the **same exact** canonical 2624-byte B and host
+nonce, using separately trusted source/target public-key paths and expectation
+records. It requires cross-role peer IDs and pins to agree with the opposite
+trusted signer, rejecting individually valid quotes with unrelated peer keys.
+Only then it accepts a source pending SET row sequence strictly below
+the target-measured tombstone row sequence, each sequence within its role's
+high-water, tombstone position at/before target cursor, and frame position
+immediately after that cursor without overflow. It is EVIDENCE ONLY, not a
+grant, approval, consume or production B action; role-level nonstale quotes
+remain valid. t420 independently owns trusted clock, complete frozen roster,
+Operator provenance and the one-use checkpoint. These quotes do not establish
+manifest issuer authenticity, historical authorship, a two-node lock, trusted
+nonce freshness or a one-use approval. Issuance, consumption, suppression and
+recovery mutation remain disabled; neither verifier grants access to frame
+payloads. Upgrade note: rebuild daemons and disposable fixture tools, then run
+`make test-ct-recovery-manifest test-ct1-node-quote`. Old 2624-byte B manifests
+without this nonzero field fail decode and must be regenerated for testing;
+stored KV data needs no migration or reindex. Production B is unchanged.
+
+The additive `qihse_ct1_authority_service_evaluate_pair()` is a **local
+host-side evidence-only** check: it compares the exact canonical unspent
+2624-byte B wire against a separately trusted manifest, matches epoch,
+issuance, expiry and nonce to a supplied strict-store challenge, checks the
+host `CLOCK_REALTIME` within its maximum 900,000 ms window, streams both
+complete frozen 8/7 rosters under private roots, then invokes the strict
+paired stale verifier over independently trusted ML-DSA-87 source/target
+public keys and expected identity, peer-pin and live-state records. It returns
+only a boolean evidence check. Neither its caller-supplied challenge nor its
+manifest is authenticated by this function: the caller must obtain challenge
+from the independently retained strict root checkpoint, and expectations and
+roots from trusted configuration. This API does not query the store for
+outstanding/retired status, prevent a replay, prove historical authorship,
+freeze both nodes atomically, approve an Operator, or issue/consume a grant;
+`authorize()` and `consume()` stay unconditionally disabled. The additive
+`qihse_ct1_authority_service_evaluate_pair_bound(store, evidence)` variant
+first checks the exact B wire and supplied challenge against the current strict
+root store using `check_bound()`, then calls the existing paired evaluator; it
+cannot be satisfied by a caller-manufactured challenge alone. This is still
+**evidence only**, not approval or consumption: the store lock is released
+before frozen-file and quote checks, so retirement, expiry or changes to either
+node's files can race the second check. No joint snapshot, reservation, one-use
+grant or production call site is created. Repeated copies of the same evidence
+remain checkable while the binding is current and deny after retirement.
+The standalone fixture generates two disposable signed role quotes and 15 frozen
+files, checks nonce/manifest/role/key/peer/roster/ordering/expiry denials, and
+on root uses a freshly issued and bound strict-store challenge. Upgrade: rebuild
+standalone consumers with `make test-ct1-authority-store test-ct1-authority-service`
+(also `sudo -n make test-ct1-authority-store test-ct1-authority-service` for
+strict mode); stored data needs no migration or reindex. Production B remains
+untouched.
+
+## Disconnected root-host QKP admission (not approval)
+
+`include/qihse_ct1_host_admission.h` and its standalone C implementation
+provide one local admission attempt on a module-owned AF_UNIX listener. The
+first argument is a root-owned mode-0700 **private config** directory under
+trusted ancestors. It contains `host/`, `operator/`, `replication/` and
+`migration/` key directories (mode 0700), exact `node.id` labels and QKP PEM
+pins; host private ML-DSA/ML-KEM keys stay there. It also requires root-owned,
+single-link mode-0600 `local-uids.conf` with exactly `operator_uid=<decimal>\n`
+then `b_uid=<decimal>\n`: both must be nonzero, valid platform UIDs and
+distinct. Missing, malformed, unsafe or co-UID configuration denies open.
+The file's descriptor/name identity, metadata and bytes are captured at open
+and rechecked at admission and before returning success; edits or swaps after
+open deny that handle, including if the original bytes are later restored.
+The second argument is a separate, preprovisioned, root-owned mode-0711
+**socket** directory under trusted ancestors, never under the private config.
+Its root-owned `admission.sock` is mode 0666: any local UID, including
+untrusted B, can connect but cannot gain admission without the configured
+signed Operator QKP identity **and** an accepted AF_UNIX `SO_PEERCRED` UID
+exactly equal to the root-configured Operator UID and unequal to B's UID. A copied
+Operator signing key under B's UID or any other UID does not suffice; neither
+caller flags, usernames nor socket mode supply UID evidence. Accept-time
+`SO_PEERCRED` alone does not identify a subsequent writer when Operator passes
+its connected socket to B. The accepted socket enables Linux `SO_PASSCRED`
+before QKP negotiation; the admission-specific sealed-frame receiver uses
+`recvmsg` and requires valid kernel `SCM_CREDENTIALS` with the configured
+Operator UID on **every read fragment** of both the header and ciphertext.
+Missing, control-truncated, inconsistent or foreign-UID credentials deny,
+even with an intact sealed frame and copied Operator signing key. The
+ordinary QKP receive API and other clients retain their existing behavior.
+The server walks
+both directory paths without symlinks, verifies
+stable directory identity/mode/ownership and socket inode/mode/ownership at
+admission and before cleanup. Each attempt requires host effective UID 0,
+rechecks the root-controlled pins, performs the existing **server-side**
+signed QKP handshake with `require=true`, checks the live admin role/pin
+(rejecting replication/migration key overlap), and checks the active system
+Operator in the native auth table. On that **same server-owned live session**
+it reads exactly one authenticated sealed QKP frame whose entire plaintext is
+`CT1.HOST.ADMIT.V1` (17 bytes, no NUL or fields); only then does it return
+admission. The single four-second monotonic absolute deadline spans both
+handshake and request; no request, wrong version/length, raw plaintext,
+truncated frame, replay or wrong sequence denies. The connection and QKP
+session are destroyed before returning only a process-local admission/denial
+enum. The disposable root fixture proves a signed Operator client under
+nonroot UID 65532 (with B at distinct UID 65534) can connect and send this
+request while its key remains outside private config; a separate UID and
+B-like UID 65534 deny even with a copied Operator key. The real-QKP fixture
+also hands Operator's connected socket to B via `SCM_RIGHTS` after the handshake;
+B's valid sealed request is denied despite a copied key. A split request with
+Operator's header and B's ciphertext also denies. Same-UID/missing/unsafe
+configuration, post-open changes, wrong label and plaintext, and invalid
+owner/mode/symlink, idle handshake and stalled request. No private host
+pin/key/store is opened by a nonroot client. Other than QKP's transport
+handshake/ACK, there is no application reply, serialized token, challenge,
+store binding/retirement, grant, manifest issuer signature, one-use approval,
+recovery executor, production listener installation, or B/t420 integration.
+The fixture does not prove remote connectivity, production pin-set
+synchronization or a multi-peer pin roster.
+Local root ownership is the trust boundary; root compromise or
+root-administered key rotation is not excluded. Run
+`sudo -n make -C tests/ct1_authority test-host-admission` against a checkout-
+built `libqihse.so` and current QKP source. Its keys, auth database and socket
+are disposable. A nonroot runner must not be treated as a skipped positive
+test. Upgrade: this additive internal-only `open(root_dir, socket_dir)` API
+requires standalone callers to rebuild and explicitly preprovision the
+separate socket directory and the root-private UID configuration before open;
+existing standalone config without this file now fails closed. Stored KV data
+requires no migration or reindex.
+
 ## Proposed next-stage verified-evidence capability ABI (not shipped)
 
 This is an **internal, same-process** Rust/C ABI sketch, not a new RESP command
@@ -350,22 +641,23 @@ an independently signed origin receipt/journal and trust root before permitting
 a `CANDIDATE`; otherwise label the evidence as bounded local-WAL provenance,
 not historical peer attestation. No read-only response or Rust decision grants suppression.
 
-## Proposed crash-safe B transaction and cross-process fence (not shipped)
+## Proposed crash-safe B transaction and cross-process fence (not deployed)
 
 The committed private `ct1-recovery-fence.bin` reader was startup-only. The
-local, **uncommitted upgraded-binary admission-denial candidate** adds an
-installer that persists fail-closed intent in CT state before publishing the
-marker, under a lock on the stable store-directory inode. Already-open
+**committed and pushed upgraded-binary local prerequisite** adds an installer
+that persists fail-closed intent in CT state before publishing the marker,
+under a lock on the stable store-directory inode. Already-open
 participating handles revalidate persisted state at admission; startup holds
 the same lock through state/marker validation, SST indexing and WAL replay.
 Marker removal must fail closed: the persisted CT-state intent still denies
 admission, including on reopen; deletion is not a release mechanism.
 
-This is a local candidate, not a production deployment or approval, and it
-does not fence old binaries that ignore the gate. QKP-bound Operator/TPM
-recovery authority remains deferred; there is no trusted epoch/expiry,
-release protocol, suppression disposition or B replay. Do not deploy this
-candidate as B's target fence or use ordinary `RECONCILE` as a release shortcut.
+This is a committed local prerequisite, not a production deployment or approval, and it
+does not fence old binaries that ignore the gate. TPM-free QKP Operator
+recovery authority remains unimplemented; there is no independent trusted
+epoch/expiry service, release protocol, suppression disposition or B replay.
+Do not deploy this candidate as B's target fence or use ordinary `RECONCILE`
+as a release shortcut.
 
 A single KV lock cannot freeze two server processes. The target's read-locked
 HISTORY-V1 snapshot can be stale before the source publishes a floor, and the
@@ -522,8 +814,12 @@ Operator identity through a live pinned QKP session. A copied manifest or a
 caller-supplied Operator name is not a signature or an authenticated session;
 if a detached manifest must be accepted, its integrity/authentication must
 be bound to that existing identity by a verified mechanism, not by inventing
-an offline key or treating SHA-256 as a MAC. The exact serialization,
-authentication mechanism and C admission API remain to be specified and tested.
+an offline key or treating SHA-256 as a MAC. The additive
+`qihse_qkp_admin_open_strict_peer()` client API checks the signed server label
+and exact current ML-DSA pin before exposing a sealed session; this is
+transport identity evidence, not an Operator grant or node-state attestation.
+The exact serialization, authentication mechanism and C admission API remain
+to be specified and tested.
 
 The one-use, bounded approval must commit to the complete **approved frozen
 source and target manifest file/hash sets**, exact retained original frame

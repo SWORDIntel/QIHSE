@@ -345,6 +345,35 @@ bool qihse_kv_ct_source_retained_frame_v1(qihse_kv_store_t* store,
     qihse_user_t* principal,
     const qihse_kv_ct_source_retained_frame_request_t* request,
     qihse_kv_ct_source_retained_frame_result_t* out);
+/* Local source-only quote prerequisite, NOT a signer or frozen-file attestation.
+ * Requires an active Operator AND the exact configured, active, non-Operator
+ * system replication principal. Under exclusive store and directory locks,
+ * validates sealed persisted baseline/generation/bounds, exact row high-water
+ * and original QKV6
+ * bytes via the retained-frame reader. frame_offset is the measured byte offset
+ * of retained.frame in the exact retained wal.log (offset + length fits WAL).
+ * No caller-supplied identity overrides.
+ * The caller owns out->retained.frame/key on success; failure zeroes out.
+ * Target history, trusted recovery-root roster, QKP pins and nonce freshness
+ * still require independent validation before any signing endpoint is safe.
+ * Additive API: rebuild with `make lib`; stored data needs no migration. */
+typedef struct {
+    qihse_kv_ct_source_retained_frame_result_t retained;
+    uint64_t frame_offset;
+    uint64_t row_seq_high_water;
+} qihse_kv_ct_source_quote_snapshot_t;
+bool qihse_kv_ct_source_quote_snapshot_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    uint64_t expected_row_seq_high_water,
+    qihse_kv_ct_source_quote_snapshot_t* out);
+/* Ordinary ACK/reconcile are never CT1 custody-release operations. A source
+ * custody hold fences BOTH entry points, including an exact pinned peer cursor,
+ * matching digest, or an authenticated principal with the same UID. Releasing
+ * retained originals requires a separate durable root-host decision bound to
+ * the exact canonical B, original frame and source principal, consumed under
+ * source ownership; an archive ID/path/digest or same-UID caller is not proof.
+ * No such release interface is currently connected to these APIs. */
 bool qihse_kv_ct_source_ack(qihse_kv_store_t* store, qihse_user_t* principal,
     const char* peer_id, const char* generation, uint64_t durable_lsn);
 /* Called only after pinned QKP peer STATUS. Re-arms a reopened or timed-out
@@ -386,11 +415,50 @@ bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
  * The directory-inode lock serializes installation with receiver apply on
  * already-open upgraded handles. Quiesce old binaries before relying on it.
  * No ordinary RECONCILE releases it. The CT-state intent bit also denies
- * startup when the sidecar is missing or damaged. Rebuild with `make lib`;
- * stored data needs no migration (legacy CT metadata upgrades on first write). */
+ * startup when the sidecar is missing or damaged. For a disposable scalar
+ * fixture only, a separately authored exact QCT1SO02 suppressed-original
+ * disposition may follow PREPARED at the pinned cursor: replay validates the
+ * complete SOURCE frame and successor tombstone, then advances the receiver
+ * cursor without applying the old SET. Both sidecar and CT-state denial remain
+ * in force; WAL rotation, snapshots and compaction stay denied, including after
+ * reopen. This does not admit generic CT apply or enable a runtime recovery
+ * command. Rebuild with `make lib`; stored data needs no migration (legacy CT
+ * metadata upgrades on first write). */
 bool qihse_kv_ct_receiver_recovery_fence_install(qihse_kv_store_t* store,
     qihse_user_t* principal, const char* generation, uint64_t baseline_row_seq,
     const unsigned char baseline_digest[32], uint64_t durable_cursor);
+/* Operator-only SOURCE custody hold for an unacknowledged retained group.
+ * Persistently denies ACK, RECONCILE and WAL retirement; it does not archive
+ * the original or authorize compensation. No release path exists until a
+ * separately authenticated root archive and target high-water are available.
+ * The fixture-only source row-floor/QKV6 tombstone exercise is not callable
+ * from production. A future source-side endpoint MUST receive a synchronous,
+ * non-transferable decision from the live root-host QKP Operator session,
+ * independently verify that the immutable root archive precedes retirement
+ * and binds the exact canonical B, original 1644-byte SOURCE QKV6 digest,
+ * both signed node quotes, configured generation/source/target IDs, target
+ * high-water and target tombstone position/row sequence; neither a caller
+ * path/digest nor a process UID or generic Operator principal is that fact.
+ * ACK and reconcile continue to deny while the custody hold is installed.
+ * Quiesce old binaries before relying on this denial. Rebuild with `make lib`;
+ * stored data needs no migration. */
+bool qihse_kv_ct_source_custody_hold_install(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* generation, uint64_t baseline_row_seq,
+    const unsigned char baseline_digest[32], uint64_t durable_position);
+/* Pin the sole unacknowledged dense source group (ACK + 1 == durable), its
+ * exact physical QKV6 frame at the quoted WAL offset, and source row high-water
+ * immediately before installing the same irreversible custody hold. Earlier
+ * ACKed frames may remain in the WAL. The caller must supply an exact prior
+ * source quote; this operation verifies local pins, NOT the live root QKP
+ * session, archive, canonical B, or target history.
+ * Only the root-host boundary may assert those independently before calling;
+ * an archive path/ID/digest is never accepted as release authority. No release
+ * endpoint exists. Rebuild with `make lib`; stored data needs no migration. */
+bool qihse_kv_ct_source_custody_hold_install_pinned_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    uint64_t expected_row_seq_high_water, size_t expected_frame_length,
+    const unsigned char expected_frame_sha256[32]);
 
 /* Read-only legacy (non-lane) receiver-history check. The caller must supply
  * an active principal; this result attests neither QKP peer identity nor any
@@ -420,6 +488,18 @@ typedef struct {
 } qihse_kv_ct_receiver_history_result_t;
 bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
     qihse_user_t* principal, const qihse_kv_ct_receiver_history_request_t* request,
+    qihse_kv_ct_receiver_history_result_t* out);
+/* Read-only local TARGET quote prerequisite, not a signer or peer attestation.
+ * Requires an active local Operator and the exact configured active SYSTEM
+ * non-Operator replication principal. Holds the exclusive store and stable
+ * directory locks while checking persisted receiver state, WAL, and the exact
+ * caller-expected row high-water; failure zeroes out. No stored-data migration;
+ * rebuild with `make lib`. Signing still requires independent peer identity,
+ * recovery-root authority, QKP pins and nonce freshness validation. */
+bool qihse_kv_ct_target_quote_snapshot_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_receiver_history_request_t* request,
+    uint64_t expected_row_seq_high_water,
     qihse_kv_ct_receiver_history_result_t* out);
 
 /* Store-level durable fences and locally minted, opaque ownership evidence.

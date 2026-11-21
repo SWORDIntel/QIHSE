@@ -1118,6 +1118,7 @@ static void usage(const char* argv0) {
         "          [--topology-qkp-map TOPOLOGY_ID QKP_NODE_ID] (repeatable; exact explicit identity mapping)\n"
         "          [--ct-group LANE64,OWNER_TOPOLOGY_ID,SUCCESSOR_TOPOLOGY_ID,GENERATION32,SLOTS] (repeatable; slots are inclusive ranges joined by ';')\n"
         "          [--ct-role primary|successor --ct-peer HOST:PORT]\n"
+        "          [--ct1-recovery-frozen-root DIR] (inert node-quote root; existing private absolute directory, pinned QKP admin and explicit replication principal required)\n"
         "          [--ct-auto-successor TOPOLOGY_ID --consensus-authority-proposals]\n"
         "          [--replica-of REPLICA_INDEX:PRIMARY_INDEX] (repeat global CT pair map)\n"
         "          [--ct-learn-generation] (fresh spare: exact pinned source only)\n"
@@ -3298,6 +3299,7 @@ int main(int argc, char** argv) {
     const char* operator_password = NULL;
     char* operator_password_arg = NULL;
     uint32_t replication_principal_id = 65535u;
+    bool replication_principal_id_explicit = false;
     uint16_t replication_principal_clearance = UINT16_MAX;
     uint16_t replication_principal_sci = UINT16_MAX;
     uint32_t machine_principal_id = 0u;      /* 0 = no machine principal */
@@ -3355,6 +3357,7 @@ int main(int argc, char** argv) {
     const char* replication_peer_node_id = NULL;
     const char* replication_peer_dsa_pub = NULL;
     const char* ct_role = NULL;
+    const char* ct1_recovery_frozen_root = NULL;
     const char* ct_auto_successor_id = NULL;
     bool ct_learn_generation = false;
     char ct_recovered_generation[33] = {0};
@@ -3498,6 +3501,7 @@ int main(int argc, char** argv) {
             if (errno != 0 || !end || *end || v == 0u || v > 65535u)
                 return usage(argv[0]), 2;
             replication_principal_id = (uint32_t)v;
+            replication_principal_id_explicit = true;
         } else if (strcmp(a, "--replication-principal-clearance") == 0 && i + 1 < argc) {
             uint64_t v = 0u;
             if (!parse_u64_decimal(argv[++i], &v) || v > UINT16_MAX)
@@ -3610,6 +3614,9 @@ int main(int argc, char** argv) {
             ct_learn_generation = true;
         } else if (strcmp(a, "--consensus-authority-proposals") == 0) {
             consensus_authority_proposals = true;
+        } else if (strcmp(a, "--ct1-recovery-frozen-root") == 0 && i + 1 < argc) {
+            if (ct1_recovery_frozen_root) return usage(argv[0]), 2;
+            ct1_recovery_frozen_root = argv[++i];
         } else if (strcmp(a, "--ct-role") == 0 && i + 1 < argc) {
             ct_role = argv[++i];
             if (strcmp(ct_role, "primary") != 0 && strcmp(ct_role, "successor") != 0)
@@ -4007,6 +4014,16 @@ int main(int argc, char** argv) {
         (ct_learn_generation && (!ct_configured || ct_group_mode ||
                                  !ct_role || strcmp(ct_role, "successor")))) {
         fprintf(stderr, "qihse-cluster-daemon: automatic CT requires a configured consensus authority; generation learning requires a pinned successor\n");
+        return 2;
+    }
+    if (ct1_recovery_frozen_root &&
+        (!ct_configured || ct_group_mode || !ct_role ||
+         !admin_peer_node_id || !admin_peer_dsa_pub ||
+         !replication_peer_node_id || !replication_peer_dsa_pub ||
+         !strcmp(admin_peer_node_id, replication_peer_node_id) ||
+         !replication_principal_id_explicit || !pqc_identity_dir || !pqc_node_id ||
+         !qihse_resp_ct1_frozen_root_valid(ct1_recovery_frozen_root))) {
+        fprintf(stderr, "qihse-cluster-daemon: CT1 frozen root requires an installed private directory, legacy CT role, distinct pinned QKP admin peer and exact replication principal\n");
         return 2;
     }
     if (ct_configured && replica_read_only) {
@@ -4731,6 +4748,9 @@ int main(int argc, char** argv) {
     config.ct_owner_token = ct_configured && ct_role && strcmp(ct_role, "primary") == 0
         ? ct_owner_token : NULL;
     config.ct_control_principal = ct_configured ? startup_operator : NULL;
+    config.ct1_recovery_frozen_root = ct1_recovery_frozen_root;
+    config.ct1_recovery_replication_principal_id = ct1_recovery_frozen_root
+        ? replication_principal_id : 0u;
     config.ct_topology_qkp_id = ct_identity_map_lookup;
     config.ct_topology_qkp_id_context = &ct_identity_maps;
     config.ct_groups = ct_group_count ? ct_groups : NULL;

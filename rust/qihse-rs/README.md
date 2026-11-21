@@ -206,3 +206,73 @@ LD_LIBRARY_PATH=../.. cargo test
 The controller-SDK tests (`tests/controller_sdk.rs` and the in-module tests in
 `src/controller.rs`) need no running server: they drive the client against an
 in-process mock controller bound to `127.0.0.1` ephemeral ports.
+
+## Opt-in Python SDK port (partial)
+
+`cargo test --manifest-path rust/qihse-rs/Cargo.toml --features python-port`
+(from the repository root, after `make lib`; set `LD_LIBRARY_PATH=.` for native-linked tests).
+The `python-port` feature exports `python_port` plus its separately named
+`python_vector`, `python_storage`, `python_remote`, `python_browser`, and
+`python_peripheral` modules. Default builds and the existing crate API remain
+unchanged; Python remains active and the native C library still owns storage,
+authorization, hardware profiling, and vector computation. `python_port` uses
+`NativeVectorDB`/`StorageKv` names to avoid confusing these with legacy
+`VectorDB`/`KVStore` wrappers. Its UWP codec does not open a socket.
+
+Exact top-level `python/qihse/__init__.py` `__all__` inventory (in order),
+with port status:
+
+| Python exports | Rust coverage | Missing or different behavior |
+|---|---|---|
+| `VectorDB`, `VectorQuery`, `VectorResult`, `DistanceMetric`, `QueryMode` | partial (`NativeVectorDB`, `VectorQuery`, `VectorResult`, native FFI enums) | `VectorDB.open`, graph edges/build, quantization, metadata/result vectors, container, PG wire, and context manager; no Rust enum aliases |
+| `KVStore`, `TimeSeriesDB`, `DocumentStore` | partial (`StorageKv`, `StorageTimeSeries`, `StorageDocument`) | Python method/signature parity not yet verified; use explicit authenticated `StorageUser` rather than legacy context-free reads |
+| `EventStream`, `EventRecord`, `EventScope`, `Durability` | partial (`StorageEventStream`, `EventRecord`, `EventScope`, `Durability`) | Python stream lifecycle and schema method parity unverified |
+| `UWPServer` | **missing** | TLS server launcher and TLS UWP client transport absent; `UwpCodec` supports only bounded framing and auth/error state, no verified socket |
+| `NeuralClassifier`, `KeystoneClass`, `AnchorIndex` | implemented native-backed subset | Python type/signature parity needs fixture checks |
+| `HardwareProfiler`, `HardwareProfile` | native C profiler implemented | Actual host CPU/cache values vary; compare stable fields and units |
+| `FTSIndex`, `FTSResult` | partial native-backed | Python handle/context-manager interface absent |
+| `MultimodalFusion`, `FusionResult` | **missing** | No Rust-side approximation of native fusion |
+| `Controller`, `Reply`, `Watch`, `ControllerError`, `ControllerServerError` | partial (`controller` SDK) | error class and Python method parity not verified |
+| `AIMEMClient`, `Scope`, `MemoryHit`, `DurableReceipt`, `KnowledgeVersion`, `KnowledgeRelation`, `KnowledgeProvenance`, `ExtendedKnowledgeVersion`, `DocumentSourceRef`, `Handoff`, `QueryHit`, `RecallMode` | first four and `RecallMode` partial (`python_remote`) | `KnowledgeVersion`, `KnowledgeRelation`, `KnowledgeProvenance`, `ExtendedKnowledgeVersion`, `DocumentSourceRef`, `Handoff`, `QueryHit` missing; remaining methods unverified; remote QKP/pinned peers unsupported by plaintext controller transport |
+| `get_fleet_telemetry`, `collect_local_telemetry`, `publish_telemetry` | **missing** | Only `parse_ipmi`/`ThermalTelemetry` calculation exists; no CSV/IPMI process execution, fleet deadlines, JSON, TLS RESP publishing, or daemon |
+
+`python/qihse/uwp.py` also defines a **non-`__all__`** `UWPClient`
+(`connect`, `close`, `authenticate`, `send_command`, `kv_set`, `kv_get`,
+`vector_upsert`, `doc_insert`, `tsdb_insert`, `is_authenticated`); none of these
+network operations is implemented in Rust. `UwpCodec` is not a wire-client
+substitute. It builds the Python-compatible 15-byte little-endian header and
+rejects non-AUTH frame construction before an accepted auth reply; only a
+caller-supplied verified TLS transport may carry its frames. No unverified
+plain TCP fallback is offered.
+
+`python/qihse/browser/__init__.py` `__all__` is **exactly** `keyslot`,
+`SLOT_COUNT`, `NodeSpec`, `SessionFleet`. `python_port::browser` exports all
+four names (Rust `SLOT_COUNT=16384`); the `SessionFleet` API is a *different,
+read-only* authenticated subset. `browse`/`fetch` and `prepare_action` are
+additional Rust helpers, not exports from Python's browser package root.
+Python's fleet topology/snapshot/health methods and the HTTP/WebAuthn UI,
+challenge verification, credential store, mutations, and CLI remain missing.
+
+Conformance plan before any parity claim: (1) run matching Python/Rust fixtures
+against the same native library for hardware units, vector/FTS scores, storage
+labels and stream rows; (2) test low-clearance/high-data denial through *each*
+Rust adapter, including direct-ID lookup, enumeration, batch/export and browser
+read/slot-owner fallbacks, in CI; (3) use a mock TLS endpoint for UWP framed
+AUTH, rejection, truncation, deadlines and retry behavior before implementing
+any network client, and a real TLS test for the server launcher; (4) compare
+all `__all__` method signatures/results and browser root exports across both
+languages; (5) record missing methods and only promote individual rows after
+negative auth and integration tests pass. The focused Rust checks do not
+establish this conformance. The separate native extension in
+`sdks/python/qihse.c` is another Python-facing surface; this table inventories
+`python/qihse` only and does not establish parity with the extension.
+
+Run the feature-gated peripheral checks with
+`LD_LIBRARY_PATH=. cargo test --manifest-path rust/qihse-rs/Cargo.toml --features python-port --test python_peripheral -- --test-threads=1`
+from the repository root. Omitting `--features python-port` runs **zero** tests
+in that target, not a peripheral conformance check.
+
+Upgrade: opt in with `--features python-port`, rebuild `make lib` then
+`cargo build --manifest-path rust/qihse-rs/Cargo.toml --features python-port`.
+No existing symbol is retired, no reindex is needed, and stored data needs no
+migration.

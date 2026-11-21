@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "qihse_auth.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,8 @@ extern "C" {
 #define QIHSE_CT1_RECOVERY_WIRE_SIZE 2624u
 #define QIHSE_CT1_RECOVERY_MAX_AGE_MS 900000u
 #define QIHSE_CT1_RECOVERY_FRAME_BYTES 1644u
+#define QIHSE_CT1_RECOVERY_ARCHIVE_BYTES \
+    (QIHSE_CT1_RECOVERY_WIRE_SIZE + QIHSE_CT1_RECOVERY_FRAME_BYTES)
 #define QIHSE_CT1_RECOVERY_FILE_SIZE_MAX (UINT64_C(1) << 40)
 
 /* Kind is checked against the exact canonical native basename. SSTable
@@ -62,7 +65,7 @@ typedef struct {
     uint64_t epoch, issued_ms, expires_ms;
     uint64_t frame_offset, frame_length, frame_position, baseline_row_seq;
     uint64_t target_cursor, target_high_water, source_high_water;
-    uint64_t row_change_seq, tombstone_position;
+    uint64_t row_change_seq, tombstone_position, tombstone_row_seq;
     uint32_t row_tenant_id, principal_tenant_id;
     uint16_t classification, sci, principal_classification, principal_sci;
     uint16_t operation;
@@ -109,11 +112,31 @@ bool qihse_ct1_recovery_ledger_consume(const char* path,
     const char* local_node, const qihse_ct1_recovery_manifest_t* manifest,
     uint64_t caller_now_ms);
 /* Structural evidence only: independently stream-hash the complete source or
- * target roster in a caller-supplied frozen directory. Never grants access or
- * authenticates an issuer. Requires private, caller-owned regular files and a
- * private final directory under trusted, non-writable directory ancestors. */
-bool qihse_ct1_recovery_verify_frozen(const char* frozen_dir,
-    const qihse_ct1_recovery_manifest_t* manifest, bool source);
+ * target roster in a caller-supplied frozen directory. The files may contain
+ * mixed tenants and all uint16_t labels: require an active, system-tenant
+ * principal with maximum clearance/SCI, not the manifest's single-row label.
+ * Never grants recovery or issuer authority. Requires private, caller-owned
+ * regular files and a private directory under trusted ancestors. */
+bool qihse_ct1_recovery_verify_frozen(const qihse_user_t* principal,
+    const char* frozen_dir, const qihse_ct1_recovery_manifest_t* manifest,
+    bool source);
+/* INSECURE DEVELOPMENT-ONLY API: compiled only for disposable fixtures.
+ * No authenticated security context or clearance/SCI check exists here.
+ * Do not enable for production or use with classified frames. Verify reads
+ * frame bytes internally for hashing but never returns them. File privacy
+ * relies on OS ownership/mode, not clearance/SCI.
+ * Archive is one exclusive private file: canonical B manifest wire followed
+ * by exactly 1644 frame bytes. Reopen requires the same complete manifest,
+ * exact size and frame digest. Failure leaves the artifact in place; no
+ * rollback protection. Neither return authorizes recovery, ACK, suppression
+ * or target apply. */
+#ifdef QIHSE_CT1_INSECURE_DEV_ARCHIVE
+bool qihse_ct1_recovery_archive_create(const char* path,
+    const qihse_ct1_recovery_manifest_t* manifest,
+    const unsigned char* frame, size_t frame_length);
+bool qihse_ct1_recovery_archive_verify(const char* path,
+    const qihse_ct1_recovery_manifest_t* manifest);
+#endif
 /* Deliberately fail-closed integration hook. Actual approval requires QKP
  * Operator issuer authentication, current pin checks and RESP/core policy. */
 bool qihse_ct1_recovery_issuer_authorized(void);

@@ -866,6 +866,47 @@ The [cluster operations design](docs/plans/cluster_ops_roadmap.md) records usefu
 
 ---
 
+## Foundations from the parked compact-search experiment (2026-11-16)
+
+**Conditional design input, not scheduled delivery or an implemented QIHSE feature.**
+The companion `tgrep` repository's `experiments/compact-search/` remains parked;
+rg stays the working tool. These lessons do not authorize Hax/CodeGraph integration
+or restart prototype development. Existing checklist counts and sequencing are unchanged.
+
+- **Prune work, retain authority.** Cheap candidate filtering avoided reading most
+  indexed files on selective queries. Derived indexes must still verify current
+  source and propagate authenticated `qihse_user_t` authorization to authoritative
+  retrieval; a cache hit is not permission, and stale negatives are not evidence.
+- **Measure freshness costs separately.** Live traversal and metadata checks remain
+  per-query work. Reliable incremental tracking, with gap/restart recovery and
+  generation validation, is a future hypothesis to evaluate—not a demonstrated gain.
+- **Bound the entire replacement.** Reserve retained + scratch + new-generation
+  bytes, including cooperating concurrent writers. A private managed namespace is
+  an accounting boundary, not a filesystem-wide quota; unlinked readers, snapshots,
+  and external writers require separate treatment.
+- **Preserve the last good generation.** Immutable atomic publication and refusal
+  tests are reusable foundations. Corruption and orphan staging must fail closed;
+  explicit crash recovery is required before claiming unattended operation.
+- **Representation and I/O matter before tuning compute.** Six-byte instead of
+  eight-byte scratch records reduced that representation by 25%; buffered block I/O
+  removed millions of per-record syscalls. Bounded external sorting and merge fan-in
+  are useful ingestion/compaction techniques, subject to encoding and memory bounds.
+- **Gate adoption on the consumer contract.** Reuse independent oracle, mutation,
+  corruption, permission, and refusal tests. Measure cold/warm latency, query mix,
+  build/update amortization, and end-to-end cost. A text filter cannot replace AST
+  extraction, and fixed-string wins do not establish Hax search-semantic parity.
+
+Evidence from the QIHSE source-tree scan (2026-11-15): 13,818 visible files,
+11,783 indexed and 2,035 scan-only; 19,892,249-byte index; 71,048,550 scratch bytes
+in 68 runs. Five filename queries and one 14-line query matched independent rg.
+Six alternating-order warm-cache trials per pattern had compact-search/rg median
+seconds of 0.10/0.165 (selective), 0.11/0.16 (broad), and 0.10/0.13 (absent).
+This small live-tree sample used coarse timing; it is not a cold-cache benchmark,
+a QIHSE engine throughput result, or proof of Hax/CodeGraph acceleration.
+The companion experiment's `README.md`, `STORAGE_RESULTS.md`, `proof.py`,
+`line_proof.py`, and `storage_proof.py` preserve reusable design and correctness
+methods; the source-tree timing observation above is separate from their pinned runs.
+
 ## 4. Sequencing
 
 **Historical W0–W10 checklist sequence (completed):** `W0 → F0 → F1 → F2 → {F3, F4} → F5 → F6 → F7`. The horizons below describe that program's original order. **Active next sequence:** complete the confirmed repair batch, then W11.0 → scoped W11.1–W11.5 work → W11.6. **Cluster transport:** CT.1 and CT.2 have an implemented baseline but are reopened for the confirmed interruption and convergence defects above. **Independent optional research lane:** W12.0 → W12.1 → W12.2 → W12.3 → W12.5 → W12.6 (W12.4 only after scalar correctness).

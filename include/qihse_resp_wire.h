@@ -319,6 +319,11 @@ typedef struct {
     uint32_t ct_ack_timeout_ms;
     const unsigned char* ct_owner_token; /* primary capability; never on RESP */
     qihse_user_t* ct_control_principal; /* active startup Operator, borrowed */
+    /* Optional, inert CT1 node-quote recovery root. Must be an existing private
+     * directory installed by the administrator; copied at server creation.
+     * No RESP request supplies or reads this path, and no signer is installed. */
+    const char* ct1_recovery_frozen_root;
+    uint32_t ct1_recovery_replication_principal_id; /* exact existing principal; 0 rejects root */
     qihse_cluster_topology_qkp_id_fn ct_topology_qkp_id;
     void* ct_topology_qkp_id_context;
     /* Optional per-range CT1 lanes. Each entry maps a stable lane ID and
@@ -428,6 +433,9 @@ typedef struct {
 } qihse_resp_server_config_t;
 
 void qihse_resp_server_config_init(qihse_resp_server_config_t* config);
+/* Startup-only, metadata-only validation: no frozen file is opened or read.
+ * The future signer must independently pin and revalidate before opening. */
+bool qihse_resp_ct1_frozen_root_valid(const char* path);
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* config);
 bool qihse_resp_server_start(qihse_resp_server_t* server);
 bool qihse_resp_server_run(qihse_resp_server_t* server);

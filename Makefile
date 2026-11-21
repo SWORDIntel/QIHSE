@@ -242,6 +242,10 @@ ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
 SRCS_BASE += src/spinnaker/qihse_aimem_onnx_embedder.c
 endif
 
+SRCS_BASE += src/black_hole/qihse_ct1_recovery_manifest.c \
+    src/black_hole/qihse_ct1_node_quote.c
+SRCS_BASE += src/black_hole/qihse_ct1_archive.c \
+    src/black_hole/qihse_ct1_disposition.c
 SRCS_BASE += src/black_hole/qihse_ct_codec.c src/spinnaker/qihse_cluster_ownership.c \
     src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c \
     src/spinnaker/qihse_cluster_range_authority.c \
@@ -575,7 +579,7 @@ test-ct-legacy-expiry: lib
 test-serial: test-ct-legacy-expiry
 
 test-ct-storage: lib
-	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_storage tests/test_ct_storage.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_CT_STORAGE_FLOOR_TEST -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_ct_storage tests/test_ct_storage.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_storage
 
 .PHONY: test-ct-replication-lanes
@@ -1442,7 +1446,7 @@ test-workload-admission: lib
 
 test-aimem-workload-admission: lib
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -o tests/test_aimem_workload_admission tests/test_aimem_workload_admission.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_aimem_workload_admission tests/test_aimem_workload_admission.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_workload_admission
 
 # QH-00: separate process instances; SIGKILL immediately after durable ACK.
@@ -2927,12 +2931,76 @@ test-ct-recovery-abi:
 	    build/ct1-recovery-abi/cargo/debug/libqihse_ct1_recovery.a -ldl -lpthread -lm
 	./build/ct1-recovery-abi/test_ct1_evidence_abi
 
-# Opt-in structural-only receipt checks; the issuer hook remains fail-closed.
+# Opt-in structural checks; the context-free archive is disposable-fixture only.
 .PHONY: test-ct-recovery-manifest
-test-ct-recovery-manifest:
+test-ct-recovery-manifest: $(LIB_TARGET)
 	@mkdir -p build/ct1-recovery-manifest
-	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -I./include \
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
+	    -DQIHSE_CT1_INSECURE_DEV_ARCHIVE -I./include \
 	    -o build/ct1-recovery-manifest/test_ct1_recovery_manifest \
 	    src/black_hole/qihse_ct1_recovery_manifest.c \
-	    tests/test_ct1_recovery_manifest.c -lcrypto
-	./build/ct1-recovery-manifest/test_ct1_recovery_manifest
+	    tests/test_ct1_recovery_manifest.c -L. -lqihse -lcrypto
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./build/ct1-recovery-manifest/test_ct1_recovery_manifest
+test-serial: test-ct-recovery-manifest
+
+# Context-free witness is an insecure disposable fixture, never a daemon API.
+.PHONY: test-ct1-authority-witness
+test-ct1-authority-witness: $(LIB_TARGET)
+	@mkdir -p build/ct1-authority-witness
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -UNDEBUG \
+	    -DQIHSE_CT1_INSECURE_DEV_WITNESS -I./include \
+	    -o build/ct1-authority-witness/test_ct1_authority_witness \
+	    src/black_hole/qihse_ct1_authority_witness.c \
+	    src/black_hole/qihse_ct1_recovery_manifest.c \
+	    tests/test_ct1_authority_witness.c -L. -lqihse -lcrypto
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./build/ct1-authority-witness/test_ct1_authority_witness
+
+# Host-only ledger test; explicit provisioning is not a grant or rollback anchor.
+.PHONY: test-ct1-authority-store
+test-ct1-authority-store:
+	$(MAKE) -C tests/ct1_authority test-host-state
+test-serial: test-ct1-authority-store
+
+# Read-only pinned-node quote verification, using disposable ML-DSA keys.
+.PHONY: test-ct1-node-quote
+test-ct1-node-quote:
+	$(MAKE) -C tests/ct1_authority test-quote
+test-serial: test-ct1-node-quote
+
+# Local safe prerequisites only. Disabled authority cannot mint/consume grants.
+.PHONY: test-ct1-authority test-ct1-authority-service
+test-ct1-authority:
+	$(MAKE) -C tests/ct1_authority test-ci
+test-ct1-authority-service:
+	$(MAKE) -C tests/ct1_authority test-service
+test-serial: test-ct1-authority-service
+
+.PHONY: test-ct1-disposition
+test-ct1-disposition:
+	$(MAKE) -C tests/ct1_authority test-disposition
+test-serial: test-ct1-disposition
+
+# Source custody probe/lease is fixture-only; not linked into production.
+.PHONY: test-ct1-source-authority
+test-ct1-source-authority:
+	@mkdir -p build/ct1-source
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -UNDEBUG -D_GNU_SOURCE \
+	    -I./include -I./core -o build/ct1-source/test_ct1_source_authority \
+	    tests/test_ct1_source_authority.c \
+	    src/black_hole/qihse_ct1_source_authority.c \
+	    src/black_hole/qihse_ct1_recovery_manifest.c -L. -lqihse -lcrypto
+	@fixture=$$(sudo -n mktemp -d -p "$$(dirname "$$(pwd)")" \
+	    qihse-ct1-source-test.XXXXXX) && \
+	    sudo -n env LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH:-}" \
+	    ./build/ct1-source/test_ct1_source_authority "$$fixture"
+
+# Root custody tests remain disposable and separate from production startup.
+.PHONY: test-ct1-archive
+test-ct1-archive: $(LIB_TARGET)
+	@mkdir -p build/ct1-archive
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -UNDEBUG -D_GNU_SOURCE \
+	    -I./include -I./core -o build/ct1-archive/test_ct1_archive \
+	    tests/test_ct1_archive.c src/black_hole/qihse_ct1_archive.c \
+	    src/black_hole/qihse_ct1_disposition.c src/black_hole/qihse_ct_codec.c \
+	    -L. -lqihse -lcrypto
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./build/ct1-archive/test_ct1_archive

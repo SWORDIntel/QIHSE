@@ -19,7 +19,7 @@ enum { HEADER = 12, ID_BYTES = 65, DIGEST_BYTES = 32,
        FILE_BYTES = 1 + ID_BYTES + 8 + DIGEST_BYTES,
        CHECKSUM_OFFSET = QIHSE_CT1_RECOVERY_WIRE_SIZE - 32,
        USED_BYTES = HEADER + 10 * ID_BYTES + 6 * DIGEST_BYTES +
-           12 * 8 + 2 * 4 + 5 * 2 +
+           13 * 8 + 2 * 4 + 5 * 2 +
            (QIHSE_CT1_RECOVERY_SOURCE_FILES + QIHSE_CT1_RECOVERY_TARGET_FILES) * FILE_BYTES };
 typedef char recovery_wire_fits[(USED_BYTES <= CHECKSUM_OFFSET) ? 1 : -1];
 static const unsigned char magic[8] = {'Q','C','T','1','B','R','0','2'};
@@ -145,7 +145,7 @@ static bool shape(const qihse_ct1_recovery_manifest_t* m) {
         m->frame_length == QIHSE_CT1_RECOVERY_FRAME_BYTES &&
         m->frame_position && m->frame_offset <= UINT64_MAX - m->frame_length &&
         m->target_cursor && m->target_high_water && m->source_high_water &&
-        m->row_change_seq && m->tombstone_position &&
+        m->row_change_seq && m->tombstone_position && m->tombstone_row_seq &&
         m->operation == QIHSE_CT1_RECOVERY_VERIFY;
 }
 static void put_id(unsigned char* out, const char* s) {
@@ -199,8 +199,8 @@ bool qihse_ct1_recovery_encode(const qihse_ct1_recovery_manifest_t* m,
     const uint64_t values[] = {m->epoch, m->issued_ms, m->expires_ms,
         m->frame_offset, m->frame_length, m->frame_position, m->baseline_row_seq,
         m->target_cursor, m->target_high_water, m->source_high_water,
-        m->row_change_seq, m->tombstone_position};
-    for (size_t i = 0; i < 12; ++i, n += 8) put64(out + n, values[i]);
+        m->row_change_seq, m->tombstone_position, m->tombstone_row_seq};
+    for (size_t i = 0; i < 13; ++i, n += 8) put64(out + n, values[i]);
     const uint32_t words[] = {m->row_tenant_id, m->principal_tenant_id};
     for (size_t i = 0; i < 2; ++i, n += 4) put32(out + n, words[i]);
     const uint16_t shorts[] = {m->classification, m->sci,
@@ -240,8 +240,8 @@ bool qihse_ct1_recovery_decode(const unsigned char* data, size_t length,
     uint64_t* values[] = {&m.epoch, &m.issued_ms, &m.expires_ms,
         &m.frame_offset, &m.frame_length, &m.frame_position, &m.baseline_row_seq,
         &m.target_cursor, &m.target_high_water, &m.source_high_water,
-        &m.row_change_seq, &m.tombstone_position};
-    for (size_t i = 0; i < 12; ++i, n += 8) *values[i] = get64(data + n);
+        &m.row_change_seq, &m.tombstone_position, &m.tombstone_row_seq};
+    for (size_t i = 0; i < 13; ++i, n += 8) *values[i] = get64(data + n);
     uint32_t* words[] = {&m.row_tenant_id, &m.principal_tenant_id};
     for (size_t i = 0; i < 2; ++i, n += 4) *words[i] = get32(data + n);
     uint16_t* shorts[] = {&m.classification, &m.sci,
@@ -658,8 +658,17 @@ fail:
     close(fd);
     return -1;
 }
+static bool frozen_reader_authorized(const qihse_user_t* principal);
+#ifdef QIHSE_CT1_INSECURE_DEV_ARCHIVE
+extern void qihse_ct1_frozen_test_before_block(const char*, uint64_t)
+    __attribute__((weak));
+extern void qihse_ct1_frozen_test_after_block(const char*, uint64_t)
+    __attribute__((weak));
+extern void qihse_ct1_frozen_test_after_entry(void) __attribute__((weak));
+#endif
 static bool frozen_entries(int fd, const qihse_ct1_recovery_file_t* files,
-    size_t count) {
+    size_t count, const qihse_user_t* principal) {
+    if (!frozen_reader_authorized(principal)) return false;
     int scan = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
         O_NONBLOCK | O_CLOEXEC);
     if (scan < 0) return false;
@@ -667,22 +676,29 @@ static bool frozen_entries(int fd, const qihse_ct1_recovery_file_t* files,
     if (!dir) { close(scan); return false; }
     unsigned seen = 0;
     bool ok = true;
-    struct dirent* entry;
+    struct dirent* entry = NULL;
     errno = 0;
-    while ((entry = readdir(dir))) {
+    while (ok && frozen_reader_authorized(principal)) {
+        entry = readdir(dir);
+        if (!entry) break;
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         size_t i = 0;
         for (; i < count; ++i)
             if (!strcmp(entry->d_name, files[i].filename)) break;
         if (i == count || (seen & (1u << i))) { ok = false; break; }
         seen |= 1u << i;
+#ifdef QIHSE_CT1_INSECURE_DEV_ARCHIVE
+        if (qihse_ct1_frozen_test_after_entry) qihse_ct1_frozen_test_after_entry();
+#endif
         errno = 0;
     }
-    if (!entry && errno) ok = false;
+    if (!frozen_reader_authorized(principal) || (!entry && errno)) ok = false;
     if (closedir(dir)) ok = false;
     return ok && seen == (1u << count) - 1u;
 }
-static bool frozen_file(int dir, const qihse_ct1_recovery_file_t* file) {
+static bool frozen_file(int dir, const qihse_ct1_recovery_file_t* file,
+    const qihse_user_t* principal) {
+    if (!frozen_reader_authorized(principal)) return false;
     int fd = openat(dir, file->filename,
         O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return false;
@@ -696,13 +712,28 @@ static bool frozen_file(int dir, const qihse_ct1_recovery_file_t* file) {
     if (ok) ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1;
     uint64_t total = 0;
     unsigned char block[16384], digest[32];
-    while (ok) {
+    while (ok && (ok = frozen_reader_authorized(principal))) {
+#ifdef QIHSE_CT1_INSECURE_DEV_ARCHIVE
+        if (qihse_ct1_frozen_test_before_block)
+            qihse_ct1_frozen_test_before_block(file->filename, total);
+#endif
+        if (!frozen_reader_authorized(principal)) { ok = false; break; }
         ssize_t n = read(fd, block, sizeof(block));
+        if (!frozen_reader_authorized(principal)) {
+            OPENSSL_cleanse(block, sizeof(block));
+            ok = false;
+            break;
+        }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 || (uint64_t)n > file->size - total) { ok = false; break; }
         if (!n) break;
         total += (uint64_t)n;
-        ok = EVP_DigestUpdate(ctx, block, (size_t)n) == 1;
+        ok = frozen_reader_authorized(principal) &&
+            EVP_DigestUpdate(ctx, block, (size_t)n) == 1;
+#ifdef QIHSE_CT1_INSECURE_DEV_ARCHIVE
+        if (ok && qihse_ct1_frozen_test_after_block)
+            qihse_ct1_frozen_test_after_block(file->filename, total);
+#endif
     }
     unsigned digest_len = 0;
     if (ok) ok = total == file->size &&
@@ -716,9 +747,21 @@ static bool frozen_file(int dir, const qihse_ct1_recovery_file_t* file) {
     if (close(fd)) ok = false;
     return ok;
 }
-bool qihse_ct1_recovery_verify_frozen(const char* frozen_dir,
-    const qihse_ct1_recovery_manifest_t* manifest, bool source) {
-    if (!shape(manifest)) return false;
+/* A native roster is not row-scoped: WAL, SSTables and baseline may span
+ * every tenant and every representable label regardless of the B row fields. */
+static bool frozen_reader_authorized(const qihse_user_t* principal) {
+    bool active = false;
+    uint32_t tenant = QIHSE_TENANT_INVALID;
+    qihse_auth_user_active_and_tenant(principal, &active, &tenant);
+    return active && tenant == QIHSE_TENANT_SYSTEM &&
+        qihse_user_get_classification(principal) == UINT16_MAX &&
+        qihse_user_get_sci(principal) == UINT16_MAX &&
+        qihse_auth_can_access(principal, UINT16_MAX, UINT16_MAX);
+}
+bool qihse_ct1_recovery_verify_frozen(const qihse_user_t* principal,
+    const char* frozen_dir, const qihse_ct1_recovery_manifest_t* manifest,
+    bool source) {
+    if (!frozen_reader_authorized(principal) || !shape(manifest)) return false;
     const qihse_ct1_recovery_file_t* files = source ?
         manifest->source_files : manifest->target_files;
     size_t count = source ? QIHSE_CT1_RECOVERY_SOURCE_FILES :
@@ -726,21 +769,97 @@ bool qihse_ct1_recovery_verify_frozen(const char* frozen_dir,
     int dir = frozen_open_dir(frozen_dir);
     if (dir < 0) return false;
     struct stat before, after, reopened;
-    bool ok = fstat(dir, &before) == 0 && frozen_entries(dir, files, count);
+    bool ok = fstat(dir, &before) == 0 &&
+        frozen_entries(dir, files, count, principal);
     for (size_t i = 0; ok && i < count; ++i)
-        ok = frozen_file(dir, &files[i]);
-    if (ok) ok = frozen_entries(dir, files, count);
+        ok = frozen_file(dir, &files[i], principal);
+    if (ok) ok = frozen_entries(dir, files, count, principal);
     /* A second full pass catches changes to earlier files while later ones
      * were being read; this is evidence, not a writer-exclusion lock. */
     for (size_t i = 0; ok && i < count; ++i)
-        ok = frozen_file(dir, &files[i]);
-    if (ok) ok = frozen_entries(dir, files, count) &&
+        ok = frozen_file(dir, &files[i], principal);
+    if (ok) ok = frozen_entries(dir, files, count, principal) &&
         fstat(dir, &after) == 0 && frozen_same(&before, &after);
-    int check = frozen_open_dir(frozen_dir);
+    int check = ok && frozen_reader_authorized(principal) ?
+        frozen_open_dir(frozen_dir) : -1;
     if (ok) ok = check >= 0 && fstat(check, &reopened) == 0 &&
         frozen_same(&after, &reopened);
     if (check >= 0 && close(check)) ok = false;
     if (close(dir)) ok = false;
+    return frozen_reader_authorized(principal) && ok;
+}
+#ifdef QIHSE_CT1_INSECURE_DEV_ARCHIVE
+/* The wire prefix binds every canonical B field, not just the frame hash.
+ * This is a local integrity check, not an issuer signature or read grant. */
+static bool archive_check(int dir, const char* name, int fd,
+    const unsigned char wire[QIHSE_CT1_RECOVERY_WIRE_SIZE],
+    const unsigned char frame_sha256[32]) {
+    struct stat before, after;
+    unsigned char stored[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    unsigned char frame[QIHSE_CT1_RECOVERY_FRAME_BYTES], digest[32];
+    return receipt_stat(dir, name, fd, QIHSE_CT1_RECOVERY_ARCHIVE_BYTES, &before) &&
+        read_exact_at(fd, stored, sizeof(stored), 0) &&
+        memcmp(stored, wire, sizeof(stored)) == 0 &&
+        read_exact_at(fd, frame, sizeof(frame), sizeof(stored)) &&
+        SHA256(frame, sizeof(frame), digest) != NULL &&
+        memcmp(digest, frame_sha256, sizeof(digest)) == 0 &&
+        receipt_stat(dir, name, fd, QIHSE_CT1_RECOVERY_ARCHIVE_BYTES, &after) &&
+        frozen_same(&before, &after);
+}
+
+bool qihse_ct1_recovery_archive_create(const char* path,
+    const qihse_ct1_recovery_manifest_t* manifest,
+    const unsigned char* frame, size_t frame_length) {
+    unsigned char wire[QIHSE_CT1_RECOVERY_WIRE_SIZE], digest[32];
+    if (!frame || frame_length != QIHSE_CT1_RECOVERY_FRAME_BYTES ||
+        !qihse_ct1_recovery_encode(manifest, false, false, wire) ||
+        !SHA256(frame, frame_length, digest) ||
+        memcmp(digest, manifest->frame_sha256, sizeof(digest))) return false;
+    char name[256], parent[4097];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    struct stat existing, before, after;
+    bool ok = false;
+    int fd = -1;
+    if (fstatat(dir, name, &existing, AT_SYMLINK_NOFOLLOW) == 0 ||
+        errno != ENOENT || !receipt_parent_same(dir, parent)) goto done;
+    fd = openat(dir, name, O_RDWR | O_CREAT | O_EXCL |
+        O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+    if (fd < 0) goto done;
+    ok = receipt_stat(dir, name, fd, 0, NULL) &&
+        write_all(fd, wire, sizeof(wire)) &&
+        write_all(fd, frame, frame_length) && fsync(fd) == 0 &&
+        fstat(dir, &before) == 0 &&
+        archive_check(dir, name, fd, wire, manifest->frame_sha256) &&
+        fstat(dir, &after) == 0 && frozen_same(&before, &after) &&
+        fsync(dir) == 0 && receipt_parent_same(dir, parent);
+done:
+    if (fd >= 0 && close(fd)) ok = false;
+    if (close(dir)) ok = false;
     return ok;
 }
+
+bool qihse_ct1_recovery_archive_verify(const char* path,
+    const qihse_ct1_recovery_manifest_t* manifest) {
+    unsigned char wire[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (!qihse_ct1_recovery_encode(manifest, false, false, wire))
+        return false;
+    char name[256], parent[4097];
+    int dir = receipt_dir(path, name, parent);
+    if (dir < 0) return false;
+    struct stat before, after;
+    bool ok = false;
+    int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) {
+        ok = fstat(dir, &before) == 0 &&
+            archive_check(dir, name, fd, wire, manifest->frame_sha256) &&
+            fstat(dir, &after) == 0 && frozen_same(&before, &after) &&
+            receipt_parent_same(dir, parent);
+        if (close(fd)) ok = false;
+    }
+    if (close(dir)) ok = false;
+    return ok;
+}
+#endif /* QIHSE_CT1_INSECURE_DEV_ARCHIVE */
+
 bool qihse_ct1_recovery_issuer_authorized(void) { return false; }

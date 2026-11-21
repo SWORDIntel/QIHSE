@@ -130,7 +130,11 @@ ledger and authorized tombstone metadata, it returns `ERR UNRESOLVED` rather
 than claiming success. `ERR NOT_DURABLE` means the local fence failed and the
 caller should retry the identical request. The receipt does not assert remote
 replication or quorum. The older integer `FORGET-SCOPED-DURABLE` remains
-available for clients that do not need retry reconciliation.
+available for clients that do not need retry reconciliation. It runs the local
+KV fsync fence before returning either `:1` (a visible matching record was
+removed) or `:0` (no visible matching record was removed); thus an absent/retry
+response also confirms the current deletion state crossed the local fence. It
+does not provide the receipt command's exact retry reconciliation semantics.
 
 `EVENT APPEND` accepts the registered kinds `session_start`, `session_end`,
 `task_started`, `task_completed`, `observation`, `decision`, `blocker`, and

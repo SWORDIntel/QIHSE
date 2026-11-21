@@ -671,6 +671,28 @@ int main(void) {
     high_forget[2] = high_scoped_id;
     expect_contains(guest, 7u, high_forget, ":0\r\n");
 
+    /* Durable scoped forget: every ACK fences the store, including the
+     * absent/retried result, so a lost reply cannot leave the current
+     * deletion state unacknowledged as durable. Denials keep the integer
+     * grammar and disclose no payload. The retry must fence even when it
+     * removes nothing: the probe row is written without a sync, so only
+     * the absent ACK's fence can carry it into a new SSTable. */
+    const char* high_forget_durable[] = { "AIMEM", "FORGET-SCOPED-DURABLE",
+        "placeholder", "project-high", "", "", "" };
+    high_forget_durable[2] = high_scoped_id;
+    expect_contains(guest, 7u, high_forget_durable, ":0\r\n");
+    expect_contains(op, 6u, high_count, ":1\r\n");
+    expect_contains(op, 7u, high_forget_durable, ":1\r\n");
+    expect_contains(op, 7u, high_get, "$-1\r\n");
+    qihse_kv_sstable_stats_t fence_before, fence_after;
+    assert(qihse_kv_sstable_stats(store, &fence_before));
+    assert(qihse_kv_set_user(store, "durable-forget-fence-probe",
+                             "unflushed probe row", 0u, 0u, op));
+    expect_contains(op, 7u, high_forget_durable, ":0\r\n");
+    assert(qihse_kv_sstable_stats(store, &fence_after));
+    assert(fence_after.sstable_counter == fence_before.sstable_counter + 1u);
+    expect_contains(op, 6u, high_count, ":0\r\n");
+
     const char* worktree_store[] = { "AIMEM", "STORE-SCOPED", "1",
         "checkout boundary marker", "project-alpha", "checkout-a", "stream-a", "session-a" };
     reply = NULL;

@@ -7,7 +7,16 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+
+/* The library resolves its index-rebuild failpoints through this weak symbol;
+ * this fixture maps the QIHSE_AIMEM_QH08_FAIL_AT phase name to a failpoint. */
+bool qihse_aimem_test_failpoint(const char* name) {
+    const char* fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
+    if (!fail_at || !name) return false;
+    return strcmp(fail_at, name) == 0;
+}
 
 typedef struct {
     pthread_mutex_t mutex;
