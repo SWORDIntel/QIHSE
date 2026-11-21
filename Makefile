@@ -543,6 +543,30 @@ test-slot-migration-auth: lib
 	$(CC) $(CFLAGS) -o tests/test_slot_migration_auth tests/test_slot_migration_auth.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_slot_migration_auth
 
+.PHONY: test-ct1-recovery-host-auth
+test-ct1-recovery-host-auth: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o build/test_ct1_recovery_host_auth tests/test_ct1_recovery_host_auth.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_ct1_recovery_host_auth
+
+.PHONY: test-ct1-source-hold-resp
+test-ct1-source-hold-resp: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o build/test_ct1_source_hold_resp tests/test_ct1_source_hold_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_ct1_source_hold_resp
+
+.PHONY: test-ct-target-epoch-fence
+test-ct-target-epoch-fence: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o build/test_ct_target_epoch_fence tests/test_ct_target_epoch_fence.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_ct_target_epoch_fence
+
+.PHONY: test-ct1-target-disposition
+test-ct1-target-disposition: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o build/test_ct1_target_disposition tests/test_ct1_target_disposition.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_ct1_target_disposition
+
 test-ownership-journal: lib
 	$(CC) $(CFLAGS) -o tests/test_ownership_journal tests/test_ownership_journal.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_journal
@@ -1635,7 +1659,7 @@ GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^
 # parallel OS processes. All other `test-serial:` prerequisites run serially;
 # the nested-make gold pack runs last. Override with TEST_JOBS=1..32.
 .PHONY: test-serial test-parallel test-parallel-runner
-test: test-parallel
+test: test-parallel test-ct1-recovery-host-auth test-ct1-source-hold-resp test-ct-target-epoch-fence test-ct1-target-disposition
 test-parallel-runner:
 	PYTHONPATH=tests python3 -m unittest -v test_parallel_suite test_gold_parallel
 

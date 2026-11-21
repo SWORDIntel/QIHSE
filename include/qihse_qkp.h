@@ -156,6 +156,9 @@ typedef struct {
     const char* const* migration_peer_node_ids;
     const char* const* migration_peer_dsa_pub_paths;
     size_t migration_peer_count;
+    /* Optional recovery-host identity. This pin grants no RESP commands. */
+    const char* recovery_peer_node_id;
+    const char* recovery_peer_dsa_pub_path;
 } qihse_qkp_config_t;
 
 typedef enum {
@@ -239,6 +242,12 @@ bool qihse_qkp_session_is_admin_peer(const qihse_qkp_session_t* s,
                                     const qihse_qkp_config_t* config,
                                     const qihse_qkp_replication_peer_t* peers,
                                     size_t peer_count);
+
+/* An optional recovery signer must not share a key with any admin, migration,
+ * or replication identity, regardless of signed label. Disabled is valid. */
+bool qihse_qkp_recovery_pin_valid(const qihse_qkp_config_t* config,
+    const char* second_admin_node_id, const char* second_admin_pub_path,
+    const qihse_qkp_replication_peer_t* peers, size_t peer_count);
 
 /* Requires an actual replication-authorized server handshake and exact pin. */
 bool qihse_qkp_session_is_replication_peer_any(

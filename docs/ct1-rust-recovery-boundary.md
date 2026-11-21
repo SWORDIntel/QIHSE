@@ -650,14 +650,21 @@ under a lock on the stable store-directory inode. Already-open
 participating handles revalidate persisted state at admission; startup holds
 the same lock through state/marker validation, SST indexing and WAL replay.
 Marker removal must fail closed: the persisted CT-state intent still denies
-admission, including on reopen; deletion is not a release mechanism.
+admission, including on reopen; deletion is not a release mechanism. A pinned
+source hold now writes `QCTRF002`, binding the exact pending WAL tail offset,
+length, SHA-256 and pre-hold row high-water to the fenced generation/cursor.
+CT state persists that V2 is required; reopen re-hashes the tail under the
+store-directory lock before and after WAL replay, compares the recovered row
+high-water, and refuses a substituted frame or V1 downgrade.
+Existing generic `QCTRF001` holds remain fenced.
+Neither marker authorizes an ACK, disposition or release.
 
-This is a committed local prerequisite, not a production deployment or approval, and it
+This is a local prerequisite, not a production deployment or approval, and it
 does not fence old binaries that ignore the gate. TPM-free QKP Operator
 recovery authority remains unimplemented; there is no independent trusted
-epoch/expiry service, release protocol, suppression disposition or B replay.
-Do not deploy this candidate as B's target fence or use ordinary `RECONCILE`
-as a release shortcut.
+epoch/expiry service, release protocol, protected production suppression
+writer or live B replay. The isolated disposition codec/replay tests do not
+supply that authority. Do not use ordinary `RECONCILE` as a release shortcut.
 
 A single KV lock cannot freeze two server processes. The target's read-locked
 HISTORY-V1 snapshot can be stale before the source publishes a floor, and the
@@ -859,12 +866,204 @@ fail-closed recovery of that exact durable intent or fresh authenticated
 reapproval can proceed. The 15-minute default and trusted-time/ledger format
 need operational validation before implementation.
 
-**Still unresolved:** the on-disk disposition/absence-barrier format and
-retention semantics, durable cross-process fence for all target writers,
-manifest authentication/ledger mechanics, and the crash-cut tests above must
-be designed and validated before any executor or deployment is approved.
+**Still unresolved:** the on-disk disposition/absence-barrier retention
+beyond the fenced window (checkpoint/compaction carry-forward), durable
+cross-process fence semantics beyond the now-implemented target epoch
+fence, manifest authentication/ledger mechanics, recovery-peer RESP
+admission for the disposition writer, and the crash-cut tests above have
+concrete fail-closed formats and a release protocol proposed in the later
+"recovery executor formats" section (target epoch fence and disposition
+writer implemented and fixture-tested; the rest unimplemented); they must
+pass that validation before any executor or deployment is approved.
 `CANDIDATE` is not permission to mutate or unstop B. No B restart, durable
 source sequence floor, or target suppression/disposition has shipped.
+
+## Restricted recovery-host identity and live-source hold (shipped, fixture-tested)
+
+Two capabilities are implemented and covered by disposable-fixture tests.
+Neither is production authority, and neither is enabled by default.
+
+**Recovery-only QKP peer.** `qihse_qkp_config_t` accepts an optional
+`recovery_peer_node_id` / `recovery_peer_dsa_pub_path` pin. When configured,
+`qihse_qkp_recovery_pin_valid` refuses any key-fingerprint or node-ID-label
+collision with the admin, second-admin, replication or migration pins, so the
+recovery identity can never alias an existing privileged principal; an
+incomplete pair is rejected, and an absent pin simply leaves the role off. A
+session authenticated by that peer maps to `QIHSE_RESP_AUTH_QKP_RECOVERY`
+with no attached user principal, and the RESP engine denies it every command
+except the single hold interface below (early dispatch gate plus an empty
+command allowlist as defense in depth). The daemon validates the pin pair at
+startup. Covered by `make test-ct1-recovery-host-auth` (label/key collision
+matrix and runtime denials for PING, HELLO, AUTH, REPL.CT1, CLUSTER, MIGRATE,
+GET, NOAUTH).
+
+**`REPL.CT1 SOURCE HOLD-V1 <manifest-wire>`.** The one command the recovery
+peer may run. Admission is fail-closed and requires, in order: exactly four
+arguments with a `QIHSE_CT1_RECOVERY_WIRE_SIZE` manifest; a session
+authenticated as the configured recovery peer; distinct server-held Operator
+control and replication service principals (the recovery session itself
+carries no user); a `primary`-role CT1 store with no lanes and a configured
+frozen recovery root; a canonical manifest decode/re-encode round trip; a
+live issued/expires window; issuer/source/target/peer identities and DSA
+public-key pins matching the local pin set; the exact replication principal
+id and principal attributes; `frame_length` equal to the production frame
+bytes with nonzero frame position, source high-water and row change
+sequence; and a full frozen source-roster verification
+(`qihse_ct1_recovery_verify_frozen`: exact names, sizes, SHA-256, private
+ownership, double-pass stability). Only then is the durable V2 custody hold
+installed through `qihse_kv_ct_source_custody_hold_install_pinned_v1` with
+the manifest's exact frame facts. Every failure returns one generic denial;
+success returns `+OK` exactly once — a replay of the identical admitted wire
+is refused by the store. The hold denies ACK, reconcile, ordinary writes and
+WAL retirement, and is not a release or compensation authorization. The
+manifest's trailing SHA-256 is a local integrity check, not an issuer
+signature; no production approval, disposition writer or release path
+exists. Covered by `make test-ct1-source-hold-resp` on a fixture built
+through the public store API only (no floor-test helpers): the retained
+frame is calibrated to the exact production frame size, ten denial paths
+(tampered wire, expired window, wrong generation, wrong issuer pin, wrong
+frame digest, wrong high-water, wrong row sequence, frozen-roster digest
+mismatch, non-recovery successor peer, replay) precede the single admitted
+hold.
+
+## Proposed recovery executor formats and release protocol (design; epoch fence and disposition writer implemented)
+
+Concrete on-disk and admission formats for the four unresolved artifacts.
+Of these, the **target recovery epoch fence** and the **protected
+disposition writer with its exact-frame archive** are implemented
+(store-level, fixture-tested, store-local); the source floor and release
+protocol remain design only, and the disposition writer has no
+recovery-peer RESP admission yet. None is authority,
+and none may be provisioned for the production hosts: B's owner service
+stays stopped, the frozen originals stay untouched, and `CANDIDATE`
+remains a label, not permission. All fixed-width fields are little-endian;
+every file is a regular, owner-only (`0600`), `nlink == 1` file under a
+private (`0700`) directory tree, checksummed with SHA-256 over all
+preceding bytes; unknown magic, wrong version, size mismatch, checksum
+failure or missing file fails closed.
+
+**Target recovery epoch fence.** A marker `ct1-target-recovery-fence.bin`
+with magic `QCTTF001`, exactly 299 bytes: magic[8]; zero-padded
+generation[65]; manifest digest[32]; zero-padded source and target QKP
+ids[65+65]; LE recovery epoch[8]; LE cursor[8]; LE row high-water[8]; LE
+same-key tombstone row sequence[8]; SHA-256[32]. The epoch is minted fresh
+under the target store write lock at install (strictly monotone per store,
+starting at one), and travels with every subsequent protocol step; each
+executor mutation revalidates it under the lock. The implemented mechanism
+layers on the existing receiver recovery fence rather than a new state
+version: CT state keeps `fence_state` `0x80` (the existing sticky receiver
+denial, validated by the existing base `QCTRF001` marker), adds `0x40` on
+mode 2 to require the epoch binding, and persists a QCTRX001 extension
+sidecar `ct-recovery-ext.bin` (exactly 480 bytes: magic; ext flags `0x01`;
+zero; LE epoch, cursor, high-water, tombstone row sequence, tombstone
+position, pending position, frame length, baseline row sequence; frame
+SHA-256; baseline digest; manifest digest; zero-padded generation, source
+and target ids and the affected key; tenant and label fields; trailing
+SHA-256). The existing `0x40` read validation already rejects mode-2 use in
+legacy binaries, so the mutual-rejection property holds without a new state
+magic or struct migration. On reopen, `0x40` on mode 2 requires base
+marker, sidecar and epoch marker to all be present, checksum-valid,
+mutually consistent and consistent with CT state (generation, ids,
+baseline, cursor); without `0x40` none of the epoch artifacts may exist.
+Loss, damage, substitution or downgrade of any artifact fails closed: the
+store refuses to open. Installation (`qihse_kv_ct_target_epoch_fence_
+install_pinned_v1`) is once-only, persists state first, then base marker,
+sidecar and epoch marker, each fsynced with the parent directory, and
+denies ordinary writes, receiver apply/rebind, cursor advance, WAL
+mutation, snapshot install and reads through the existing `0x80` gates.
+Marker deletion is never a release. Covered by
+`make test-ct-target-epoch-fence` (disposable fixtures: eight admission
+mismatches, wrong principals, pre-existing plain fence, positive install
+with cold-reopen denials, and six fail-closed artifact corruptions).
+
+**Protected disposition writer and exact-frame archive.** Implemented at
+the store level (`qihse_kv_ct_target_suppression_commit_pinned_v1`,
+fixture-tested, store-local, no recovery-peer RESP admission yet). The
+suppression is the existing WAL-committed `QCT1SO02` custody unit (already
+replayed by `ct_replay_suppressed_original` with full manifest, source-frame
+and tombstone-history validation), appended by the pinned writer under the
+target epoch fence only, advancing the cursor to the pending position
+without applying the old SET. Before that WAL commit the writer creates and
+fsyncs the exact-frame archive `dispositions/<generation>/<position>.frame`
+with magic `QCTDA001`: magic[8]; zero-padded generation[65]; LE position[8];
+LE frame length[8]; frame SHA-256[32]; manifest SHA-256[32]; LE epoch[8]
+(161-byte header); the exact frame bytes (1644 for B); trailing SHA-256[32]
+(1837 bytes total for B). A hash alone never substitutes for the retained
+payload. The writer requires the Operator control and exact replication
+service principals, an installed epoch fence whose sidecar binds the same
+manifest frame digest, pending position, cursor, high-water and tombstone
+facts, `SHA256(frame) == manifest.frame_sha256`, and an authorized
+`QCT1SO01` disposition record; it is once-only, idempotent after commit only
+while the archive still binds, and holds a dedicated publishing exception
+under the store write lock so the generic fenced-receiver revalidation
+cannot strand the roll-forward. Reopen coupling is fail-closed: with the
+epoch fence installed the cursor may rest only at the fence cursor (a torn
+pre-commit archive may exist but must be intact — the retry rolls the same
+transaction forward) or at the pending position (the archive is then
+mandatory); any other cursor, or a lost, damaged or substituted archive,
+refuses to open. Generic apply, `RECONCILE`, ACK or ordinary peers can
+never create a disposition; a duplicate or mismatched apply of the exact
+bound position resolves suppressed, never visible. Checkpoint/compaction
+carry-forward of the disposition segment remains future work; compaction
+and WAL rotation stay denied while fenced. Covered by
+`make test-ct1-target-disposition` (disposable fixtures: no-fence and
+mismatched-tuple refusals that leave the receiver operational, a torn
+pre-commit crash cut with cold-reopen roll-forward and idempotent retry,
+positive commit with cold-reopen cursor advance and absent-key read, and
+fail-closed archive tamper/deletion).
+
+**Durable source sequence floor and compensating deletion.** The floor is
+`ct1-sequence-floor.bin` with magic `QCTSF001`, exactly 153 bytes: magic[8];
+zero-padded generation[65]; LE floor[8]; LE bound target epoch[8]; manifest
+digest[32]; SHA-256[32]. The floor value is at least the maximum of the
+current source high-water and a fresh target high-water receipt fetched
+under the target lock outside the source lock; publication order is fixed:
+verify both persisted fences, fetch and validate the fresh receipt, then
+under the source write lock recheck fence, intent and receipt, write and
+fsync the floor record and directory, re-read it, and only then allocate.
+CT-state `recovery_ext` bit `0x02` makes the reopen path re-verify the
+record under the directory lock, and the allocator refuses any sequence at
+or below the floor permanently; `kv_change_seq_floor()` remains memory-only
+and is not this record. The compensation itself is a source-authored,
+same-key, same-label tombstone appended as a **new** group after the
+pending one, allocated strictly above the floor, fsynced WAL first then CT
+state/intent in recoverable commit order; the original group is never
+rewritten, skipped, ACKed or garbage-collected to make room. The target
+later applies that group through ordinary sequence and identity checks —
+the design deliberately creates no target-side deletion authority.
+
+**Crash-cut recovery and release protocol.** Both sides persist an intent
+state machine bound to the manifest digest and epoch: source
+`HELD → FLOOR → COMPENSATED → ACKED → COMPLETE`, target
+`FENCED → PREPARED → SUPPRESSED → APPLIED → VERIFIED → RELEASED`. Every
+step is idempotent under the same binding; on reopen with any fence or
+intent present, both sides boot control-only, revalidate every binding
+(marker checksums, epochs, cursor, high-water, archive), and either roll
+forward the identical transaction or deny service — never guess an outcome,
+never TTL-release, never treat marker deletion or an ordinary `RECONCILE`
+as release. Release is durably ordered and each step fsynced: verify the
+disposition and archive checksums and same-key absence after a cold target
+reopen including post-compaction; verify cursor equality with the source
+durable/ACK positions and that both fence epochs match; write target
+`RELEASED` (lifting only the affected key's read fence — the disposition
+and absence barrier are permanent); then write source `COMPLETE`. The
+source recovery fence (`0x80`/`0x40`) is **not** released by this protocol:
+B's owner service stays stopped, and any later start is a separate explicit
+authenticated approval with its own full recheck. An uncertain fsync at any
+step is treated as an uncertain commit and resolved by replay before retry;
+the crash-cut table above maps onto these states unchanged.
+
+Test-matrix additions for a future implementation: target-fence install,
+reopen, epoch monotonicity and cursor-drift invalidation with denials on
+every writer path including unrelated keys, expiry and compaction, plus V6
+downgrade refusal; disposition archive torn write, missing/corrupt archive,
+duplicate apply, post-compaction and snapshot/import/export reopen, and
+read fencing throughout an incomplete transaction; floor fsync cuts at every
+row, allocator refusal at and below the floor, and re-read-before-allocate;
+protocol replay from every state, interleaved cursor/row drift, lost ACK,
+competing apply, and independent cold reopens of both sides at every state.
+No production root-host identity, one-use Operator approval, protected
+disposition writer or release path has been provisioned.
 
 ## Release gates
 

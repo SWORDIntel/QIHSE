@@ -745,6 +745,10 @@ static void ct_floor_fixture(const char* phase, const char* variant) {
     qihse_user_t* op = qihse_auth_authenticate_id(0u, "CtStorageOperator1!");
     assert(op);
     qihse_kv_store_t* source = qihse_kv_store_create_user(op);
+    if (strcmp(phase, "denied") == 0) {
+        assert(!source);
+        _exit(0);
+    }
     assert(source);
     bool nonzero_hold = strcmp(variant, "hold-nonzero") == 0;
     if (strcmp(phase, "reopen") == 0 &&
@@ -1220,6 +1224,10 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 && strcmp(argv[1], "floor-reopen") == 0) {
         ct_floor_fixture("reopen", argv[2]);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "floor-denied") == 0) {
+        ct_floor_fixture("denied", argv[2]);
         return 0;
     }
 #endif
@@ -2484,6 +2492,55 @@ int main(int argc, char** argv) {
         }
         assert(waitpid(child, &result, 0) == child && WIFEXITED(result) &&
                WEXITSTATUS(result) == 0);
+        aimem_fixture_cleanup(fixture_dir);
+    }
+    /* Correctly checksummed offset, digest, high-water and format changes
+     * must each deny reopening the disposable source after a crash. */
+    for (unsigned which = 0u; which < 4u; ++which) {
+        char fixture_dir[] = "./ct_hold_pin_XXXXXX";
+        umask(0077);
+        assert(mkdtemp(fixture_dir));
+        pid_t child = fork();
+        assert(child >= 0);
+        if (!child) {
+            assert(!setenv("QIHSE_DATA_DIR", fixture_dir, 1) &&
+                   !setenv("QIHSE_FIPS_MODE", "disabled", 1));
+            execl(argv[0], argv[0], "floor-setup", "hold-only", (char*)NULL);
+            _exit(99);
+        }
+        int status = 0;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 86);
+        char path[512];
+        assert(snprintf(path, sizeof(path), "%s/ct1-recovery-fence.bin",
+                        fixture_dir) > 0);
+        int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        unsigned char marker[209];
+        struct stat st;
+        assert(fd >= 0 && !fstat(fd, &st) && st.st_size == (off_t)sizeof(marker) &&
+               pread(fd, marker, sizeof(marker), 0) == (ssize_t)sizeof(marker) &&
+               !memcmp(marker, "QCTRF002", 8u));
+        size_t length = sizeof(marker);
+        if (which == 2u) {
+            /* Downgrade to a correctly checksummed legacy marker. CT state
+             * still requires the pinned V2 extent and must refuse reopen. */
+            memcpy(marker, "QCTRF001", 8u);
+            length = 153u;
+            assert(!ftruncate(fd, (off_t)length));
+        } else marker[which == 3u ? 138u : (which ? 145u : 121u)] ^= 1u;
+        assert(SHA256(marker, length - 32u, marker + length - 32u));
+        assert(pwrite(fd, marker, length, 0) == (ssize_t)length &&
+               !fsync(fd) && !close(fd));
+        child = fork();
+        assert(child >= 0);
+        if (!child) {
+            assert(!setenv("QIHSE_DATA_DIR", fixture_dir, 1) &&
+                   !setenv("QIHSE_FIPS_MODE", "disabled", 1));
+            execl(argv[0], argv[0], "floor-denied", "hold-only", (char*)NULL);
+            _exit(99);
+        }
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+               WEXITSTATUS(status) == 0);
         aimem_fixture_cleanup(fixture_dir);
     }
 #endif
