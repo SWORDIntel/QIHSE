@@ -1005,12 +1005,24 @@ refuses to open. Generic apply, `RECONCILE`, ACK or ordinary peers can
 never create a disposition; a duplicate or mismatched apply of the exact
 bound position resolves suppressed, never visible. Checkpoint/compaction
 carry-forward of the disposition segment remains future work; compaction
-and WAL rotation stay denied while fenced. Covered by
-`make test-ct1-target-disposition` (disposable fixtures: no-fence and
+and WAL rotation stay denied while fenced. The recovery-peer-only RESP
+command `REPL.CT1 TARGET DISPOSITION-V1 <manifest-wire> <exact-frame>`
+admits the commit on a successor role through the same chain as HOLD-V1
+with the target-side identity directions of the target-quote handler
+(canonical manifest, live window, issuer/source/target/peer pins, exact
+principal attributes, frame length 1644, `frame_position ==
+target_cursor + 1`, nonzero target high-water and tombstone facts); the
+store writer re-derives every fence, manifest and archive binding under
+its own lock, and the exact replay is an idempotent `+OK` (crash-retry
+semantics), never a second application. Covered by
+`make test-ct1-target-disposition` (store-level: no-fence and
 mismatched-tuple refusals that leave the receiver operational, a torn
 pre-commit crash cut with cold-reopen roll-forward and idempotent retry,
 positive commit with cold-reopen cursor advance and absent-key read, and
-fail-closed archive tamper/deletion).
+fail-closed archive tamper/deletion) and
+`make test-ct1-target-disposition-resp` (RESP-level: denial battery of
+nine paths plus wrong-identity peer, single admitted commit, idempotent
+exact replay).
 
 **Durable source sequence floor and compensating deletion.** The floor is
 `ct1-sequence-floor.bin` with magic `QCTSF001`, exactly 153 bytes: magic[8];

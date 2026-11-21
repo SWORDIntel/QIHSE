@@ -7357,7 +7357,8 @@ bool qihse_kv_ct_target_suppression_commit_pinned_v1(qihse_kv_store_t* store,
         manifest->tombstone_row_seq == store->ct_recovery_target_tombstone_seq &&
         manifest->tombstone_position ==
             store->ct_recovery_target_tombstone_position &&
-        ct_source_quote_principals(store, local_operator, replication_principal);    int gen_fd = -1;
+        ct_source_quote_principals(store, local_operator, replication_principal);
+    int gen_fd = -1;
     if (ok && !ct_disposition_archive_dir(store, store->ct_generation,
             &gen_fd)) ok = false;
     bool existed = false;
@@ -7418,10 +7419,6 @@ bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
     memset(out, 0, sizeof(*out));
     kv_store_rdlock(store);
     bool ok = store->ct_enabled && store->ct_mode == 2u && !store->recovery_pending;
-    if (!ok && getenv("DISP_DEBUG"))
-        fprintf(stderr, "D: status gate enabled=%d mode=%u pending=%d\n",
-            (int)store->ct_enabled, (unsigned)store->ct_mode,
-            (int)store->recovery_pending);
     if (ok) {
         snprintf(out->source_id, sizeof(out->source_id), "%s", store->ct_source_id);
         snprintf(out->generation, sizeof(out->generation), "%s", store->ct_generation);
