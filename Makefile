@@ -573,6 +573,12 @@ test-ct1-target-disposition-resp: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o build/test_ct1_target_disposition_resp tests/test_ct1_target_disposition_resp.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./build/test_ct1_target_disposition_resp
 
+.PHONY: test-ct-source-floor
+test-ct-source-floor: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o build/test_ct_source_floor tests/test_ct_source_floor.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_ct_source_floor
+
 test-ownership-journal: lib
 	$(CC) $(CFLAGS) -o tests/test_ownership_journal tests/test_ownership_journal.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_journal
@@ -1665,7 +1671,7 @@ GOLD_WORKLOAD_BINS := $(shell sed -n '/^[[:space:]]*#/d; s/.*[[:space:]]bin=\([^
 # parallel OS processes. All other `test-serial:` prerequisites run serially;
 # the nested-make gold pack runs last. Override with TEST_JOBS=1..32.
 .PHONY: test-serial test-parallel test-parallel-runner
-test: test-parallel test-ct1-recovery-host-auth test-ct1-source-hold-resp test-ct-target-epoch-fence test-ct1-target-disposition test-ct1-target-disposition-resp
+test: test-parallel test-ct1-recovery-host-auth test-ct1-source-hold-resp test-ct-target-epoch-fence test-ct1-target-disposition test-ct1-target-disposition-resp test-ct-source-floor
 test-parallel-runner:
 	PYTHONPATH=tests python3 -m unittest -v test_parallel_suite test_gold_parallel
 

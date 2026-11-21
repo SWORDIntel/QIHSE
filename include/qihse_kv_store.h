@@ -525,6 +525,64 @@ bool qihse_kv_ct_target_suppression_commit_pinned_v1(qihse_kv_store_t* store,
     const qihse_ct1_recovery_manifest_t* manifest,
     const unsigned char* original_frame, size_t original_frame_length);
 
+/* Durable source sequence floor for the exceptional CT1 recovery: the
+ * pinned record that the compensating deletion must allocate above. The
+ * floor is at least the maximum of the current source row high-water and a
+ * fresh target high-water receipt, and is installed only while the V2
+ * source custody hold denies ordinary allocation. Publishes the QCTSF001
+ * sidecar (exactly 153 bytes: magic, generation, LE floor, LE bound target
+ * recovery epoch, manifest digest, trailing SHA-256) and then persists
+ * state magic QCTST006 (same struct layout, no migration) so that reopen
+ * REQUIRES the sidecar: loss, damage, substitution or downgrade of either
+ * fails closed. A torn install (sidecar durable, state magic not yet
+ * flipped) also fails closed on reopen, matching the source hold. Requires
+ * the Operator control and exact replication service principals, the
+ * installed hold, an exact generation, a nonzero epoch and a manifest
+ * digest; an identical retry of the exact tuple is idempotent. Rebuild
+ * with `make lib`; stored data needs no migration. */
+#define QIHSE_KV_CT_SOURCE_FLOOR_V1 1u
+typedef struct {
+    uint32_t version; /* QIHSE_KV_CT_SOURCE_FLOOR_V1 */
+    uint32_t size;    /* sizeof(qihse_kv_ct_source_floor_request_t) */
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    const char* key;   /* affected row key; bound, never read-authorized */
+    unsigned char manifest_sha256[32];
+    uint64_t floor;          /* >= source high-water and target receipt */
+    uint64_t target_epoch;   /* bound target recovery fence epoch */
+    uint64_t target_high_water; /* fresh receipt; must be <= floor */
+} qihse_kv_ct_source_floor_request_t;
+bool qihse_kv_ct_source_floor_install_pinned_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_source_floor_request_t* request);
+
+/* Pinned compensating deletion on the held, floored source: appends a NEW
+ * same-key tombstone group after the pending one with a row sequence
+ * allocated strictly above the installed floor, WAL-first with the state
+ * publication in recoverable commit order, and applies the tombstone so
+ * reads observe absence. The original group is never rewritten, skipped,
+ * ACKed or garbage-collected; while the hold stands this is the only
+ * allocation the source admits. A retry after a crash cut (group durable,
+ * state not yet published) rolls forward through WAL replay and succeeds
+ * idempotently once the row high-water exceeds the floor. Requires the
+ * Operator control and exact replication service principals, the installed
+ * floor with an exact match, and the bound generation. Rebuild with
+ * `make lib`; stored data needs no migration. */
+#define QIHSE_KV_CT_SOURCE_COMPENSATE_V1 1u
+typedef struct {
+    uint32_t version; /* QIHSE_KV_CT_SOURCE_COMPENSATE_V1 */
+    uint32_t size;    /* sizeof(qihse_kv_ct_source_compensate_request_t) */
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    const char* key;  /* the held pending row key */
+    uint64_t floor;   /* must equal the installed floor */
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+} qihse_kv_ct_source_compensate_request_t;
+bool qihse_kv_ct_source_compensate_pinned_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_source_compensate_request_t* request,
+    uint64_t* out_seq);
+
 /* Read-only legacy (non-lane) receiver-history check. The caller must supply
  * an active principal; this result attests neither QKP peer identity nor any
  * source pending frame and confers no mutation/ACK capability. */

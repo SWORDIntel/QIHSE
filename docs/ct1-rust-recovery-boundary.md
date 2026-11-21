@@ -867,16 +867,17 @@ reapproval can proceed. The 15-minute default and trusted-time/ledger format
 need operational validation before implementation.
 
 **Still unresolved:** the on-disk disposition/absence-barrier retention
-beyond the fenced window (checkpoint/compaction carry-forward), durable
-cross-process fence semantics beyond the now-implemented target epoch
-fence, manifest authentication/ledger mechanics, recovery-peer RESP
-admission for the disposition writer, and the crash-cut tests above have
-concrete fail-closed formats and a release protocol proposed in the later
-"recovery executor formats" section (target epoch fence and disposition
-writer implemented and fixture-tested; the rest unimplemented); they must
-pass that validation before any executor or deployment is approved.
-`CANDIDATE` is not permission to mutate or unstop B. No B restart, durable
-source sequence floor, or target suppression/disposition has shipped.
+beyond the fenced window (checkpoint/compaction carry-forward), manifest
+authentication/ledger mechanics, recovery-peer RESP admission for the
+disposition writer and the source floor/compensation, and the release
+protocol itself have concrete fail-closed formats proposed in the later
+"recovery executor formats" section (target epoch fence, disposition
+writer and source floor/compensation implemented and fixture-tested;
+the rest unimplemented); they must pass that validation before any
+executor or deployment is approved.
+`CANDIDATE` is not permission to mutate or unstop B. No B restart has
+shipped, and none of the shipped store-level executors is a release or
+ACK authority.
 
 ## Restricted recovery-host identity and live-source hold (shipped, fixture-tested)
 
@@ -926,14 +927,14 @@ frame digest, wrong high-water, wrong row sequence, frozen-roster digest
 mismatch, non-recovery successor peer, replay) precede the single admitted
 hold.
 
-## Proposed recovery executor formats and release protocol (design; epoch fence and disposition writer implemented)
+## Proposed recovery executor formats and release protocol (design; epoch fence, disposition writer, source floor implemented)
 
 Concrete on-disk and admission formats for the four unresolved artifacts.
-Of these, the **target recovery epoch fence** and the **protected
-disposition writer with its exact-frame archive** are implemented
-(store-level, fixture-tested, store-local); the source floor and release
-protocol remain design only, and the disposition writer has no
-recovery-peer RESP admission yet. None is authority,
+Of these, the **target recovery epoch fence**, the **protected
+disposition writer with its exact-frame archive** and the **durable source
+floor with the pinned compensation** are implemented (store-level,
+fixture-tested, store-local); the release protocol remains design only,
+and the floor/compensation have no recovery-peer RESP admission yet. None is authority,
 and none may be provisioned for the production hosts: B's owner service
 stays stopped, the frozen originals stay untouched, and `CANDIDATE`
 remains a label, not permission. All fixed-width fields are little-endian;
@@ -1024,25 +1025,40 @@ fail-closed archive tamper/deletion) and
 nine paths plus wrong-identity peer, single admitted commit, idempotent
 exact replay).
 
-**Durable source sequence floor and compensating deletion.** The floor is
-`ct1-sequence-floor.bin` with magic `QCTSF001`, exactly 153 bytes: magic[8];
+**Durable source sequence floor and compensating deletion.** Implemented at
+the store level (`qihse_kv_ct_source_floor_install_pinned_v1` and
+`qihse_kv_ct_source_compensate_pinned_v1`, fixture-tested, store-local; no
+recovery-peer RESP admission yet). The floor sidecar is
+`ct1-source-floor.bin` with magic `QCTSF001`, exactly 153 bytes: magic[8];
 zero-padded generation[65]; LE floor[8]; LE bound target epoch[8]; manifest
-digest[32]; SHA-256[32]. The floor value is at least the maximum of the
-current source high-water and a fresh target high-water receipt fetched
-under the target lock outside the source lock; publication order is fixed:
-verify both persisted fences, fetch and validate the fresh receipt, then
-under the source write lock recheck fence, intent and receipt, write and
-fsync the floor record and directory, re-read it, and only then allocate.
-CT-state `recovery_ext` bit `0x02` makes the reopen path re-verify the
-record under the directory lock, and the allocator refuses any sequence at
-or below the floor permanently; `kv_change_seq_floor()` remains memory-only
-and is not this record. The compensation itself is a source-authored,
-same-key, same-label tombstone appended as a **new** group after the
-pending one, allocated strictly above the floor, fsynced WAL first then CT
-state/intent in recoverable commit order; the original group is never
-rewritten, skipped, ACKed or garbage-collected to make room. The target
-later applies that group through ordinary sequence and identity checks —
-the design deliberately creates no target-side deletion authority.
+digest[32]; SHA-256[32]. The floor is at least the maximum of the current
+source high-water and the supplied fresh target high-water receipt, and is
+installed only while the V2 hold denies ordinary allocation; the sidecar is
+published first and state magic `QCTST006` (same struct layout, no
+migration — legacy binaries reject the unknown magic) is persisted second,
+so reopen REQUIRES the sidecar: loss, damage, substitution, downgrade or a
+torn install all fail closed, and the exact tuple retry is idempotent
+while a differing tuple never rebinds. The pinned compensation appends a
+source-authored, same-key, same-label tombstone as a **new** group after
+the pending one with the row sequence allocated exactly `floor + 1`
+(WAL-first, state publication second in recoverable commit order; the
+original group is never rewritten, skipped, ACKed or garbage-collected).
+To admit this single sanctioned tail append, the V2 hold's reopen binding
+was narrowed from "pinned frame ends at the retained WAL boundary" to
+"pinned frame does not extend past the retained WAL boundary" (offset,
+length, digest and inode/metadata checks unchanged), the post-replay
+high-water check now accepts exactly the recorded high-water or the
+floored `floor + 1`, and the marker cursor check admits exactly
+`cursor + 1` on a floored pinned source; a crash cut between the WAL
+append and the state publication rolls forward through replay and the
+retry succeeds idempotently. Covered by `make test-ct-source-floor`
+(14 disposable cases: no-hold, low-floor, receipt-above-floor, zero-epoch,
+wrong-generation, wrong-principal, compensation-without-floor and
+wrong-floor refusals that leave the fixture operational, torn-install and
+tamper/delete/substitute fail-closed reopens, positive install with cold
+reopen, and the crash-cut roll-forward). The target later applies the
+compensating group through ordinary sequence and identity checks — the
+design deliberately creates no target-side deletion authority.
 
 **Crash-cut recovery and release protocol.** Both sides persist an intent
 state machine bound to the manifest digest and epoch: source
