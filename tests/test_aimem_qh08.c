@@ -14,6 +14,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static const char* selected_failpoint;
+static unsigned failpoint_hits;
+
+bool qihse_aimem_test_failpoint(const char* name) {
+    if (!selected_failpoint || !name || strcmp(selected_failpoint, name) != 0) return false;
+    ++failpoint_hits;
+    return true;
+}
+
 static qihse_resp_server_t* make_server(qihse_kv_store_t* store) {
     qihse_resp_server_config_t cfg;
     qihse_resp_server_config_init(&cfg);
@@ -46,9 +55,12 @@ static int crash_child(const char* phase, const char* root) {
     qihse_kv_store_t* store = qihse_kv_store_create();
     qihse_resp_server_t* child_server = store ? make_server(store) : NULL;
     qihse_ai_memory_scope_t scope = { "project-qh08", "tree-a", "stream-a", "session-a" };
-    if (!tenant_op || !store || !child_server ||
-        setenv("QIHSE_AIMEM_QH08_FAIL_AT", phase, 1) != 0 ||
-        qihse_ai_memory_index_rebuild(child_server, tenant_op, &scope)) return 32;
+    if (!tenant_op || !store || !child_server) return 32;
+    failpoint_hits = 0u;
+    selected_failpoint = phase;
+    bool rebuilt = qihse_ai_memory_index_rebuild(child_server, tenant_op, &scope);
+    selected_failpoint = NULL;
+    if (rebuilt || failpoint_hits != 1u) return 32;
     _exit(0); /* deliberate crash: skip server/store/audit teardown */
 }
 

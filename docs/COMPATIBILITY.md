@@ -28,6 +28,32 @@ QIHSE exposes compatibility layers for several established database protocols an
 
 Compatibility is implemented inside QIHSE; it is not a statement that every edge case of every upstream database is identical. Treat this document as the supported surface, then validate application-specific behavior before migration.
 
+## Native recovery APIs are not protocol parity
+
+The opt-in durable `qihse_txn_*` coordinator, explicit SQL DML enlistment and blob
+PREPARE/resolve are native C contracts, not automatic pgwire/RESP/SDK cross-model
+transactions. Default managers remain volatile. COMMITTING is irreversible:
+retry/recover the same decision, not ABORT. SQL DDL and retry-key resources do not
+join the native SQL 2PC bridge; bounded SQL/protocol semantics below are unchanged.
+
+`include/qihse_shared_backup.h` provides local CT-disabled export, verification
+and unpack of authenticated KV/SQL/blob/coordinator payloads. It does not add a
+protocol command or apply a package into live stores. Native restore in a fresh
+process must preserve SQL/blob receipts, register manifest engine IDs, restore at
+least the captured allocator floor and advance beyond every participant receipt
+**before recovery**, then complete common-decision replay before exposure.
+HMAC authenticates but does not encrypt; the package does not separately collect
+principal/ACL authority, private keys or service configuration. Published-unsynced
+is ambiguous, not a rollback guarantee. See
+[API native contracts](API_REFERENCE.md#native-upgrade-surfaces--current-source-contracts)
+and [shared backup contract](contracts/shared-backup-v1.md).
+
+AIMEM scoped durable admission confirms local sync, not a quorum ACK. RESP
+source-aware knowledge wrappers sync before acknowledging; native knowledge
+callers must supply the documented serialized sync fence. Source metadata alone
+is not externally verified citation evidence. These additions do not prove full
+W11/CT acceptance, remote semantic readiness or general client compatibility.
+
 ## PostgreSQL / pgwire
 
 **Status: partial — bounded authenticated SQL, not universal PostgreSQL compatibility.**

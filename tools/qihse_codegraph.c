@@ -64,6 +64,7 @@ extern char **environ;
 #define CG_MAX_OUT 100000u
 #define CG_MAX_FILES 64u
 #define CG_REQUEST_MAX 65536u
+#define CG_UNTRACKED_FILE_MAX (64u << 20)
 
 typedef cg_projection_node cg_node;
 
@@ -223,7 +224,8 @@ static bool sha256_file(const char *path, char out[65], double deadline) {
     if (fd < 0)
         return false;
     struct stat info;
-    if (fstat(fd, &info) || !S_ISREG(info.st_mode)) {
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < 0 ||
+        (uint64_t)info.st_size > CG_UNTRACKED_FILE_MAX) {
         close(fd);
         return false;
     }
@@ -2713,6 +2715,14 @@ static struct json_object *usage_json(const cg_disk_usage *usage) {
 }
 static struct json_object *storage_accounting(cg_state *st) {
     if (!principal_active(st)) return NULL;
+    /* This process's own scratch runtime is deleted at exit and is never
+     * persistent storage. Its sparse pages materialize asynchronously, so
+     * accounting it would make repeated identical invocations report
+     * different byte counts. Only identify it by inode: a lookalike name
+     * from another lifecycle is still a real runtime. */
+    struct stat self_runtime;
+    bool self_known = st->scratch[0] &&
+        fstatat(AT_FDCWD, st->scratch, &self_runtime, AT_SYMLINK_NOFOLLOW) == 0;
     int fd = open(st->directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return NULL;
     struct stat directory;
@@ -2786,6 +2796,9 @@ static struct json_object *storage_accounting(cg_state *st) {
             }
             usage = &scan.auxiliary;
         } else if (S_ISDIR(info.st_mode) && !strncmp(name, ".runtime-", 9)) {
+            if (self_known && info.st_dev == self_runtime.st_dev &&
+                info.st_ino == self_runtime.st_ino)
+                continue;
             int child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             struct stat opened;
             if (child < 0 || fstat(child, &opened) || opened.st_dev != info.st_dev ||

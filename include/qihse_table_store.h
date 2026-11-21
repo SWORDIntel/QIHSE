@@ -102,6 +102,21 @@ qihse_table_store_t* qihse_table_store_create(void);
  * open alone neither binds a SQL context nor installs a missing catalog. */
 qihse_table_store_t* qihse_table_store_open_durable(const char* path);
 
+/* Durable SQL 2PC participant boundary. PREPARE consumes a non-empty group,
+ * persists its complete candidate snapshot without publishing it, and fences
+ * all further writes to the store. Resolve is idempotent for the transaction
+ * ID and must be called only with the coordinator's irreversible decision.
+ * A prepared store reopens with committed rows visible and remains write-fenced
+ * until its decision is replayed. DDL/schema generations are not supported. */
+bool qihse_table_txn_prepare_group(qihse_table_txn_t** txns, size_t count,
+                                   uint64_t txn_id);
+/* Record a durable no-op participant vote when the engine has no local
+ * transaction resource; it still receives the common decision on replay. */
+bool qihse_table_store_prepare_noop(qihse_table_store_t* store,
+                                    uint64_t txn_id);
+bool qihse_table_store_resolve_prepared(qihse_table_store_t* store,
+                                        uint64_t txn_id, bool commit);
+
 /* SQL snapshot transfer requires the active bootstrap Operator (id 0, tenant
  * 0), not an arbitrary Operator. Transfer accepts committed v3-v5 images with
  * a catalog and preserves their bytes, including retry receipts; it does not
@@ -118,6 +133,18 @@ bool qihse_table_store_backup(qihse_table_store_t* store,
 bool qihse_table_store_restore(const qihse_user_t* user,
                                const char* backup_path, const char* target_path);
 
+/* Authenticated runtime publication fence, restricted exactly like backup.
+ * Requires a healthy same-process durable handle with a catalog and no pending
+ * prepare. Leaves *epoch unchanged on failure, including counter saturation.
+ * Tracks snapshot/catalog/row/retry publications, PREPARE, terminal receipts and
+ * pending cleanup; one transaction may advance it more than once. Partial I/O
+ * publications may also advance it. No-op terminal replay does not.
+ * Comparisons are valid ONLY on the same live handle (not across reopen/fork).
+ * This alone is NOT a cross-store snapshot: a future coordinator must capture
+ * ALL source epochs before ANY export, then recheck ALL after ALL exports. */
+bool qihse_table_store_snapshot_epoch_user(qihse_table_store_t* store,
+    const qihse_user_t* user, uint64_t* epoch);
+
 /* A durable SQL store must carry a catalog image. Installation is permitted
  * only before any table exists; callers validate the versioned schema image.
  * Input bytes are copied. schema_image returns borrowed bytes invalidated by
@@ -132,6 +159,10 @@ bool qihse_table_store_replace_schema_image(qihse_table_store_t* store,
 bool qihse_table_store_schema_image(const qihse_table_store_t* store,
                                     const uint8_t** image, size_t* len);
 bool qihse_table_store_is_durable(const qihse_table_store_t* store);
+/* Return the next transaction ID above every durable SQL decision receipt.
+ * Fails closed on invalid receipts, I/O errors, or exhausted ID space. */
+bool qihse_table_store_decision_next_id(qihse_table_store_t* store,
+                                        uint64_t* next_id);
 /* Raw enumeration, without authorization. table_at returns a borrowed handle;
  * caller must keep the store alive. Not an adapter catalog listing API. */
 size_t qihse_table_store_table_count(const qihse_table_store_t* store);

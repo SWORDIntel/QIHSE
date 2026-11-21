@@ -1,9 +1,13 @@
 # Native cluster artifact parity
 
-Use one portable `libqihse.so` and `qihse-cluster-daemon` pair for a mesh
-whose nodes have different CPU instruction sets. Node identity, network
-endpoints, proposal policy, and election delay belong in service arguments
-and protected configuration, not in role-specific binaries.
+A portable `libqihse.so` and `qihse-cluster-daemon` pair can serve a mesh
+whose nodes have different CPU instruction sets; the build procedure below is
+that portable option, not a requirement to replace host-native packages. Native
+rollouts may use separately built per-host pairs from the same reviewed inputs,
+with host-specific ISA/dependency manifests and expected hashes. Compare each
+mapped pair to its own manifest, not unlike native artifacts to each other.
+Node identity, network endpoints, proposal policy, and election delay belong in
+service arguments and protected configuration, not in role-specific binaries.
 
 ## Historical inventory — not current parity
 
@@ -67,15 +71,22 @@ overwrite a mapped library in place.
    validated v3–v5 images with catalogs and retry receipts into fresh private
    destinations. Test restore/rollback in isolation with the matching
    pre-upgrade runtime/image, not old code on newly written data.
-6. Require `make test TEST_JOBS=32` plus isolated retained-log/audit continuity,
-   restart/crash recovery, backup/restore, TLS/auth, low-clearance denial and
-   application read/write gates. Establish current leadership, quorum and
-   replication/commit progress with authenticated evidence. Unknown leadership
-   blocks rollout: do not infer a follower from a hostname or historical role.
-   Only after those gates pass, roll one confirmed follower at a time and
-   recheck health after each restart; handle the current leader last through
-   the tested leadership procedure. Keep intentionally fenced nodes fenced.
-   Halt on lag, hash mismatch, ambiguous leadership or startup/auth failures.
+6. Apply [Operations §1.6](../OPERATIONS.md#16-staged-installation-and-upgrade-gates),
+   including its version/format and common-authority startup gates, not just
+   symbol/CPU parity. `QCTLN005` publication fences old readers; 004/read-v4
+   staging with an unknown preparation cut must remain unknown, not guessed
+   from zero or a current cursor. Prove any mixed-version wire/disk path before
+   a rolling change. Inventory all six legacy recovery units and metadata
+   quorum separately; preserve per-group roles and pending/fenced work. The
+   old rolling bringup runbook is superseded and the generic rolling helper
+   is not validated for those units. Use authenticated per-unit native
+   recovery, baseline/ACK/cursor, ownership and application read/write evidence.
+   A local same-state cold restart with synthetic volatile auth is not
+   production persistent-auth, physical-node or W11 acceptance. CI is not a
+   veto or a replacement for actual native local/live results; retain observed
+   failures and stop on unresolved recovery, format incompatibility, lag, hash
+   mismatch, ambiguous leadership or authorization failures. Keep intentionally
+   fenced nodes fenced.
 
 No live replacement is justified by parity alone. The required gates above
 are not evidence that current artifacts or any mixed-version rollout passed.

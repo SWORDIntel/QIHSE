@@ -663,14 +663,15 @@ done:
     return ok;
 }
 
-bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
+static bool ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     qihse_user_t* operator_principal, qihse_user_t* data_principal,
     const char* lane_id,
     const uint8_t selected_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
     const char* snapshot_filepath,
     uint64_t baseline_row_seq, uint64_t source_cut,
     const unsigned char expected_digest[32],
-    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    bool enforce_change_seq, uint64_t expected_change_seq) {
     if (!store || !ct_admin(operator_principal) ||
         !qihse_auth_user_is_active(data_principal)) {
         errno = EACCES;
@@ -696,7 +697,8 @@ bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
             selected_bitmap, lane->status.slot_bitmap)) ||
          (!selected_nonempty &&
           !ct_lane_baseline_bitmap_nonempty(lane->status.slot_bitmap))) &&
-        mismatch == 0u && !store->recovery_pending && store->wal_fd;
+        mismatch == 0u && !store->recovery_pending && store->wal_fd &&
+        (!enforce_change_seq || store->change_seq == expected_change_seq);
     if (allowed) {
         snprintf(lane_generation, sizeof(lane_generation), "%s",
                  lane->status.generation);
@@ -776,4 +778,17 @@ bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
     }
     OPENSSL_cleanse(frame, sizeof(frame));
     return ok;
+}
+
+bool qihse_kv_ct_lane_receiver_baseline_install(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, qihse_user_t* data_principal,
+    const char* lane_id,
+    const uint8_t selected_bitmap[QIHSE_KV_CT_SLOT_BITMAP_BYTES],
+    const char* snapshot_filepath,
+    uint64_t baseline_row_seq, uint64_t source_cut,
+    const unsigned char expected_digest[32],
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES]) {
+    return ct_lane_receiver_baseline_install(store, operator_principal,
+        data_principal, lane_id, selected_bitmap, snapshot_filepath,
+        baseline_row_seq, source_cut, expected_digest, owner_token, false, 0u);
 }

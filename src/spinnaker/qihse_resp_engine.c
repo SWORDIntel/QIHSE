@@ -12,6 +12,8 @@
 #include "qihse_federation.h"
 #include "qihse_federation_mtls.h"
 #include "qihse_qkp.h"
+#include "qihse_ct1_recovery_manifest.h"
+#include "qihse_ct1_node_quote.h"
 #include "qihse_supply_chain.h"
 #include "qihse_runtime_trust.h"
 #include "qihse_security_audit.h"
@@ -425,6 +427,8 @@ struct qihse_resp_server {
     /* R4c QKP1: caller-owned handshake config (identity, trust anchors,
      * require flag). NULL/zeroed = opportunistic cleartext-only server. */
     qihse_qkp_config_t pqc;
+    char* admin_peer_node_id_2;
+    char* admin_peer_dsa_pub_path_2;
     qihse_user_t* replication_service_principal;
     _Atomic(const char*) ct_role;
     pthread_mutex_t ct_config_lock;
@@ -443,6 +447,8 @@ struct qihse_resp_server {
     bool ct_control_only;
     bool ct_recovery_ready;
     qihse_user_t* ct_control_principal;
+    /* Startup configuration only; deliberately no reader, signer or RESP getter. */
+    char ct1_recovery_frozen_root[PATH_MAX];
     qihse_cluster_topology_qkp_id_fn ct_topology_qkp_id;
     void* ct_topology_qkp_id_context;
     qihse_kv_replica_snapshot_t* ct_baseline_snapshot;
@@ -676,6 +682,10 @@ static const qihse_resp_command_descriptor_t g_qihse_resp_commands[] = {
     {"command", -1, QIHSE_COMMAND_ADMIN, 0, 0, 0},
     {"decr", 2, QIHSE_COMMAND_WRITE | QIHSE_COMMAND_FAST, 1, 1, 1},
     {"debug", -2, QIHSE_COMMAND_ADMIN, 0, 0, 0},
+    {"directeye.feed.ack", 2, QIHSE_COMMAND_WRITE, 0, 0, 0},
+    {"directeye.feed.read", 3, QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"directeye.record.get", 2, QIHSE_COMMAND_READONLY, 0, 0, 0},
+    {"directeye.record.mutate", -5, QIHSE_COMMAND_WRITE, 0, 0, 0},
     {"del", -2, QIHSE_COMMAND_WRITE, 1, -1, 1},
     {"echo", 2, QIHSE_COMMAND_FAST, 0, 0, 0},
     {"exists", -2, QIHSE_COMMAND_READONLY | QIHSE_COMMAND_FAST, 1, -1, 1},
@@ -9497,7 +9507,10 @@ static bool qihse_resp_handle_aimem(qihse_resp_session_t* session,
         if (scoped_forget_durable) pthread_rwlock_wrlock(&session->server->kv_lock);
         bool removed = qihse_ai_memory_forget_scoped(session->server, session->user,
                                                       id, &scope);
-        bool fenced = !scoped_forget_durable || !removed || qihse_kv_sync_store(store);
+        /* A durable ACK fences the store even when nothing was removed: the
+         * record may be absent because a prior attempt crashed before its
+         * deletion became durable, so the retry must fence it. */
+        bool fenced = !scoped_forget_durable || qihse_kv_sync_store(store);
         if (scoped_forget_durable) pthread_rwlock_unlock(&session->server->kv_lock);
         free(id);
         if (!fenced) return qihse_resp_error(session, "ERR NOT_DURABLE AIMEM delete not confirmed durable");
@@ -11098,7 +11111,7 @@ static bool dsp_expireat(qihse_resp_session_t* s, const qihse_resp_request_t* r)
 static bool dsp_pexpireat(qihse_resp_session_t* s, const qihse_resp_request_t* r){ return qihse_resp_handle_expireat(s, r, true); }
 /* ── R4 replicated namespaces (REPL.*) — registry, sovereign routing, ops ──
  *
- * A replicated namespace is a glob (e.g. "sabot/*"). Keys matching one are
+ * A replicated namespace is a glob (e.g. "sabot/" followed by "*"). Keys matching one are
  * SOVEREIGN-LOCAL: every node may hold them, so the routing layer never
  * MOVED-redirects or CLUSTERDOWN-gates them (qihse_resp_route exempts a
  * request whose EVERY key is marked). Unmarked keys route exactly as
@@ -12875,6 +12888,324 @@ static void qihse_resp_ct_hex32(const unsigned char in[32], char out[65]) {
     out[64] = '\0';
 }
 
+/* Pin a configured ML-DSA public key as QKP does: SHA256(DER SPKI). */
+static bool qihse_resp_ct1_public_pin(const char* path, unsigned char pin[32]) {
+    if (!path || !*path) return false;
+    FILE* file = fopen(path, "rb");
+    if (!file) return false;
+    EVP_PKEY* key = PEM_read_PUBKEY(file, NULL, NULL, NULL);
+    fclose(file);
+    if (!key) return false;
+    int length = EVP_PKEY_is_a(key, "ML-DSA-87") ? i2d_PUBKEY(key, NULL) : -1;
+    unsigned char* der = length > 0 && length <= 8192 ?
+        OPENSSL_malloc((size_t)length) : NULL;
+    unsigned char* cursor = der;
+    bool ok = der && i2d_PUBKEY(key, &cursor) == length &&
+        SHA256(der, (size_t)length, pin) != NULL;
+    OPENSSL_clear_free(der, der ? (size_t)length : 0u);
+    EVP_PKEY_free(key);
+    return ok;
+}
+
+static bool qihse_resp_handle_ct1_source_quote_v2(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    static const char key_suffix[] = "qihse_dsa_key.pem";
+    static const char pub_suffix[] = "qihse_dsa_pub.pem";
+    qihse_resp_server_t* server = s->server;
+    const qihse_qkp_config_t* pqc = &server->pqc;
+    bool operator_active = false, service_active = false;
+    uint32_t operator_tenant = QIHSE_TENANT_INVALID;
+    uint32_t service_tenant = QIHSE_TENANT_INVALID;
+    const char* key_path = pqc->dsa_key_path;
+    size_t key_len = key_path ? strlen(key_path) : 0u;
+    if (r->argc != 5u || r->argv[3].len != QIHSE_CT1_NODE_QUOTE_NONCE_SIZE ||
+        r->argv[4].len != QIHSE_CT1_RECOVERY_WIRE_SIZE ||
+        s->auth_kind != QIHSE_RESP_AUTH_QKP_ADMIN || !s->qkp ||
+        !s->user || s->user != server->ct_control_principal ||
+        qihse_user_get_id(s->user) != 0u ||
+        qihse_user_get_role(s->user) != QIHSE_ROLE_OPERATOR ||
+        !server->replication_service_principal ||
+        !server->ct_role || strcmp(server->ct_role, "primary") ||
+        server->ct_group_count || !server->ct1_recovery_frozen_root[0] ||
+        !pqc->require || !pqc->node_id || !pqc->replication_peer_node_id ||
+        !pqc->replication_peer_dsa_pub_path || !pqc->admin_peer_node_id ||
+        !pqc->admin_peer_dsa_pub_path || !server->ct_generation[0] ||
+        !key_path || key_len < sizeof(key_suffix) - 1u ||
+        strcmp(key_path + key_len - (sizeof(key_suffix) - 1u), key_suffix) ||
+        key_len - (sizeof(key_suffix) - 1u) + sizeof(pub_suffix) > PATH_MAX ||
+        !qihse_qkp_session_is_admin_peer(s->qkp, pqc,
+            server->replication_peers, server->replication_peer_count))
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+    qihse_auth_user_active_and_tenant(s->user, &operator_active, &operator_tenant);
+    qihse_auth_user_active_and_tenant(server->replication_service_principal,
+        &service_active, &service_tenant);
+    qihse_user_t* service = server->replication_service_principal;
+    if (!operator_active || operator_tenant != QIHSE_TENANT_SYSTEM ||
+        !service_active || service_tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(service) == QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_classification(service) != UINT16_MAX ||
+        qihse_user_get_sci(service) != UINT16_MAX)
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+
+    char own_pub[PATH_MAX], principal_id[32];
+    memcpy(own_pub, key_path, key_len - (sizeof(key_suffix) - 1u));
+    memcpy(own_pub + key_len - (sizeof(key_suffix) - 1u),
+        pub_suffix, sizeof(pub_suffix));
+    int n = snprintf(principal_id, sizeof(principal_id), "%u",
+        qihse_user_get_id(service));
+    unsigned char own_pin[32], peer_pin[32], issuer_pin[32];
+    qihse_ct1_recovery_manifest_t manifest;
+    unsigned char canonical[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (n <= 0 || (size_t)n >= sizeof(principal_id) ||
+        !qihse_resp_ct1_public_pin(own_pub, own_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->replication_peer_dsa_pub_path, peer_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->admin_peer_dsa_pub_path, issuer_pin) ||
+        !CRYPTO_memcmp(own_pin, peer_pin, 32u) ||
+        !qihse_ct1_recovery_decode(r->argv[4].data, r->argv[4].len,
+            false, &manifest, NULL) ||
+        !qihse_ct1_recovery_encode(&manifest, false, false, canonical) ||
+        CRYPTO_memcmp(canonical, r->argv[4].data, sizeof(canonical)) ||
+        CRYPTO_memcmp(manifest.nonce, r->argv[3].data, 32u) ||
+        strcmp(manifest.issuer_qkp_id, pqc->admin_peer_node_id) ||
+        CRYPTO_memcmp(manifest.issuer_operator_pin, issuer_pin, 32u) ||
+        strcmp(manifest.source_qkp_id, pqc->node_id) ||
+        strcmp(manifest.target_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.source_store_id, pqc->node_id) ||
+        strcmp(manifest.target_store_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.source_peer_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.target_peer_qkp_id, pqc->node_id) ||
+        CRYPTO_memcmp(manifest.source_peer_pin, peer_pin, 32u) ||
+        CRYPTO_memcmp(manifest.target_peer_pin, own_pin, 32u) ||
+        strcmp(manifest.replication_principal_id, principal_id) ||
+        strcmp(manifest.generation, server->ct_generation) ||
+        manifest.principal_tenant_id != service_tenant ||
+        manifest.principal_classification != qihse_user_get_classification(service) ||
+        manifest.principal_sci != qihse_user_get_sci(service) ||
+        !qihse_ct1_recovery_verify_frozen(service,
+            server->ct1_recovery_frozen_root, &manifest, true))
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+
+    qihse_kv_ct_source_retained_frame_request_t request = {
+        .version = QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1,
+        .size = sizeof(request), .source_id = pqc->node_id,
+        .successor_id = pqc->replication_peer_node_id,
+        .generation = server->ct_generation,
+        .baseline_row_seq = manifest.baseline_row_seq,
+        .acknowledged_position = manifest.frame_position - 1u,
+        .durable_position = manifest.frame_position,
+        .stream_position = manifest.frame_position,
+        .key = manifest.row_key,
+        .resource_tenant_id = manifest.row_tenant_id,
+        .classification = manifest.classification,
+        .sci_compartment = manifest.sci,
+        .row_change_seq = manifest.row_change_seq
+    };
+    memcpy(request.baseline_digest, manifest.baseline_sha256, 32u);
+    qihse_kv_ct_source_quote_snapshot_t snapshot = {0};
+    bool measured = manifest.frame_position > 0u &&
+        manifest.frame_length == QIHSE_CT1_RECOVERY_FRAME_BYTES &&
+        manifest.source_high_water != 0u;
+    if (measured) {
+        pthread_rwlock_rdlock(&server->kv_lock);
+        measured = qihse_kv_ct_source_quote_snapshot_v1(server->store,
+            s->user, service, &request, manifest.source_high_water, &snapshot);
+        pthread_rwlock_unlock(&server->kv_lock);
+    }
+    if (measured) measured = snapshot.frame_offset == manifest.frame_offset &&
+        snapshot.retained.frame_length == manifest.frame_length &&
+        snapshot.retained.stream_position == manifest.frame_position &&
+        snapshot.retained.row_change_seq == manifest.row_change_seq &&
+        snapshot.retained.resource_tenant_id == manifest.row_tenant_id &&
+        snapshot.retained.classification == manifest.classification &&
+        snapshot.retained.sci_compartment == manifest.sci &&
+        snapshot.row_seq_high_water == manifest.source_high_water &&
+        snapshot.retained.key && !strcmp(snapshot.retained.key, manifest.row_key) &&
+        !CRYPTO_memcmp(snapshot.retained.frame_sha256, manifest.frame_sha256, 32u);
+    unsigned char quote[QIHSE_CT1_NODE_QUOTE_SIZE];
+    bool signed_quote = false;
+    if (measured) {
+        /* Target cursor/high-water remain host commitments, never source measurements. */
+        qihse_ct1_node_quote_expected_t expected = {0};
+        snprintf(expected.source_qkp_id, sizeof(expected.source_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.target_qkp_id, sizeof(expected.target_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.source_peer_qkp_id, sizeof(expected.source_peer_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.target_peer_qkp_id, sizeof(expected.target_peer_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.replication_principal_id, sizeof(expected.replication_principal_id),
+            "%s", principal_id);
+        snprintf(expected.generation, sizeof(expected.generation), "%s", server->ct_generation);
+        memcpy(expected.source_signer_pin, own_pin, 32u);
+        memcpy(expected.target_signer_pin, peer_pin, 32u);
+        memcpy(expected.source_peer_pin, peer_pin, 32u);
+        memcpy(expected.target_peer_pin, own_pin, 32u);
+        memcpy(expected.baseline_sha256, request.baseline_digest, 32u);
+        expected.source_high_water = snapshot.row_seq_high_water;
+        expected.target_cursor = manifest.target_cursor;
+        expected.target_high_water = manifest.target_high_water;
+        qihse_ct1_recovery_manifest_t verified = manifest;
+        qihse_ct1_node_quote_signing_evidence_t evidence = {
+            .manifest_wire = canonical, .manifest_len = sizeof(canonical),
+            .verified_manifest = &verified, .expected = &expected,
+            .role = QIHSE_CT1_NODE_QUOTE_SOURCE, .now_ms = qihse_resp_now_ms(),
+            .host_nonce = r->argv[3].data, .own_private_key_path = key_path,
+            .own_public_key_path = own_pub
+        };
+        signed_quote = qihse_ct1_node_quote_sign_verified(&evidence, quote);
+    }
+    if (snapshot.retained.frame) {
+        OPENSSL_cleanse(snapshot.retained.frame, snapshot.retained.frame_length);
+        free(snapshot.retained.frame);
+    }
+    free(snapshot.retained.key);
+    if (!signed_quote)
+        return qihse_resp_error(s, "ERR CT1 source quote unavailable or denied");
+    bool sent = qihse_resp_bulk(s, quote, sizeof(quote));
+    OPENSSL_cleanse(quote, sizeof(quote));
+    return sent;
+}
+
+static bool qihse_resp_handle_ct1_target_quote_v2(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    static const char key_suffix[] = "qihse_dsa_key.pem";
+    static const char pub_suffix[] = "qihse_dsa_pub.pem";
+    qihse_resp_server_t* server = s->server;
+    const qihse_qkp_config_t* pqc = &server->pqc;
+    bool operator_active = false, service_active = false;
+    uint32_t operator_tenant = QIHSE_TENANT_INVALID;
+    uint32_t service_tenant = QIHSE_TENANT_INVALID;
+    const char* key_path = pqc->dsa_key_path;
+    size_t key_len = key_path ? strlen(key_path) : 0u;
+    if (r->argc != 5u || r->argv[3].len != QIHSE_CT1_NODE_QUOTE_NONCE_SIZE ||
+        r->argv[4].len != QIHSE_CT1_RECOVERY_WIRE_SIZE ||
+        s->auth_kind != QIHSE_RESP_AUTH_QKP_ADMIN || !s->qkp ||
+        !s->user || s->user != server->ct_control_principal ||
+        qihse_user_get_id(s->user) != 0u ||
+        qihse_user_get_role(s->user) != QIHSE_ROLE_OPERATOR ||
+        !server->replication_service_principal ||
+        !server->ct_role || strcmp(server->ct_role, "successor") ||
+        server->ct_group_count || !server->ct1_recovery_frozen_root[0] ||
+        !pqc->require || !pqc->node_id || !pqc->replication_peer_node_id ||
+        !pqc->replication_peer_dsa_pub_path || !pqc->admin_peer_node_id ||
+        !pqc->admin_peer_dsa_pub_path || !server->ct_generation[0] ||
+        !key_path || key_len < sizeof(key_suffix) - 1u ||
+        strcmp(key_path + key_len - (sizeof(key_suffix) - 1u), key_suffix) ||
+        key_len - (sizeof(key_suffix) - 1u) + sizeof(pub_suffix) > PATH_MAX ||
+        !qihse_qkp_session_is_admin_peer(s->qkp, pqc,
+            server->replication_peers, server->replication_peer_count))
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+    qihse_auth_user_active_and_tenant(s->user, &operator_active, &operator_tenant);
+    qihse_auth_user_active_and_tenant(server->replication_service_principal,
+        &service_active, &service_tenant);
+    qihse_user_t* service = server->replication_service_principal;
+    if (!operator_active || operator_tenant != QIHSE_TENANT_SYSTEM ||
+        !service_active || service_tenant != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(service) == QIHSE_ROLE_OPERATOR ||
+        qihse_user_get_classification(service) != UINT16_MAX ||
+        qihse_user_get_sci(service) != UINT16_MAX)
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+
+    char own_pub[PATH_MAX], principal_id[32];
+    memcpy(own_pub, key_path, key_len - (sizeof(key_suffix) - 1u));
+    memcpy(own_pub + key_len - (sizeof(key_suffix) - 1u),
+        pub_suffix, sizeof(pub_suffix));
+    int n = snprintf(principal_id, sizeof(principal_id), "%u",
+        qihse_user_get_id(service));
+    unsigned char own_pin[32], peer_pin[32], issuer_pin[32];
+    qihse_ct1_recovery_manifest_t manifest;
+    unsigned char canonical[QIHSE_CT1_RECOVERY_WIRE_SIZE];
+    if (n <= 0 || (size_t)n >= sizeof(principal_id) ||
+        !qihse_resp_ct1_public_pin(own_pub, own_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->replication_peer_dsa_pub_path, peer_pin) ||
+        !qihse_resp_ct1_public_pin(pqc->admin_peer_dsa_pub_path, issuer_pin) ||
+        !CRYPTO_memcmp(own_pin, peer_pin, 32u) ||
+        !qihse_ct1_recovery_decode(r->argv[4].data, r->argv[4].len,
+            false, &manifest, NULL) ||
+        !qihse_ct1_recovery_encode(&manifest, false, false, canonical) ||
+        CRYPTO_memcmp(canonical, r->argv[4].data, sizeof(canonical)) ||
+        CRYPTO_memcmp(manifest.nonce, r->argv[3].data, 32u) ||
+        strcmp(manifest.issuer_qkp_id, pqc->admin_peer_node_id) ||
+        CRYPTO_memcmp(manifest.issuer_operator_pin, issuer_pin, 32u) ||
+        strcmp(manifest.target_qkp_id, pqc->node_id) ||
+        strcmp(manifest.source_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.target_store_id, pqc->node_id) ||
+        strcmp(manifest.source_store_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.target_peer_qkp_id, pqc->replication_peer_node_id) ||
+        strcmp(manifest.source_peer_qkp_id, pqc->node_id) ||
+        CRYPTO_memcmp(manifest.target_peer_pin, peer_pin, 32u) ||
+        CRYPTO_memcmp(manifest.source_peer_pin, own_pin, 32u) ||
+        strcmp(manifest.replication_principal_id, principal_id) ||
+        strcmp(manifest.generation, server->ct_generation) ||
+        manifest.principal_tenant_id != service_tenant ||
+        manifest.principal_classification != qihse_user_get_classification(service) ||
+        manifest.principal_sci != qihse_user_get_sci(service) ||
+        !qihse_ct1_recovery_verify_frozen(service,
+            server->ct1_recovery_frozen_root, &manifest, false))
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+
+    qihse_kv_ct_receiver_history_request_t request = {
+        .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1,
+        .size = sizeof(request), .source_id = pqc->replication_peer_node_id,
+        .target_id = pqc->node_id, .generation = server->ct_generation,
+        .baseline_row_seq = manifest.baseline_row_seq,
+        .durable_cursor = manifest.target_cursor,
+        .key = manifest.row_key,
+        .resource_tenant_id = manifest.row_tenant_id,
+        .classification = manifest.classification,
+        .sci_compartment = manifest.sci
+    };
+    memcpy(request.baseline_digest, manifest.baseline_sha256, 32u);
+    qihse_kv_ct_receiver_history_result_t snapshot = {0};
+    bool measured = manifest.target_cursor != 0u &&
+        manifest.target_high_water != 0u && manifest.tombstone_position != 0u;
+    if (measured) {
+        pthread_rwlock_rdlock(&server->kv_lock);
+        measured = qihse_kv_ct_target_quote_snapshot_v1(server->store,
+            s->user, service, &request, manifest.target_high_water, &snapshot);
+        pthread_rwlock_unlock(&server->kv_lock);
+    }
+    measured = measured && snapshot.stream_position == manifest.tombstone_position &&
+        snapshot.row_change_seq == manifest.tombstone_row_seq &&
+        snapshot.durable_cursor == manifest.target_cursor &&
+        snapshot.row_seq_high_water == manifest.target_high_water;
+    unsigned char quote[QIHSE_CT1_NODE_QUOTE_SIZE];
+    bool signed_quote = false;
+    if (measured) {
+        /* Source frame and high-water remain host commitments, not target measurements. */
+        qihse_ct1_node_quote_expected_t expected = {0};
+        snprintf(expected.source_qkp_id, sizeof(expected.source_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.target_qkp_id, sizeof(expected.target_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.source_peer_qkp_id, sizeof(expected.source_peer_qkp_id), "%s", pqc->node_id);
+        snprintf(expected.target_peer_qkp_id, sizeof(expected.target_peer_qkp_id), "%s",
+            pqc->replication_peer_node_id);
+        snprintf(expected.replication_principal_id, sizeof(expected.replication_principal_id),
+            "%s", principal_id);
+        snprintf(expected.generation, sizeof(expected.generation), "%s", server->ct_generation);
+        memcpy(expected.source_signer_pin, peer_pin, 32u);
+        memcpy(expected.target_signer_pin, own_pin, 32u);
+        memcpy(expected.source_peer_pin, own_pin, 32u);
+        memcpy(expected.target_peer_pin, peer_pin, 32u);
+        memcpy(expected.baseline_sha256, request.baseline_digest, 32u);
+        expected.source_high_water = manifest.source_high_water;
+        expected.target_cursor = snapshot.durable_cursor;
+        expected.target_high_water = snapshot.row_seq_high_water;
+        qihse_ct1_node_quote_signing_evidence_t evidence = {
+            .manifest_wire = canonical, .manifest_len = sizeof(canonical),
+            .verified_manifest = &manifest, .expected = &expected,
+            .role = QIHSE_CT1_NODE_QUOTE_TARGET, .now_ms = qihse_resp_now_ms(),
+            .host_nonce = r->argv[3].data, .own_private_key_path = key_path,
+            .own_public_key_path = own_pub
+        };
+        signed_quote = qihse_ct1_node_quote_sign_verified(&evidence, quote);
+    }
+    if (!signed_quote)
+        return qihse_resp_error(s, "ERR CT1 target quote unavailable or denied");
+    bool sent = qihse_resp_bulk(s, quote, sizeof(quote));
+    OPENSSL_cleanse(quote, sizeof(quote));
+    return sent;
+}
+
 static bool qihse_resp_handle_ct1_status(qihse_resp_session_t* s) {
     if (!qihse_resp_ct_source_allowed(s))
         return qihse_resp_error(s, "NOPERM CT1 status requires the configured successor QKP pin");
@@ -12927,6 +13258,134 @@ static bool qihse_resp_handle_ct1_target_status(qihse_resp_session_t* s) {
         qihse_resp_ct_bulk_u64(s, bound && st.baseline_sealed ? 1u : 0u) &&
         qihse_resp_bulk_text(s, digest) &&
         qihse_resp_ct_bulk_u64(s, bound ? (uint64_t)st.tenant_policy : 0u);
+}
+
+static bool qihse_resp_handle_ct1_target_history_v1(qihse_resp_session_t* s,
+                                                     const qihse_resp_request_t* r) {
+    if (r->argc != 11u)
+        return qihse_resp_error(s, "ERR invalid CT1 target history request");
+    if (!s->server->ct_role || strcmp(s->server->ct_role, "successor") != 0 ||
+        !qihse_resp_repl_data_plane_allowed(s) ||
+        !s->server->pqc.replication_peer_node_id || !s->server->pqc.node_id ||
+        strcmp(qihse_resp_replication_peer_id(s->server, s->qkp),
+               s->server->pqc.replication_peer_node_id) != 0)
+        return qihse_resp_error(s, "NOPERM CT1 target history denied");
+
+    char *generation = NULL, *digest_text = NULL, *key = NULL;
+    uint64_t baseline = 0u, cursor = 0u, tenant = 0u, classification = 0u, sci = 0u;
+    qihse_kv_ct_receiver_history_request_t req = {
+        .version = QIHSE_KV_CT_RECEIVER_HISTORY_V1, .size = sizeof(req),
+        .source_id = s->server->pqc.replication_peer_node_id,
+        .target_id = s->server->pqc.node_id
+    };
+    bool valid = qihse_resp_repl_arg_string(&r->argv[3], 32u, false, &generation) &&
+        strlen(generation) == 32u;
+    for (size_t i = 0u; valid && i < 32u; ++i)
+        valid = (generation[i] >= '0' && generation[i] <= '9') ||
+            (generation[i] >= 'a' && generation[i] <= 'f');
+    valid = valid && strcmp(generation, s->server->ct_generation) == 0 &&
+        qihse_resp_parse_u64_arg(&r->argv[4], &baseline) &&
+        qihse_resp_repl_arg_string(&r->argv[5], 64u, false, &digest_text) &&
+        qihse_resp_ct_hex32_parse(digest_text, req.baseline_digest) &&
+        qihse_resp_parse_u64_arg(&r->argv[6], &cursor) && cursor != 0u &&
+        qihse_resp_repl_arg_string(&r->argv[7], 65535u, false, &key) &&
+        qihse_resp_parse_u64_arg(&r->argv[8], &tenant) && tenant <= UINT32_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[9], &classification) &&
+        classification <= UINT16_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[10], &sci) && sci <= UINT16_MAX;
+    req.generation = generation;
+    req.baseline_row_seq = baseline;
+    req.durable_cursor = cursor;
+    req.key = key;
+    req.resource_tenant_id = (uint32_t)tenant;
+    req.classification = (uint16_t)classification;
+    req.sci_compartment = (uint16_t)sci;
+    qihse_kv_ct_receiver_history_result_t out = {0};
+    bool ok = valid && qihse_kv_ct_receiver_history_v1(s->server->store,
+        s->user, &req, &out);
+    free(generation);
+    free(digest_text);
+    free(key);
+    OPENSSL_cleanse(req.baseline_digest, sizeof(req.baseline_digest));
+    if (!ok) return qihse_resp_error(s, "ERR CT1 target history unavailable or denied");
+    return qihse_resp_array(s, 4u) &&
+        qihse_resp_ct_bulk_u64(s, out.stream_position) &&
+        qihse_resp_ct_bulk_u64(s, out.row_change_seq) &&
+        qihse_resp_ct_bulk_u64(s, out.durable_cursor) &&
+        qihse_resp_ct_bulk_u64(s, out.row_seq_high_water);
+}
+
+static bool qihse_resp_handle_ct1_source_frame_v1(qihse_resp_session_t* s,
+                                                   const qihse_resp_request_t* r) {
+    if (r->argc != 14u || !qihse_resp_ct_source_allowed(s) ||
+        !s->server->pqc.node_id || !s->server->ct_generation[0])
+        return qihse_resp_error(s, "ERR CT1 source frame unavailable or denied");
+    char *generation = NULL, *digest_text = NULL, *key = NULL;
+    uint64_t baseline = 0u, ack = 0u, durable = 0u, position = 0u;
+    uint64_t tenant = 0u, classification = 0u, sci = 0u, row_seq = 0u;
+    qihse_kv_ct_source_retained_frame_request_t req = {
+        .version = QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1, .size = sizeof(req),
+        .source_id = s->server->pqc.node_id,
+        .successor_id = s->server->pqc.replication_peer_node_id
+    };
+    bool valid = qihse_resp_repl_arg_string(&r->argv[3], 32u, false, &generation) &&
+        strlen(generation) == 32u;
+    for (size_t i = 0u; valid && i < 32u; ++i)
+        valid = (generation[i] >= '0' && generation[i] <= '9') ||
+            (generation[i] >= 'a' && generation[i] <= 'f');
+    valid = valid && strcmp(generation, s->server->ct_generation) == 0 &&
+        qihse_resp_repl_arg_string(&r->argv[5], 64u, false, &digest_text) &&
+        qihse_resp_ct_hex32_parse(digest_text, req.baseline_digest) &&
+        qihse_resp_repl_arg_string(&r->argv[9], 65535u, false, &key);
+    for (size_t i = 4u; valid && i < 14u; ++i) {
+        if (i == 5u || i == 9u) continue;
+        valid = r->argv[i].len > 0u && r->argv[i].len <= 20u;
+        for (size_t j = 0u; valid && j < r->argv[i].len; ++j)
+            valid = r->argv[i].data[j] >= '0' && r->argv[i].data[j] <= '9';
+    }
+    valid = valid && qihse_resp_parse_u64_arg(&r->argv[4], &baseline) &&
+        qihse_resp_parse_u64_arg(&r->argv[6], &ack) &&
+        qihse_resp_parse_u64_arg(&r->argv[7], &durable) &&
+        qihse_resp_parse_u64_arg(&r->argv[8], &position) &&
+        qihse_resp_parse_u64_arg(&r->argv[10], &tenant) && tenant <= UINT32_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[11], &classification) &&
+        classification <= UINT16_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[12], &sci) && sci <= UINT16_MAX &&
+        qihse_resp_parse_u64_arg(&r->argv[13], &row_seq) && row_seq != 0u;
+    req.generation = generation;
+    req.baseline_row_seq = baseline;
+    req.acknowledged_position = ack;
+    req.durable_position = durable;
+    req.stream_position = position;
+    req.key = key;
+    req.resource_tenant_id = (uint32_t)tenant;
+    req.classification = (uint16_t)classification;
+    req.sci_compartment = (uint16_t)sci;
+    req.row_change_seq = row_seq;
+    qihse_kv_ct_source_retained_frame_result_t out = {0};
+    bool ok = valid && qihse_kv_ct_source_retained_frame_v1(s->server->store,
+        s->user, &req, &out);
+    free(generation);
+    free(digest_text);
+    free(key);
+    OPENSSL_cleanse(req.baseline_digest, sizeof(req.baseline_digest));
+    if (!ok) return qihse_resp_error(s, "ERR CT1 source frame unavailable or denied");
+    char digest[65];
+    qihse_resp_ct_hex32(out.frame_sha256, digest);
+    bool sent = qihse_resp_array(s, 9u) &&
+        qihse_resp_bulk(s, out.frame, out.frame_length) &&
+        qihse_resp_bulk_text(s, digest) &&
+        qihse_resp_bulk_text(s, out.key) &&
+        qihse_resp_ct_bulk_u64(s, out.resource_tenant_id) &&
+        qihse_resp_ct_bulk_u64(s, out.classification) &&
+        qihse_resp_ct_bulk_u64(s, out.sci_compartment) &&
+        qihse_resp_ct_bulk_u64(s, out.stream_position) &&
+        qihse_resp_ct_bulk_u64(s, out.row_change_seq) &&
+        qihse_resp_ct_bulk_u64(s, out.expire_time_ms);
+    OPENSSL_cleanse(out.frame, out.frame_length);
+    free(out.frame);
+    free(out.key);
+    return sent;
 }
 
 static bool qihse_resp_handle_ct1_baseline_status(qihse_resp_session_t* s) {
@@ -13624,7 +14083,18 @@ static bool qihse_resp_handle_ct1(qihse_resp_session_t* s,
     if (qihse_resp_arg_equal(&r->argv[1], "TARGET")) {
         if (r->argc == 3u && qihse_resp_arg_equal(&r->argv[2], "STATUS"))
             return qihse_resp_handle_ct1_target_status(s);
+        if (r->argc >= 3u && qihse_resp_arg_equal(&r->argv[2], "HISTORY-V1"))
+            return qihse_resp_handle_ct1_target_history_v1(s, r);
     }
+    if (qihse_resp_arg_equal(&r->argv[1], "SOURCE") && r->argc >= 3u &&
+        qihse_resp_arg_equal(&r->argv[2], "QUOTE-V2"))
+        return qihse_resp_handle_ct1_source_quote_v2(s, r);
+    if (qihse_resp_arg_equal(&r->argv[1], "TARGET") && r->argc >= 3u &&
+        qihse_resp_arg_equal(&r->argv[2], "QUOTE-V2"))
+        return qihse_resp_handle_ct1_target_quote_v2(s, r);
+    if (qihse_resp_arg_equal(&r->argv[1], "SOURCE") && r->argc >= 3u &&
+        qihse_resp_arg_equal(&r->argv[2], "FRAME-V1"))
+        return qihse_resp_handle_ct1_source_frame_v1(s, r);
     if (qihse_resp_arg_equal(&r->argv[1], "BASELINE")) {
         if (r->argc == 3u && qihse_resp_arg_equal(&r->argv[2], "STATUS"))
             return qihse_resp_handle_ct1_baseline_status(s);
@@ -13825,7 +14295,7 @@ static bool qihse_resp_ct_group_cursor(qihse_resp_session_t* s,
         qihse_kv_ct_lane_status(s->server->store, s->user,
             claim.target_group_id, &status);
     if (ok && !strcmp(s->server->pqc.node_id, claim.target_qkp_id)) {
-        ok = status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+        ok = status.mode == QIHSE_KV_CT_LANE_SOURCE && status.admitted &&
             strcmp(status.source_id, claim.target_qkp_id) == 0 &&
             strcmp(status.peer_id, claim.successor_qkp_id) == 0 &&
             strcmp(status.generation, claim.target_generation) == 0;
@@ -13872,6 +14342,7 @@ static bool qihse_resp_ct_group_stage_begin(qihse_resp_session_t* s,
         s->server->store, s->user, claim.target_group_id, &target_status);
     if (target_cursor_ready && !strcmp(s->server->pqc.node_id, claim.target_qkp_id))
         target_cursor_ready = target_status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+            target_status.admitted &&
             target_status.acknowledged_position >= claim.target_cursor;
     else if (target_cursor_ready)
         target_cursor_ready = target_status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
@@ -14895,7 +15366,20 @@ static bool qihse_resp_ct2_receipt(qihse_resp_session_t* s,
             OPENSSL_cleanse(composite, sizeof(composite));
             OPENSSL_cleanse(&lane_transfer, sizeof(lane_transfer));
         } else {
-            qihse_kv_ct_proof_t* seal = qihse_kv_ct_target_seal_create(
+            /* The KV seal proof only needs the import plus the target's CT1
+             * successor ACK, which can land after SEAL refused the stage. A
+             * receipt authorizes COMMIT and ACTIVATE, and finalization
+             * requires a SEALED stage, so the stage itself must be SEALED. */
+            uint64_t stage_offset = 0, stage_total = 0;
+            qihse_ct_target_state_t stage_state = QIHSE_CT_TARGET_ABSENT;
+            char stage_err[192] = {0};
+            bool stage_sealed = s->server->ct_target &&
+                qihse_ct_target_status(s->server->ct_target, s->user, caller_qkp,
+                    transfer, NULL, 0, NULL, NULL, 0, &stage_offset, &stage_total,
+                    &stage_state, stage_err, sizeof(stage_err)) &&
+                (stage_state == QIHSE_CT_TARGET_SEALED ||
+                 stage_state == QIHSE_CT_TARGET_FINALIZED);
+            qihse_kv_ct_proof_t* seal = !stage_sealed ? NULL : qihse_kv_ct_target_seal_create(
                 s->server->store, s->server->ct_ownership_context->principal,
                 s->user, t->transfer_id, t->source_qkp_id, t->target_qkp_id,
                 t->generation, t->start, t->end, t->source_lsn);
@@ -20311,6 +20795,340 @@ static bool qihse_resp_handle_maintenance(qihse_resp_session_t* session, const q
     return qihse_resp_error(session, "ERR expected CLUSTER MAINTENANCE BEGIN, STATUS or RELEASE");
 }
 
+typedef struct {
+    const char* operation_id;
+    const char* record_id;
+    const char* record_key;
+    const char* mutation;
+    uint32_t tenant;
+    uint16_t classification;
+    uint16_t sci;
+    const char* record_json;
+} qihse_resp_directeye_event_ctx_t;
+
+static bool qihse_resp_directeye_event_build(uint64_t generation, uint64_t cursor,
+        uint64_t committed_at_ms, char* out, size_t capacity, void* opaque) {
+    const qihse_resp_directeye_event_ctx_t* ctx = opaque;
+    if (!ctx || !out || !capacity) return false;
+    int n;
+    if (committed_at_ms) {
+        n = snprintf(out, capacity,
+            "{\"schema\":1,\"event_id\":\"%s\",\"record_id\":\"%s\","
+            "\"record_key\":\"%s\",\"mutation\":\"%s\",\"tenant\":%u,"
+            "\"classification\":%u,\"sci\":%u,\"generation\":%llu,"
+            "\"cursor\":%llu,\"committed_at_ms\":%llu,\"record\":%s}",
+            ctx->operation_id, ctx->record_id, ctx->record_key, ctx->mutation,
+            ctx->tenant, ctx->classification, ctx->sci,
+            (unsigned long long)generation, (unsigned long long)cursor,
+            (unsigned long long)committed_at_ms,
+            ctx->record_json ? ctx->record_json : "null");
+    } else {
+        n = snprintf(out, capacity,
+            "{\"schema\":1,\"event_id\":\"%s\",\"record_id\":\"%s\","
+            "\"record_key\":\"%s\",\"mutation\":\"%s\",\"tenant\":%u,"
+            "\"classification\":%u,\"sci\":%u,\"generation\":%llu,"
+            "\"cursor\":%llu,\"record\":%s}",
+            ctx->operation_id, ctx->record_id, ctx->record_key, ctx->mutation,
+            ctx->tenant, ctx->classification, ctx->sci,
+            (unsigned long long)generation, (unsigned long long)cursor,
+            ctx->record_json ? ctx->record_json : "null");
+    }
+    return n >= 0 && (size_t)n < capacity;
+}
+
+static const uint8_t* qihse_directeye_json_ws(const uint8_t* p, const uint8_t* end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    return p;
+}
+
+static bool qihse_directeye_json_hex4(const uint8_t* p, const uint8_t* end, uint16_t* out) {
+    if ((size_t)(end - p) < 4u) return false;
+    uint16_t value = 0u;
+    for (unsigned i = 0u; i < 4u; ++i) {
+        uint8_t c = p[i];
+        unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+            c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10u) :
+            c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10u) : 16u;
+        if (digit > 15u) return false;
+        value = (uint16_t)((value << 4) | digit);
+    }
+    *out = value;
+    return true;
+}
+
+static const uint8_t* qihse_directeye_json_string(const uint8_t* p, const uint8_t* end) {
+    if (p >= end || *p++ != '"') return NULL;
+    while (p < end) {
+        uint8_t c = *p++;
+        if (c == '"') return p;
+        if (c < 0x20u) return NULL;
+        if (c == '\\') {
+            if (p >= end) return NULL;
+            c = *p++;
+            if (c == 'u') {
+                uint16_t code = 0u;
+                if (!qihse_directeye_json_hex4(p, end, &code)) return NULL;
+                p += 4u;
+                if (code >= 0xd800u && code <= 0xdbffu) {
+                    uint16_t low = 0u;
+                    if ((size_t)(end - p) < 6u || p[0] != '\\' || p[1] != 'u' ||
+                        !qihse_directeye_json_hex4(p + 2u, end, &low) ||
+                        low < 0xdc00u || low > 0xdfffu) return NULL;
+                    p += 6u;
+                } else if (code >= 0xdc00u && code <= 0xdfffu) return NULL;
+            } else if (!strchr("\\\"/bfnrt", c)) return NULL;
+        }
+    }
+    return NULL;
+}
+
+static const uint8_t* qihse_directeye_json_value(const uint8_t* p,
+        const uint8_t* end, unsigned depth) {
+    if (depth > 64u) return NULL;
+    p = qihse_directeye_json_ws(p, end);
+    if (p >= end) return NULL;
+    if (*p == '"') return qihse_directeye_json_string(p, end);
+    if (*p == '{') {
+        p = qihse_directeye_json_ws(p + 1u, end);
+        if (p < end && *p == '}') return p + 1u;
+        for (;;) {
+            p = qihse_directeye_json_string(p, end);
+            if (!p || (p = qihse_directeye_json_ws(p, end)) >= end || *p++ != ':') return NULL;
+            p = qihse_directeye_json_value(p, end, depth + 1u);
+            if (!p) return NULL;
+            p = qihse_directeye_json_ws(p, end);
+            if (p < end && *p == '}') return p + 1u;
+            if (p >= end || *p++ != ',') return NULL;
+            p = qihse_directeye_json_ws(p, end);
+        }
+    }
+    if (*p == '[') {
+        p = qihse_directeye_json_ws(p + 1u, end);
+        if (p < end && *p == ']') return p + 1u;
+        for (;;) {
+            p = qihse_directeye_json_value(p, end, depth + 1u);
+            if (!p) return NULL;
+            p = qihse_directeye_json_ws(p, end);
+            if (p < end && *p == ']') return p + 1u;
+            if (p >= end || *p++ != ',') return NULL;
+        }
+    }
+    const char* literal = *p == 't' ? "true" : *p == 'f' ? "false" :
+                          *p == 'n' ? "null" : NULL;
+    if (literal) {
+        size_t n = strlen(literal);
+        return (size_t)(end - p) >= n && memcmp(p, literal, n) == 0 ? p + n : NULL;
+    }
+    const uint8_t* start = p;
+    if (*p == '-') ++p;
+    if (p < end && *p == '0') ++p;
+    else {
+        if (p >= end || *p < '1' || *p > '9') return NULL;
+        do { ++p; } while (p < end && *p >= '0' && *p <= '9');
+    }
+    if (p < end && *p == '.') {
+        ++p;
+        if (p >= end || *p < '0' || *p > '9') return NULL;
+        do { ++p; } while (p < end && *p >= '0' && *p <= '9');
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        ++p;
+        if (p < end && (*p == '+' || *p == '-')) ++p;
+        if (p >= end || *p < '0' || *p > '9') return NULL;
+        do { ++p; } while (p < end && *p >= '0' && *p <= '9');
+    }
+    return p == start ? NULL : p;
+}
+
+static bool qihse_directeye_json_utf8_valid(const uint8_t* data, size_t length) {
+    for (size_t i = 0; i < length;) {
+        uint8_t c = data[i++];
+        if (c < 0x80u) continue;
+        size_t extra;
+        uint8_t low = 0x80u, high = 0xbfu;
+        if (c >= 0xc2u && c <= 0xdfu) extra = 1u;
+        else if (c >= 0xe0u && c <= 0xefu) {
+            extra = 2u;
+            if (c == 0xe0u) low = 0xa0u;
+            if (c == 0xedu) high = 0x9fu;
+        } else if (c >= 0xf0u && c <= 0xf4u) {
+            extra = 3u;
+            if (c == 0xf0u) low = 0x90u;
+            if (c == 0xf4u) high = 0x8fu;
+        } else return false;
+        if (extra > length - i || data[i] < low || data[i] > high) return false;
+        ++i;
+        while (--extra) {
+            if (data[i] < 0x80u || data[i] > 0xbfu) return false;
+            ++i;
+        }
+    }
+    return true;
+}
+
+static bool qihse_directeye_json_object(const uint8_t* data, size_t length) {
+    if (!data || !length || length > QIHSE_KV_DIRECTEYE_MAX_EVENT ||
+        memchr(data, 0, length) || !qihse_directeye_json_utf8_valid(data, length)) return false;
+    const uint8_t* end = data + length;
+    const uint8_t* p = qihse_directeye_json_ws(data, end);
+    if (p >= end || *p != '{') return false;
+    p = qihse_directeye_json_value(p, end, 0u);
+    return p && qihse_directeye_json_ws(p, end) == end;
+}
+
+static bool qihse_resp_directeye_id(const qihse_resp_arg_t* arg, bool uuid) {
+    if (!arg || !arg->len || arg->len > (uuid ? 36u : 128u) ||
+        memchr(arg->data, 0, arg->len)) return false;
+    if (uuid && arg->len != 36u) return false;
+    for (size_t i = 0; i < arg->len; ++i) {
+        uint8_t c = arg->data[i];
+        if (uuid) {
+            if (i == 8u || i == 13u || i == 18u || i == 23u) {
+                if (c != '-') return false;
+            } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        } else if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+    }
+    return true;
+}
+
+static bool qihse_resp_bulk_u64(qihse_resp_session_t* session, uint64_t value) {
+    char text[32];
+    int n = snprintf(text, sizeof(text), "%" PRIu64, value);
+    return n > 0 && (size_t)n < sizeof(text) && qihse_resp_bulk(session, text, (size_t)n);
+}
+
+static bool qihse_resp_handle_directeye(qihse_resp_session_t* session,
+        const qihse_resp_request_t* request) {
+    if (!session || !session->server || !session->server->store || !session->user ||
+        !qihse_auth_user_is_active(session->user))
+        return qihse_resp_error(session, "NOAUTH authenticated session required");
+    qihse_kv_store_t* store = session->server->store;
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.GET")) {
+        if (request->argc != 2u) return qihse_resp_wrong_arity(session, "directeye.record.get");
+        if (!qihse_resp_directeye_id(&request->argv[1], false))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE record identifier");
+        char record_id[129], record_key[192];
+        memcpy(record_id, request->argv[1].data, request->argv[1].len);
+        record_id[request->argv[1].len] = '\0';
+        uint32_t tenant = qihse_user_get_tenant_id(session->user);
+        int n = snprintf(record_key, sizeof(record_key),
+                         "t:%u/directeye/canonical/v1/%s", tenant, record_id);
+        if (n <= 0 || (size_t)n >= sizeof(record_key))
+            return qihse_resp_error(session, "ERR DIRECTEYE key too long");
+        qihse_kv_change_meta_t meta = {0};
+        char* value = NULL;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool found = qihse_kv_change_meta_user(store, record_key, session->user, &meta);
+        if (found && !meta.tombstone)
+            value = qihse_kv_get_user(store, record_key, session->user);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        bool live = found && !meta.tombstone && value != NULL;
+        bool emitted = qihse_resp_array(session, 3u) &&
+            qihse_resp_bulk_u64(session, found ? meta.change_seq : 0u) &&
+            qihse_resp_bulk_u64(session, found && meta.tombstone ? 1u : 0u) &&
+            (live ? qihse_resp_bulk_text(session, value) : qihse_resp_null(session));
+        free(value);
+        return emitted;
+    }
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.MUTATE")) {
+        bool upsert = request->argc >= 4u && qihse_resp_arg_equal(&request->argv[3], "UPSERT");
+        bool deletion = request->argc >= 4u && qihse_resp_arg_equal(&request->argv[3], "DELETE");
+        if ((!upsert && !deletion) || request->argc != (upsert ? 6u : 5u))
+            return qihse_resp_wrong_arity(session, "directeye.record.mutate");
+        if (!qihse_resp_directeye_id(&request->argv[1], true) ||
+            !qihse_resp_directeye_id(&request->argv[2], false))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE operation or record identifier");
+        uint64_t expected = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[4], &expected) ||
+            (deletion && expected == 0u))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE expected sequence");
+        char operation_id[37], record_id[129], record_key[192], event_key[192];
+        memcpy(operation_id, request->argv[1].data, 36u); operation_id[36] = '\0';
+        memcpy(record_id, request->argv[2].data, request->argv[2].len); record_id[request->argv[2].len] = '\0';
+        uint32_t tenant = qihse_user_get_tenant_id(session->user);
+        int r = snprintf(record_key, sizeof(record_key), "t:%u/directeye/canonical/v1/%s", tenant, record_id);
+        int e = snprintf(event_key, sizeof(event_key), "t:%u/directeye/outbox/v1/%s", tenant, operation_id);
+        if (r <= 0 || (size_t)r >= sizeof(record_key) || e <= 0 || (size_t)e >= sizeof(event_key))
+            return qihse_resp_error(session, "ERR DIRECTEYE key too long");
+        char* record_json = NULL;
+        if (upsert) {
+            const qihse_resp_arg_t* payload = &request->argv[5];
+            if (!qihse_directeye_json_object(payload->data, payload->len))
+                return qihse_resp_error(session, "ERR DIRECTEYE payload must be a JSON object");
+            record_json = malloc(payload->len + 1u);
+            if (!record_json) return qihse_resp_error(session, "ERR out of memory");
+            memcpy(record_json, payload->data, payload->len); record_json[payload->len] = '\0';
+        }
+        uint16_t classification = qihse_user_get_classification(session->user);
+        uint16_t sci = qihse_user_get_sci(session->user);
+        qihse_kv_change_meta_t event_meta, source_meta;
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool prior_event = qihse_kv_change_meta_user(store, event_key, session->user, &event_meta);
+        bool source_exists = qihse_kv_change_meta_user(store, record_key, session->user, &source_meta);
+        if (prior_event) {
+            classification = event_meta.classification;
+            sci = event_meta.sci_compartment;
+        } else if (source_exists) {
+            classification = source_meta.classification;
+            sci = source_meta.sci_compartment;
+        } else if (deletion || expected != 0u) {
+            pthread_rwlock_unlock(&session->server->kv_lock);
+            free(record_json);
+            return qihse_resp_error(session, "ERR DIRECTEYE source record unavailable or sequence mismatch");
+        }
+        qihse_resp_directeye_event_ctx_t event = {
+            .operation_id = operation_id, .record_id = record_id, .record_key = record_key,
+            .mutation = upsert ? "upsert" : "delete", .tenant = tenant,
+            .classification = classification, .sci = sci, .record_json = record_json
+        };
+        uint64_t generation = 0u, cursor = 0u;
+        bool ok = qihse_kv_directeye_mutate_user(store, record_key, record_json,
+            expected, event_key, classification, sci, qihse_resp_directeye_event_build,
+            &event, session->user, &generation, &cursor);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        free(record_json);
+        if (!ok) return qihse_resp_error(session, "ERR DIRECTEYE mutation denied, stale, conflicting, or unavailable");
+        return qihse_resp_array(session, 2u) && qihse_resp_bulk_u64(session, generation) &&
+               qihse_resp_bulk_u64(session, cursor);
+    }
+    if (qihse_resp_command_is(request, "DIRECTEYE.FEED.READ")) {
+        if (request->argc != 3u) return qihse_resp_wrong_arity(session, "directeye.feed.read");
+        uint64_t after = 0u, limit = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &after) ||
+            !qihse_resp_parse_u64_arg(&request->argv[2], &limit) || limit == 0u ||
+            limit > QIHSE_KV_DIRECTEYE_FEED_MAX_PAGE)
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE feed cursor or page size");
+        qihse_kv_directeye_event_t* events = NULL;
+        size_t count = 0u;
+        uint64_t next = 0u;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool ok = qihse_kv_directeye_feed_read_user(store, session->user, after,
+            (size_t)limit, &events, &count, &next);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!ok) return qihse_resp_error(session, "NOPERM DIRECTEYE feed requires a provisioned index identity");
+        bool emitted = qihse_resp_array(session, 2u + count * 2u) &&
+            qihse_resp_bulk_u64(session, next) && qihse_resp_bulk_u64(session, count);
+        for (size_t i = 0u; emitted && i < count; ++i)
+            emitted = qihse_resp_bulk_u64(session, events[i].cursor) &&
+                      qihse_resp_bulk_text(session, events[i].json);
+        qihse_kv_directeye_feed_events_free(events, count);
+        return emitted;
+    }
+    if (qihse_resp_command_is(request, "DIRECTEYE.FEED.ACK")) {
+        if (request->argc != 2u) return qihse_resp_wrong_arity(session, "directeye.feed.ack");
+        uint64_t cursor = 0u, ack = 0u;
+        if (!qihse_resp_parse_u64_arg(&request->argv[1], &cursor))
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE ACK cursor");
+        pthread_rwlock_wrlock(&session->server->kv_lock);
+        bool ok = qihse_kv_directeye_feed_ack_user(store, session->user, cursor, &ack);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!ok) return qihse_resp_error(session, "NOPERM or invalid monotonic DIRECTEYE feed ACK");
+        return qihse_resp_bulk_u64(session, ack);
+    }
+    return qihse_resp_error(session, "ERR unknown DIRECTEYE command");
+}
+
 static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse_resp_request_t* request, bool* keep_open) {
     *keep_open = true;
     if (request->argc == 0) return true;
@@ -20329,6 +21147,19 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
             qihse_resp_command_is(request, "REPL.CT1") ||
             qihse_resp_command_is(request, "REPL.CT2") ||
             qihse_resp_command_is(request, "CT.RECEIPT");
+        /* The pinned successor needs REPL.CT1 RECONCILE/ACK/READ/STATUS/
+         * BASELINE while replay is in progress, but signed quotes, retained
+         * frames and history are data-serving. They must stay fenced until
+         * recovery completes instead of racing a still-recovering store. */
+        if (control && qihse_resp_command_is(request, "REPL.CT1") &&
+            request->argc >= 3u &&
+            ((qihse_resp_arg_equal(&request->argv[1], "SOURCE") &&
+              (qihse_resp_arg_equal(&request->argv[2], "QUOTE-V2") ||
+               qihse_resp_arg_equal(&request->argv[2], "FRAME-V1"))) ||
+             (qihse_resp_arg_equal(&request->argv[1], "TARGET") &&
+              (qihse_resp_arg_equal(&request->argv[2], "QUOTE-V2") ||
+               qihse_resp_arg_equal(&request->argv[2], "HISTORY-V1")))))
+            control = false;
         if (!control && request->argc >= 3u &&
             qihse_resp_command_is(request, "CLUSTER") &&
             qihse_resp_session_is_system_operator(session) &&
@@ -20362,6 +21193,12 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         return qihse_resp_error(session,
             "NOPERM command is outside the authenticated service capability");
     }
+
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.GET") ||
+        qihse_resp_command_is(request, "DIRECTEYE.RECORD.MUTATE") ||
+        qihse_resp_command_is(request, "DIRECTEYE.FEED.READ") ||
+        qihse_resp_command_is(request, "DIRECTEYE.FEED.ACK"))
+        return qihse_resp_handle_directeye(session, request);
 
     const uint8_t* cmd_data = request->argv[0].data;
     size_t cmd_len = request->argv[0].len;
@@ -20857,6 +21694,7 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
                 qihse_resp_command_is(request, "SCHEDULE")) {
                 return qihse_resp_handle_schedule(session, request);
             }
+            break;
         case QIHSE_SWAR4('A', 'R', 'T', 'I'):
             if (request->argv[0].len >= 9u &&
                 strncasecmp((const char*)request->argv[0].data, "ARTIFACT.", 9u) == 0)
@@ -20965,11 +21803,20 @@ static bool qihse_resp_session_loop(qihse_resp_server_t* server, int fd) {
          * configured with --admin-peer-node-id/--admin-peer-dsa-pub maps to
          * the system operator. Mirrors the replication pin; grants full
          * command scope (QIHSE_RESP_AUTH_QKP_ADMIN). */
-        if (!replication_peer && !session.user && server->pqc.admin_peer_node_id &&
-            server->pqc.admin_peer_dsa_pub_path &&
-            qihse_qkp_session_is_replication_peer(
-                qkp, server->pqc.admin_peer_node_id,
-                server->pqc.admin_peer_dsa_pub_path)) {
+        bool admin_peer = false;
+        if (!replication_peer && !session.user) {
+            admin_peer = qihse_qkp_session_is_admin_peer(qkp, &server->pqc,
+                server->replication_peers, server->replication_peer_count);
+            if (!admin_peer && server->admin_peer_node_id_2 &&
+                server->admin_peer_dsa_pub_path_2) {
+                qihse_qkp_config_t alternate_admin = server->pqc;
+                alternate_admin.admin_peer_node_id = server->admin_peer_node_id_2;
+                alternate_admin.admin_peer_dsa_pub_path = server->admin_peer_dsa_pub_path_2;
+                admin_peer = qihse_qkp_session_is_admin_peer(qkp, &alternate_admin,
+                    server->replication_peers, server->replication_peer_count);
+            }
+        }
+        if (admin_peer) {
             qihse_user_t* op = qihse_auth_get_user(0u);
             bool op_active = false;
             uint32_t op_tenant = QIHSE_TENANT_INVALID;
@@ -21340,6 +22187,42 @@ static int qihse_resp_failback_cb(void* user_data, uint16_t first, uint16_t last
                                        target_index, &moved, &collected, err, err_cap);
 }
 
+bool qihse_resp_ct1_frozen_root_valid(const char* path) {
+    if (!path || path[0] != '/' || path[1] == '\0' ||
+        strlen(path) >= PATH_MAX) return false;
+    int dir = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dir < 0) return false;
+    bool ok = false;
+    const char* part = path + 1;
+    while (*part) {
+        const char* slash = strchr(part, '/');
+        size_t len = slash ? (size_t)(slash - part) : strlen(part);
+        struct stat parent;
+        if (!len || len > NAME_MAX ||
+            (len == 1u && part[0] == '.') ||
+            (len == 2u && part[0] == '.' && part[1] == '.') ||
+            fstat(dir, &parent) != 0 || !S_ISDIR(parent.st_mode) ||
+            (parent.st_uid != 0 && parent.st_uid != geteuid()) ||
+            (parent.st_mode & 022u) != 0u) break;
+        char name[NAME_MAX + 1u];
+        memcpy(name, part, len);
+        name[len] = '\0';
+        int next = openat(dir, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next < 0) break;
+        close(dir);
+        dir = next;
+        if (!slash) {
+            struct stat root;
+            ok = fstat(dir, &root) == 0 && S_ISDIR(root.st_mode) &&
+                root.st_uid == geteuid() && (root.st_mode & 077u) == 0u;
+            break;
+        }
+        part = slash + 1;
+    }
+    close(dir);
+    return ok;
+}
+
 qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* supplied) {
     if (!supplied || supplied->max_request_bytes < 64u || supplied->max_request_bytes > (size_t)INT_MAX || supplied->max_clients == 0) {
         errno = EINVAL;
@@ -21439,6 +22322,24 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
             return NULL;
         }
     }
+    if (supplied->ct1_recovery_frozen_root &&
+        (!ct_enabled || ct_group_enabled || !supplied->auth_required ||
+         !supplied->pqc.require || !supplied->pqc.admin_peer_node_id ||
+         !*supplied->pqc.admin_peer_node_id ||
+         !supplied->pqc.admin_peer_dsa_pub_path ||
+         !*supplied->pqc.admin_peer_dsa_pub_path ||
+         !supplied->pqc.replication_peer_node_id ||
+         !supplied->pqc.replication_peer_dsa_pub_path ||
+         !strcmp(supplied->pqc.admin_peer_node_id,
+                 supplied->pqc.replication_peer_node_id) ||
+         !supplied->replication_service_principal ||
+         !supplied->ct1_recovery_replication_principal_id ||
+         qihse_user_get_id(supplied->replication_service_principal) !=
+             supplied->ct1_recovery_replication_principal_id ||
+         !qihse_resp_ct1_frozen_root_valid(supplied->ct1_recovery_frozen_root))) {
+        errno = EACCES;
+        return NULL;
+    }
     if (supplied->enable_artifact_uploads) {
         struct stat staging;
         if (!supplied->auth_required || !supplied->blobs ||
@@ -21518,6 +22419,9 @@ qihse_resp_server_t* qihse_resp_server_create(const qihse_resp_server_config_t* 
     server->ct_log_limit_bytes = supplied->ct_log_limit_bytes;
     server->ct_ack_timeout_ms = supplied->ct_ack_timeout_ms;
     server->ct_control_principal = supplied->ct_control_principal;
+    if (supplied->ct1_recovery_frozen_root)
+        memcpy(server->ct1_recovery_frozen_root, supplied->ct1_recovery_frozen_root,
+               strlen(supplied->ct1_recovery_frozen_root) + 1u);
     server->ct_topology_qkp_id = supplied->ct_topology_qkp_id;
     server->ct_topology_qkp_id_context = supplied->ct_topology_qkp_id_context;
     if (ct_group_enabled) {
@@ -22151,6 +23055,59 @@ static EVP_PKEY* qihse_resp_replication_pub(const char* path) {
     return key;
 }
 
+bool qihse_resp_server_add_admin_peer(
+        qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
+        const qihse_user_t* authenticated_grantor) {
+    if (!server || !node_id || !*node_id ||
+        strlen(node_id) > QIHSE_QKP_NODE_ID_LEN || !dsa_pub_path ||
+        !*dsa_pub_path || strlen(dsa_pub_path) >= PATH_MAX) return false;
+    pthread_mutex_lock(&server->state_lock);
+    bool ok = false;
+    EVP_PKEY* key = NULL;
+    char* owned_id = NULL;
+    char* owned_path = NULL;
+    bool replication_identity = server->pqc.replication_peer_node_id &&
+        strcmp(node_id, server->pqc.replication_peer_node_id) == 0;
+    for (size_t i = 0; !replication_identity && i < server->replication_peer_count; ++i)
+        replication_identity = strcmp(node_id, server->replication_peers[i].node_id) == 0;
+    if (server->replication_peers_frozen || server->running ||
+        server->listen_fd >= 0 || server->accept_thread_started ||
+        server->stopping || server->active_clients || replication_identity ||
+        server->admin_peer_node_id_2 || server->admin_peer_dsa_pub_path_2 ||
+        !authenticated_grantor ||
+        !qihse_auth_user_is_active(authenticated_grantor) ||
+        qihse_user_get_tenant_id(authenticated_grantor) != QIHSE_TENANT_SYSTEM ||
+        qihse_user_get_role(authenticated_grantor) != QIHSE_ROLE_OPERATOR ||
+        (server->pqc.admin_peer_node_id &&
+         strcmp(node_id, server->pqc.admin_peer_node_id) == 0)) goto done;
+    key = qihse_resp_replication_pub(dsa_pub_path);
+    if (!key || !server->pqc.trusted_pubs || server->pqc.trusted_count == 0u)
+        goto done;
+    bool trusted = false;
+    for (size_t i = 0; i < server->pqc.trusted_count; ++i) {
+        EVP_PKEY* anchor = server->pqc.trusted_pubs[i]
+            ? qihse_resp_replication_pub(server->pqc.trusted_pubs[i]) : NULL;
+        if (anchor && EVP_PKEY_eq(key, anchor) == 1) trusted = true;
+        EVP_PKEY_free(anchor);
+        if (trusted) break;
+    }
+    if (!trusted) goto done;
+    owned_id = strdup(node_id);
+    owned_path = strdup(dsa_pub_path);
+    if (!owned_id || !owned_path) goto done;
+    server->admin_peer_node_id_2 = owned_id;
+    server->admin_peer_dsa_pub_path_2 = owned_path;
+    owned_id = NULL;
+    owned_path = NULL;
+    ok = true;
+done:
+    free(owned_id);
+    free(owned_path);
+    EVP_PKEY_free(key);
+    pthread_mutex_unlock(&server->state_lock);
+    return ok;
+}
+
 bool qihse_resp_server_add_replication_peer(
         qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
         const qihse_user_t* authenticated_grantor) {
@@ -22441,6 +23398,8 @@ void qihse_resp_server_destroy(qihse_resp_server_t* server) {
         free((char*)server->replication_peers[i].node_id);
         free((char*)server->replication_peers[i].dsa_pub_path);
     }
+    free(server->admin_peer_node_id_2);
+    free(server->admin_peer_dsa_pub_path_2);
     /* R5 §13: watches die with their sessions; the detach in the session
      * teardown guarantees the registry is empty by the time clients drain. */
     free(server->watch_entries);

@@ -22,32 +22,34 @@
  * INTERNAL UTILITIES
  * ============================================================================ */
 
-/* Box-Muller transform for Gaussian random variables */
-static double generate_gaussian(double mu, double sigma, uint64_t* seed) {
-    /* Simple implementation - in production, use better PRNG */
-    static int has_spare = 0;
-    static double spare;
+/* Per-construction state: odd-sized kernels and concurrent callers cannot
+ * share the Box-Muller spare sample. */
+typedef struct { uint64_t seed; int has_spare; double spare; } rff_rng_t;
+static uint64_t random_word(rff_rng_t *rng) {
+    uint64_t z = (rng->seed += UINT64_C(0x9e3779b97f4a7c15));
+    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return z ^ (z >> 31);
+}
+static double uniform(rff_rng_t *rng) { return (double)(random_word(rng) >> 11) * 0x1.0p-53; }
+static double generate_gaussian(double mu, double sigma, rff_rng_t* rng) {
 
-    if (has_spare) {
-        has_spare = 0;
-        return spare * sigma + mu;
+    if (rng->has_spare) {
+        rng->has_spare = 0;
+        return rng->spare * sigma + mu;
     }
 
-    has_spare = 1;
+    rng->has_spare = 1;
     double u, v, s;
     do {
-        /* Simple LCG for demo - replace with proper PRNG */
-        *seed = (*seed * 1103515245 + 12345) & 0x7fffffff;
-        u = (double)*seed / 0x7fffffff * 2.0 - 1.0;
-
-        *seed = (*seed * 1103515245 + 12345) & 0x7fffffff;
-        v = (double)*seed / 0x7fffffff * 2.0 - 1.0;
+        u = uniform(rng) * 2.0 - 1.0;
+        v = uniform(rng) * 2.0 - 1.0;
 
         s = u * u + v * v;
     } while (s >= 1.0 || s == 0.0);
 
     s = sqrt(-2.0 * log(s) / s);
-    spare = v * s;
+    rng->spare = v * s;
     return (u * s) * sigma + mu;
 }
 
@@ -61,8 +63,14 @@ qihse_rff_kernel_t* qihse_rff_create(
     double gamma,
     uint64_t seed
 ) {
-    if (input_dims == 0 || output_dims == 0 || gamma <= 0.0) {
+    if (input_dims == 0 || output_dims == 0 || !isfinite(gamma) || gamma <= 0.0) {
         errno = EINVAL;
+        return NULL;
+    }
+
+    if (output_dims > SIZE_MAX / input_dims ||
+        output_dims * input_dims > SIZE_MAX / sizeof(double)) {
+        errno = EOVERFLOW;
         return NULL;
     }
 
@@ -88,18 +96,17 @@ qihse_rff_kernel_t* qihse_rff_create(
     }
 
     /* Initialize random parameters */
-    uint64_t current_seed = seed;
-    double sigma = sqrt(2.0 * gamma);
+    rff_rng_t rng = {seed, 0, 0.0};
+    double sigma = sqrt(gamma) * sqrt(2.0);
 
     /* Generate Gaussian random frequencies ω ~ N(0, 2γ) */
     for (size_t i = 0; i < output_dims * input_dims; i++) {
-        kernel->omega[i] = generate_gaussian(0.0, sigma, &current_seed);
+        kernel->omega[i] = generate_gaussian(0.0, sigma, &rng);
     }
 
     /* Generate uniform random biases b ~ U[0, 2π] */
     for (size_t i = 0; i < output_dims; i++) {
-        current_seed = (current_seed * 1103515245 + 12345) & 0x7fffffff;
-        kernel->bias[i] = (double)current_seed / 0x7fffffff * 2.0 * M_PI;
+        kernel->bias[i] = uniform(&rng) * 2.0 * M_PI;
     }
 
     return kernel;

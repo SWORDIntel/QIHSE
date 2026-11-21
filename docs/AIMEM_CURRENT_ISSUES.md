@@ -1,6 +1,6 @@
 # AIMEM Current Issues
 
-Status updated 2026-11-10. This note records verified blockers and risks; it contains no credential values. The Nov. 9 cluster ownership and outage observations in section 1 are historical; the later three-owner health and inventory checkpoint is in [the recovery record](plans/cluster_recovery_20261109.md). Remote KEYSTONE semantic-projection readiness remains unverified.
+Status updated 2026-11-15 (current-source API alignment; runtime and deployment observations below retain their original dates). This note records verified blockers and risks; it contains no credential values. The Nov. 9 cluster ownership and outage observations in section 1 are historical; the later three-owner health and inventory checkpoint is in [the recovery record](plans/cluster_recovery_20261109.md). Remote KEYSTONE semantic-projection readiness remains unverified.
 
 ## 1. Durable authentication authority migration is blocked
 
@@ -76,6 +76,41 @@ The final CT1/CT2 integration supersedes the earlier transport coverage-gap resu
 
 The earlier required `make test TEST_JOBS=32` run completed 188 targets with two failures. `test-docs-api-counts` found a stale generated KV header count; `make docs-api-counts` refreshed the table and the focused gate now passes. At that stage, `test-parallel-runner` rejected the gold pack's explicit CT1 pinned-write-replication and CT2 fenced-slot-transfer gaps. Those guarantees still required implementation and proof; the test was kept intact. The new AIMEM atomic forget, scoped authorization, source citation, Python SDK, and CodeGraph aggregate targets passed. HAX's final full suite passed 305 tests and lint passed. The local runtime verification is recorded above. On 2026-11-09, the required standard-build full run completed 188 targets with only `test-parallel-runner` failing on the same CT1/CT2 coverage gaps; the gold pack and CodeGraph aggregate passed. The projection-enabled interruption/ranking/authorization fixture also passed against the installed library, followed by the real HAX QKP memory smoke.
 
+## Current-source recovery and AIMEM boundaries (2026-11-15)
+
+Current headers and implementations include local authenticated shared
+KV/SQL/blob/coordinator backup, explicit native durable SQL/blob 2PC, scoped AIMEM
+local-fsync receipts and source-aware knowledge. These are source capabilities,
+not a claim that this review deployed a release or reran the full suite.
+Historical results below remain dated evidence.
+
+Shared export requires retained live handles, all-source checkpoint bracketing,
+the bootstrap Operator and no unresolved participant decisions. Verify/unpack is
+not native restore or readiness proof. In a fresh restore process preserve SQL
+sidecars/blob receipts, register manifest engine IDs, advance the coordinator to
+at least the captured allocator floor and above every participant receipt before
+recovery, then complete common-decision replay before application exposure.
+HMAC authenticates but does not encrypt; the package does not separately collect
+principal/ACL authority, external private keys or service configuration. It is
+not an authority migration or CT journal/cursor resume image.
+
+Scoped durable store receipts confirm local sync, not quorum replication.
+Native source-aware knowledge create/revise needs its caller's serialized KV
+sync fence; RESP source-aware wrappers supply it. Exact external source identity
+remains caller-supplied provenance until a trusted provider validates the
+revision/range. Neither source metadata nor a local receipt proves remote
+KEYSTONE semantic readiness.
+
+Bounded shared-snapshot and order-recovery records describe focused native
+restore, receipt/floor replay, SIGKILL and injected-I/O cases, not W11.1/W11.6 or
+CT.1/CT.2 closure. Wider node/partition/storage and scale/resource coverage,
+a controlled storage target and a selected 768-dimensional semantic provider
+remain acceptance prerequisites. See
+[shared-snapshot evidence and open gates](plans/w11_shared_snapshot.md),
+[native order fixture](contracts/w11-order-recovery-fixture.md), and
+[API native contracts](API_REFERENCE.md#native-upgrade-surfaces--current-source-contracts).
+No host/power-loss or production-rollout acceptance is inferred here.
+
 ## 5. Repair batch in progress (2026-11-10)
 
 These changes are local source repairs, with focused checks in isolated
@@ -93,7 +128,7 @@ the existing APIs and identities.
 | SDK/build tools | Missing installed public headers, Python input bounds, overlapping header names, unsafe native object reuse and inaccurate rollout script discovery. | Focused fixes integrated. Rolling script refuses immutable release-package paths; activation of new versioned releases is still separate work. |
 | Generic graph engine | Property updates left stale index entries; external-ID maps were shared across graphs; analytics and fixed neighbor buffers returned wrong/truncated results. | Repairs integrated: typed full-value index checks, per-graph mappings, dynamic traversal, corrected analytics and strict ingest failures. The CodeGraph CLI uses its own CSR engine. |
 | Hybrid graph/vector | Expanded neighbors lacked per-vector authorization; query-sized buffers could receive database-sized vectors. | Repairs integrated: authenticated vector visibility for every admitted vertex, dimension checks before fetch, dynamic frontiers. Focused protected-neighbor and high-degree cases pass. |
-| Transactions/query results | Participant commit failures were reported as success; Cypher accepted ordering/pagination clauses without applying them. | Retryable COMMITTING/ABORTING outcomes, stable participant sets and retained OCC history integrated. Cypher applies final projected ordering/pagination; negative values and unsupported WITH modifiers are explicit errors. Durable coordinator-decision recovery remains absent. |
+| Transactions/query results | Participant commit failures were reported as success; Cypher accepted ordering/pagination clauses without applying them. | Retryable COMMITTING/ABORTING outcomes, stable participant sets and retained OCC history integrated. Cypher applies final projected ordering/pagination; negative values and unsupported WITH modifiers are explicit errors. The default coordinator remains volatile; current source also provides opt-in durable decision replay and explicit native SQL/blob participation, not transparent protocol-wide cross-model transactions. |
 | Persistence | Native KV replay could truncate valid frames after an apply failure. Generic MVCC redo ignored mutation failures; sparse cache truncation retained pages; VFS WAL accepted partial replay and unchecked offset arithmetic. | Repairs integrated with focused fault cases: apply/read failures preserve the WAL; required tail-repair failures stop startup; failed generic redo inhibits checkpointing; VFS replay distinguishes completion from a valid prefix. Generic recovery is exercised through its public API/tests; no daemon caller was found. VFS WAL has no current in-tree consumers. SQLite has conditional cache calls but never creates the cache; those VFS defects are latent. |
 
 Owner-data containers are data recovery images, not CT journal/cursor resume
@@ -103,10 +138,16 @@ it no longer builds a third full trie, but is not a fully streaming
 merge. Legacy full exports do not contain deletion causality and cannot be
 mixed with owner-data containers.
 
-The generic 2PC manager retains pending decisions only in memory. Participants
-must durably deduplicate commit/abort callbacks by transaction ID, including
-an effect whose acknowledgement was lost. Resolve pending decisions before
-destroying the manager; this repair does not supply crash recovery for them.
+The default `qihse_txn_manager_create()` retains pending decisions only in
+memory. Current source adds opt-in `qihse_txn_manager_create_durable()` and
+recovery after explicit participant registration and allocator-floor setup.
+Its portable journal uses 36-byte `QT2P` v1 records, not a full MVCC/one-phase
+registry image. Participants must durably deduplicate commit/abort by transaction
+ID, including effects whose acknowledgements were lost. COMMITTING is irreversible
+and retries COMMIT; ABORTING retries ABORT. Resolve pending decisions before
+destroying a volatile manager. Native SQL DML/blob participation does not silently
+extend pgwire/RESP guarantees. See the
+[API native contracts](API_REFERENCE.md#native-upgrade-surfaces--current-source-contracts).
 The dormant VFS WAL implementation uses a dense replay image capped at 1 GiB.
 The dormant page cache still opens the process-global persistent KV namespace;
 it must not be enabled for multiple databases without isolating that storage.
@@ -146,8 +187,9 @@ integrated these repairs:
 
 MVCC collection still only unlinks obsolete versions: arena memory and delete
 intents remain retained until store destruction. This repair does not supply
-arena compaction, a durable transaction coordinator or an authenticated CT
-promotion chain. The additional targets are wired into the existing suite for
+arena compaction or an authenticated CT promotion chain. The later opt-in durable
+coordinator is a separate current-source capability, not evidence that those
+earlier MVCC repairs provided it. The additional targets are wired into the existing suite for
 future runs; the full suite remains stopped at the user's request.
 
 Vector handles still require callers to synchronize shared access. The further

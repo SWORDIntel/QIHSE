@@ -16,6 +16,14 @@ bool qihse_resp_server_add_replication_peer(
     qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
     const qihse_user_t* authenticated_grantor);
 
+/* Before first listener/session only. Adds one exact optional administrator
+ * QKP identity for key-rotation overlap; the server copies both strings. The
+ * grantor must be an active system Operator. A replication-only pin cannot
+ * acquire administrator authority through this API. */
+bool qihse_resp_server_add_admin_peer(
+    qihse_resp_server_t* server, const char* node_id, const char* dsa_pub_path,
+    const qihse_user_t* authenticated_grantor);
+
 /* Before first listener/session only; requires an active authenticated system
  * Operator and config.enable_failover. Holds automatic/manual promotion and
  * failback until authenticated CLUSTER FAILOVER.RESUME. No live drain, write,

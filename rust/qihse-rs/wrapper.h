@@ -4,3 +4,4 @@
 #include "qihse_document.h"
 #include "qihse_trinary_trie.h"
 #include "qihse_uwp.h"
+#include "qihse_dist_planner.h"

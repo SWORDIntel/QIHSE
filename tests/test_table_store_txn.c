@@ -19,24 +19,29 @@
 
 #ifdef QIHSE_TABLE_STORE_TESTING
 /* Defined only in the test-instrumented table-store build. */
+extern void qihse_table_store_test_set_snapshot_epoch(qihse_table_store_t*, uint64_t);
 extern void qihse_table_txn_test_set_generation(qihse_table_txn_t*, uint64_t);
 extern void qihse_table_test_set_generation(qihse_table_t*, uint64_t);
 extern void qihse_table_txn_test_set_base_generation(qihse_table_txn_t*, uint64_t);
 #endif
 
-/* Test-only fsync fault: fail exactly once after rename, on the directory. */
+/* Test-only fsync fault: fail exactly once at a directory durability boundary. */
 static __thread int fail_directory_fsync;
 static __thread const char* verify_directory_fsync_target;
+static __thread int verify_directory_fsync_skip;
 static void arm_directory_fsync_failure(void) {
     fail_directory_fsync = 1;
 }
 int fsync(int fd) {
     struct stat st;
     if (verify_directory_fsync_target && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
-        struct stat published;
-        assert(stat(verify_directory_fsync_target, &published) == 0);
-        assert(published.st_nlink == 1);
-        verify_directory_fsync_target = NULL;
+        if (verify_directory_fsync_skip) --verify_directory_fsync_skip;
+        else {
+            struct stat published;
+            assert(stat(verify_directory_fsync_target, &published) == 0);
+            assert(published.st_nlink == 1);
+            verify_directory_fsync_target = NULL;
+        }
     }
     if (fail_directory_fsync && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
         fail_directory_fsync = 0;
@@ -1297,6 +1302,166 @@ static void test_catalog_name_bijection(void) {
     assert(unlink(path) == 0 && unlink(lock) == 0 && rmdir(dir) == 0);
 }
 
+static uint64_t snapshot_epoch(qihse_table_store_t* store,
+                               const qihse_user_t* user) {
+    uint64_t epoch = UINT64_MAX;
+    assert(qihse_table_store_snapshot_epoch_user(store, user, &epoch));
+    return epoch;
+}
+
+static void assert_snapshot_epoch_denied(qihse_table_store_t* store,
+                                          const qihse_user_t* user) {
+    uint64_t epoch = UINT64_C(0x123456789);
+    assert(!qihse_table_store_snapshot_epoch_user(store, user, &epoch));
+    assert(epoch == UINT64_C(0x123456789));
+}
+
+static void test_snapshot_epoch(const char* dir, const qihse_col_def_t* defs,
+    const qihse_user_t* operator, const qihse_user_t* guest,
+    const qihse_user_t* delegated) {
+    char path[256], backup[256], lock[264];
+    assert(snprintf(path, sizeof path, "%s/epoch", dir) < (int)sizeof path);
+    assert(snprintf(backup, sizeof backup, "%s/epoch-backup", dir) < (int)sizeof backup);
+    assert_snapshot_epoch_denied(NULL, operator);
+    qihse_table_store_t* memory = qihse_table_store_create();
+    assert(memory);
+    assert_snapshot_epoch_denied(memory, operator);
+    qihse_table_store_destroy(memory);
+    qihse_table_store_t* store = qihse_table_store_open_durable(path);
+    assert(store);
+    assert_snapshot_epoch_denied(store, operator); /* catalog required */
+    const uint8_t catalog[] = {1, 2, 3, 4};
+    const uint8_t replacement[] = {2, 3, 4, 5};
+    assert(qihse_table_store_set_schema_image(store, catalog, sizeof catalog));
+    uint64_t epoch = snapshot_epoch(store, operator);
+    assert(epoch > 0 && snapshot_epoch(store, operator) == epoch);
+    assert_snapshot_epoch_denied(store, NULL);
+    assert_snapshot_epoch_denied(store, guest);
+    assert_snapshot_epoch_denied(store, delegated);
+    assert(!qihse_table_store_snapshot_epoch_user(store, operator, NULL));
+    assert(qihse_table_store_replace_schema_image(store, catalog, sizeof catalog,
+        replacement, sizeof replacement));
+    assert(snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    qihse_table_t* table = qihse_table_store_create_table(store, "epoch_items", defs, 3);
+    assert(table && snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    qihse_col_value_t row[] = {{.type=QIHSE_TS_INT32, .v.i32=1},
+        {.type=QIHSE_TS_STRING, .v.str="epoch"},
+        {.type=QIHSE_TS_INT32, .v.i32=7}};
+    qihse_table_txn_t* txn = qihse_table_txn_begin(table);
+    assert(txn && qihse_table_txn_insert(txn, row, 3) >= 0);
+    qihse_table_txn_rollback(txn);
+    assert(qihse_table_row_count(table) == 0 && snapshot_epoch(store, operator) == epoch);
+    txn = qihse_table_txn_begin(table);
+    qihse_table_txn_t* group[] = {txn};
+    assert(txn && qihse_table_txn_validate_group(group, 1));
+    assert(snapshot_epoch(store, operator) == epoch);
+    txn = qihse_table_txn_begin(table);
+    assert(txn && qihse_table_txn_insert(txn, row, 3) >= 0);
+    assert(qihse_table_txn_commit(txn));
+    assert(snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    assert_live_row(table, 1, "epoch", 7);
+    assert(snapshot_epoch(store, operator) == epoch);
+
+    qihse_ts_retry_identity_t id = {.key="epoch-retry", .principal="user:0",
+        .tenant="tenant:0", .digest={71}};
+    qihse_ts_retry_outcome_t outcome = {.command_count=1};
+    group[0] = qihse_table_txn_begin(table);
+    assert(group[0] && qihse_table_txn_commit_group_retry(group, 1, operator,
+        &id, &outcome) == QIHSE_TS_RETRY_COMMITTED);
+    assert(snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    group[0] = qihse_table_txn_begin(table);
+    assert(group[0] && qihse_table_txn_commit_group_retry(group, 1, operator,
+        &id, &outcome) == QIHSE_TS_RETRY_COMMITTED);
+    assert(qihse_table_store_retry_lookup(store, operator, &id, &outcome) ==
+        QIHSE_TS_RETRY_COMMITTED);
+    assert(snapshot_epoch(store, operator) == epoch);
+
+    assert(qihse_table_store_prepare_noop(store, 0x701));
+    assert_snapshot_epoch_denied(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x701, false));
+    assert(qihse_table_row_count(table) == 1 && snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x701, false));
+    assert(snapshot_epoch(store, operator) == epoch);
+    row[0].v.i32 = 2;
+    txn = qihse_table_txn_begin(table);
+    assert(txn && qihse_table_txn_insert(txn, row, 3) >= 0);
+    group[0] = txn;
+    assert(qihse_table_txn_prepare_group(group, 1, 0x702));
+    assert_snapshot_epoch_denied(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x702, false));
+    assert(qihse_table_row_count(table) == 1 && snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    txn = qihse_table_txn_begin(table);
+    assert(txn && qihse_table_txn_insert(txn, row, 3) >= 0);
+    group[0] = txn;
+    assert(qihse_table_txn_prepare_group(group, 1, 0x703));
+    assert_snapshot_epoch_denied(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x703, true));
+    assert(qihse_table_row_count(table) == 2 && snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x703, true));
+    assert(snapshot_epoch(store, operator) == epoch);
+    /* Receipt-only ABORT changes transfer state even without a local prepare. */
+    assert(qihse_table_store_resolve_prepared(store, 0x704, false));
+    assert(snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x704, false));
+    assert(snapshot_epoch(store, operator) == epoch);
+    assert(qihse_table_store_prepare_noop(store, 0x705));
+    arm_directory_fsync_failure();
+    assert(!qihse_table_store_resolve_prepared(store, 0x705, false));
+    assert(!fail_directory_fsync);
+    assert_snapshot_epoch_denied(store, operator);
+    /* Replay of an existing receipt must still fence pending-state cleanup. */
+    assert(qihse_table_store_resolve_prepared(store, 0x705, false));
+    assert(snapshot_epoch(store, operator) > epoch);
+    epoch = snapshot_epoch(store, operator);
+    assert(qihse_table_store_resolve_prepared(store, 0x705, false));
+    assert(snapshot_epoch(store, operator) == epoch);
+
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert_snapshot_epoch_denied(store, operator);
+        _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(qihse_table_store_backup(store, operator, backup));
+    assert(snapshot_epoch(store, operator) == epoch);
+    qihse_table_store_t* copy = qihse_table_store_open_durable(backup);
+    assert(copy && qihse_table_row_count(qihse_table_store_find_table(copy, "epoch_items")) == 2);
+    qihse_table_store_destroy(copy);
+#ifdef QIHSE_TABLE_STORE_TESTING
+    qihse_table_store_test_set_snapshot_epoch(store, UINT64_MAX - 1);
+    assert(snapshot_epoch(store, operator) == UINT64_MAX - 1);
+    group[0] = qihse_table_txn_begin(table);
+    assert(group[0] && qihse_table_txn_commit_group(group, 1));
+    assert_snapshot_epoch_denied(store, operator);
+    group[0] = qihse_table_txn_begin(table);
+    assert(group[0] && qihse_table_txn_commit_group(group, 1));
+    assert_snapshot_epoch_denied(store, operator); /* saturation, never wrap */
+#endif
+    qihse_table_store_destroy(store);
+    const char* stores[] = {path, backup};
+    for (size_t i = 0; i < sizeof stores / sizeof *stores; ++i) {
+        for (uint64_t receipt = 0x701; receipt <= 0x705; ++receipt) {
+            char name[296];
+            assert(snprintf(name, sizeof name, "%s.decision.%016llx", stores[i],
+                (unsigned long long)receipt) < (int)sizeof name);
+            assert(unlink(name) == 0);
+        }
+        assert(unlink(stores[i]) == 0);
+        assert(snprintf(lock, sizeof lock, "%s.lock", stores[i]) < (int)sizeof lock);
+        assert(unlink(lock) == 0);
+    }
+}
+
 static void test_backup_restore(const qihse_col_def_t* defs) {
     char dir[] = "./build/qihse-backup-txn-XXXXXX";
     assert(mkdtemp(dir));
@@ -1319,6 +1484,7 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     qihse_user_t* delegated = qihse_auth_create_user(operator, 39173,
         QIHSE_ROLE_OPERATOR, 0, 0, "TableStoreBackupDelegate1!", false);
     assert(delegated);
+    test_snapshot_epoch(dir, defs, operator, guest, delegated);
     test_seeded_publication(dir, operator);
     test_exact_typed_transform(operator);
     test_numeric_float_index(operator);
@@ -1351,16 +1517,36 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     qihse_table_txn_t* group[] = {tx};
     assert(qihse_table_txn_commit_group_retry(group, 1, operator, &id, &outcome) ==
            QIHSE_TS_RETRY_COMMITTED);
+    const uint64_t receipt_commit_id = UINT64_C(0x202);
+    const uint64_t receipt_abort_id = UINT64_C(0x203);
+    assert(qihse_table_store_prepare_noop(s, receipt_commit_id));
+    assert(qihse_table_store_resolve_prepared(s, receipt_commit_id, true));
+    assert(qihse_table_store_prepare_noop(s, receipt_abort_id));
+    assert(qihse_table_store_resolve_prepared(s, receipt_abort_id, false));
+    char malformed_decision[sizeof original + 32];
+    assert(snprintf(malformed_decision, sizeof malformed_decision,
+                    "%s.decision.not-hex", original) < (int)sizeof malformed_decision);
+    int malformed_fd = open(malformed_decision,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    assert(malformed_fd >= 0);
+    assert(write(malformed_fd, "bad", 3u) == 3 && close(malformed_fd) == 0);
+    uint64_t next_transaction_id = 0u;
+    assert(!qihse_table_store_decision_next_id(s, &next_transaction_id));
+    assert(unlink(malformed_decision) == 0);
+    assert(qihse_table_store_decision_next_id(s, &next_transaction_id) &&
+           next_transaction_id > receipt_abort_id);
     assert(!qihse_table_store_backup(s, NULL, backup));
     assert(!qihse_table_store_backup(s, guest, backup));
     assert(!qihse_table_store_backup(s, delegated, backup));
     verify_directory_fsync_target = backup;
+    verify_directory_fsync_skip = 1; /* receipt directory sync precedes snapshot */
     assert(qihse_table_store_backup(s, operator, backup));
     assert(!verify_directory_fsync_target);
     assert(!qihse_table_store_backup(s, operator, backup));
     assert(!qihse_table_store_restore(guest, backup, target));
     assert(!qihse_table_store_restore(operator, original, target)); /* writer lock */
     verify_directory_fsync_target = target;
+    verify_directory_fsync_skip = 1; /* receipt directory sync precedes snapshot */
     assert(qihse_table_store_restore(operator, backup, target));
     assert(!verify_directory_fsync_target);
     assert(!qihse_table_store_restore(operator, backup, target));
@@ -1374,16 +1560,20 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     assert(!qihse_table_store_backup(s, operator, failed_backup));
     assert(!fail_directory_fsync);
     qihse_table_store_t* uncertain = qihse_table_store_open_durable(failed_backup);
-    assert(uncertain && qihse_table_row_count(qihse_table_store_find_table(uncertain, "items")) == 1);
+    assert(uncertain && qihse_table_row_count(qihse_table_store_find_table(uncertain, "items")) == 0);
     qihse_table_store_destroy(uncertain);
     arm_directory_fsync_failure();
     assert(!qihse_table_store_restore(operator, backup, failed_restore));
     assert(!fail_directory_fsync);
     uncertain = qihse_table_store_open_durable(failed_restore);
-    assert(uncertain && qihse_table_row_count(qihse_table_store_find_table(uncertain, "items")) == 1);
+    assert(uncertain && qihse_table_row_count(qihse_table_store_find_table(uncertain, "items")) == 0);
     qihse_table_store_destroy(uncertain);
-    assert(unlink(failed_backup) == 0 && unlink(failed_backup_lock) == 0);
-    assert(unlink(failed_restore) == 0 && unlink(failed_restore_lock) == 0);
+    int failed_rc = unlink(failed_backup);
+    assert(failed_rc == 0 || errno == ENOENT);
+    assert(unlink(failed_backup_lock) == 0);
+    failed_rc = unlink(failed_restore);
+    assert(failed_rc == 0 || errno == ENOENT);
+    assert(unlink(failed_restore_lock) == 0);
     qihse_table_store_t* recovered = qihse_table_store_open_durable(target);
     assert(recovered);
     assert_live_row(qihse_table_store_find_table(recovered, "items"), 17, "recovered", 19);
@@ -1394,6 +1584,9 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     qihse_ts_retry_outcome_t looked = {0};
     assert(qihse_table_store_retry_lookup(recovered, operator, &id, &looked) == QIHSE_TS_RETRY_COMMITTED);
     assert(looked.affected_rows == 1 && looked.command_count == 1);
+    assert(qihse_table_store_resolve_prepared(recovered, receipt_commit_id, true));
+    assert(qihse_table_store_resolve_prepared(recovered, receipt_abort_id, false));
+    assert(!qihse_table_store_resolve_prepared(recovered, receipt_abort_id, true));
     assert(!qihse_table_store_restore(operator, backup, target));
     qihse_table_store_destroy(recovered);
     id.key = "uncertain-key";
@@ -1406,6 +1599,7 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
            QIHSE_TS_RETRY_ERROR);
     assert(!fail_directory_fsync);
     assert(!qihse_table_store_backup(s, operator, after));
+    assert_snapshot_epoch_denied(s, operator); /* ambiguous snapshot publication */
     assert(access(after, F_OK) == -1);
     qihse_table_store_destroy(s);
     s = qihse_table_store_open_durable(original);
@@ -1437,6 +1631,20 @@ static void test_backup_restore(const qihse_col_def_t* defs) {
     assert(!qihse_table_store_restore(operator, backup, target));
     assert(access(target, F_OK) == -1);
     qihse_table_store_destroy(s);
+    const char* receipt_stores[] = {original, backup, target, failed_backup, failed_restore};
+    for (size_t i = 0; i < sizeof receipt_stores / sizeof *receipt_stores; ++i) {
+        char receipt_path[sizeof dir + 64];
+        assert(snprintf(receipt_path, sizeof receipt_path, "%s.decision.%016llx",
+            receipt_stores[i], (unsigned long long)receipt_commit_id) <
+            (int)sizeof receipt_path);
+        int rc = unlink(receipt_path);
+        assert(rc == 0 || errno == ENOENT);
+        assert(snprintf(receipt_path, sizeof receipt_path, "%s.decision.%016llx",
+            receipt_stores[i], (unsigned long long)receipt_abort_id) <
+            (int)sizeof receipt_path);
+        rc = unlink(receipt_path);
+        assert(rc == 0 || errno == ENOENT);
+    }
     assert(unlink(original) == 0 && unlink(original_lock) == 0);
     assert(unlink(backup) == 0 && unlink(backup_lock) == 0);
     assert(unlink(target_lock) == 0);

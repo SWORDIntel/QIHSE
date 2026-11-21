@@ -115,8 +115,139 @@ possible. A durable phase-3 intent alone never authorizes membership; restart
 revalidates the common decision and repeats finalization idempotently.
 Phase 4 records completed local membership publication. Only that durable
 completed state may be replaced by a different transfer; phase 3 must remain
-retryable until its bitmap and cache changes finish. Completed same-ID retries
-must still return the original result.
+retryable until its bitmap and cache changes finish. A distinct zero-cut INTENT
+can be journaled and interrupted before replacing that old phase-4 descriptor.
+Replay and explicit abort must treat the retained completion as historical, not
+as the new INTENT's unresolved fence. They still require the exact common ABORT
+and keep the old descriptor unchanged; same-ID or mismatching phase-1/2/3 state
+is not discarded. `test-ct-lane-transfer` constructs a real completed descriptor,
+then checks direct abort and automatic replay after separate durable INTENTs and
+reopens, low-authority denial, exact descriptor preservation and a subsequent
+native source fence/export. The regression fails at direct abort before the fix.
+Completed same-ID retries must still return the original result. Adjacent
+negative cases retain real native phase-1/2/3 descriptors and phase-4 same-ID or
+nonzero-cut claims: rejected operations must not invoke common ABORT, alter the
+descriptor/group state, advance row sequence or rewrite the rejected journal.
+Authorized visibility is compared before/after rather than bypassing an
+unadmitted or fenced lane to inspect rows; the unrelated source write is ACKed
+before its positive read check. Negative-case journals are preserved separately
+inside their own fresh fixture, never substituted for pre-existing history.
+The phase-3 fixture already has common FINAL, so replay may legitimately finish
+it; only its conflicting abort is a negative case, not that valid FINAL replay.
+
+The converse is an actual same-ID native phase-1 source fence at cut zero, not
+an unfenced INTENT alongside a different retained phase-4 completion.
+[`zero_cut_case`](../../tests/test_ownership_lane_abort.c) in
+`test-ownership-lane-abort` journals INTENT0, establishes that real fence and
+verifies that its exact descriptor survives a clean store close/reopen while
+the journal still contains only INTENT0. SOURCE admission is runtime state:
+both SOURCE lanes are explicitly re-admitted with their authenticated peer
+before ownership replay. Replay rebinds INTENT0 to same-ID PREPARED0 and leaves
+it unresolved, without invoking common ABORT, discarding the fence or changing
+lane state or row sequence. Zero alone is not evidence of an unfenced intent.
+A valid SOURCE-scoped write and a low-authority abort are denied while the
+fence, lanes, row sequence, journal, topology and authority counters remain
+unchanged. An authenticated explicit abort obtains the exact common ABORT and
+releases the fence; retries
+and terminal replay recheck that decision idempotently without rewriting the
+terminal journal. Both groups' state and row sequence are preserved through
+abort; the unrelated group and both slots' topology owner/state/peer/epoch
+remain unchanged even after a classified source write is ACKed and read by the
+authorized principal. The low-clearance read remains denied. A distinct
+reservation then acquires a real cut-1 fence, refuses an overwrite, and preserves
+the classified row after exact common ABORT.
+
+The same target now also runs a separate witnessed process-death case. A fresh
+exec journals INTENT0 and returns from the real durable same-ID phase-1 fence,
+checks the native descriptor and INTENT-only journal, writes an exact
+`SOURCE_FENCED_PHASE1_INTENT0`/transfer-ID pipe witness, then receives SIGKILL
+before any destructor or PREPARED append. The parent requires exact bytes, EOF
+and direct SIGKILL; watchdog SIGALRM is failure. A second fresh exec opens the
+same stores without rerunning SOURCE creation helpers. Before native open it
+checks all three original lane-metadata/fence/journal file hashes and identities
+against fixture-owned same-build expectations, never used as restore inputs.
+Startup legitimately republishes lane metadata with SOURCE admission disarmed;
+after open the descriptor/journal remain exact, while decoded lane state differs
+only in runtime admission. Both SOURCE lanes are then explicitly reconciled from
+their persisted baseline evidence before the existing PREPARED0/no-auto-ABORT,
+fenced-write/low-abort denial, preservation, exact common ABORT release and
+classified cut-1 progress assertions run. New crash fixtures and witness records
+remain preserved. The original clean-reopen case remains exercised too.
+
+Main verified normal `test-ownership-lane-abort`, its fixture/ownership/KV-TU
+ASAN/fatal-UBSan/leak-detection target, and adjacent lane-transfer, staging
+discovery, ownership abort/transfer and range-authority targets passed. These
+are live-filesystem process-death checks with deterministic common-authority
+hooks, not persistent-authentication, live-consensus, power-loss or physical
+storage evidence. Full CT gates remain open; these focused results do not close
+the recovery or failure matrix.
+
+## Reservation-owned cancelled staging
+
+Receiver preparation now writes private `QCTLN005` metadata. Only allocation of
+an absent receiver, or reset of an empty non-admitted receiver bitmap, records
+staging provenance: transfer ID, reservation index and SHA-256 binding of the
+immutable reservation tuple plus lane identity, token, policy and bitmap, plus
+the preparation-time source cut and an explicit known flag. Exact reuse of an
+occupied unmarked receiver never acquires cleanup authority. `QCTLN002/003`
+remain readable and upgrade as unmarked; 004 provenance retains an unknown cut,
+not an inferred zero. Older binaries cannot read the new format. This is not an
+in-place deployment or downgrade procedure.
+
+An exact authenticated common ABORT may retire only matching temporary receiver
+membership. It checkpoints historical shared WAL, durably publishes an empty
+bitmap and invalid baseline, then removes the transfer descriptor. Rows, labels,
+identity, token and cursors remain intact. Uncertain metadata publication fences
+the handle until reopen; descriptor-removal failure retains retry evidence.
+FINAL membership, explicit prune, admission and promotion invalidate staging
+eligibility. Unmarked replicas, SOURCE contexts and differing occupied images
+are not made disposable by an ABORT.
+
+`test-ownership-lane-abort` reproduces the old `EBUSY` on disjoint reuse after a
+real nonempty import/ABORT/reopen. It now checks reuse, preserved classified
+source-target data, prepared-only native cancellation, missing/wrong proofs,
+stale token/generation/reservation isolation, and failures before metadata rename,
+after rename at parent fsync, and at descriptor unlink. Each fault is witnessed
+by fixture-only exact-path/inode-guarded interception and reopened before retry.
+Canonical 003 migration remains unmarked through exact prepare/import/ABORT.
+A real completed phase-4 receipt also survives later prepared-only cancellation,
+immediate retry and reopen byte-for-byte. Retired unowned rows remain excluded
+from public snapshots; identical native reimport proves their retention without
+bypassing that fence. `test-ownership-lane-abort-sanitize` instruments the fixture
+and its directly compiled ownership and KV translation units with ASAN/UBSAN
+(fatal undefined behavior) and leak detection against the rebuilt native library,
+not a wholly instrumented library.
+
+Ownership reconciliation now discovers marked pre-import candidates when no
+descriptor exists, or beside a retained completed phase-4 receipt. An additive
+Operator-only enumeration API supplies hints, never tokens or cleanup authority.
+For a known cut, reconciliation resolves the provisioned topology/QKP map, obtains
+the full common claim through the unchanged authority adapter, verifies an
+already committed ABORT, and obtains the current native capability for cleanup.
+It never creates a common ABORT. Unknown, RESERVED, FINALIZED, unavailable and
+cut-unknown marked candidates are preserved and defer readiness; unmarked
+receivers are not cleanup candidates. An earlier unresolved candidate does not
+hide later committed cancellations. The scheduler
+retries local pending/staged work every five one-second ticks even if the common
+commit index is unchanged, without unconditional idle authority sweeps.
+
+`test-ownership-staging-discovery` uses real KV prepare/close/reopen with nonzero
+cuts, the actual range-authority adapter and a deterministic typed common log.
+It discards transient claims/tokens before reopen, checks enumeration denial and
+cleared outputs, unknown/reserved/final preservation, unavailable authority,
+unchanged unrelated SOURCE/unmarked membership and labelled data, and repeated
+reopen. A valid canonical FINAL control and a valid ABORT for a different source
+cut are independently verified before testing preservation/rejection. Its 004
+compatibility exec keeps cuts unknown through upgrade; explicit native cleanup
+with a separately supplied exact common ABORT still works. A separate historical
+ABORT replay has neither old capability and preserves a newer SOURCE incarnation,
+its token, labelled row and newer routing epoch. Native no-op resolution does not
+require an unrelated new token; actual staged retirement still does.
+The retained-receipt wrapper test uses a deterministic authority fixture, not
+that real-adapter common log; neither is a live consensus cancellation drill.
+Unmarked historical cancellations remain conservative. These bounded local
+results are not independent-node, power-loss, storage-controller or full CT
+acceptance evidence.
 
 ## Promotion and certificate recovery
 
@@ -133,6 +264,41 @@ a KV writer token or an old-generation ACK path. A returned former owner can
 become the new successor through the existing verified authority claim; its
 stale persisted role must neither block that transition forever nor be reset
 from the original CLI map. Unrelated local groups remain usable.
+
+The daemon must keep scheduling an unfinished durable promotion even if common
+FINAL already cleared the local `promotion_pending` flag and a later routing
+refresh or FINALIZED append failed. SOURCE recovery selects the latest validated
+PREPARED/COMMITTED lane journal record, binding the local topology/QKP identity,
+exact generation/bitmap and recorded successor's explicit mapping/pin. Mutable
+successor health or return of the old owner does not discard this retry; the
+promotion resolver still verifies common authority and proof before acting.
+Missing, unreadable, malformed, foreign or mismatching records are not permission
+to start a new election. A FINALIZED record stops automatic retries.
+
+`make test-ct-group-failover-tick` exercises the actual daemon scheduler with real
+auth, topology, journal and promotion producer calls, using deterministic KV,
+common-authority and transport boundary doubles. The pre-fix scheduler fails
+after one injected post-FINAL routing-refresh failure; the fixed scheduler
+recovers the same ID with pending cleared and stale successor health, appends
+FINALIZED once, and leaves no-work/mismatched/unauthorized cases unchanged.
+A fixed-size, scheduler-owned discovery cache now retains only the globally
+unresolved promotion tuple permitted by the validated journal. It caches terminal
+absence as well as pending work, preventing idle SOURCE lanes from re-parsing
+history every second. Path, inode, size, ownership/mode/link metadata and
+nanosecond mtime/ctime changes invalidate it; a failed or observably changing
+replay drops every candidate and is retried. Live lane identity, principal,
+generation, bitmap and successor pin are still checked per tick, and the real
+producer still replays and verifies authority before acting. Metadata bracketing
+is not an atomic snapshot proof or permission to skip producer validation.
+
+The actual-tick test counts daemon replay calls: unchanged post-FINAL failures
+retry without another discovery scan, terminal histories stay idle, and valid
+append, equal-size inode replacement and same-size corruption (including
+preserved mtime) invalidate the cache. It also forces FINALIZED-append failure
+and verifies later recovery with pending already cleared. This is not a journal
+lifecycle, resource/scale gate or whole-daemon stack bound. Adjacent loopback
+`test-ct-multigroup-promotion` and `test-ct-group-admission-recovery` exercise the
+rebuilt local daemon; bounded passes are not the full CT recovery/failure matrix.
 
 Certificate logs can contain signed prepared/aborted attempts. Recovery pages
 are original signed envelopes, not assertions re-signed by a later node.
@@ -152,6 +318,32 @@ Historical journals/certificates cannot overwrite a newer committed map.
 existing KV page records: BE32 length, SHA-256 digest, exact envelope. An
 authenticated pinned observer can fetch authority metadata even if it is not
 the current data successor. The requested canonical QCP2 event bounds recovery.
+
+## Interrupted SOURCE ACK recovery
+
+SOURCE ACK metadata is durable before data-image sync and sidecar prefix GC.
+An observed promotion-drill restart left metadata ACK/durable 2 with a valid
+sidecar ACK 1/last 2 and matching WAL frame 2. The old startup path rejected that
+legal split before reaching post-WAL reconciliation.
+
+Only private recovery calls now permit a lagging sidecar ACK. They retain the
+sidecar's own ACK for exact duplicate verification and contiguous reconstruction;
+metadata ACK does not skip uncollected frames. Sidecar ACK ahead of metadata,
+wrong duplicates, identity mismatches and unavailable/gapped suffixes still fail.
+Normal append callers remain strict. Post-WAL reconciliation alone advances ACK
+and collects the prefix; recovery does not GC first to make space.
+
+`test-ct-lane-log` witnesses actual metadata-file and parent fsync followed by
+SIGKILL before data sync/sidecar GC. Fresh exec checks the native WAL/checked
+sidecar, reopens twice, verifies labelled rows and SOURCE re-admission fencing,
+and preserves the unrelated lane sidecar byte-for-byte. Additional private
+fixtures use valid checked headers or native-codec re-encoding: ACK-ahead,
+byte-different duplicate and a missing stream-position suffix are rejected;
+a complete WAL suffix reconstructs a shorter sidecar. Synthetic principals are
+bootstrapped afresh for these execs; this does not establish identity durability.
+The focused sanitizer target instruments the fixture and KV translation unit,
+not the entire library. These live-filesystem process-death and synthetic-corruption
+cases do not establish host/power-loss or full CT acceptance.
 
 ## WAL and retention
 

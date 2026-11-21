@@ -2816,9 +2816,11 @@ static qihse_sql_ast_t* parse_statement(const char* sql) {
                         qihse_sql_type_t* grown_casts = realloc(casts, next * sizeof(*casts));
                         if (!grown_casts) goto bad_insert_row;
                         casts = grown_casts;
+                        memset(casts + cap, 0, (next - cap) * sizeof(*casts));
                         int* grown_quoted = realloc(quoted, next * sizeof(*quoted));
                         if (!grown_quoted) goto bad_insert_row;
                         quoted = grown_quoted;
+                        memset(quoted + cap, 0, (next - cap) * sizeof(*quoted));
                         uint16_t* grown_parameters = realloc(parameters, next * sizeof(*parameters));
                         if (!grown_parameters) goto bad_insert_row;
                         parameters = grown_parameters;

@@ -75,6 +75,15 @@ uwp_sts_result_t qihse_uwp_sql_catalog_indexes(qihse_uwp_context_t* ctx,
 /* True only for a staged DDL-only SQL resource. Used by pgwire to reject
  * mixed statements with a truthful unsupported-feature SQLSTATE. */
 bool qihse_uwp_sql_txn_has_ddl(const qihse_txn_t* txn);
+/* Opt into durable coordinator participation for SQL DML. Register before
+ * qihse_txn_manager_recover(); enlist an already-staged SQL transaction before
+ * PREPARE. Registration advances a fresh coordinator beyond all decision
+ * receipts in this store, including receipts restored without their old journal.
+ * DDL and retry-key resources remain unsupported by this bridge. */
+int qihse_uwp_sql_txn_register_durable_participant(
+    qihse_txn_manager_t* manager, uint8_t engine_id);
+int qihse_uwp_sql_txn_enlist_durable(qihse_txn_manager_t* manager,
+    qihse_txn_t* txn, uint8_t engine_id);
 /* Bind an authenticated request identity to a transaction with staged SQL
  * writes before COMMIT. The resource copies all identity fields; status_out
  * and outcome remain caller-owned until the synchronous commit returns. */

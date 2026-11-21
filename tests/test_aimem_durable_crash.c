@@ -503,6 +503,88 @@ static void verify_scoped_durable_replay(const char* id, const char* receipt) {
     qihse_kv_store_destroy(store);
 }
 
+#define REBUILD_TEXT_A "W11-6 rebuild exact source row alpha"
+#define REBUILD_TEXT_B "W11-6 rebuild exact source row beta"
+
+bool qihse_aimem_test_failpoint(const char* name) {
+    const char* fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
+    if (!fail_at || !name) return false;
+    return strcmp(name, "suppress-audit") == 0 || strcmp(fail_at, name) == 0;
+}
+
+void qihse_aimem_test_rebuild_entry_hook(qihse_kv_store_t* store,
+                                         size_t entry_index) {
+    const char* fail_at = getenv("QIHSE_AIMEM_QH08_FAIL_AT");
+    if (entry_index == 0u && fail_at && strcmp(fail_at, "during-rebuild") == 0) {
+        if (!qihse_kv_sync_store(store)) _exit(102);
+        kill(getpid(), SIGKILL);
+    }
+}
+
+static qihse_ai_memory_scope_t rebuild_fixture_scope(void) {
+    qihse_ai_memory_scope_t scope = {0};
+    strcpy(scope.project, "w116-rebuild");
+    strcpy(scope.worktree, "tree");
+    strcpy(scope.workstream, "stream");
+    strcpy(scope.session, "restart");
+    return scope;
+}
+
+static void interrupt_index_rebuild(void) {
+    open_instance();
+    qihse_ai_memory_scope_t scope = rebuild_fixture_scope();
+    qihse_ai_memory_knowledge_version_t row = {0};
+    assert(qihse_ai_memory_knowledge_create(server, operator_user, &scope,
+        QIHSE_AIMEM_KNOWLEDGE_RULE, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+        REBUILD_TEXT_A, &row) == QIHSE_AIMEM_WRITE_NEW);
+    qihse_ai_memory_knowledge_free(&row);
+    memset(&row, 0, sizeof row);
+    assert(qihse_ai_memory_knowledge_create(server, operator_user, &scope,
+        QIHSE_AIMEM_KNOWLEDGE_RULE, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+        REBUILD_TEXT_B, &row) == QIHSE_AIMEM_WRITE_NEW);
+    qihse_ai_memory_knowledge_free(&row);
+    assert(setenv("QIHSE_AIMEM_QH08_FAIL_AT", "during-rebuild", 1) == 0);
+    (void)qihse_ai_memory_index_rebuild(server, operator_user, &scope);
+    _exit(101);
+}
+
+static void recover_and_verify_index_rebuild(void) {
+    open_instance();
+    qihse_ai_memory_scope_t scope = rebuild_fixture_scope();
+    assert(qihse_ai_memory_index_recover(server, operator_user, &scope));
+    assert(unsetenv("QIHSE_AIMEM_QH08_FAIL_AT") == 0);
+    assert(qihse_ai_memory_index_rebuild(server, operator_user, &scope));
+    qihse_ai_memory_health_t health = {0};
+    assert(qihse_ai_memory_health(server, operator_user, &scope, &health));
+    assert(health.ready && health.index_state == QIHSE_AIMEM_INDEX_READY);
+    assert(health.generation >= 2u && health.indexed_records == 2u);
+    assert(health.recovered_builds == 1u);
+
+    qihse_ai_memory_query_v1_t query = {0};
+    query.scope = scope;
+    query.current_only = true;
+    query.text = "W11-6 rebuild exact source row";
+    query.mode = QIHSE_AIMEM_MODE_BM25;
+    query.max_rows = 4u;
+    qihse_ai_memory_query_snapshot_t* snapshot =
+        qihse_ai_memory_query_begin(server, operator_user, &query);
+    assert(snapshot);
+    qihse_ai_memory_query_hit_t hits[4] = {0};
+    size_t count = qihse_ai_memory_query_next(snapshot, operator_user, hits, 4u);
+    assert(count == 2u);
+    bool saw_a = false, saw_b = false;
+    for (size_t i = 0; i < count; i++) {
+        saw_a |= hits[i].version.content && strcmp(hits[i].version.content, REBUILD_TEXT_A) == 0;
+        saw_b |= hits[i].version.content && strcmp(hits[i].version.content, REBUILD_TEXT_B) == 0;
+    }
+    assert(saw_a && saw_b);
+    qihse_ai_memory_query_hits_free(hits, count);
+    qihse_ai_memory_query_end(snapshot);
+    qihse_audit_flush();
+    qihse_resp_server_destroy(server);
+    qihse_kv_store_destroy(store);
+}
+
 static void expect_killed(pid_t pid) {
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
@@ -702,6 +784,22 @@ int main(void) {
     status = 0;
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    puts("PASS QH-00 crash/fence; QH-01 migration recovery; QH-02 event replay/fence; QH-03 handoff recovery");
+
+    /* W11.6: crash after the first candidate projection is durable, while the
+     * private generation remains BUILDING; restart must recover and rebuild. */
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) interrupt_index_rebuild();
+    expect_killed(pid);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        recover_and_verify_index_rebuild();
+        _exit(0);
+    }
+    status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    puts("PASS QH-00 crash/fence; QH-01 migration recovery; QH-02 event replay/fence; QH-03 handoff recovery; W11.6 interrupted index rebuild recovery");
     return 0;
 }

@@ -1,5 +1,7 @@
 /* #define _GNU_SOURCE handled by Makefile */
 #include "qihse_search.h"
+#include "qihse_search_internal.h"
+#include "qihse_amplification.h"
 #include "qihse_instr.h"
 #include <stdlib.h>
 #include <string.h>
@@ -69,117 +71,32 @@ void qihse_amplification_config_init_impl(
     qihse_amplification_config_t* config,
     size_t problem_size
 ) {
-    if (!config) return;
-
-    config->min_rounds = 1;
-    config->max_rounds = 0; /* 0 = auto */
-    config->convergence_threshold = 1e-6;
-    config->oracle_selectivity = 0.1; /* 10% selectivity */
-    config->adaptive_rounds = true;
-
-    if (config->adaptive_rounds) {
-        size_t estimated_solutions = problem_size / 1000;
-        if (estimated_solutions < 1) estimated_solutions = 1;
-
-        double sqrt_ratio = sqrt((double)problem_size / estimated_solutions);
-        config->fixed_rounds = (int)(M_PI / 4.0 * sqrt_ratio);
-
-        if (config->fixed_rounds < 1) config->fixed_rounds = 1;
-        if (config->fixed_rounds > 20) config->fixed_rounds = 20;
-    }
+    qihse_amplification_config_init(config, problem_size);
 }
 
 void qihse_apply_grover_diffusion(qihse_superposition_t* superposition) {
-    if (!superposition || superposition->num_states == 0) return;
-
-    double mean_real = 0.0;
-    double mean_imag = 0.0;
-    size_t total_elements = superposition->num_states * superposition->dims_per_state;
-
-    for (size_t i = 0; i < total_elements; i++) {
-        mean_real += superposition->real[i];
-        mean_imag += superposition->imag[i];
-    }
-    mean_real /= total_elements;
-    mean_imag /= total_elements;
-
-    for (size_t i = 0; i < total_elements; i++) {
-        superposition->real[i] = 2.0 * mean_real - superposition->real[i];
-        superposition->imag[i] = 2.0 * mean_imag - superposition->imag[i];
-    }
+    qihse_diffusion_operator(superposition);
 }
 
-void qihse_apply_oracle(
-    qihse_superposition_t* superposition,
-    const void* query,
-    qihse_data_type_t type,
-    double selectivity
-) {
-    (void)query;
-    (void)type;
-    for (size_t state = 0; state < superposition->num_states; state++) {
-        double total_amplitude = 0.0;
-        for (size_t dim = 0; dim < superposition->dims_per_state; dim++) {
-            size_t idx = state * superposition->dims_per_state + dim;
-            total_amplitude += sqrt(superposition->real[idx] * superposition->real[idx] +
-                                   superposition->imag[idx] * superposition->imag[idx]);
-        }
-        total_amplitude /= superposition->dims_per_state;
-
-        if (total_amplitude > selectivity) {
-            for (size_t dim = 0; dim < superposition->dims_per_state; dim++) {
-                size_t idx = state * superposition->dims_per_state + dim;
-                superposition->real[idx] *= -1.0;
-                superposition->imag[idx] *= -1.0;
-            }
-        }
-    }
+/* A raw scalar query does not identify marked states in a projected state.
+ * Use qihse_amplify with explicit target indices for state experiments. */
+void qihse_apply_oracle(qihse_superposition_t* superposition,
+                       const void* query, qihse_data_type_t type,
+                       double selectivity) {
+    (void)superposition; (void)query; (void)type; (void)selectivity;
+    errno = ENOTSUP;
 }
 
 void qihse_apply_diffusion(qihse_superposition_t* superposition) {
     qihse_apply_grover_diffusion(superposition);
 }
 
-int qihse_adaptive_amplify(
-    qihse_superposition_t* superposition,
-    const void* query,
-    qihse_data_type_t query_type,
-    const qihse_amplification_config_t* config
-) {
-    if (!superposition || !config) return -1;
-
-    int rounds_used = 0;
-    double prev_amplitude_sum = 0.0;
-    size_t total_elements = superposition->num_states * superposition->dims_per_state;
-
-    for (size_t i = 0; i < total_elements; i++) {
-        prev_amplitude_sum += sqrt(superposition->real[i] * superposition->real[i] +
-                                  superposition->imag[i] * superposition->imag[i]);
-    }
-
-    int max_rounds = config->max_rounds > 0 ? config->max_rounds :
-                     (config->adaptive_rounds ? config->fixed_rounds : 10);
-
-
-    for (int round = 0; round < max_rounds; round++) {
-        qihse_apply_oracle(superposition, query, query_type, config->oracle_selectivity);
-        qihse_apply_diffusion(superposition);
-
-        double current_amplitude_sum = 0.0;
-        for (size_t i = 0; i < total_elements; i++) {
-            current_amplitude_sum += sqrt(superposition->real[i] * superposition->real[i] +
-                                         superposition->imag[i] * superposition->imag[i]);
-        }
-
-        if (fabs(current_amplitude_sum - prev_amplitude_sum) < config->convergence_threshold) {
-            break;
-        }
-        prev_amplitude_sum = current_amplitude_sum;
-        rounds_used++;
-    }
-
-    superposition->global_phase += rounds_used * M_PI / max_rounds;
-    return rounds_used;
+int qihse_adaptive_amplify(qihse_superposition_t* superposition,
+                         const void* query, qihse_data_type_t query_type,
+                         const qihse_amplification_config_t* config) {
+    (void)superposition; (void)query; (void)query_type; (void)config;
+    errno = ENOTSUP;
+    return -ENOTSUP;
 }
 
 /* ============================================================================
@@ -204,75 +121,157 @@ void qihse_verify_config_init(
 }
 
 qihse_collapse_result_t qihse_dimensional_collapse_l2_norm(
-    const qihse_superposition_t* superposition
-) {
+    const qihse_superposition_t* superposition) {
     qihse_collapse_result_t result = {0};
-    size_t best_state = 0;
-    double max_norm = 0.0;
-
-    for (size_t state = 0; state < superposition->num_states; state++) {
-        double state_norm = 0.0;
-        for (size_t dim = 0; dim < superposition->dims_per_state; dim++) {
-            size_t idx = state * superposition->dims_per_state + dim;
-            state_norm += superposition->real[idx] * superposition->real[idx] +
-                         superposition->imag[idx] * superposition->imag[idx];
-        }
-        state_norm = sqrt(state_norm);
-        if (state_norm > max_norm) {
-            max_norm = state_norm;
-            best_state = state;
-        }
+    result.predicted_index = NOT_STISLA_NOT_FOUND;
+    if (!superposition || !superposition->real || !superposition->imag ||
+        !superposition->num_states || !superposition->dims_per_state ||
+        superposition->num_states > SIZE_MAX / superposition->dims_per_state) {
+        errno = EINVAL;
+        return result;
     }
-
-    result.predicted_index = best_state;
-    result.confidence = max_norm / superposition->dims_per_state;
+    size_t count = superposition->num_states * superposition->dims_per_state;
+    if (count > SIZE_MAX / sizeof(double)) {
+        errno = EOVERFLOW;
+        return result;
+    }
+    double scale = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!isfinite(superposition->real[i]) || !isfinite(superposition->imag[i])) {
+            errno = EDOM;
+            return result;
+        }
+        scale = fmax(scale, fmax(fabs(superposition->real[i]), fabs(superposition->imag[i])));
+    }
+    if (scale == 0.0) return result;
+    double total = 0.0, best = -1.0;
+    for (size_t state = 0; state < superposition->num_states; ++state) {
+        double norm = 0.0;
+        for (size_t dim = 0; dim < superposition->dims_per_state; ++dim) {
+            size_t idx = state * superposition->dims_per_state + dim;
+            double re = superposition->real[idx] / scale;
+            double im = superposition->imag[idx] / scale;
+            norm += re * re + im * im;
+        }
+        total += norm;
+        if (norm > best) { best = norm; result.predicted_index = state; }
+    }
+    result.confidence = total > 0.0 ? best / total : 0.0;
     return result;
 }
 
-not_stisla_result_t qihse_verify_result(
-    const void* data,
-    size_t n,
-    const void* query,
-    qihse_data_type_t type,
-    const qihse_collapse_result_t* collapse,
-    const qihse_verify_config_t* config
-) {
-    if (!data || !query || !collapse || !config) return NOT_STISLA_NOT_FOUND;
-
-    /* Optimistic early exit for extremely high confidence */
-    if (collapse->confidence > 0.95 && collapse->predicted_index < n) {
-        return collapse->predicted_index;
-    }
-
-    if (config->mode == QIHSE_VERIFY_NONE ||
-        (config->mode == QIHSE_VERIFY_FAST && collapse->confidence >= config->min_confidence)) {
-        if (type == QIHSE_TYPE_INT64) {
-            if (collapse->predicted_index < n && ((const int64_t*)data)[collapse->predicted_index] == *(const int64_t*)query) {
-                return collapse->predicted_index;
-            }
+static bool qihse_record_equals(const void* element, const void* query,
+                                qihse_data_type_t type,
+                                const qihse_type_descriptor_t* descriptor) {
+    if (descriptor->compare_fn) return descriptor->compare_fn(element, query) == 0;
+    switch (type) {
+        case QIHSE_TYPE_INT64: {
+            int64_t a, b;
+            memcpy(&a, element, sizeof(a)); memcpy(&b, query, sizeof(b));
+            return a == b;
         }
-    }
-
-    if (config->mode == QIHSE_VERIFY_WINDOW ||
-        (config->mode == QIHSE_VERIFY_FALLBACK && collapse->confidence >= config->min_confidence)) {
-        size_t start = (collapse->predicted_index > config->window_size / 2) ? collapse->predicted_index - config->window_size / 2 : 0;
-        size_t end = start + config->window_size;
-        if (end > n) end = n;
-
-        if (type == QIHSE_TYPE_INT64) {
-            const int64_t* arr = (const int64_t*)data;
-            const int64_t q = *(const int64_t*)query;
-            for (size_t i = start; i < end; i++) {
-                if (arr[i] == q) return i;
-            }
+        case QIHSE_TYPE_UINT64: {
+            uint64_t a, b;
+            memcpy(&a, element, sizeof(a)); memcpy(&b, query, sizeof(b));
+            return a == b;
         }
+        case QIHSE_TYPE_DOUBLE: {
+            double a, b;
+            memcpy(&a, element, sizeof(a)); memcpy(&b, query, sizeof(b));
+            return a == b; /* NaN is never equal; signed zero compares equal. */
+        }
+        case QIHSE_TYPE_STRING: {
+            size_t a = strnlen(element, descriptor->element_size);
+            size_t b = strnlen(query, descriptor->element_size);
+            return a < descriptor->element_size && a == b && memcmp(element, query, a) == 0;
+        }
+        case QIHSE_TYPE_BINARY:
+        case QIHSE_TYPE_STRUCT:
+            return memcmp(element, query, descriptor->element_size) == 0;
+        default:
+            return false;
+    }
+}
+
+static bool qihse_record_equals_counted(const void* element, const void* query,
+    qihse_data_type_t type, const qihse_type_descriptor_t* descriptor,
+    qihse_verification_work_t* work) {
+    if (work && work->comparisons != SIZE_MAX) ++work->comparisons;
+    return qihse_record_equals(element, query, type, descriptor);
+}
+
+not_stisla_result_t qihse_verify_result_with_work(
+    const void* data, size_t n, const void* query, qihse_data_type_t type,
+    const qihse_type_descriptor_t* descriptor,
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config,
+    qihse_verification_work_t* work) {
+    if (work) memset(work, 0, sizeof(*work));
+    if (!data || !query || !descriptor || !collapse || !config ||
+        !descriptor->element_size || type < QIHSE_TYPE_INT64 || type > QIHSE_TYPE_CUSTOM ||
+        config->mode < QIHSE_VERIFY_NONE || config->mode > QIHSE_VERIFY_EXACT ||
+        (type <= QIHSE_TYPE_DOUBLE && descriptor->element_size < sizeof(uint64_t)) ||
+        (type == QIHSE_TYPE_CUSTOM && !descriptor->compare_fn)) {
+        errno = EINVAL;
+        return NOT_STISLA_NOT_FOUND;
+    }
+    if (n > SIZE_MAX / descriptor->element_size) {
+        errno = EOVERFLOW;
+        return NOT_STISLA_NOT_FOUND;
+    }
+    const unsigned char* rows = data;
+    size_t width = descriptor->element_size;
+    size_t candidate = collapse->predicted_index;
+    if (candidate < n && qihse_record_equals_counted(rows + candidate * width,
+                                                   query, type, descriptor, work)) {
+        if (work) work->candidate_matched = true;
+        return candidate;
     }
 
-    if (config->mode == QIHSE_VERIFY_EXACT || config->mode == QIHSE_VERIFY_FALLBACK || config->fallback_to_classical) {
-        return collapse->predicted_index;
+    if ((config->mode == QIHSE_VERIFY_WINDOW || config->mode == QIHSE_VERIFY_FALLBACK) && candidate < n) {
+        size_t half = config->window_size / 2;
+        size_t start = candidate > half ? candidate - half : 0;
+        size_t length = config->window_size < n - start ? config->window_size : n - start;
+        if (work && length) work->scanned = true;
+        for (size_t i = start; i < start + length; ++i)
+            if (qihse_record_equals_counted(rows + i * width, query, type, descriptor, work)) return i;
     }
-
+    if (config->mode == QIHSE_VERIFY_EXACT || config->mode == QIHSE_VERIFY_FALLBACK ||
+        config->fallback_to_classical) {
+        /* This bounded scan is valid for unsorted records and every comparator.
+         * RFF collisions (including int64 -> double) cannot become false hits. */
+        if (work && n) work->scanned = true;
+        for (size_t i = 0; i < n; ++i)
+            if (qihse_record_equals_counted(rows + i * width, query, type, descriptor, work)) return i;
+    }
     return NOT_STISLA_NOT_FOUND;
+}
+
+not_stisla_result_t qihse_verify_result_with_descriptor(
+    const void* data, size_t n, const void* query, qihse_data_type_t type,
+    const qihse_type_descriptor_t* descriptor,
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config) {
+    return qihse_verify_result_with_work(data, n, query, type, descriptor,
+                                         collapse, config, NULL);
+}
+
+not_stisla_result_t qihse_verify_result(
+    const void* data, size_t n, const void* query, qihse_data_type_t type,
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config) {
+    qihse_type_descriptor_t descriptor = {0};
+    descriptor.type = type;
+    switch (type) {
+        case QIHSE_TYPE_INT64: descriptor.element_size = sizeof(int64_t); break;
+        case QIHSE_TYPE_UINT64: descriptor.element_size = sizeof(uint64_t); break;
+        case QIHSE_TYPE_DOUBLE: descriptor.element_size = sizeof(double); break;
+        default: errno = ENOTSUP; return NOT_STISLA_NOT_FOUND;
+    }
+    return qihse_verify_result_with_descriptor(data, n, query, type, &descriptor, collapse, config);
+}
+
+not_stisla_result_t qihse_verify_search_result(
+    const void* data, size_t n, const void* query, qihse_data_type_t type,
+    const qihse_collapse_result_t* collapse, const qihse_verify_config_t* config) {
+    return qihse_verify_result(data, n, query, type, collapse, config);
 }
 
 /* ============================================================================

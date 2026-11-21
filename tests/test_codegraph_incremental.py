@@ -272,13 +272,47 @@ class AdapterTests(unittest.TestCase):
             schema = conn.execute(
                 "SELECT name,sql FROM sqlite_master ORDER BY name"
             ).fetchall()
-        result = adapter.reclaim_source_database(self.database)
+        samples = []
+        native_lstat = Path.lstat
+        native_accounting = adapter.database_accounting
+
+        def observe_accounting(path):
+            samples.append({})
+            return native_accounting(path)
+
+        def observe_lstat(path, *args, **kwargs):
+            measured = samples[-1]
+            try:
+                info = native_lstat(path, *args, **kwargs)
+            except FileNotFoundError:
+                measured.pop(path, None)
+                raise
+            measured[path] = info
+            return info
+
+        with patch.object(adapter, "database_accounting", side_effect=observe_accounting), \
+             patch.object(Path, "lstat", autospec=True, side_effect=observe_lstat):
+            result = adapter.reclaim_source_database(self.database)
         self.assertEqual(result["status"], "reclaimed")
         self.assertGreater(result["before"]["free_pages"], 0)
         self.assertEqual(result["after"]["free_pages"], 0)
         self.assertLess(
-            result["after"]["allocated_bytes"], result["before"]["allocated_bytes"]
+            result["after"]["logical_bytes"], result["before"]["logical_bytes"]
         )
+        # Physical accounting can lag on ZFS; report the real sampled stat values,
+        # not an invented immediate reduction or a later, racy second sample.
+        self.assertEqual(len(samples), 2)
+        for phase, measured in zip(("before", "after"), samples):
+            for name, suffix in (("database", ""), ("wal", "-wal"), ("shared_memory", "-shm")):
+                info = measured.get(Path(str(self.database) + suffix))
+                self.assertEqual(result[phase]["files"][name], {
+                    "logical_bytes": info.st_size if info else 0,
+                    "allocated_bytes": info.st_blocks * 512 if info else 0,
+                })
+            for metric in ("logical_bytes", "allocated_bytes"):
+                self.assertEqual(result[phase][metric], sum(
+                    item[metric] for item in result[phase]["files"].values()
+                ))
         with closing(sqlite3.connect(self.database)) as conn, conn:
             self.assertEqual(
                 conn.execute("SELECT rowid,data FROM facts ORDER BY rowid").fetchall(),

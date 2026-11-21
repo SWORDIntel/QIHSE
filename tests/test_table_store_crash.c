@@ -249,6 +249,92 @@ static void verify_and_retry_idempotent(void) {
     _exit(0);
 }
 
+static void expect_killed(pid_t pid);
+
+static void prepare_then_kill(uint64_t txn_id, int row_id, const char* name) {
+    qihse_table_store_t* store = qihse_table_store_open_durable(crash_path);
+    if (!store) _exit(90);
+    qihse_table_t* table = qihse_table_store_find_table(store, "items");
+    qihse_table_t* audit = qihse_table_store_find_table(store, "audit");
+    qihse_table_txn_t* txn = table ? qihse_table_txn_begin(table) : NULL;
+    qihse_table_txn_t* audit_txn = audit ? qihse_table_txn_begin(audit) : NULL;
+    if (!txn || !audit_txn) _exit(91);
+    insert_row(txn, row_id, name);
+    char audit_name[64];
+    snprintf(audit_name, sizeof audit_name, "%s-audit", name);
+    insert_row(audit_txn, row_id + 100, audit_name);
+    qihse_table_txn_t* group[] = {txn, audit_txn};
+    if (!qihse_table_txn_prepare_group(group, 2, txn_id)) _exit(92);
+    kill(getpid(), SIGKILL);
+    _exit(100);
+}
+
+static void test_prepared_generation_recovery(void) {
+    const uint64_t commit_id = UINT64_C(0x101);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) prepare_then_kill(commit_id, 7, "prepared-commit");
+    expect_killed(pid);
+
+    qihse_table_store_t* store = qihse_table_store_open_durable(crash_path);
+    assert(store);
+    qihse_table_t* table = qihse_table_store_find_table(store, "items");
+    qihse_table_t* audit = qihse_table_store_find_table(store, "audit");
+    assert(table && audit && qihse_table_row_count(table) == 2 &&
+           qihse_table_row_count(audit) == 1);
+    qihse_table_txn_t* blocked = qihse_table_txn_begin(table);
+    assert(blocked);
+    insert_row(blocked, 8, "must-stay-fenced");
+    assert(!qihse_table_txn_commit(blocked));
+    assert(qihse_table_store_resolve_prepared(store, commit_id, true));
+    assert(qihse_table_row_count(table) == 3 && qihse_table_row_count(audit) == 2);
+    assert_row(table, 7, "prepared-commit");
+    assert_row(audit, 107, "prepared-commit-audit");
+    assert(qihse_table_store_resolve_prepared(store, commit_id, true));
+    blocked = qihse_table_txn_begin(table);
+    assert(blocked);
+    insert_row(blocked, 8, "duplicate-txn-id");
+    qihse_table_txn_t* duplicate[] = {blocked};
+    assert(!qihse_table_txn_prepare_group(duplicate, 1, commit_id));
+    qihse_table_store_destroy(store);
+
+    const uint64_t abort_id = UINT64_C(0x102);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) prepare_then_kill(abort_id, 9, "prepared-abort");
+    expect_killed(pid);
+
+    store = qihse_table_store_open_durable(crash_path);
+    assert(store);
+    table = qihse_table_store_find_table(store, "items");
+    audit = qihse_table_store_find_table(store, "audit");
+    assert(table && audit && qihse_table_row_count(table) == 3 &&
+           qihse_table_row_count(audit) == 2);
+    assert(qihse_table_store_resolve_prepared(store, abort_id, false));
+    assert(qihse_table_row_count(table) == 3 && qihse_table_row_count(audit) == 2);
+    assert(qihse_table_store_resolve_prepared(store, abort_id, false));
+    assert(!qihse_table_store_resolve_prepared(store, abort_id, true));
+    qihse_table_txn_t* reused = qihse_table_txn_begin(table);
+    assert(reused);
+    insert_row(reused, 11, "reused-abort-id");
+    qihse_table_txn_t* reused_group[] = {reused};
+    assert(!qihse_table_txn_prepare_group(reused_group, 1, abort_id));
+
+    qihse_table_txn_t* resumed = qihse_table_txn_begin(table);
+    assert(resumed);
+    insert_row(resumed, 10, "after-abort");
+    assert(qihse_table_txn_commit(resumed));
+    assert(qihse_table_row_count(table) == 4);
+    qihse_table_store_destroy(store);
+
+    char path[128];
+    for (uint64_t id = commit_id; id <= abort_id; ++id) {
+        assert(snprintf(path, sizeof path, "%s.decision.%016llx", crash_path,
+                        (unsigned long long)id) < (int)sizeof path);
+        assert(unlink(path) == 0);
+    }
+}
+
 static void expect_killed(pid_t pid) {
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
@@ -300,6 +386,8 @@ int main(void) {
     if (pid == 0) verify_and_retry_idempotent();
     expect_ok(pid);
 
+    test_prepared_generation_recovery();
+
     assert(unlink(crash_path) == 0);
     char lock_path[96];
     assert(snprintf(lock_path, sizeof lock_path, "%s.lock", crash_path) <
@@ -315,7 +403,8 @@ int main(void) {
         assert(rc == 0 || errno == ENOENT);
     }
     assert(rmdir(crash_dir) == 0);
-    puts("PASS durable table store ACK/SIGKILL: rows, receipts and group "
-         "atomicity survive kill; unacknowledged shadows leave no state");
+    puts("PASS durable table store ACK/SIGKILL and prepared 2PC recovery: "
+         "commit/abort decisions replay idempotently and unresolved shadows "
+         "remain unpublished and fenced");
     return 0;
 }

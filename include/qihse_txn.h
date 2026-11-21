@@ -65,6 +65,11 @@ typedef struct qihse_rw_entry_s {
  * resource; a coordinator for multiple resources belongs in durable 2PC. */
 typedef int  (*qihse_txn_resource_commit_fn)(void* resource_ctx);
 typedef void (*qihse_txn_resource_rollback_fn)(void* resource_ctx);
+/* Durable participant prepare may consume the transaction-local resource after
+ * persisting its prepared state. It must consume resource_ctx on success or
+ * failure; commit/abort replay then uses the participant's durable record. */
+typedef int (*qihse_txn_resource_prepare_fn)(void* engine_ctx, uint64_t txn_id,
+                                              void* resource_ctx);
 
 /* ── 2PC participant interface ──────────────────────────────────────────── */
 
@@ -102,17 +107,73 @@ typedef struct qihse_txn_s {
 
 /* ── Transaction manager (opaque) ───────────────────────────────────────── */
 
+/* A manager handle belongs to its creating process. Every API receiving a
+ * manager refuses inherited handles after fork, before locking, allocating or
+ * invoking callbacks: NULL/false/0/-1, or a void no-op, as for a NULL manager.
+ * Output parameters and transaction fields remain unchanged; inherited destroy
+ * does not run the parent's resource callbacks or close inherited descriptors.
+ * Transaction-only helpers cannot enforce this ownership rule.
+ *
+ * Children must exec/exit and discard inherited handles, not use or destroy
+ * them. Arrange a proper fresh-owner journal handoff: the inherited journal FD
+ * retains its flock until all copies close (O_CLOEXEC closes it on exec).
+ * Discarding a handle alone does not close that FD, so it does not permit a
+ * non-exec child to reopen the same journal while an old FD still exists. */
 typedef struct qihse_txn_manager qihse_txn_manager_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
 
-/* The manager has no durable 2PC decision journal. Callers must resolve all
- * COMMITTING/ABORTING transactions before destroying it or pending participant
- * work will require external recovery. Terminal handles are retained so their
- * state remains readable; call qihse_txn_release() promptly in long-lived
- * managers, or destruction releases all remaining handles. */
+/* The default manager uses no durable 2PC decision journal. Callers must
+ * resolve all COMMITTING/ABORTING transactions before destroying it or pending
+ * participant work will require external recovery. Terminal handles are
+ * retained so their state remains readable; call qihse_txn_release() promptly
+ * in long-lived managers, or destruction releases all remaining handles. */
 qihse_txn_manager_t* qihse_txn_manager_create(void);
+/* Opt-in durable 2PC coordinator. The journal path must name a private,
+ * owner-only regular file; opening the coordinator also syncs its parent
+ * directory before transaction admission. Register each participant engine_id
+ * exactly once, then call recover() before beginning transactions. Participant
+ * callbacks must durably deduplicate by txn_id and be safe to retry. */
+qihse_txn_manager_t* qihse_txn_manager_create_durable(const char* journal_path);
+int qihse_txn_manager_recover(qihse_txn_manager_t* mgr);
 void qihse_txn_manager_destroy(qihse_txn_manager_t* mgr);
+
+/* Local shared-backup support. Checkpoints compare only on the SAME retained
+ * live manager (never across close/reopen or fork). The private epoch covers
+ * membership, decisions, recovery, configuration and ID-floor changes, including
+ * unjournaled BEGIN/rollback ABA; it saturates and capture then fails closed.
+ * Only an active System Operator (role Operator, user 0, tenant 0) may capture.
+ * Volatile, unrecovered, poisoned, inherited, exhausted or non-idle managers
+ * are refused. Validation never repairs/truncates the journal.
+ *
+ * Export requires the starting checkpoint, validates before any output, copies
+ * immutable journal bytes, calls write_fn WITHOUT the manager lock, and checks
+ * the checkpoint, health and principal generation again afterwards. Callbacks
+ * may call manager APIs but must not destroy the manager or the user. A false
+ * return leaves *out unchanged: discard ALL callback bytes, even if complete.
+ * The caller must retain the handle/user and synchronize their destruction.
+ *
+ * Bytes are the portable CRC-protected replay journal, NOT an authenticated
+ * bundle or full one-phase/MVCC registry snapshot. Record next_txn_id in the
+ * authenticated manifest; restore that floor with advance_next_id BEFORE
+ * recover(), alongside matching participant receipts. Journal length alone
+ * cannot preserve unjournaled IDs. Obtain all sources' starting checkpoints
+ * before any export and revalidate all sources after all exports. */
+
+typedef struct qihse_user_s qihse_user_t;
+typedef struct qihse_txn_backup_checkpoint_s {
+    uint64_t epoch;
+    uint64_t next_txn_id;
+    uint64_t journal_bytes;
+} qihse_txn_backup_checkpoint_t;
+typedef bool (*qihse_txn_backup_write_fn)(void* ctx, const void* data, size_t len);
+
+bool qihse_txn_backup_checkpoint_user(qihse_txn_manager_t* mgr,
+    const qihse_user_t* user, qihse_txn_backup_checkpoint_t* out);
+bool qihse_txn_backup_export_user(qihse_txn_manager_t* mgr,
+    const qihse_user_t* user, const qihse_txn_backup_checkpoint_t* expected,
+    qihse_txn_backup_write_fn write_fn, void* ctx,
+    qihse_txn_backup_checkpoint_t* out);
 
 /* ── Transaction operations ─────────────────────────────────────────────── */
 
@@ -171,12 +232,28 @@ int qihse_txn_validate_occ(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 int qihse_txn_attach_resource(qihse_txn_t* txn, void* resource_ctx,
                               qihse_txn_resource_commit_fn commit_fn,
                               qihse_txn_resource_rollback_fn rollback_fn);
+/* Attach one resource to a registered durable participant. PREPARE routes the
+ * resource to that participant's resource_prepare callback, which must persist
+ * and consume it. Ordinary one-phase qihse_txn_commit refuses this binding. */
+int qihse_txn_attach_participant_resource(qihse_txn_manager_t* mgr,
+    qihse_txn_t* txn, uint8_t engine_id, void* resource_ctx,
+    qihse_txn_resource_rollback_fn rollback_fn);
+/* Move an existing one-phase transaction resource into a registered durable
+ * participant binding. On success the participant's resource PREPARE callback
+ * owns it; the original one-phase commit callback is not invoked. */
+int qihse_txn_enlist_attached_resource(qihse_txn_manager_t* mgr,
+    qihse_txn_t* txn, uint8_t engine_id);
 
 /* ── 2PC interface ──────────────────────────────────────────────────────── */
 
 /* Register a participant engine for 2PC. */
 int qihse_txn_register_participant(qihse_txn_manager_t* mgr,
                                    qihse_txn_participant_t participant);
+/* Register a participant whose prepare callback can persist a per-transaction
+ * resource. Keeps qihse_txn_participant_t layout stable. */
+int qihse_txn_register_resource_participant(qihse_txn_manager_t* mgr,
+    qihse_txn_participant_t participant,
+    qihse_txn_resource_prepare_fn resource_prepare);
 
 /* PREPARE phase: call prepare() on all registered participants.
  * Returns 0 if all participants prepared successfully, -1 otherwise. */
@@ -185,14 +262,15 @@ int qihse_txn_prepare(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 /* After PREPARE succeeds, COMMIT calls participants. If any callback fails,
  * returns -1 with txn->state == QIHSE_TXN_COMMITTING. The commit decision is
  * irrevocable; call this function again to retry only unfinished callbacks.
- * This pending decision is in-memory only and is not recovered after manager
- * process loss. Participants must deduplicate retries by txn_id. */
+ * Durable managers persist and replay the decision; volatile managers retain
+ * it only in memory. Participants must deduplicate retries by txn_id. */
 int qihse_txn_commit_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
 /* After PREPARE fails (or coordinator decides to abort), call abort(). A
  * failed abort leaves state ABORTING; retry this function until acknowledged.
- * Participants must durably deduplicate decisions by txn_id. The pending
- * decision is in memory only and is not recovered after manager process loss. */
+ * Durable managers persist the ABORT decision before callbacks and replay it
+ * during recovery; volatile managers retain pending work only in memory.
+ * Participants must durably deduplicate decisions by txn_id. */
 int qihse_txn_abort_prepared(qihse_txn_manager_t* mgr, qihse_txn_t* txn);
 
 /* ── Registry queries ───────────────────────────────────────────────────── */
@@ -241,3 +319,5 @@ void qihse_txn_register_aborted(qihse_txn_manager_t* mgr, uint64_t txn_id);
 /* Set the next transaction ID (used by crash recovery to continue
  * monotonic ID allocation after replay). */
 void qihse_txn_set_next_id(qihse_txn_manager_t* mgr, uint64_t next_id);
+/* Raise the next ID before recovery on a durable, idle coordinator. */
+int qihse_txn_advance_next_id(qihse_txn_manager_t* mgr, uint64_t next_id);

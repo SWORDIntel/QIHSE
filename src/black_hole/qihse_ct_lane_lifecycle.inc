@@ -154,6 +154,13 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
                                        : reserved_claim->source_generation;
     qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
     bool is_new = (lane == NULL);
+    if (transfer && store->lane_transfer && store->lane_transfer->active &&
+        store->lane_transfer->phase < 4u &&
+        !ct_lane_transfer_claim_same_reservation(&store->lane_transfer->claim, reserved_claim)) {
+        kv_store_unlock(store);
+        errno = EBUSY;
+        return false;
+    }
 
     /* Existing exact new tuple is idempotent and preserves baseline/cursors. */
     if (lane && lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
@@ -164,6 +171,14 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
         lane->tenant_id == 0u &&
         memcmp(lane->status.slot_bitmap, reserved_claim->slots,
                QIHSE_KV_CT_SLOT_BITMAP_BYTES) == 0) {
+        if (transfer && lane->staging_reserve_index) {
+            bool matches = false;
+            if (!ct_lane_transfer_staging_matches(lane, reserved_claim, &matches) || !matches) {
+                kv_store_unlock(store);
+                errno = EBUSY;
+                return false;
+            }
+        }
         memcpy(out_owner_token, lane->owner_token, QIHSE_KV_CT_TOKEN_BYTES);
         kv_store_unlock(store);
         return true;
@@ -175,11 +190,8 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
     bool occupied = false;
     if (lane) for (size_t i = 0; i < sizeof(lane->status.slot_bitmap); ++i)
         occupied |= lane->status.slot_bitmap[i] != 0;
-    if (transfer && ((lane && (lane->status.mode != QIHSE_KV_CT_LANE_RECEIVER ||
-                              lane->status.admitted || occupied)) ||
-        (store->lane_transfer && store->lane_transfer->active &&
-         store->lane_transfer->phase < 4u &&
-         strcmp(store->lane_transfer->claim.transfer_id, reserved_claim->transfer_id)))) {
+    if (transfer && lane &&
+        (lane->status.mode != QIHSE_KV_CT_LANE_RECEIVER || lane->status.admitted || occupied)) {
         kv_store_unlock(store);
         errno = EBUSY;
         return false;
@@ -261,6 +273,19 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
         return false;
     }
 
+    if (transfer) {
+        memcpy(lane->staging_transfer_id, reserved_claim->transfer_id,
+               sizeof(lane->staging_transfer_id));
+        lane->staging_reserve_index = reserved_claim->reserve_index;
+        lane->staging_source_cut = reserved_claim->source_cut;
+        lane->staging_source_cut_known = true;
+        if (!ct_lane_transfer_staging_digest(reserved_claim, lane, lane->staging_digest)) {
+            *lane = old;
+            kv_store_unlock(store);
+            errno = EIO;
+            return false;
+        }
+    }
     if (is_new) store->ct_lane_count++;
     store->ct_enabled = true;
     store->ct_system_principal = control_principal;
@@ -357,6 +382,7 @@ bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
     /* Persist reduced bitmap and digest; invalidate cached baseline and set
      * baseline_sealed=false without changing existing durable cursor. */
     qihse_kv_ct_lane_status_t old_status = lane->status;
+    uint64_t old_staging = lane->staging_reserve_index;
     memcpy(lane->status.slot_bitmap, subset_bitmap, QIHSE_KV_CT_SLOT_BITMAP_BYTES);
     if (!ct_lane_digest_bitmap(subset_bitmap, lane->status.slot_bitmap_digest)) {
         lane->status = old_status;
@@ -372,9 +398,11 @@ bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
         return false;
     }
 
+    lane->staging_reserve_index = 0u;
     bool ok = ct_lanes_state_write(store) && ct_lane_marker_write(store);
     if (!ok) {
         lane->status = old_status;
+        lane->staging_reserve_index = old_staging;
         store->recovery_pending = true;
         kv_store_unlock(store);
         errno = EIO;

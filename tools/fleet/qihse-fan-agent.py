@@ -5,26 +5,15 @@ QIHSE Fleet Fan Control & Thermal Telemetry Agent
 Runs on sovereign Dell PowerEdge nodes (T420, R730xd, T320) to:
   1. Collect real-time thermal and fan tachometer telemetry via ipmitool.
   2. Compute thermal_headroom_milli (0..1000) for CITADEL workload placement.
-  3. Publish observed telemetry to the QIHSE cluster over the RESP wire protocol.
+  3. Publish observed telemetry over QKP-sealed RESP to the QIHSE cluster.
   4. Observe leased desired profiles (bedroom, balanced, performance).
   5. Provide a single-shot fleet status CLI (`--fleet`).
 
-Client design (rewritten 2026-10-03, auth-storm fix):
-  * PERSISTENT connections. The old agent opened a fresh TCP connection per
-    command (3 per tick) and sent AUTH with the operator password on every
-    one, making each cluster node run a multi-second PBKDF2 verify ~36
-    times/minute, forever — one core pegged per node. This client connects
-    once per target node, authenticates once per connection lifetime, and
-    reuses the connection across ticks.
-  * MACHINEAUTH preferred. If a machine token is present (see
-    /etc/qihse/machine_token, minted by `qihse-machine-token`), the client
-    authenticates with it: PQC-signed, no password KDF on the server at all,
-    one token per connection (the server consumes the token nonce).
-  * Password fallback: QIHSE_OPERATOR_PASSWORD from the environment. There
-    is deliberately NO hardcoded default password in this file anymore.
-  * MOVED/ASK cluster redirects are followed transparently (bounded hops).
-
-Zero external Python dependencies (pure standard library).
+Each seed has a persistent native QKP-sealed RESP session, strictly pinned to
+its server identity. A distinct, non-admin fan identity authenticates with a
+one-use MACHINEAUTH bearer per connection. No password or plaintext fallback.
+MOVED/ASK redirects remain bounded to configured seeds. Requires libqihse.so
+and its runtime cryptographic dependencies, but no external Python packages.
 """
 
 import os
@@ -35,9 +24,12 @@ import subprocess
 import re
 import json
 import argparse
+import ctypes
+import hashlib
+import io
 
 # Cluster topology and defaults
-MACHINE_TOKEN_PATH = os.environ.get("QIHSE_MACHINE_TOKEN", "/etc/qihse/machine_token")
+MACHINE_TOKEN_PATH = os.environ.get("QIHSE_MACHINE_TOKEN")
 MACHINE_TENANT = int(os.environ.get("QIHSE_MACHINE_TENANT", "0"))
 MACHINE_USER_ID = int(os.environ.get("QIHSE_MACHINE_USER_ID", "0"))
 CLUSTER_SEEDS = [
@@ -90,16 +82,6 @@ def run_cmd(cmd: list[str], timeout=5):
         return ""
 
 
-def _encode_command(args):
-    lines = [f"*{len(args)}".encode()]
-    for a in args:
-        b = str(a).encode("utf-8")
-        lines.append(f"${len(b)}".encode())
-        lines.append(b)
-    lines.append(b"")
-    return b"\r\n".join(lines)
-
-
 def _read_reply(f, depth=0, budget=None):
     """Bounded RESP2 reply parser; no attacker-sized reads or recursive storms."""
     if budget is None:
@@ -148,177 +130,175 @@ def _remaining(deadline):
     return remaining
 
 
-class _DeadlineReader:
-    """Read bounded RESP frames without resetting the budget on trickle traffic."""
-
-    def __init__(self, sock, deadline):
-        self.sock = sock
-        self.deadline = deadline
-        self.buffer = bytearray()
-
-    def _recv(self, size):
-        self.sock.settimeout(_remaining(self.deadline))
-        data = self.sock.recv(size)
-        _remaining(self.deadline)
-        return data
-
-    def readline(self, limit):
-        while True:
-            _remaining(self.deadline)
-            end = self.buffer.find(b"\n", 0, limit)
-            if end >= 0 or len(self.buffer) >= limit:
-                size = end + 1 if end >= 0 else limit
-                data = bytes(self.buffer[:size])
-                del self.buffer[:size]
-                return data
-            data = self._recv(min(4096, limit - len(self.buffer)))
-            if not data:
-                data = bytes(self.buffer)
-                self.buffer.clear()
-                return data
-            self.buffer.extend(data)
-
-    def read(self, size):
-        data = bytearray(self.buffer[:size])
-        del self.buffer[:size]
-        while len(data) < size:
-            chunk = self._recv(min(65536, size - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-        _remaining(self.deadline)
-        return bytes(data)
-
-    def close(self):
-        self.buffer.clear()
+_QKP_LIB = None
+_USED_TOKEN_DIGESTS = set()
 
 
-def _resp_socket(host, port, timeout, deadline=None):
-    """Bounded TCP/TLS connection; endpoints are IPs, TLS identity is separate.
+class QihseCommandOutcomeUnknown(ConnectionError):
+    """Native transport failed after command submission; never retry on another seed."""
 
-    Literal addresses avoid unbounded system DNS resolution. Remote endpoints
-    still require a configured CA and verified TLS server name.
-    """
-    import ipaddress
-    import ssl
-    if deadline is None:
-        deadline = time.monotonic() + timeout
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError as exc:
-        raise ConnectionError("RESP endpoint must be a literal IP address") from exc
-    loopback = address.is_loopback
-    ca = os.environ.get("QIHSE_RESP_CA_FILE")
-    peer = os.environ.get("QIHSE_RESP_SERVER_NAME")
-    if not loopback and (not ca or not peer):
-        raise ConnectionError("remote RESP requires pinned CA and TLS server identity")
-    sock = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
-                         socket.SOCK_STREAM)
-    try:
-        sock.settimeout(_remaining(deadline))
-        sock.connect((host, port))
-        _remaining(deadline)
-        if not loopback:
-            tls = ssl.create_default_context(cafile=ca)
-            tls.minimum_version = ssl.TLSVersion.TLSv1_3
-            sock.settimeout(_remaining(deadline))
-            sock = tls.wrap_socket(sock, server_hostname=peer)
-        _remaining(deadline)
-        return sock
-    except Exception:
-        sock.close()
-        raise
+
+def _qkp_library():
+    global _QKP_LIB
+    if _QKP_LIB is None:
+        path = os.environ.get("QIHSE_FAN_QKP_LIB")
+        if not path:
+            raise ConnectionError("QIHSE_FAN_QKP_LIB is required")
+        try:
+            lib = ctypes.CDLL(path)
+            lib.qihse_qkp_admin_open.argtypes = [
+                ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_size_t]
+            lib.qihse_qkp_admin_open.restype = ctypes.c_int
+            if hasattr(lib, "qihse_qkp_admin_open_strict_peer"):
+                lib.qihse_qkp_admin_open_strict_peer.argtypes = [
+                    ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
+                    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                    ctypes.c_char_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.c_void_p, ctypes.c_size_t]
+                lib.qihse_qkp_admin_open_strict_peer.restype = ctypes.c_int
+            lib.qihse_qkp_admin_command.argtypes = [
+                ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p, ctypes.c_size_t]
+            lib.qihse_qkp_admin_command.restype = ctypes.c_int
+            lib.qihse_qkp_admin_close.argtypes = [ctypes.c_void_p]
+            lib.qihse_qkp_admin_close.restype = None
+            lib.qihse_qkp_admin_free.argtypes = [ctypes.c_void_p]
+            lib.qihse_qkp_admin_free.restype = None
+        except (OSError, AttributeError) as exc:
+            raise ConnectionError("QKP-native library unavailable or incompatible") from exc
+        _QKP_LIB = lib
+    return _QKP_LIB
 
 
 class QihseConnection:
-    """One authenticated, persistent RESP connection to one node."""
+    """One authenticated, persistent QKP-sealed RESP connection to one node."""
 
     def __init__(self, host, port, timeout=10):
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.sock = None
-        self.f = None
+        self.client = None
 
     def _open_and_auth(self, deadline=None):
         self.close()
         if deadline is None:
             deadline = time.monotonic() + self.timeout
-        s = _resp_socket(self.host, self.port, self.timeout, deadline)
-        self.sock = s
-        self.f = _DeadlineReader(s, deadline)
-
-        token = self._load_machine_token()
-        if token is not None:
-            kind, value = self._roundtrip(["MACHINEAUTH", token], deadline)
-            if kind == "ok" and value == "OK":
-                return
-            # A failed machine-token exchange must not downgrade to a password.
+        if MACHINE_TENANT <= 0 or MACHINE_USER_ID <= 0:
+            raise ConnectionError("positive QIHSE_MACHINE_TENANT and QIHSE_MACHINE_USER_ID required")
+        identity = os.environ.get("QIHSE_FAN_QKP_IDENTITY_DIR")
+        client_id = os.environ.get("QIHSE_FAN_QKP_CLIENT_NODE_ID")
+        seed = next((name for host, port, name in CLUSTER_SEEDS
+                     if (host, port) == (self.host, self.port)), None)
+        suffix = seed.upper().replace("-", "_") if seed else ""
+        peer_id = os.environ.get(f"QIHSE_FAN_QKP_SERVER_{suffix}_NODE_ID") if seed else None
+        pin = os.environ.get(f"QIHSE_FAN_QKP_SERVER_{suffix}_DSA_PUB") if seed else None
+        if not identity or not client_id or not client_id.startswith("fan-") or not peer_id or not pin or client_id == peer_id:
+            raise ConnectionError("distinct fan QKP identity and exact seed peer pin required")
+        lib = _qkp_library()
+        client = ctypes.c_void_p()
+        err = ctypes.create_string_buffer(256)
+        timeout_ms = max(1, int(_remaining(deadline) * 1000))
+        if hasattr(lib, "qihse_qkp_admin_open_strict_peer"):
+            rc = lib.qihse_qkp_admin_open_strict_peer(
+                self.host.encode(), self.port, client_id.encode(), identity.encode(),
+                pin.encode(), peer_id.encode(), pin.encode(),
+                timeout_ms, ctypes.byref(client), err, len(err))
+        else:
+            # Older deployments still verify the signed server H1 against this one
+            # exact public-key pin; only the additional signed node-label check is absent.
+            rc = lib.qihse_qkp_admin_open(
+                self.host.encode(), self.port, client_id.encode(), identity.encode(),
+                pin.encode(), timeout_ms, ctypes.byref(client), err, len(err))
+        if rc or not client.value:
+            raise ConnectionError("QKP pinned peer connection failed (library, key, pin or handshake)")
+        self.client = client
+        try:
+            # Every new connection needs a fresh nonce, including after an agent restart.
+            try:
+                refresh = subprocess.run(
+                    ["systemctl", "start", "qihse-machine-token-refresh.service"],
+                    capture_output=True, timeout=_remaining(deadline), check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ConnectionError("machine token refresh unavailable") from exc
+            if refresh.returncode != 0:
+                raise ConnectionError("machine token refresh failed")
+            token = self._load_machine_token()
+            digest = (self.host, self.port, hashlib.sha256(token.encode("ascii")).digest())
+            if digest in _USED_TOKEN_DIGESTS:
+                raise ConnectionError("MACHINEAUTH one-use token already attempted; refresh token before reconnect")
+            # Mark before sending: an ambiguous send must not replay the nonce.
+            _USED_TOKEN_DIGESTS.add(digest)
+            if self._roundtrip(["MACHINEAUTH", token], deadline) != ("ok", "OK"):
+                raise ConnectionError("MACHINEAUTH refused")
+        except Exception:
             self.close()
-            raise ConnectionError("MACHINEAUTH refused; password downgrade prohibited")
-
-        password = os.environ.get("QIHSE_OPERATOR_PASSWORD")
-        if not password:
-            raise ConnectionError(
-                f"no machine token usable at {MACHINE_TOKEN_PATH} and "
-                "QIHSE_OPERATOR_PASSWORD not set — cannot authenticate")
-        kind, value = self._roundtrip(["AUTH", password], deadline)
-        if (kind, value) != ("ok", "OK"):
-            raise ConnectionError("AUTH refused")
+            raise
 
     @staticmethod
     def _load_machine_token():
+        if not MACHINE_TOKEN_PATH:
+            raise ConnectionError("QIHSE_MACHINE_TOKEN path required")
         try:
             with open(MACHINE_TOKEN_PATH, "r", encoding="ascii") as tf:
-                token = tf.read(8193).strip()
-            if not token or len(token) > 8192:
+                token = tf.read(16385).strip()
+            if not token or len(token) > 16384:
                 raise ConnectionError("configured machine token is empty or oversized")
             return token
         except FileNotFoundError:
-            return None
+            raise ConnectionError("machine token required") from None
         except (OSError, UnicodeError) as exc:
             raise ConnectionError("configured machine token cannot be read") from exc
 
     def _roundtrip(self, args, deadline):
-        self.sock.settimeout(_remaining(deadline))
-        self.sock.sendall(_encode_command(args))
-        self.f.deadline = deadline
-        reply = _read_reply(self.f)
         _remaining(deadline)
-        return reply
+        encoded = [str(arg).encode("utf-8") for arg in args]
+        argv = (ctypes.c_char_p * len(encoded))(*encoded)
+        sizes = (ctypes.c_size_t * len(encoded))(*(len(arg) for arg in encoded))
+        reply = ctypes.c_void_p()
+        size = ctypes.c_size_t()
+        err = ctypes.create_string_buffer(256)
+        rc = _qkp_library().qihse_qkp_admin_command(
+            self.client, len(encoded), argv, sizes, ctypes.byref(reply),
+            ctypes.byref(size), err, len(err))
+        try:
+            if rc or not reply.value or size.value > 4 * 1024 * 1024:
+                raise QihseCommandOutcomeUnknown("QKP command outcome unknown or oversized reply; not retried")
+            data = ctypes.string_at(reply, size.value)
+        finally:
+            if reply.value:
+                _qkp_library().qihse_qkp_admin_free(reply)
+        stream = io.BytesIO(data)
+        try:
+            result = _read_reply(stream)
+            if stream.read(1):
+                raise ConnectionError("trailing RESP data")
+            _remaining(deadline)
+        except (ConnectionError, ValueError, UnicodeError, TimeoutError) as exc:
+            raise QihseCommandOutcomeUnknown("QKP command reply invalid or timed out; not retried") from exc
+        return result
 
     def command(self, args, deadline=None, asking=False):
-        """One total deadline covers reconnect, authentication and the command."""
+        """One total deadline covers opening and the command; never replay writes."""
         if deadline is None:
             deadline = time.monotonic() + self.timeout
-        for attempt in (0, 1):
-            try:
-                _remaining(deadline)
-                if self.sock is None:
-                    self._open_and_auth(deadline)
-                if asking and self._roundtrip(["ASKING"], deadline) != ("ok", "OK"):
-                    raise ConnectionError("ASKING refused")
-                return self._roundtrip(args, deadline)
-            except (OSError, ConnectionError, ValueError):
-                self.close()
-                if attempt == 1:
-                    raise
-                time.sleep(min(0.2, _remaining(deadline)))
-        raise ConnectionError("unreachable")
+        try:
+            if self.client is None:
+                self._open_and_auth(deadline)
+            if asking and self._roundtrip(["ASKING"], deadline) != ("ok", "OK"):
+                raise ConnectionError("ASKING refused")
+            return self._roundtrip(args, deadline)
+        except Exception:
+            self.close()
+            raise
 
     def close(self):
-        try:
-            if self.f:
-                self.f.close()
-        except OSError:
-            pass
-        try:
-            if self.sock:
-                self.sock.close()
-        except OSError:
-            pass
-        self.f = None
-        self.sock = None
+        if self.client is not None:
+            _qkp_library().qihse_qkp_admin_close(self.client)
+            self.client = None
 
 
 def _parse_redirect(err_text):
@@ -367,6 +347,9 @@ class QihsePool:
             _remaining(deadline)
             try:
                 kind, value = self._conn_for(host, port).command(args, deadline=deadline)
+            except QihseCommandOutcomeUnknown:
+                self._discard(host, port)
+                raise
             except (OSError, ConnectionError) as exc:
                 self._discard(host, port)
                 last_err = exc

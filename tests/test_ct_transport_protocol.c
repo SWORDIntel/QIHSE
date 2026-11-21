@@ -283,10 +283,11 @@ int main(int argc, char** argv) {
     assert(setenv("QIHSE_DATA_DIR", source_dir, 1) == 0);
     assert(setenv("QIHSE_FIPS_MODE", "disabled", 1) == 0);
     assert(qihse_pqc_init_providers() >= 0);
-    identity_t source_id, target_id, forged_id;
+    identity_t source_id, target_id, forged_id, admin_id;
     make_identity(&source_id, root, "source-identity");
     make_identity(&target_id, root, "target-identity");
     make_identity(&forged_id, root, "forged-identity");
+    make_identity(&admin_id, root, "admin-identity");
     assert(qihse_auth_init());
     assert(qihse_auth_bootstrap_operator(OP_PASSWORD));
     qihse_user_t* op = qihse_auth_authenticate_id(0, OP_PASSWORD);
@@ -351,11 +352,18 @@ int main(int argc, char** argv) {
     /* A dedicated pinned QKP administrator exercises normal Operator scope;
      * the existing replication peer remains data-plane-only. */
     qihse_resp_server_config_t local_cfg = cfg;
+    /* The pinned administrator is a distinct identity from the data-plane
+     * replication peer: qihse_qkp_session_is_admin_peer refuses an admin pin
+     * equal to the replication peer pin, so the admin peer cannot inherit the
+     * replication principal's key material. */
     local_cfg.pqc.admin_peer_node_id = "ct-backup-admin";
-    local_cfg.pqc.admin_peer_dsa_pub_path = target_id.pub;
+    local_cfg.pqc.admin_peer_dsa_pub_path = admin_id.pub;
+    const char* local_trusted[] = {target_id.pub, admin_id.pub};
+    local_cfg.pqc.trusted_pubs = local_trusted;
+    local_cfg.pqc.trusted_count = 2;
     qihse_resp_server_t* local_server = qihse_resp_server_create(&local_cfg);
     assert(local_server);
-    peer_t* backup_peer = open_peer(local_server, &target_id, &source_id,
+    peer_t* backup_peer = open_peer(local_server, &admin_id, &source_id,
                                     "ct-backup-admin", true);
     size_t reply_len = 0u;
     char* reply;

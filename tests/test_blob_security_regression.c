@@ -11,11 +11,13 @@
 #endif
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "qihse_auth.h"
 #include "qihse_blob.h"
@@ -27,9 +29,24 @@
 typedef struct {
     int seen;
     int foreign_seen;
+    int high_class_seen;
 } list_counter_t;
 
 typedef struct { uint64_t offset, length; } generated_blob_t;
+
+typedef struct {
+    qihse_blob_store_t* store;
+    qihse_user_t* user;
+    const uint8_t* delete_hash;
+    const uint8_t* pin_hash;
+    uint32_t expected_pins;
+    size_t entries;
+    size_t high_class_entries;
+    uint64_t bytes;
+    bool delete_attempted;
+    bool delete_blocked;
+    bool saw_pin_count;
+} snapshot_test_ctx_t;
 
 static int64_t generated_read(void* opaque, uint8_t* buffer, size_t capacity) {
     generated_blob_t* source = opaque;
@@ -47,7 +64,42 @@ static bool count_cb(const qihse_blob_info_t* info, void* opaque) {
     list_counter_t* c = opaque;
     c->seen++;
     if (info->tenant_id == 7 && info->tag != QIHSE_BLOB_TAG_COMMONS_SNAPSHOT) c->foreign_seen++;
+    if (info->classification >= 95) c->high_class_seen++;
     return true;
+}
+
+static bool abort_snapshot_entry_cb(const qihse_blob_info_t* info, uint32_t pin_count,
+                                    qihse_blob_read_fn read_fn, void* read_opaque,
+                                    void* opaque) {
+    (void)info;
+    (void)pin_count;
+    (void)read_fn;
+    (void)read_opaque;
+    ((snapshot_test_ctx_t*)opaque)->entries++;
+    return false;
+}
+
+static bool snapshot_entry_cb(const qihse_blob_info_t* info, uint32_t pin_count,
+                              qihse_blob_read_fn read_fn, void* read_opaque,
+                              void* opaque) {
+    snapshot_test_ctx_t* ctx = opaque;
+    ctx->entries++;
+    if (info->classification >= 95) ctx->high_class_entries++;
+    if (ctx->pin_hash &&
+        memcmp(info->hash, ctx->pin_hash, QIHSE_BLOB_HASH_BYTES) == 0)
+        ctx->saw_pin_count = (pin_count == ctx->expected_pins);
+    if (ctx->delete_hash &&
+        memcmp(info->hash, ctx->delete_hash, QIHSE_BLOB_HASH_BYTES) == 0) {
+        ctx->delete_attempted = true;
+        ctx->delete_blocked = !qihse_blob_delete_user(ctx->store, info->hash, ctx->user);
+    }
+    uint8_t buffer[4096];
+    for (;;) {
+        int64_t n = read_fn(read_opaque, buffer, sizeof(buffer));
+        if (n < 0) return false;
+        if (n == 0) return true;
+        ctx->bytes += (uint64_t)n;
+    }
 }
 
 int main(void) {
@@ -102,6 +154,30 @@ int main(void) {
                                       operator_user, pattern, sizeof(pattern), hash7b));
     assert(memcmp(hash7b, hash7, QIHSE_BLOB_HASH_BYTES) == 0);
 
+    /* Pin multiplicity is backup metadata; the boolean helper alone cannot
+     * preserve this state. Pin counts remain authorized to the owning tenant. */
+    uint32_t pin_count = UINT32_MAX;
+    assert(qihse_blob_pin_count_user(blobs, hash7, tenant7, &pin_count));
+    assert(pin_count == 0);
+    assert(qihse_blob_pin_user(blobs, hash7, tenant7));
+    assert(qihse_blob_pin_user(blobs, hash7, tenant7));
+    assert(qihse_blob_pin_count_user(blobs, hash7, tenant7, &pin_count));
+    assert(pin_count == 2);
+    qihse_blob_store_destroy(blobs);
+    blobs = qihse_blob_store_create(blob_dir);
+    assert(blobs != NULL);
+    assert(qihse_blob_pin_count_user(blobs, hash7, tenant7, &pin_count));
+    assert(pin_count == 2); /* Exact multiplicity survives store recovery. */
+    bool pinned = false;
+    assert(qihse_blob_is_pinned_user(blobs, hash7, tenant7, &pinned) && pinned);
+    pin_count = UINT32_MAX;
+    assert(!qihse_blob_pin_count_user(blobs, hash7, tenant8, &pin_count));
+    assert(pin_count == 0);
+    assert(qihse_blob_unpin_user(blobs, hash7, tenant7));
+    assert(qihse_blob_unpin_user(blobs, hash7, tenant7));
+    assert(qihse_blob_pin_count_user(blobs, hash7, tenant7, &pin_count));
+    assert(pin_count == 0);
+
     /* --- Negative: hash binding-clash (cross-tenant dedup claim) -------- */
     uint8_t clash[QIHSE_BLOB_HASH_BYTES];
     assert(!qihse_blob_put_buffer_user(blobs, 8, QIHSE_BLOB_TAG_PATTERN_BUNDLE, 91, 0,
@@ -136,7 +212,7 @@ int main(void) {
     assert(!qihse_blob_delete_user(blobs, hash7, tenant8));
     assert(!qihse_blob_ref_user(blobs, hash7, tenant8));
 
-    list_counter_t counts = { 0, 0 };
+    list_counter_t counts = { 0, 0, 0 };
     assert(qihse_blob_list_user(blobs, tenant8, count_cb, &counts));
     assert(counts.foreign_seen == 0); /* tenant 8 sees no tenant 7 blobs */
 
@@ -151,9 +227,65 @@ int main(void) {
     uint8_t hash_secret[QIHSE_BLOB_HASH_BYTES];
     assert(qihse_blob_put_buffer_user(blobs, 7, QIHSE_BLOB_TAG_SCRIPT_SET, 95, 0,
                                       operator_user, secret, sizeof(secret), hash_secret));
+    assert(qihse_blob_pin_user(blobs, hash7, tenant7));
+    snapshot_test_ctx_t denied_snapshot = { .store = blobs, .user = tenant7 };
+    assert(!qihse_blob_snapshot_all_user(blobs, tenant7, snapshot_entry_cb,
+                                         &denied_snapshot));
+    assert(denied_snapshot.entries == 0); /* Preflight denies before any bytes. */
+    snapshot_test_ctx_t full_snapshot = {
+        .store = blobs, .user = operator_user, .delete_hash = hash_secret,
+        .pin_hash = hash7, .expected_pins = 1,
+    };
+    assert(qihse_blob_snapshot_all_user(blobs, operator_user, snapshot_entry_cb,
+                                        &full_snapshot));
+    assert(full_snapshot.entries == 3 && full_snapshot.high_class_entries == 1);
+    assert(full_snapshot.bytes == sizeof(pattern) + sizeof(script) + sizeof(secret));
+    assert(full_snapshot.delete_attempted && full_snapshot.delete_blocked);
+    assert(full_snapshot.saw_pin_count);
+    assert(qihse_blob_unpin_user(blobs, hash7, tenant7));
+    assert(qihse_blob_verify_user(blobs, hash_secret, operator_user));
+    uint8_t temporary_blob[] = { 1, 3, 5, 7, 9 };
+    uint8_t temporary_hash[QIHSE_BLOB_HASH_BYTES];
+    assert(qihse_blob_put_buffer_user(blobs, 7, QIHSE_BLOB_TAG_SCRIPT_SET, 0, 0,
+        tenant7, temporary_blob, sizeof(temporary_blob), temporary_hash));
+    snapshot_test_ctx_t aborted_snapshot = { .store = blobs, .user = operator_user };
+    assert(!qihse_blob_snapshot_all_user(blobs, operator_user,
+        abort_snapshot_entry_cb, &aborted_snapshot));
+    assert(aborted_snapshot.entries == 1);
+
+    char temporary_hex[QIHSE_BLOB_HASH_HEX];
+    char temporary_path[640];
+    qihse_blob_hash_to_hex(temporary_hash, temporary_hex);
+    assert(snprintf(temporary_path, sizeof(temporary_path), "%s/objects/%.2s/%s",
+                    blob_dir, temporary_hex, temporary_hex + 2) > 0);
+    int temporary_fd = open(temporary_path, O_RDWR | O_CLOEXEC);
+    assert(temporary_fd >= 0);
+    uint8_t original_byte = 0;
+    assert(pread(temporary_fd, &original_byte, 1, 0) == 1);
+    uint8_t corrupted_byte = (uint8_t)(original_byte ^ 0xFFu);
+    assert(pwrite(temporary_fd, &corrupted_byte, 1, 0) == 1);
+    assert(close(temporary_fd) == 0);
+    snapshot_test_ctx_t corrupt_snapshot = { .store = blobs, .user = operator_user };
+    assert(!qihse_blob_snapshot_all_user(blobs, operator_user,
+        snapshot_entry_cb, &corrupt_snapshot));
+    temporary_fd = open(temporary_path, O_WRONLY | O_CLOEXEC);
+    assert(temporary_fd >= 0);
+    assert(pwrite(temporary_fd, &original_byte, 1, 0) == 1);
+    assert(fsync(temporary_fd) == 0);
+    assert(close(temporary_fd) == 0);
+    assert(qihse_blob_verify_user(blobs, temporary_hash, operator_user));
+    assert(qihse_blob_delete_user(blobs, temporary_hash, tenant7));
     memset(out, 0, sizeof(out));
     assert(!qihse_blob_get_user(blobs, hash_secret, 0, out, sizeof(out), &nread, tenant7));
     for (size_t i = 0; i < sizeof(out); i++) assert(out[i] == 0);
+    /* Listing succeeds but omits entries above the caller's clearance; it is
+     * not a completeness signal suitable for a full-store backup. */
+    counts = (list_counter_t){ 0, 0, 0 };
+    assert(qihse_blob_list_user(blobs, tenant7, count_cb, &counts));
+    assert(counts.high_class_seen == 0);
+    counts = (list_counter_t){ 0, 0, 0 };
+    assert(qihse_blob_list_user(blobs, operator_user, count_cb, &counts));
+    assert(counts.high_class_seen >= 1);
 
     /* --- Commons: readable by all authenticated tenants ------------------ */
     uint8_t commons[1024];

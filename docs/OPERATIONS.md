@@ -33,6 +33,59 @@ command has not been exercised on a live daemon in this update.
 
 ---
 
+## Legacy CT1 pending-tail restart
+
+A primary cold restart may open its still-fenced listener when its pinned
+successor proves the same generation and sealed baseline, its cursor lies
+between the source ACK and durable tail, and native history reads validate the
+entire missing tail. This permits replay, not data admission: ordinary reads and
+writes remain fenced until actual successor catch-up and authenticated
+reconciliation. An unsealed, foreign, below-ACK or ahead-of-source successor is
+not a substitute. Preserve both native directories and pending operations; do
+not reset cursors or change generation to recover a binary upgrade.
+
+In legacy `REPL.CT1 STATUS`, the field after durable position is **oldest LSN**
+(`ACK + 1`), not the next allocation counter. A zero-filled `TARGET STATUS`
+with policy zero can mean native receiver status is unavailable (including a
+recovery fence); it does not establish that persisted receiver state was reset.
+
+An expired, non-tombstone row can remain in a checkpointed SST and its
+retained CT WAL. Cold replay must compare the authenticated physical value
+bytes for an equal-sequence frame, not infer mismatch because ordinary GET
+logically hides expired values. This repair changes neither the stored format
+nor read visibility; a conflicting equal-sequence frame still fails closed.
+
+Legacy CT1 receivers and not-yet-admitted sources also defer physical expiry
+tombstones without poisoning recovery state. Expired values remain logically
+absent; only the admitted source may durably publish and replicate an expiry.
+A cold reopen replays the existing log; never discard an expired retained row
+or reset CT metadata to clear a recovery fence.
+
+Legacy CT1 successor compaction retains the latest physical tombstone or
+expired row for each key while that receiver generation is bound. Otherwise a
+later-position, lower-version SET could pass the live receiver guard after the
+dead SST record is pruned, even though the same SET was rejected before
+compaction. Older overwritten SST copies still compact; retaining the newest
+dead state uses storage until the receiver generation is retired. The
+compaction/reopen negative cases run with `make test-ct-storage` and
+`make test-ct-storage-crash`. This prevents future pruning, not recovery of an
+already-pruned tombstone or acceptance of an existing conflicting group.
+
+Before a source retires fully ACKed CT1 WAL frames, it durably publishes its
+mutation-sequence floor using the existing `restore-highwater.bin` format.
+Otherwise compaction can later prune the highest-sequence tombstone and a cold
+reopen could allocate an older row sequence. A failed floor publication keeps
+the retained WAL available for an exact ACK retry. This protects future ACK
+retirement; it does not reconstruct a predecessor's already-pruned history or
+resolve an existing conflicting pending group. The focused restart/compaction
+regression runs with `make test-ct-storage test-ct-storage-crash`.
+
+No stored-data format migration or public API change is required. Rebuild with
+`make lib cluster-daemon`, stage a new immutable runtime, and restart the selected
+successor and then primary with their retained configuration and pinned peer.
+Validate with `make test-ct-legacy-expiry` and
+`python3 tests/test_ct_transfer.py Ct1RealDaemonTests.test_reopens_primary_with_exact_retained_unacked_successor_tail -v`.
+
 ## Delivery and local service gates
 
 The installer refuses a prefix resolving to its own source checkout. Build and
@@ -77,7 +130,7 @@ and mode 0600. Never print the token to establish service health.
 | Demo default | if `QIHSE_OPERATOR_PASSWORD` is unset, `./qihse demo` uses `qihse-demo-operator` | demo only, per-process (auth state is in-memory) |
 | RESP wire auth | `AUTH GODMODE_OP <password>` (or `AUTH <password>`); `PING` answers pre-auth | redis-server, cluster-daemon |
 | `--password` flag | bootstraps the credential when none is configured; must MATCH `QIHSE_OPERATOR_PASSWORD` when that env is set — mismatch exits 2 (enforced in `tools/qihse_redis_server.c`: the server refuses rather than silently rotating the credential) | `qihse-redis-server --require-auth` |
-| Auth is in-memory | restarting a process resets credentials to env/flag state; no password persists on disk (decision record: [auth_persistence.md](architecture/auth_persistence.md)) | all tools |
+| Legacy auth is in-memory | Without explicit durable-authority configuration, restarting resets credentials to env/flag state. Opt-in standalone durable authority has separate provision/recover gates; the cluster daemon refuses consensus auth mode and standalone authority with consensus enabled rather than falling back. See [auth_persistence.md](architecture/auth_persistence.md); a volatile-auth fixture is not persistent-auth acceptance. | distinguish the actual configured daemon mode |
 
 Expect multi-second delays on any authentication path — the CNSA 2.0 KDF is
 deliberately expensive. This is normal. (Repeated authentications leverage the
@@ -282,6 +335,49 @@ These are required gates, not evidence that any current host passed them.
 No live hashes, leadership, rollout, backup recovery or credential changes were
 verified/performed in this documentation update.
 
+#### Native CT and snapshot compatibility
+
+Record the source and candidate readers/writers for every persisted format before
+activation, not just their exported symbols. Opening older lane state can itself
+rewrite it as `QCTLN005`; old readers cannot consume that format. The 002/003
+readers migrate unmarked staging, while the 004/read-v4 compatibility path retains
+an **unknown** preparation cut. Never guess zero, a row sequence, a slot epoch or
+a current stream position for that cut. Preserve cut-unknown staging and defer
+readiness; automated discovery must not invent a common ABORT. Cleanup requires
+the exact authenticated common decision and native capability. Preserve journals,
+fences, retained group logs, baselines and certificate history, including terminal
+receipts; do not delete or relabel them to make a restart succeed. See the
+[range-group contract](plans/ct_range_group_contract.md#reservation-owned-cancelled-staging).
+
+In configured group/common-consensus mode, common authority must initialize and
+ownership replay must succeed before the daemon releases its startup control-only
+hold. Legacy CT1 pairs do not require enabling consensus as part of a binary
+upgrade; preserve their exact role, pinned peer and generation configuration and
+prove cold-reopen/reconciliation separately. An open listener is not data
+readiness. SOURCE admission is disarmed on reopen and must be reconciled against
+authenticated baseline/peer evidence, not restored from an old CLI ownership map.
+Verified unresolved group fences can remain range-local while unrelated groups
+serve; do not override them. The separate `--failover-start-paused` ownership hold
+is not an all-writer fence; use the maintenance/ingress controls in §3.2 when
+cutover requires them. Preserve existing holds until their own authenticated
+release gates pass.
+
+For explicitly enlisted SQL/blob durable 2PC, preserve the coordinator journal,
+participant PREPARE state and terminal receipts together. COMMITTING/ABORTING or
+a returned I/O error is not permission to choose another outcome. Recover the
+same durable decision with stable participant IDs before new transactions or
+shared backup; never turn an uncertain COMMIT into ABORT. Pending/poisoned stores
+remain fenced. Ordinary UWP COMMIT is still one-phase, not automatic cross-engine
+enlistment. See [transactions/MVCC](architecture/transactions_mvcc.md) and the
+[shared restore procedure](deployment/README.md#backup-and-recovery).
+
+The local upgraded fixture passed same-state cold restart and native
+read/write/CT checks, but used synthetic volatile authentication. It does not
+establish production persistent-auth recovery, independent physical-node or
+power-loss durability, or full W11 acceptance. CI status is not a veto or a
+substitute for real native local/live evidence; record actual failures and limits
+and use the per-unit recovery, format and application gates above.
+
 ## 2. Test
 
 ### 2.1 The aggregate
@@ -361,6 +457,20 @@ PYTHONPATH=python LD_LIBRARY_PATH=. python3 -m unittest discover -s python/tests
 # Rust controller SDK (pure-std, mock-controller tests):
 cd rust/qihse-rs && LD_LIBRARY_PATH=../.. cargo test --offline
 ```
+
+The Python controller E2E tests compile
+`python/tests/controller_sdk_fixture.c` against the canonical
+`qihse_resp_wire.h` configuration and link the checkout's `libqihse.so`.
+The server runs in an isolated child process on loopback; Python passes
+opaque handles instead of maintaining a second copy of the C configuration
+layout. Run `make lib` after changing native headers. Missing compiler or
+library prerequisites skip the E2E class; helper compilation and server
+startup errors fail it. The authenticated operator and denied guest and
+unauthenticated cases all use the real server.
+
+On 2026-11-15, the controller target passed all 61 tests with no skips:
+57 unit/mock cases and all four native E2E cases. The E2E run includes both
+denied-access checks; the earlier skipped-class result in §2.2 is historical.
 
 The Rust run was verified on this branch: 22 controller integration tests
 pass (plus the lib unit tests). The FFI side of `rust/qihse-rs` links
@@ -722,19 +832,29 @@ See [Admin CLI and SDK](ADMIN_CLI.md) for persistent sessions, explicit user
 AUTH inside QKP, binary stdin, structured replies, and generic AIMEM/data/admin
 commands. These options never downgrade the transport or bypass user clearance.
 
-For a native rolling update, build with `./scripts/build-native.sh --auto`, then
-build the daemon and admin CLI targets in the same checkout. Verify the pinned
-commit and run `make test-admin-protocol test-sqlite-vfs` followed by the actual
-`./test-sqlite-vfs` executable. `make test-admin-cli` additionally needs the
-standalone server binary and ONNX development headers; a cluster-only build
-host may not have these, so run that isolated integration suite on a host with
-ONNX installed before the rollout. The native rolling script's node entries
-have fixed source/build paths. If a host has a source export without Git
-metadata, do not pull into it: create a separate checkout at the verified
-commit and deploy its native outputs with timestamped binary/library backups.
-Restart one non-seed node at a time; after each restart verify pinned QKP PING,
-3/3 cluster members and full 0–16383 coverage from `CLUSTER SLOTS` before
-advancing. Check replica units and retain the backups for rollback.
+For a native rolling update, use [§1.6](#16-staged-installation-and-upgrade-gates),
+including its CT/format gates, and the actual installed unit/dependency inventory.
+The old rolling bringup procedure is superseded, not an execution runbook. The
+generic `scripts/cluster_rolling_restart.sh` is not a validated activation plan
+for the six recovery units or versioned packages; do not assume that its node
+file, restart order or PING/member checks cover them.
+
+For the documented six-daemon legacy layout, distinguish the three successors
+from the three owners and inventory the metadata quorum separately. Preserve
+unit arguments, data paths, identities, pins, generations and existing fences.
+Only with tested mixed-version wire/disk compatibility and current authority
+health, restart one verified successor at a time, then one owner at a time,
+preserving quorum and handling any current consensus leader through the tested
+leadership procedure. A daemon can own one group and receive another: do not
+apply this legacy ordering blindly to `--ct-group` deployments. After each unit,
+verify mapped daemon/library hashes, authenticated ownership and full slot map,
+baseline identity/digest/seal, durable/ACK/receiver cursor progress, recovery
+fences, and application reads/writes before advancing. If compatibility cannot
+be proved, stop the rolling plan and design a fenced coordinated cutover; do
+not experiment on live data. Rollback uses the matching pre-upgrade runtime and
+restored pre-upgrade generation, never old code on newly rewritten state.
+See [native deployment evidence](validation/cluster_range_groups_20261110.md);
+its dated rollout is not acceptance of the current candidate.
 
 #### Slot Migration Durability (COPY → PERSIST → SWITCH → GC)
 

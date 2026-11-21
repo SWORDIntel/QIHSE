@@ -12,6 +12,8 @@
 #ifndef QIHSE_VERIFICATION_H
 #define QIHSE_VERIFICATION_H
 
+#include "../include/qihse_math_types.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include "qihse_rff.h"
@@ -28,14 +30,7 @@ extern "C" {
 /**
  * Verification modes for different accuracy/performance trade-offs.
  */
-typedef enum qihse_verification_mode_e {
-    QIHSE_VERIFY_NONE = 0,      /* No verification - maximum performance */
-    QIHSE_VERIFY_FAST = 1,      /* Fast verification with consistency checks */
-    QIHSE_VERIFY_WINDOW = 2,    /* Window-based verification with rolling checks */
-    QIHSE_VERIFY_FALLBACK = 3,  /* Fallback verification with retry logic */
-    QIHSE_VERIFY_EXACT = 4,     /* Exact verification - maximum accuracy */
-    QIHSE_VERIFY_PRECISION = 5  /* NEW: Precision search mode (90%+ required) */
-} qihse_verification_mode_t;
+/* Defined in the shared installed math-types header. */
 
 /* ============================================================================
  * VERIFICATION CONFIGURATION
@@ -44,16 +39,7 @@ typedef enum qihse_verification_mode_e {
 /**
  * Verification configuration structure.
  */
-typedef struct qihse_verification_config_s {
-    qihse_verification_mode_t mode;      /* Verification mode */
-    double confidence_threshold;         /* Minimum confidence required (0.0-1.0) */
-    size_t max_retries;                  /* Maximum verification retries */
-    double tolerance;                    /* Numerical tolerance for comparisons */
-    int enable_fallback;                 /* Enable fallback to higher verification */
-    double performance_budget;           /* Performance budget for verification (%) */
-    size_t window_size;                  /* Window size for rolling verification */
-    int adaptive_verification;           /* Enable adaptive verification level */
-} qihse_verification_config_t;
+/* Defined in the shared installed math-types header. */
 
 /**
  * Initialize verification config with defaults for given mode.
@@ -73,16 +59,7 @@ void qihse_verification_config_init(
 /**
  * Verification result structure.
  */
-typedef struct qihse_verification_result_s {
-    int is_valid;               /* 1 if verification passed, 0 if failed */
-    double confidence;          /* Confidence score (0.0-1.0) */
-    double accuracy;            /* Measured accuracy (0.0-1.0) */
-    size_t verification_time_us; /* Time spent on verification */
-    size_t retries_used;        /* Number of retries performed */
-    qihse_verification_mode_t mode_used; /* Verification mode actually used */
-    char* error_message;        /* Error message if verification failed */
-    void* detailed_metrics;     /* Backend-specific metrics */
-} qihse_verification_result_t;
+/* Defined in the shared installed math-types header. */
 
 /**
  * Initialize verification result.
@@ -98,12 +75,25 @@ void qihse_verification_result_init(qihse_verification_result_t* result);
  */
 void qihse_verification_result_destroy(qihse_verification_result_t* result);
 
+
+/* Sized APIs consume exactly data_size float elements. EXACT checks equality;
+ * PRECISION checks every element against absolute config->tolerance. Other
+ * modes report bounded cosine similarity, not a calibrated probability. */
+int qihse_verify_result_advanced_sized(const void* query, const float* result,
+                                      const float* ground_truth, size_t data_size,
+                                      const qihse_verification_config_t* config,
+                                      qihse_verification_result_t* verification_result);
+int qihse_verify_batch_sized(const void* const* queries, const float* const* results,
+                            const float* const* ground_truths, const size_t* data_sizes,
+                            size_t batch_size, const qihse_verification_config_t* config,
+                            qihse_verification_result_t* verification_results);
+
 /* ============================================================================
  * VERIFICATION OPERATIONS
  * ============================================================================ */
 
 /**
- * Verify search result accuracy.
+ * Legacy unsized API: returns -1 with errno=ENOTSUP. Use the sized API.
  *
  * Performs verification according to the configured mode.
  *
@@ -123,7 +113,7 @@ int qihse_verify_result_advanced(
 );
 
 /**
- * Verify batch of search results.
+ * Legacy unsized batch API: returns -1 with errno=ENOTSUP. Use the sized API.
  *
  * @param queries Array of query data
  * @param results Array of search results

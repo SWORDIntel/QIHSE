@@ -201,6 +201,23 @@ bool qihse_qkp_send_sealed(qihse_qkp_session_t* s, int fd, const void* data, siz
 ssize_t qihse_qkp_recv_sealed(qihse_qkp_session_t* s, int fd,
                               uint8_t* out, size_t cap);
 
+/* Receive one sealed frame like qihse_qkp_recv_sealed, but bind every byte
+ * of the frame — header, body, and any fragmented or already-queued parts —
+ * to kernel-recorded AF_UNIX writer credentials: the receiving socket must
+ * have SO_PASSCRED enabled, and every read fragment must carry
+ * SCM_CREDENTIALS whose uid equals expected_uid. The kernel captures the
+ * writer's credentials at write time, never merges fragments from different
+ * writers into one read, and validates any sender-supplied SCM_CREDENTIALS
+ * against the sender's own ids, so a process of another UID holding a live
+ * socket received via SCM_RIGHTS cannot be attributed to the original
+ * connector. Absent, truncated, control-truncated, inconsistent or
+ * non-matching credentials fail closed exactly like a crypto failure.
+ * Returns plaintext length, -1 on transport error, -2 on crypto or
+ * credential failure (caller closes either way). */
+ssize_t qihse_qkp_recv_sealed_uid_checked(qihse_qkp_session_t* s, int fd,
+                                          uid_t expected_uid,
+                                          uint8_t* out, size_t cap);
+
 void qihse_qkp_session_free(qihse_qkp_session_t* s);
 
 /* True only for a server-side session whose signed client label and exact
@@ -208,6 +225,20 @@ void qihse_qkp_session_free(qihse_qkp_session_t* s);
 bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
                                            const char* expected_node_id,
                                            const char* expected_dsa_pub_path);
+
+/* Identity evidence for a live server-side admin QKP session, not an
+ * authorization decision. Shared signing keys with array-registered
+ * replication peers (`peers`) or migration peers fail closed even under
+ * another label. The single primary replication pin
+ * (`replication_peer_node_id`/`replication_peer_dsa_pub_path`) is
+ * label-scoped and may share the admin signer: the negotiated session binds
+ * the signed label to exactly one pin identity, and a session matching the
+ * replication pin is refused here before any key comparison.
+ * The caller must independently enforce the command's Operator policy. */
+bool qihse_qkp_session_is_admin_peer(const qihse_qkp_session_t* s,
+                                    const qihse_qkp_config_t* config,
+                                    const qihse_qkp_replication_peer_t* peers,
+                                    size_t peer_count);
 
 /* Requires an actual replication-authorized server handshake and exact pin. */
 bool qihse_qkp_session_is_replication_peer_any(
@@ -247,6 +278,18 @@ int qihse_qkp_admin_open(const char* host, uint16_t port, const char* node_id,
                          const char* identity_dir, const char* trusted_pub_path,
                          unsigned timeout_ms, qihse_qkp_admin_client_t** out,
                          char* err_buf, size_t err_cap);
+/* Strict transport peer identity: in addition to the trusted handshake key,
+ * require the live signed server H1 label and ML-DSA public key to match the
+ * separately configured exact pin. `node_id` remains the CLIENT label, never
+ * the expected server label. A mismatch returns 3 with *out == NULL before a
+ * client can issue commands; invalid pin arguments return 2. This is identity
+ * evidence only: it does not grant Operator approval or mutator authority. */
+int qihse_qkp_admin_open_strict_peer(const char* host, uint16_t port, const char* node_id,
+                                     const char* identity_dir, const char* trusted_pub_path,
+                                     const char* expected_server_node_id,
+                                     const char* expected_server_dsa_pub_path,
+                                     unsigned timeout_ms, qihse_qkp_admin_client_t** out,
+                                     char* err_buf, size_t err_cap);
 int qihse_qkp_admin_command(qihse_qkp_admin_client_t* client, size_t argc,
                             const char* const* argv, const size_t* lengths,
                             char** reply, size_t* reply_len,

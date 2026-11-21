@@ -83,6 +83,34 @@ bool qihse_blob_put_expected_user(qihse_blob_store_t* store,
                                   const uint8_t expected_hash[QIHSE_BLOB_HASH_BYTES],
                                   uint64_t expected_size);
 
+/* Durable 2PC participant operations. PREPARE validates authorization and
+ * content hash/length, durably stages the object and metadata without making it
+ * visible to reads or enumeration. Resolve is a control-plane operation: the
+ * caller must supply the coordinator's durable irreversible decision. Exact
+ * retries of recorded receipts are idempotent; conflicting recorded decisions
+ * fail. An absent ID accepts ABORT as a no-op without creating a binding or
+ * receipt; an absent COMMIT fails. The authoritative coordinator journal and its
+ * captured ID floor must prevent late PREPARE and ID reuse: a standalone blob
+ * archive cannot reconstruct unused coordinator IDs. Resolve rejects inherited
+ * handles before locking. An unresolved prepared object is invisible after
+ * reopen until replay. */
+bool qihse_blob_prepare_expected_user(qihse_blob_store_t* store, uint64_t txn_id,
+                                      uint32_t tenant_id, qihse_blob_tag_t tag,
+                                      uint16_t classification, uint16_t sci_compartment,
+                                      qihse_user_t* user, qihse_blob_read_fn read_fn,
+                                      void* read_opaque,
+                                      const uint8_t expected_hash[QIHSE_BLOB_HASH_BYTES],
+                                      uint64_t expected_size);
+bool qihse_blob_resolve_prepared(qihse_blob_store_t* store, uint64_t txn_id,
+                                 bool commit);
+
+/* Coordinator allocation fence, not a blob-data read: returns one greater than
+ * every durable PREPARE/COMMIT/ABORT ID (1 for an empty store), under the store
+ * lock. False for invalid arguments, a poisoned store or UINT64_MAX exhaustion;
+ * leaves *next_id unchanged on failure. Advance the idle coordinator before
+ * recovery; this query neither reserves IDs nor resolves orphan PREPAREs. */
+bool qihse_blob_decision_next_id(qihse_blob_store_t* store, uint64_t* next_id);
+
 /* Convenience one-shot write of an in-memory buffer. */
 bool qihse_blob_put_buffer_user(qihse_blob_store_t* store, uint32_t tenant_id,
                                 qihse_blob_tag_t tag, uint16_t classification,
@@ -128,16 +156,83 @@ bool qihse_blob_pin_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_u
 bool qihse_blob_unpin_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);
 bool qihse_blob_is_pinned_user(qihse_blob_store_t* store, const uint8_t* hash,
                                qihse_user_t* user, bool* out_pinned);
+/* Read exact pin multiplicity for authorized backup/restore metadata. */
+bool qihse_blob_pin_count_user(qihse_blob_store_t* store, const uint8_t* hash,
+                               qihse_user_t* user, uint32_t* out_pin_count);
 
 /* Delete one reference; the object is unlinked when the refcount hits zero. */
 bool qihse_blob_delete_user(qihse_blob_store_t* store, const uint8_t* hash, qihse_user_t* user);
 
 /* Tenant-scoped enumeration (a read primitive — clearance-checked per entry,
- * confined to the caller's tenant plus commons). Callback returning false
- * stops iteration. */
+ * confined to the caller's tenant plus commons). Entries the caller cannot
+ * read are omitted; success does not prove complete-store enumeration or form
+ * a full-store backup snapshot. Callback returning false stops iteration. */
 typedef bool (*qihse_blob_list_fn)(const qihse_blob_info_t* info, void* opaque);
 bool qihse_blob_list_user(qihse_blob_store_t* store, qihse_user_t* user,
                           qihse_blob_list_fn callback, void* callback_opaque);
+
+/* Complete point-in-time stream of live entries in the whole store (not 2PC
+ * receipts or unresolved prepared content). Use the archive API for recovery.
+ * Authorization is checked for every entry before the first callback.
+ * Each callback must consume the complete verified reader and must not retain
+ * callback data/reader after return. On any failure, discard its staged output.
+ * This primitive does not itself serialize/authenticate or publish a backup. */
+typedef bool (*qihse_blob_snapshot_entry_fn)(
+    const qihse_blob_info_t* info, uint32_t pin_count,
+    qihse_blob_read_fn read_fn, void* read_opaque, void* callback_opaque);
+bool qihse_blob_snapshot_all_user(qihse_blob_store_t* store, qihse_user_t* user,
+                                  qihse_blob_snapshot_entry_fn callback,
+                                  void* callback_opaque);
+
+/* Authenticated monotonic snapshot checkpoint for this same live handle only.
+ * Covers live metadata, references, pins and terminal receipts; rejects pending
+ * PREPAREs, poisoned/inherited handles and incomplete authorization. Leaves
+ * *epoch unchanged on failure. Snapshot-retention references do not advance it.
+ * Capture ALL participating sources before ANY export and compare ALL after ALL
+ * exports; this query alone does not establish a shared cross-store snapshot. */
+bool qihse_blob_snapshot_epoch_user(qihse_blob_store_t* store, qihse_user_t* user,
+                                    uint64_t* epoch);
+
+/* W11.6 archive v1/v2: authenticated, NOT encrypted. V2 adds terminal 2PC
+ * receipts captured with live metadata; restore never reapplies their historical
+ * COMMIT effects or resurrects deleted objects. V1 imports remain supported.
+ * Export refuses unresolved PREPAREs before emitting bytes. This is a blob-only
+ * snapshot, not a common coordinator/cross-store recovery point.
+ * The caller supplies exactly
+ * 48 cryptographically random secret key bytes, manages their lifetime/rotation,
+ * and selects the key out of band. No key or principal credentials are archived.
+ * Every byte preceding the final 48-byte HMAC-SHA-384 is authenticated.
+ * Streaming uses one chunk plus O(live entries + terminal receipts) metadata;
+ * no content-sized allocations. Export preflights the whole store before any
+ * output; a false return requires discarding ALL output (including on I/O abort).
+ * write_fn must consume the entire buffer or return false. Readers follow the
+ * read_fn contract above; restore requires EOF immediately after the MAC.
+ * Both calls require an active authenticated user. Restore also enforces normal
+ * blob write authorization for every archived binding, not merely key possession.
+ */
+#define QIHSE_BLOB_ARCHIVE_KEY_BYTES 48u
+typedef bool (*qihse_blob_write_fn)(void* opaque, const uint8_t* data, size_t length);
+bool qihse_blob_archive_export_user(qihse_blob_store_t* store, qihse_user_t* user,
+                                    const uint8_t* key, size_t key_length,
+                                    qihse_blob_write_fn write_fn, void* opaque);
+
+/* Fresh destination only: private unique sibling staging, verified content/MAC,
+ * durable files/directories, Linux atomic no-replace rename, parent fsync. The
+ * parent must already exist and be caller-controlled; no merge or replacement.
+ * Unsupported no-replace publication fails closed. Failure before publication
+ * leaves no destination. A parent-fsync error AFTER publication has its own
+ * result: a complete authenticated store is visible, durability is uncertain;
+ * do not retry blindly or remove it. Crash-orphaned staging dirs are private.
+ */
+typedef enum {
+    QIHSE_BLOB_ARCHIVE_ERROR = -1,
+    QIHSE_BLOB_ARCHIVE_OK = 0,
+    QIHSE_BLOB_ARCHIVE_PUBLISHED_UNSYNCED = 1
+} qihse_blob_archive_result_t;
+qihse_blob_archive_result_t qihse_blob_archive_restore_user(
+    const char* destination, qihse_user_t* user,
+    const uint8_t* key, size_t key_length,
+    qihse_blob_read_fn read_fn, void* opaque);
 
 /* Hex helpers (hash <-> lowercase hex, NUL-terminated). */
 void qihse_blob_hash_to_hex(const uint8_t* hash, char out[QIHSE_BLOB_HASH_HEX]);

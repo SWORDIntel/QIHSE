@@ -87,7 +87,7 @@ int qihse_analyze_problem_characteristics(
  *
  * @param characteristics Problem characteristics
  * @param config Dimension calculation config
- * @return Recommended Hilbert space dimensions
+ * @return Budget-fitting dimensions, or 0 with errno on invalid/infeasible input
  */
 size_t qihse_calculate_optimal_dimensions(
     const qihse_problem_characteristics_t* characteristics,
@@ -100,7 +100,8 @@ size_t qihse_calculate_optimal_dimensions(
  * @param characteristics Problem characteristics
  * @param target_accuracy Desired accuracy (0.0-1.0)
  * @param config Dimension config
- * @return Dimensions needed for target accuracy
+ * @return Budget-fitting heuristic dimensions, or 0 on failure. Accuracy=1
+ * selects the largest allowed fitting setting; it does not guarantee exact recall.
  */
 size_t qihse_calculate_dimensions_for_accuracy(
     const qihse_problem_characteristics_t* characteristics,
@@ -114,7 +115,7 @@ size_t qihse_calculate_dimensions_for_accuracy(
  * @param characteristics Problem characteristics
  * @param memory_budget Available memory in bytes
  * @param config Dimension config
- * @return Dimensions fitting memory budget
+ * @return Dimensions fitting memory budget, or 0/ENOMEM if the minimum does not fit
  */
 size_t qihse_calculate_dimensions_with_memory(
     const qihse_problem_characteristics_t* characteristics,
@@ -145,7 +146,7 @@ int qihse_validate_dimensions(
  *
  * @param dims Hilbert space dimensions
  * @param characteristics Problem characteristics
- * @return Estimated memory usage in bytes
+ * @return Conservative scalar-pipeline bytes, or SIZE_MAX on overflow
  */
 size_t qihse_estimate_memory_usage(
     size_t dims,

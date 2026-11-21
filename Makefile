@@ -4,10 +4,14 @@
 CC=gcc
 CXX=g++
 
+PKG_CONFIG ?= pkg-config
+LUAJIT_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags luajit 2>/dev/null)
+LUAJIT_LIBS ?= $(shell $(PKG_CONFIG) --libs luajit 2>/dev/null || printf '%s' '-lluajit-5.1')
+
 PYTHON_INCLUDES ?= $(shell python3-config --includes 2>/dev/null || pkg-config --cflags python3 2>/dev/null || echo "-I/usr/include/python3.13")
 PYTHON_LDFLAGS  ?= $(shell python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags 2>/dev/null || pkg-config --libs python3 2>/dev/null || echo "-lpython3.13")
 
-INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include -I/usr/include/luajit-2.1 -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
+INCLUDES = -I. -I./include -I./include/network_intelligence -I./core -I./algorithms -I./backends/cpu -I./backends/npu -I./orchestration/include -I./memory/include -I./quantization/include -I./ml/include -I./sync -I./vendor/tree-sitter/lib/include $(LUAJIT_CFLAGS) -I/usr/local/include -I./vendor/liboqs/include -I./src/network_intelligence -I./persistence
 QIHSE_ARCH_FLAGS ?=
 CFLAGS_BASE=-std=c99 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS) $(PYTHON_INCLUDES)
 CXXFLAGS_BASE=-std=c++20 -Wall -Wextra -fopenmp-simd $(INCLUDES) -fPIC -lm -pthread -D_GNU_SOURCE -O3 $(QIHSE_ARCH_FLAGS)
@@ -151,8 +155,8 @@ ifdef QIHSE_AUDIT_WEBHOOK_URL
 CFLAGS += -DQIHSE_AUDIT_WEBHOOK_URL=\"$(QIHSE_AUDIT_WEBHOOK_URL)\"
 endif
 
-LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
-TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 
+LDFLAGS = -L. -lqihse -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) $(LUAJIT_LIBS) -lssl -lcrypto -lbpf -lxdp -lsqlite3
+TARGET_LDFLAGS = -ldl -lm -lpthread -luring $(PYTHON_LDFLAGS) $(LUAJIT_LIBS) -lssl -lcrypto -lbpf -lxdp -lsqlite3
 ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
 LDFLAGS += -lonnxruntime
 AIMEM_ONNX_EXEC_SOURCE :=
@@ -195,14 +199,14 @@ SRCS_BASE = core/qihse.c sdks/python/qihse.c core/qihse_auth.c core/qihse_audit.
             src/frieze/qihse_column_store.c src/frieze/qihse_btree.c src/frieze/qihse_hash_index.c src/frieze/qihse_index_manager.c src/marmalade/qihse_timeseries.c src/marmalade/qihse_event_stream.c src/network_intelligence/qihse_routing_persistence.c \
             src/network_intelligence/bgp_route_probe.cpp src/network_intelligence/bgp_update_decoder.cpp src/network_intelligence/rpki_rtr_probe.cpp src/network_intelligence/rdap_probe.cpp src/network_intelligence/ptr_probe.cpp src/network_intelligence/route_helper.cpp \
             src/tractable/qihse_bytecode.c src/tractable/qihse_bytecode_compiler.c src/tractable/qihse_index_scan.c src/tractable/qihse_txn.c src/tractable/qihse_mvcc.c src/tractable/qihse_wal.c src/tractable/qihse_recovery.c src/broad_oak/qihse_graph_store.c src/broad_oak/qihse_graph_ingest.c src/tractable/qihse_cypher_parser.c src/tractable/qihse_cypher_executor.c src/broad_oak/qihse_graph_algo.c src/broad_oak/qihse_graph_vector.c \
-            src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/controller/qihse_controller.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/federation/qihse_consensus.c src/federation/qihse_consensus_snapshot_stage.c src/federation/qihse_federation_snapshot_xfer.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
+            src/spinnaker/qihse_pg_wire.c src/spinnaker/qihse_bolt.c src/spinnaker/qihse_protocol_translate.c src/spinnaker/qihse_pooler.c src/spinnaker/qihse_repl.c src/spinnaker/qihse_read_replica.c src/tractable/qihse_backup.c src/tractable/qihse_shared_backup.c src/tractable/qihse_parallel_query.c src/spinnaker/qihse_cdc.c src/spinnaker/qihse_cluster_brain.c src/spinnaker/qihse_overlay.c src/spinnaker/qihse_ai_memory.c src/controller/qihse_controller.c src/federation/qihse_federation.c src/federation/qihse_supply_chain.c src/federation/qihse_runtime_trust.c src/federation/qihse_security_audit.c src/federation/qihse_federation_sim.c src/federation/qihse_backup.c src/federation/qihse_operations.c src/federation/qihse_federation_mtls.c src/federation/qihse_federation_repl.c src/federation/qihse_federation_transport.c src/federation/qihse_federation_rejoin.c src/federation/qihse_consensus.c src/federation/qihse_consensus_snapshot_stage.c src/federation/qihse_federation_snapshot_xfer.c src/spinnaker/qihse_mongo_wire.c src/spinnaker/qihse_http_api.c src/spinnaker/qihse_metrics.c src/spinnaker/qihse_tracing.c src/spinnaker/qihse_clickhouse_http.c src/spinnaker/qihse_es_api.c src/spinnaker/qihse_influx_api.c src/tractable/qihse_compaction.c src/tractable/qihse_sql_extensions.c src/tractable/qihse_qql_parser.c qql-grammar/src/parser.c \
             vendor/tree-sitter/lib/src/lib.c src/tractable/qihse_sql_parser.c src/tractable/qihse_dist_planner.c src/tractable/qihse_join_executor.c src/tractable/qihse_aggregate_executor.c src/tractable/qihse_sort_executor.c src/tractable/qihse_window_executor.c src/tractable/qihse_table_store.c src/tractable/qihse_schema.c src/tractable/qihse_optimizer.c src/tractable/qihse_optimizer_governance.c \
      persistence/qihse_file_posix.c persistence/qihse_persist_format.c persistence/qihse_vector_store.c persistence/qihse_container.c persistence/qihse_pqc_crypto.c \
      algorithms/qihse_anchor_search.c algorithms/qihse_version.c \
      codecs/qihse_trinary_tryte_codec.c \
      quantization/src/qihse_quantization.c quantization/src/qihse_pq.c \
      core/qihse_helpers.c core/qihse_plugin.c \
-     algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c \
+     algorithms/qihse_dimensions.c algorithms/qihse_verification.c algorithms/qihse_amplification.c algorithms/qihse_superposition.c \
      backends/cpu/qihse_cpu_detect.c \
      backends/cpu/qihse_cpu_distance.c \
      backends/npu/qihse_npu_openvino.c \
@@ -238,6 +242,10 @@ ifeq ($(QIHSE_ENABLE_AIMEM_KEYSTONE),1)
 SRCS_BASE += src/spinnaker/qihse_aimem_onnx_embedder.c
 endif
 
+SRCS_BASE += src/black_hole/qihse_ct1_recovery_manifest.c \
+    src/black_hole/qihse_ct1_node_quote.c
+SRCS_BASE += src/black_hole/qihse_ct1_archive.c \
+    src/black_hole/qihse_ct1_disposition.c
 SRCS_BASE += src/black_hole/qihse_ct_codec.c src/spinnaker/qihse_cluster_ownership.c \
     src/spinnaker/qihse_cluster_transfer.c src/spinnaker/qihse_ct_target.c \
     src/spinnaker/qihse_cluster_range_authority.c \
@@ -356,9 +364,9 @@ CFLAGS += -mamx-tile -mamx-int8 -mamx-bf16 -DQIHSE_ENABLE_AMX=1
 SRCS += backends/cpu/qihse_cpu_amx.c
 endif
 
-# Note: core/qihse_plugin.c and algorithms/qihse_superposition.c etc are EXCLUDED 
-# because their functionality is already partially in qihse_math.c / qihse_search.c 
-# or provided by qihse_exports.c stubs.
+# RFF creation/projection is owned by src/bombe/qihse_math.c. State operations
+# are owned by algorithms/qihse_superposition.c. Do not link duplicate owners
+# or replace mathematical operations with successful no-op exports.
 
 .PHONY: all build build-native clean pristine workspace workspace-clean lib lib-ctypes liboqs oqs-provider persistence persistence-check test benchmark install install-host dev-setup docs redis-server redis-cluster-node cluster-daemon backup-cli test-backup-cli test-aimem-legacy-inventory test-aimem-migration-cli stress-session-delivery bench-cluster-crc test-object-acl test-cluster-slot test-cluster-numa test-resp-cluster test-resp-pubsub test-persist test-edge-persistence test-routing-persistence test-kv-read-integrity test-trinary-codec test-memory-planner test-memory-topology-probe test-memory-planner-trace test-memory-allocation-policy test-memory-coherence test-memory-migration-policy test-memory-migration test-memory-device-placement test-memory-migration-backend test-memory-migration-scheduler bench-trinary-codec bench-trinary-db-candidate bench-micro bench-trinary-search-path bench-trinary-search-sweep bench-trinary-random-sweep bench-trinary-weighted-sweep bench-trinary-magnitude-sweep bench-reference-workloads bench-reference-runner-smoke sample-vxug-pdf-workload bench-vxug-pdf-workload bench-reference-workload bench-reference-result-summary bench-sift1m-workload bench-sift1m-fallback-data calibrate-sift1m-workload validate-reference-workflow check-upstream-workflow check-upstream-workflow-strict check upstream-pr-loop test-all-isa test-vnni-bench test-vnni-only test-avx2-only test-avx512-direct test-amx-only test-direct-execution test-simple-exec test-hnsw-anchor-seeding test-column-tsdb-anchor test-neural-fts-fusion test-af-xdp-keystone-ingest test-dist-planner-hardware bench-keystone-integrated test-uwp-regression test-uwp-metrics fuzz-uwp test-replica-security test-replica-qkp test-replica-crash test-w10-aimem
 .NOTPARALLEL: validate-reference-workflow
@@ -409,7 +417,7 @@ test-ops-scripts:
 
 test-serial: test-owner-snapshot-sdk test-ops-scripts
 
-.PHONY: test-kv-durable-batch test-kv-restore-durability
+.PHONY: test-kv-durable-batch test-kv-restore-durability test-directeye-outbox test-directeye-resp
 test-kv-durable-batch: lib
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
@@ -420,6 +428,21 @@ test-kv-durable-batch: lib
 	  QIHSE_KV_DURABLE_BATCH_DIR="$$work" LD_LIBRARY_PATH=. ./tests/test_kv_durable_batch
 
 test-serial: test-kv-durable-batch
+
+test-directeye-outbox: lib
+	@mkdir -p build && chmod 0700 build
+	$(CC) $(CFLAGS) -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_directeye_outbox tests/test_directeye_outbox.c \
+	    src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	@umask 077; LD_LIBRARY_PATH=. ./tests/test_directeye_outbox
+
+test-serial: test-directeye-outbox
+
+test-directeye-resp: lib
+	$(CC) $(CFLAGS) -o tests/test_directeye_resp tests/test_directeye_resp.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_directeye_resp
+
+test-serial: test-directeye-resp
 
 test-kv-restore-durability: lib
 	@mkdir -p build && chmod 0700 build
@@ -529,6 +552,10 @@ test-ownership-abort-replay: lib
 	$(CC) $(CFLAGS) -o tests/test_ownership_abort_replay tests/test_ownership_abort_replay.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_abort_replay
 
+.PHONY: test-ct-recovery-rust
+test-ct-recovery-rust:
+	cargo test --locked --offline --manifest-path rust/ct1-recovery/Cargo.toml
+
 # Exact-history transport serialization, real registry authorization, and
 # durable mutation/cursor recovery. Keep the fault-injected KV implementation
 # local to its test executable; production library fault hooks stay disabled.
@@ -542,8 +569,17 @@ test-ct-codec-auth: lib
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_codec_auth tests/test_ct_codec_auth.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_codec_auth
 
+.PHONY: test-ct-legacy-expiry
+test-ct-legacy-expiry: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_ct_legacy_expiry tests/test_ct_legacy_expiry.c \
+	    -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_legacy_expiry
+
+test-serial: test-ct-legacy-expiry
+
 test-ct-storage: lib
-	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_storage tests/test_ct_storage.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_CT_STORAGE_FLOOR_TEST -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o tests/test_ct_storage tests/test_ct_storage.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_storage
 
 .PHONY: test-ct-replication-lanes
@@ -563,15 +599,24 @@ test-ct-lane-baseline: lib
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_baseline
 
 # The executable owns a fault-enabled KV implementation; production shared
-# objects never expose the crash-injection environment switches.
+# objects never expose the crash-injection environment switches. Fixture-only
+# rename/fsync interposers witness durable ACK publication before sidecar GC.
 test-ct-lane-log: lib
 	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
 	    -o tests/test_ct_lane_log tests/test_ct_lane_log.c src/black_hole/qihse_kv_store.c \
 	    -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_log
 
+.PHONY: test-ct-lane-log-sanitize
+test-ct-lane-log-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic -o build/test_ct_lane_log_sanitize tests/test_ct_lane_log.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_ct_lane_log_sanitize
+
 test-ct-lane-transfer: lib
-	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_lane_transfer tests/test_ct_lane_transfer.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -UNDEBUG -DQIHSE_AIMEM_DURABILITY_TEST -Wl,--export-dynamic \
+	    -o tests/test_ct_lane_transfer tests/test_ct_lane_transfer.c \
+	    src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_transfer
 
 test-serial: test-ct-lane-baseline test-ct-lane-log test-ct-lane-transfer test-ct-lane-lifecycle
@@ -668,19 +713,44 @@ test-ownership-lane-abort: lib
 	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ownership_lane_abort tests/test_ownership_lane_abort.c src/spinnaker/qihse_cluster_ownership.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ownership_lane_abort
 
+.PHONY: test-ownership-lane-abort-sanitize
+test-ownership-lane-abort-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_ownership_lane_abort_sanitize tests/test_ownership_lane_abort.c src/spinnaker/qihse_cluster_ownership.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_ownership_lane_abort_sanitize
+
 test-serial: test-ownership-lane-abort
 
-.PHONY: test-ct-lane-promotion-recovery test-ct-multigroup-promotion
+.PHONY: test-ownership-staging-discovery test-ownership-staging-discovery-sanitize
+test-ownership-staging-discovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ownership_staging_discovery tests/test_ownership_staging_discovery.c src/spinnaker/qihse_cluster_ownership.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ownership_staging_discovery
+
+test-ownership-staging-discovery-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_ownership_staging_discovery_sanitize tests/test_ownership_staging_discovery.c src/spinnaker/qihse_cluster_ownership.c src/black_hole/qihse_kv_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_ownership_staging_discovery_sanitize
+
+test-serial: test-ownership-staging-discovery
+
+.PHONY: test-ct-lane-promotion-recovery test-ct-group-failover-tick test-ct-multigroup-promotion
 test-ct-lane-promotion-recovery: lib
 	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_ct_lane_promotion_recovery tests/test_ct_lane_promotion_recovery.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_ct_lane_promotion_recovery
 
+test-ct-group-failover-tick: lib
+	$(CC) $(CFLAGS) -UNDEBUG -ffunction-sections -fdata-sections -Wl,--gc-sections -Wl,--export-dynamic \
+	    -Wl,--wrap=qihse_cluster_failover_promote_lane -o tests/test_ct_group_failover_tick tests/test_ct_group_failover_tick.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_ct_group_failover_tick
+
 test-ct-multigroup-promotion: cluster-daemon keygen
 	LD_LIBRARY_PATH=. python3 tests/ct_multigroup_promotion_drill.py
 
-test-serial: test-ct-lane-promotion-recovery test-ct-multigroup-promotion
+test-serial: test-ct-lane-promotion-recovery test-ct-group-failover-tick test-ct-multigroup-promotion
 
-.PHONY: test-ct-group-config test-ct-lane-commands test-ct-multigroup
+.PHONY: test-ct-group-config test-ct-lane-commands test-ct-multigroup test-ct-group-admission-recovery
+test-ct-group-admission-recovery: cluster-daemon keygen
+	LD_LIBRARY_PATH=. python3 tests/ct_group_admission_recovery_drill.py
 test-ct-group-config:
 	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_ct_group_config \
 	    tests/test_ct_group_config.c src/spinnaker/qihse_ct_group_config.c
@@ -693,7 +763,7 @@ test-ct-lane-commands: lib
 test-ct-multigroup: cluster-daemon keygen
 	LD_LIBRARY_PATH=. python3 tests/ct_multigroup_drill.py
 
-test-serial: test-ct-group-config test-ct-lane-commands test-ct-multigroup
+test-serial: test-ct-group-config test-ct-lane-commands test-ct-multigroup test-ct-group-admission-recovery
 
 .PHONY: test-consensus-authority-forward test-consensus-authority-auth
 test-consensus-authority-forward: lib
@@ -852,6 +922,9 @@ COBJS = $(CSRCS:.c=.o)
 CXXOBJS = $(CXXSRCS:.cpp=.o)
 OBJS = $(COBJS) $(CXXOBJS)
 
+# Tree-sitter ships the Unicode headers its amalgamated source includes.
+vendor/tree-sitter/lib/src/lib.o: CFLAGS += -I./vendor/tree-sitter/lib/src
+
 # Header dependency tracking. Without this a change to a struct in a header
 # leaves every .o that included it compiled against the OLD layout while the
 # rest of the tree is rebuilt against the new one, and the link succeeds: the
@@ -887,11 +960,8 @@ $(LIB_TARGET): $(OBJS)
 	$(CXX) -shared -fPIC -o $(LIB_TARGET) $(OBJS) $(filter-out -lqihse,$(LDFLAGS)) -lsqlite3
 	@echo "$(LIB_TARGET) build successful"
 
-lib-ctypes: $(filter-out sdks/python/qihse.o,$(OBJS))
-	@echo "Building libqihse.so..."
-	$(CXX) -shared -fPIC -o libqihse.so $(subst .c,.o,$(subst .cpp,.o,$(SRCS))) \
-	    -L. -ldl -lm -lpthread -luring -lpython3.13 -lluajit-5.1 -lssl -lcrypto -lbpf -lxdp -lsqlite3 $$(pkg-config --libs sqlite3)
-	@echo "libqihse.so build successful"
+# ctypes uses the canonical library, including the native Python entry points.
+lib-ctypes: lib
 
 persistence: test-persist
 persistence-check: test-persist
@@ -930,6 +1000,34 @@ test-vector-tenant-isolation: lib
 
 test-serial: test-vector-tenant-isolation
 
+.PHONY: test-core-search-regressions test-core-math-regressions test-runtime-math-regressions test-vector-candidate-rerank
+test-core-search-regressions:
+	bash scripts/run-core-search-regressions.sh
+
+test-core-math-regressions:
+	sh scripts/test_core_math_regressions.sh
+
+test-runtime-math-regressions:
+	bash scripts/run-runtime-math-regressions.sh
+
+test-vector-candidate-rerank: lib
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_vector_candidate_rerank tests/test_vector_candidate_rerank.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_vector_candidate_rerank
+
+test-serial: test-core-search-regressions test-core-math-regressions test-runtime-math-regressions test-vector-candidate-rerank
+
+.PHONY: test-core-methodologies test-rff-maps bench-core-methods
+test-core-methodologies:
+	bash scripts/run-core-methodology-regressions.sh
+
+test-rff-maps:
+	bash scripts/run-rff-map-regressions.sh
+
+bench-core-methods:
+	bash scripts/run-core-methods-bench.sh $(BENCH_ARGS)
+
+test-serial: test-core-methodologies test-rff-maps
+
 .PHONY: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
 test-container-lifecycle: lib
@@ -946,7 +1044,7 @@ test-http-lifecycle:
 test-cluster-bus-bind:
 	@mkdir -p build && chmod 0700 build
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o build/test_cluster_bus_bind tests/test_cluster_bus_bind.c src/spinnaker/qihse_cluster_slot.c src/spinnaker/qihse_cluster_maintenance.c -Wl,--gc-sections -L. -lqihse -pthread -lcrypto
-	./build/test_cluster_bus_bind
+	LD_LIBRARY_PATH=".$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" ./build/test_cluster_bus_bind
 
 test-serial: test-container-lifecycle test-http-lifecycle test-cluster-bus-bind
 
@@ -1176,6 +1274,14 @@ test-consensus-mesh: lib
 	$(CC) $(CFLAGS) -DQIHSE_CONSENSUS_MESH_TESTING -o tests/test_consensus_mesh tests/test_consensus_mesh.c src/federation/qihse_consensus_mesh.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_consensus_mesh
 
+.PHONY: test-blob-archive
+test-blob-archive: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -o tests/test_blob_archive tests/test_blob_archive.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_blob_archive
+
+test-serial: test-blob-archive
+
 test-consensus-blob-channel: lib
 	$(CC) $(CFLAGS) -o tests/test_consensus_blob_channel tests/test_consensus_blob_channel.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_consensus_blob_channel
@@ -1187,6 +1293,50 @@ test-fed-sim: lib
 test-incremental-export: lib
 	$(CC) $(CFLAGS) -o tests/test_incremental_export tests/test_incremental_export.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_incremental_export
+
+.PHONY: test-kv-snapshot-checkpoint
+test-kv-snapshot-checkpoint: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_kv_snapshot_checkpoint tests/test_kv_snapshot_checkpoint.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_kv_snapshot_checkpoint
+
+test-serial: test-kv-snapshot-checkpoint
+
+.PHONY: test-shared-backup
+test-shared-backup: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_shared_backup tests/test_shared_backup.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_shared_backup
+
+test-serial: test-shared-backup
+
+.PHONY: test-shared-backup-enospc
+test-shared-backup-enospc: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o build/test_shared_backup_enospc tests/test_shared_backup.c -L. -lqihse $(LDFLAGS)
+	bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc
+	bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc --capacity-export
+
+test-serial: test-shared-backup-enospc
+
+.PHONY: test-shared-backup-enospc-sanitize
+test-shared-backup-enospc-sanitize: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_shared_backup_enospc_sanitize tests/test_shared_backup.c src/tractable/qihse_shared_backup.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc_sanitize
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 bash tests/run_shared_backup_enospc.sh ./build/test_shared_backup_enospc_sanitize --capacity-export
+
+.PHONY: test-shared-backup-sanitize
+test-shared-backup-sanitize: lib
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_shared_backup_sanitize tests/test_shared_backup.c src/tractable/qihse_shared_backup.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_shared_backup_sanitize
+
+.PHONY: check-shared-backup-stack
+check-shared-backup-stack:
+	@mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 -c src/tractable/qihse_shared_backup.c -o build/shared_backup_stack.o
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 -c tests/test_shared_backup.c -o build/shared_backup_test_stack.o
 
 test-replica-security: lib
 	$(CC) $(CFLAGS) -o tests/test_replica_security_regression tests/test_replica_security_regression.c -L. -lqihse $(LDFLAGS)
@@ -1282,7 +1432,7 @@ test-aimem-qh05-08: lib
 	LD_LIBRARY_PATH=. ./tests/test_aimem_qh05_08
 
 test-aimem-qh08: lib
-	$(CC) $(CFLAGS) -o tests/test_aimem_qh08 tests/test_aimem_qh08.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_aimem_qh08 tests/test_aimem_qh08.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_qh08
 
 test-aimem-qh08-resp: lib
@@ -1296,7 +1446,7 @@ test-workload-admission: lib
 
 test-aimem-workload-admission: lib
 	@mkdir -p build && chmod 0700 build
-	$(CC) $(CFLAGS) -o tests/test_aimem_workload_admission tests/test_aimem_workload_admission.c -L. -lqihse $(LDFLAGS)
+	$(CC) $(CFLAGS) -Wl,--export-dynamic -o tests/test_aimem_workload_admission tests/test_aimem_workload_admission.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_aimem_workload_admission
 
 # QH-00: separate process instances; SIGKILL immediately after durable ACK.
@@ -1540,6 +1690,55 @@ tests/gold/workloads/%: tests/gold/workloads/%.c libqihse.so
 test-txn: lib
 	$(CC) $(CFLAGS) -o tests/test_txn tests/test_txn.c -L. -lqihse $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./tests/test_txn
+
+test-txn-durable-2pc: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o tests/test_txn_durable_2pc tests/test_txn_durable_2pc.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_txn_durable_2pc
+
+.PHONY: test-sql-blob-txn-2pc
+test-sql-blob-txn-2pc: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_sql_blob_txn_2pc tests/test_sql_blob_txn_2pc.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_sql_blob_txn_2pc
+
+.PHONY: test-sql-receipt-recovery test-sql-receipt-recovery-sanitize check-sql-receipt-stack
+test-sql-receipt-recovery: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic -o build/test_sql_receipt_recovery tests/test_sql_blob_txn_2pc.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./build/test_sql_receipt_recovery --receipt-suite
+
+test-sql-receipt-recovery-sanitize: lib
+	mkdir -p build
+	$(CC) $(filter-out -O3,$(CFLAGS)) -UNDEBUG -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic -o build/test_sql_receipt_recovery_sanitize tests/test_sql_blob_txn_2pc.c src/tractable/qihse_table_store.c -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_sql_receipt_recovery_sanitize --receipt-suite
+
+test-serial: test-sql-receipt-recovery
+
+check-sql-receipt-stack:
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 -c -o build/test_sql_receipt_recovery_stack.o tests/test_sql_blob_txn_2pc.c
+
+.PHONY: test-w11-order-recovery
+test-w11-order-recovery: lib
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--export-dynamic \
+	    -o tests/test_w11_order_recovery tests/test_w11_order_recovery.c -L. -lqihse $(LDFLAGS)
+	LD_LIBRARY_PATH=. ./tests/test_w11_order_recovery
+
+test-serial: test-w11-order-recovery
+
+.PHONY: test-w11-order-recovery-sanitize check-w11-order-stack
+test-w11-order-recovery-sanitize: lib
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -O1 -g -fno-omit-frame-pointer \
+	    -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wl,--export-dynamic \
+	    -o build/test_w11_order_recovery_sanitize tests/test_w11_order_recovery.c \
+	    -L. -lqihse $(LDFLAGS)
+	ASAN_OPTIONS=abort_on_error=1:detect_leaks=1 LD_LIBRARY_PATH=. ./build/test_w11_order_recovery_sanitize
+
+check-w11-order-stack:
+	mkdir -p build
+	$(CC) $(CFLAGS) -UNDEBUG -fstack-usage -Werror=stack-usage=16384 \
+	    -c -o build/test_w11_order_recovery_stack.o tests/test_w11_order_recovery.c
 
 # WAL durability error propagation uses a syscall shim to inject fdatasync
 # failures deterministically; this standalone test links the WAL implementation
@@ -1871,7 +2070,7 @@ test-document-store-user: lib
 
 test-cluster-maintenance: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance tests/test_cluster_maintenance.c src/spinnaker/qihse_cluster_maintenance.c -pthread $(LDFLAGS)
-	./tests/test_cluster_maintenance
+	LD_LIBRARY_PATH=".$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" ./tests/test_cluster_maintenance
 
 test-cluster-maintenance-resp: lib
 	$(CC) $(CFLAGS) -o tests/test_cluster_maintenance_resp tests/test_cluster_maintenance_resp.c -L. -lqihse $(LDFLAGS)
@@ -2451,10 +2650,10 @@ pristine: clean workspace-clean
 
 # Public C API roots and their local-header closure, not source/data internals.
 PREFIX ?= /usr/local
-PUBLIC_API_HEADERS := qihse.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_limit.h \
+PUBLIC_API_HEADERS := qihse.h qihse_math_types.h qihse_auth.h qihse_auth_maintenance.h qihse_rate_limit.h \
     qihse_hetero.h qihse_math.h qihse_instr.h qihse_search.h \
     qihse_vector_db.h qihse_uwp.h qihse_uwp_tls.h qihse_uwp_metrics.h \
-    qihse_kv_store.h qihse_backup.h qihse_operations.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
+    qihse_kv_store.h qihse_backup.h qihse_shared_backup.h qihse_operations.h qihse_trinary_trie.h qihse_document.h qihse_column.h \
     qihse_timeseries.h qihse_event_stream.h qihse_repl.h qihse_pooler.h \
     qihse_txn.h qihse_platform.h qihse_schema.h qihse_table_store.h \
     qihse_sql_parser.h qihse_sql_extensions.h qihse_sql_fts.h \
@@ -2627,6 +2826,14 @@ test-w11-combined-early: lib
 	bash benchmarks/w11_combined_early.sh 8 7 > build/w11_combined_early_ci.json
 	python3 -m json.tool build/w11_combined_early_ci.json > /dev/null
 
+.PHONY: test-w11-combined-recovery
+test-w11-combined-recovery: lib
+	bash benchmarks/w11_combined_recovery.sh
+
+.PHONY: test-w11-combined-recovery-sanitize
+test-w11-combined-recovery-sanitize: lib
+	bash benchmarks/w11_combined_recovery.sh --sanitize
+
 test-serial: test-w11-combined-early
 
 # FTS.SAVE/FTS.LOAD adapter: durable per-node projection plus the mandatory
@@ -2711,3 +2918,89 @@ codegraph-xxh3:
 
 test-codegraph-xxh3:
 	$(MAKE) -C tools/codegraph_xxh3 -j4 test
+
+# Opt-in structural-only C/Rust ABI smoke; no production library dependency.
+.PHONY: test-ct-recovery-abi
+test-ct-recovery-abi:
+	@mkdir -p build/ct1-recovery-abi
+	cargo build --locked --offline --manifest-path rust/ct1-recovery/Cargo.toml \
+	    --target-dir build/ct1-recovery-abi/cargo
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -UNDEBUG -I./include \
+	    -o build/ct1-recovery-abi/test_ct1_evidence_abi \
+	    tests/test_ct1_evidence_abi.c \
+	    build/ct1-recovery-abi/cargo/debug/libqihse_ct1_recovery.a -ldl -lpthread -lm
+	./build/ct1-recovery-abi/test_ct1_evidence_abi
+
+# Opt-in structural checks; the context-free archive is disposable-fixture only.
+.PHONY: test-ct-recovery-manifest
+test-ct-recovery-manifest: $(LIB_TARGET)
+	@mkdir -p build/ct1-recovery-manifest
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE \
+	    -DQIHSE_CT1_INSECURE_DEV_ARCHIVE -I./include \
+	    -o build/ct1-recovery-manifest/test_ct1_recovery_manifest \
+	    src/black_hole/qihse_ct1_recovery_manifest.c \
+	    tests/test_ct1_recovery_manifest.c -L. -lqihse -lcrypto
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./build/ct1-recovery-manifest/test_ct1_recovery_manifest
+test-serial: test-ct-recovery-manifest
+
+# Context-free witness is an insecure disposable fixture, never a daemon API.
+.PHONY: test-ct1-authority-witness
+test-ct1-authority-witness: $(LIB_TARGET)
+	@mkdir -p build/ct1-authority-witness
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -D_GNU_SOURCE -UNDEBUG \
+	    -DQIHSE_CT1_INSECURE_DEV_WITNESS -I./include \
+	    -o build/ct1-authority-witness/test_ct1_authority_witness \
+	    src/black_hole/qihse_ct1_authority_witness.c \
+	    src/black_hole/qihse_ct1_recovery_manifest.c \
+	    tests/test_ct1_authority_witness.c -L. -lqihse -lcrypto
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./build/ct1-authority-witness/test_ct1_authority_witness
+
+# Host-only ledger test; explicit provisioning is not a grant or rollback anchor.
+.PHONY: test-ct1-authority-store
+test-ct1-authority-store:
+	$(MAKE) -C tests/ct1_authority test-host-state
+test-serial: test-ct1-authority-store
+
+# Read-only pinned-node quote verification, using disposable ML-DSA keys.
+.PHONY: test-ct1-node-quote
+test-ct1-node-quote:
+	$(MAKE) -C tests/ct1_authority test-quote
+test-serial: test-ct1-node-quote
+
+# Local safe prerequisites only. Disabled authority cannot mint/consume grants.
+.PHONY: test-ct1-authority test-ct1-authority-service
+test-ct1-authority:
+	$(MAKE) -C tests/ct1_authority test-ci
+test-ct1-authority-service:
+	$(MAKE) -C tests/ct1_authority test-service
+test-serial: test-ct1-authority-service
+
+.PHONY: test-ct1-disposition
+test-ct1-disposition:
+	$(MAKE) -C tests/ct1_authority test-disposition
+test-serial: test-ct1-disposition
+
+# Source custody probe/lease is fixture-only; not linked into production.
+.PHONY: test-ct1-source-authority
+test-ct1-source-authority:
+	@mkdir -p build/ct1-source
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -UNDEBUG -D_GNU_SOURCE \
+	    -I./include -I./core -o build/ct1-source/test_ct1_source_authority \
+	    tests/test_ct1_source_authority.c \
+	    src/black_hole/qihse_ct1_source_authority.c \
+	    src/black_hole/qihse_ct1_recovery_manifest.c -L. -lqihse -lcrypto
+	@fixture=$$(sudo -n mktemp -d -p "$$(dirname "$$(pwd)")" \
+	    qihse-ct1-source-test.XXXXXX) && \
+	    sudo -n env LD_LIBRARY_PATH="$(CURDIR):$${LD_LIBRARY_PATH:-}" \
+	    ./build/ct1-source/test_ct1_source_authority "$$fixture"
+
+# Root custody tests remain disposable and separate from production startup.
+.PHONY: test-ct1-archive
+test-ct1-archive: $(LIB_TARGET)
+	@mkdir -p build/ct1-archive
+	$(CC) -std=c99 -O2 -Wall -Wextra -Werror -UNDEBUG -D_GNU_SOURCE \
+	    -I./include -I./core -o build/ct1-archive/test_ct1_archive \
+	    tests/test_ct1_archive.c src/black_hole/qihse_ct1_archive.c \
+	    src/black_hole/qihse_ct1_disposition.c src/black_hole/qihse_ct_codec.c \
+	    -L. -lqihse -lcrypto
+	LD_LIBRARY_PATH=.:$$LD_LIBRARY_PATH ./build/ct1-archive/test_ct1_archive

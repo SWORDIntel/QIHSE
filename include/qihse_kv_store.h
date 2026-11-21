@@ -98,6 +98,15 @@ typedef struct {
 } qihse_kv_ct_lane_status_t;
 
 typedef struct {
+    char transfer_id[QIHSE_KV_CT_ID_MAX + 1u];
+    char lane_id[QIHSE_KV_CT_LANE_ID_MAX + 1u];
+    char generation[QIHSE_KV_CT_ID_MAX + 1u];
+    uint64_t reserve_index;
+    uint64_t source_cut;
+    bool source_cut_known;
+} qihse_kv_ct_lane_staging_candidate_t;
+
+typedef struct {
     bool active;
     uint8_t phase; /* 0 none, 1 reserved, 2 imported, 3 finalized intent */
     bool source_fenced;
@@ -289,6 +298,82 @@ bool qihse_kv_ct_source_read(qihse_kv_store_t* store, qihse_user_t* principal,
     size_t max_bytes, qihse_kv_ct_group_t** out_groups, size_t* out_count,
     uint64_t* out_resume_seq);
 void qihse_kv_ct_groups_free(qihse_kv_ct_group_t* groups, size_t count);
+
+/* Local read-only legacy (non-lane, QCTST003) retained source query. Requires
+ * an active Operator or configured replication principal authorized for ALL
+ * retained frames. Exact persisted identity/bounds and clean WAL EOF must
+ * agree. Only an unacknowledged, unexpired, single-SET group is returned.
+ * No mutation, admission, ACK, remote peer attestation or recovery authority.
+ * The original QKV6 bytes are captured during authorized decoding, never
+ * reconstructed. Memory is bounded by the codec's per-frame limit, not WAL
+ * size. On success the caller owns frame and key and must free() both; key is
+ * NUL-terminated. Free a previous result before reuse. Failure zeroes out.
+ * SHA256 covers ALL original frame bytes, including its codec checksum. */
+#define QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1 1u
+typedef struct {
+    uint32_t version; /* QIHSE_KV_CT_SOURCE_RETAINED_FRAME_V1 */
+    uint32_t size;    /* sizeof(qihse_kv_ct_source_retained_frame_request_t) */
+    const char* source_id;
+    const char* successor_id;
+    const char* generation;
+    uint64_t baseline_row_seq;
+    unsigned char baseline_digest[32];
+    uint64_t acknowledged_position;
+    uint64_t durable_position;
+    uint64_t stream_position;
+    const char* key;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t row_change_seq;
+} qihse_kv_ct_source_retained_frame_request_t;
+typedef struct {
+    uint32_t version;
+    uint32_t size;
+    unsigned char* frame;
+    size_t frame_length;
+    unsigned char frame_sha256[32];
+    char* key;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+    uint64_t stream_position;
+    uint64_t row_change_seq;
+    uint64_t expire_time_ms;
+} qihse_kv_ct_source_retained_frame_result_t;
+bool qihse_kv_ct_source_retained_frame_v1(qihse_kv_store_t* store,
+    qihse_user_t* principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    qihse_kv_ct_source_retained_frame_result_t* out);
+/* Local source-only quote prerequisite, NOT a signer or frozen-file attestation.
+ * Requires an active Operator AND the exact configured, active, non-Operator
+ * system replication principal. Under exclusive store and directory locks,
+ * validates sealed persisted baseline/generation/bounds, exact row high-water
+ * and original QKV6
+ * bytes via the retained-frame reader. frame_offset is the measured byte offset
+ * of retained.frame in the exact retained wal.log (offset + length fits WAL).
+ * No caller-supplied identity overrides.
+ * The caller owns out->retained.frame/key on success; failure zeroes out.
+ * Target history, trusted recovery-root roster, QKP pins and nonce freshness
+ * still require independent validation before any signing endpoint is safe.
+ * Additive API: rebuild with `make lib`; stored data needs no migration. */
+typedef struct {
+    qihse_kv_ct_source_retained_frame_result_t retained;
+    uint64_t frame_offset;
+    uint64_t row_seq_high_water;
+} qihse_kv_ct_source_quote_snapshot_t;
+bool qihse_kv_ct_source_quote_snapshot_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    uint64_t expected_row_seq_high_water,
+    qihse_kv_ct_source_quote_snapshot_t* out);
+/* Ordinary ACK/reconcile are never CT1 custody-release operations. A source
+ * custody hold fences BOTH entry points, including an exact pinned peer cursor,
+ * matching digest, or an authenticated principal with the same UID. Releasing
+ * retained originals requires a separate durable root-host decision bound to
+ * the exact canonical B, original frame and source principal, consumed under
+ * source ownership; an archive ID/path/digest or same-UID caller is not proof.
+ * No such release interface is currently connected to these APIs. */
 bool qihse_kv_ct_source_ack(qihse_kv_store_t* store, qihse_user_t* principal,
     const char* peer_id, const char* generation, uint64_t durable_lsn);
 /* Called only after pinned QKP peer STATUS. Re-arms a reopened or timed-out
@@ -325,6 +410,97 @@ bool qihse_kv_ct_receiver_apply(qihse_kv_store_t* store, qihse_user_t* principal
     const qihse_kv_ct_group_t* group, uint64_t* out_durable_cursor);
 bool qihse_kv_ct_receiver_status(qihse_kv_store_t* store,
     qihse_user_t* principal, qihse_kv_ct_receiver_status_t* out);
+/* Operator-only CT1 receiver admission denial for new binaries. Installs a
+ * durable intent bound to the exact persisted generation, baseline and cursor.
+ * The directory-inode lock serializes installation with receiver apply on
+ * already-open upgraded handles. Quiesce old binaries before relying on it.
+ * No ordinary RECONCILE releases it. The CT-state intent bit also denies
+ * startup when the sidecar is missing or damaged. For a disposable scalar
+ * fixture only, a separately authored exact QCT1SO02 suppressed-original
+ * disposition may follow PREPARED at the pinned cursor: replay validates the
+ * complete SOURCE frame and successor tombstone, then advances the receiver
+ * cursor without applying the old SET. Both sidecar and CT-state denial remain
+ * in force; WAL rotation, snapshots and compaction stay denied, including after
+ * reopen. This does not admit generic CT apply or enable a runtime recovery
+ * command. Rebuild with `make lib`; stored data needs no migration (legacy CT
+ * metadata upgrades on first write). */
+bool qihse_kv_ct_receiver_recovery_fence_install(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* generation, uint64_t baseline_row_seq,
+    const unsigned char baseline_digest[32], uint64_t durable_cursor);
+/* Operator-only SOURCE custody hold for an unacknowledged retained group.
+ * Persistently denies ACK, RECONCILE and WAL retirement; it does not archive
+ * the original or authorize compensation. No release path exists until a
+ * separately authenticated root archive and target high-water are available.
+ * The fixture-only source row-floor/QKV6 tombstone exercise is not callable
+ * from production. A future source-side endpoint MUST receive a synchronous,
+ * non-transferable decision from the live root-host QKP Operator session,
+ * independently verify that the immutable root archive precedes retirement
+ * and binds the exact canonical B, original 1644-byte SOURCE QKV6 digest,
+ * both signed node quotes, configured generation/source/target IDs, target
+ * high-water and target tombstone position/row sequence; neither a caller
+ * path/digest nor a process UID or generic Operator principal is that fact.
+ * ACK and reconcile continue to deny while the custody hold is installed.
+ * Quiesce old binaries before relying on this denial. Rebuild with `make lib`;
+ * stored data needs no migration. */
+bool qihse_kv_ct_source_custody_hold_install(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* generation, uint64_t baseline_row_seq,
+    const unsigned char baseline_digest[32], uint64_t durable_position);
+/* Pin the sole unacknowledged dense source group (ACK + 1 == durable), its
+ * exact physical QKV6 frame at the quoted WAL offset, and source row high-water
+ * immediately before installing the same irreversible custody hold. Earlier
+ * ACKed frames may remain in the WAL. The caller must supply an exact prior
+ * source quote; this operation verifies local pins, NOT the live root QKP
+ * session, archive, canonical B, or target history.
+ * Only the root-host boundary may assert those independently before calling;
+ * an archive path/ID/digest is never accepted as release authority. No release
+ * endpoint exists. Rebuild with `make lib`; stored data needs no migration. */
+bool qihse_kv_ct_source_custody_hold_install_pinned_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_source_retained_frame_request_t* request,
+    uint64_t expected_row_seq_high_water, size_t expected_frame_length,
+    const unsigned char expected_frame_sha256[32]);
+
+/* Read-only legacy (non-lane) receiver-history check. The caller must supply
+ * an active principal; this result attests neither QKP peer identity nor any
+ * source pending frame and confers no mutation/ACK capability. */
+#define QIHSE_KV_CT_RECEIVER_HISTORY_V1 1u
+typedef struct {
+    uint32_t version; /* QIHSE_KV_CT_RECEIVER_HISTORY_V1 */
+    uint32_t size;    /* sizeof(qihse_kv_ct_receiver_history_request_t) */
+    const char* source_id;
+    const char* target_id;
+    const char* generation;
+    uint64_t baseline_row_seq;
+    unsigned char baseline_digest[32];
+    uint64_t durable_cursor;
+    const char* key;
+    uint32_t resource_tenant_id;
+    uint16_t classification;
+    uint16_t sci_compartment;
+} qihse_kv_ct_receiver_history_request_t;
+typedef struct {
+    uint32_t version;
+    uint32_t size;
+    uint64_t stream_position;
+    uint64_t row_change_seq;
+    uint64_t durable_cursor;
+    uint64_t row_seq_high_water;
+} qihse_kv_ct_receiver_history_result_t;
+bool qihse_kv_ct_receiver_history_v1(qihse_kv_store_t* store,
+    qihse_user_t* principal, const qihse_kv_ct_receiver_history_request_t* request,
+    qihse_kv_ct_receiver_history_result_t* out);
+/* Read-only local TARGET quote prerequisite, not a signer or peer attestation.
+ * Requires an active local Operator and the exact configured active SYSTEM
+ * non-Operator replication principal. Holds the exclusive store and stable
+ * directory locks while checking persisted receiver state, WAL, and the exact
+ * caller-expected row high-water; failure zeroes out. No stored-data migration;
+ * rebuild with `make lib`. Signing still requires independent peer identity,
+ * recovery-root authority, QKP pins and nonce freshness validation. */
+bool qihse_kv_ct_target_quote_snapshot_v1(qihse_kv_store_t* store,
+    qihse_user_t* local_operator, qihse_user_t* replication_principal,
+    const qihse_kv_ct_receiver_history_request_t* request,
+    uint64_t expected_row_seq_high_water,
+    qihse_kv_ct_receiver_history_result_t* out);
 
 /* Store-level durable fences and locally minted, opaque ownership evidence.
  * QKP peer pinning remains a transport responsibility. A proof is only valid
@@ -511,6 +687,8 @@ bool qihse_kv_ct_lane_transfer_target_import_begin(qihse_kv_store_t* store,
 bool qihse_kv_ct_lane_transfer_status(qihse_kv_store_t* store,
     qihse_user_t* control_principal,
     qihse_kv_ct_lane_transfer_status_t* out_status);
+/* An identical live receiver image is reused without row replacement. A
+ * differing occupied image is refused: common ABORT has no durable undo image. */
 bool qihse_kv_ct_lane_transfer_target_import_apply(qihse_kv_store_t* store,
     qihse_user_t* control_principal, qihse_user_t* replication_principal,
     qihse_user_t* data_principal,
@@ -561,6 +739,14 @@ bool qihse_kv_ct_lane_receiver_prepare(qihse_kv_store_t* store,
     const qihse_kv_ct_proof_t* reserved_proof,
     qihse_kv_ct_lane_authority_verify_fn verify_reserved, void* verify_context,
     unsigned char out_owner_token[QIHSE_KV_CT_TOKEN_BYTES]);
+/* Operator-only hints, not cleanup authority. Start cursor at zero; returns
+ * 1 for a marked, non-admitted, non-promoting receiver, 0 at end, -1 on error.
+ * Unknown cuts must not be inferred. Output is cleared at end/on error; errors
+ * leave cursor unchanged. Revalidate the full common ABORT before cleanup.
+ * This is not a snapshot; native mutation rechecks current provenance/token. */
+int qihse_kv_ct_lane_staging_next_user(qihse_kv_store_t* store,
+    qihse_user_t* operator_principal, size_t* cursor,
+    qihse_kv_ct_lane_staging_candidate_t* out_candidate);
 /* Metadata-only reduction of a non-owner replica's assigned slots. This
  * cannot add slots, turn a receiver into a source, or admit ordinary reads. */
 bool qihse_kv_ct_lane_receiver_prune(qihse_kv_store_t* store,
@@ -824,6 +1010,45 @@ bool qihse_kv_del_with_receipt_user(qihse_kv_store_t* store,
     uint16_t receipt_classification, uint16_t receipt_sci,
     qihse_kv_receipt_builder_t build_receipt, void* context,
     qihse_user_t* user, uint64_t* out_delete_seq);
+
+/* DIRECTEYE canonical mutation + outbox. The record row and event row are
+ * written in one independently checksummed WAL frame. `record_value == NULL`
+ * emits a source tombstone; otherwise it is an upsert. The keys must be in the
+ * caller's `directeye:canonical:v1:<tenant>:` and
+ * `directeye:outbox:v1:<tenant>:` namespaces. `expected_source_seq == 0`
+ * requires an absent source row; otherwise it is an exact CAS against the
+ * live row's current sequence. The event builder is called under the write
+ * lock with the reserved source generation, outbox cursor and durable source
+ * timestamp in milliseconds. Exact retries
+ * with the same event key and event bytes return the original cursor; reuse
+ * with different bytes is rejected. A failure after writing any WAL bytes
+ * fences the store until authenticated reopen. CT-mode stores are rejected.
+ */
+#define QIHSE_KV_DIRECTEYE_MAX_EVENT (256u * 1024u)
+typedef bool (*qihse_kv_directeye_event_builder_t)(uint64_t generation,
+    uint64_t cursor, uint64_t committed_at_ms, char* out_value,
+    size_t capacity, void* context);
+bool qihse_kv_directeye_mutate_user(qihse_kv_store_t* store,
+    const char* record_key, const char* record_value,
+    uint64_t expected_source_seq, const char* event_key,
+    uint16_t classification, uint16_t sci_compartment,
+    qihse_kv_directeye_event_builder_t build_event, void* context,
+    qihse_user_t* user, uint64_t* out_generation, uint64_t* out_cursor);
+#define QIHSE_KV_DIRECTEYE_FEED_MAX_PAGE 128u
+typedef struct {
+    uint64_t cursor;
+    char* json;
+} qihse_kv_directeye_event_t;
+bool qihse_kv_directeye_feed_read_user(qihse_kv_store_t* store,
+    qihse_user_t* reader, uint64_t after_cursor, size_t limit,
+    qihse_kv_directeye_event_t** out_events, size_t* out_count,
+    uint64_t* out_next_cursor);
+void qihse_kv_directeye_feed_events_free(qihse_kv_directeye_event_t* events,
+                                          size_t count);
+/* Persist a monotonic ACK for this provisioned index identity. The watermark
+ * is atomically replaced and fsynced before success; outbox rows are retained. */
+bool qihse_kv_directeye_feed_ack_user(qihse_kv_store_t* store,
+    qihse_user_t* reader, uint64_t cursor, uint64_t* out_ack_cursor);
 /* Read state only for an authorized live record or retained tombstone.
  * Success with sequence 0 means LEGACY_UNVERSIONED, not ordered mutation,
  * version, or cursor evidence. Callers requiring such evidence must reject 0.
@@ -1012,6 +1237,20 @@ typedef struct {
     uint64_t expire_time_ms;
     bool tombstone;
 } qihse_kv_delta_record_t;
+
+/* Authenticated same-handle checkpoint for a local CT-disabled durable source.
+ * Only the active bootstrap Operator (id0, tenant0) may observe this whole-store
+ * fence. Refuses busy/bulk/batch, recovery-pending, replica, inherited and view
+ * handles; output is unchanged on failure. Restore/GC may advance the epoch
+ * without changing sequence; retain the instance and compare ALL three fields.
+ * This alone is not a shared cross-store backup or a logical-TTL freeze. */
+typedef struct {
+    uint64_t instance_id;
+    uint64_t change_seq;
+    uint64_t projection_epoch;
+} qihse_kv_snapshot_checkpoint_t;
+bool qihse_kv_snapshot_checkpoint_user(qihse_kv_store_t* store,
+    const qihse_user_t* user, qihse_kv_snapshot_checkpoint_t* checkpoint);
 
 void qihse_kv_delta_records_free(qihse_kv_delta_record_t* records, size_t count);
 

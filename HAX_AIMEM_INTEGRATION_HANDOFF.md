@@ -32,10 +32,12 @@ configured storage paths directly.
 
 HAX calls `AIMEM FORGET-SCOPED-DURABLE <uuid> <project> <worktree> <workstream> <session>` through
 `HAX_ROOT/src/agent/memory.c`. When the response is lost or a durability fence fails, HAX reports an
-unknown result. In `src/spinnaker/qihse_resp_engine.c`, this scoped operation returns `:1` after a
-successful removal and local sync, but `:0` covers cases including absent, inaccessible, or already
-removed records, and the current branch does not sync when no record was removed. A later `:0` is
-therefore not evidence that an earlier deletion was durably committed.
+unknown result. In `src/spinnaker/qihse_resp_engine.c`, this scoped operation now
+fences the KV store before returning `:0` as well as `:1`; a retry that finds no
+visible matching record therefore confirms the current deletion state crossed
+the local fsync fence. It still does not recover the exact original receipt or
+distinguish every inaccessible/absent case; clients that need lost-reply
+reconciliation should use `FORGET-SCOPED-RECEIPT`.
 
 `AIMEM FORGET-RECEIPT` in `docs/architecture/aimem_resp_protocol.md` is a separate legacy/global
 operation. It must not be assumed to reconcile a scoped deletion. Similarly, a missing scoped GET

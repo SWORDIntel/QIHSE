@@ -12,6 +12,8 @@
 #ifndef QIHSE_SUPERPOSITION_H
 #define QIHSE_SUPERPOSITION_H
 
+#include "../include/qihse_math_types.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -29,18 +31,7 @@ extern "C" {
  * Represents a quantum state |ψ⟩ = Σᵢ αᵢ |i⟩ where αᵢ are complex amplitudes.
  * In classical terms, this is stored as real/imaginary components with phases.
  */
-typedef struct qihse_superposition_s {
-    double* real;               /* Real amplitude components [num_states] */
-    double* imag;               /* Imaginary amplitude components [num_states] */
-    double* phase;              /* Per-element phase angles [num_states] in radians */
-    size_t num_states;          /* Number of superposition states */
-    size_t dims_per_state;      /* Dimensions per quantum state */
-    double global_phase;        /* Global quantum phase offset */
-    double measurement_confidence; /* Confidence in quantum measurement */
-
-    /* Internal state */
-    void* internal_state;       /* Backend-specific state (if needed) */
-} qihse_superposition_t;
+/* ABI-stable definitions are shared with the installed public headers. */
 
 /* ============================================================================
  * SUPERPOSITION CREATION AND MANAGEMENT
@@ -55,7 +46,7 @@ typedef struct qihse_superposition_s {
  * @param rff_data RFF-projected array [n * rff_dims]
  * @param n Number of elements in original array
  * @param rff_dims RFF output dimensions
- * @param superposition Output superposition structure (must be allocated)
+ * @param superposition Output structure; fresh or destroyed before reuse
  * @return 0 on success, negative error code on failure
  */
 int qihse_create_superposition(
@@ -124,7 +115,7 @@ void qihse_superposition_apply_phase(
  * @param b Second superposition
  * @return Fidelity value between 0.0 and 1.0
  */
-double qihse_superposition_fidelity(
+double qihse_superposition_state_fidelity(
     const qihse_superposition_t* a,
     const qihse_superposition_t* b
 );
@@ -132,7 +123,7 @@ double qihse_superposition_fidelity(
 /**
  * Extract probability amplitudes from superposition.
  *
- * Pᵢ = |αᵢ|²
+ * Pᵢ = Σ_d |αᵢd|² / Σ_jd |α_jd|² (normalized on output)
  *
  * @param superposition Input superposition
  * @param probabilities Output probabilities [num_states]
@@ -153,7 +144,7 @@ void qihse_superposition_get_probabilities(
  *
  * @param superposition Superposition to measure
  * @param random_seed Random seed for reproducible measurements
- * @return Index of measured state (0 to num_states-1)
+ * @return Index of measured state, or SIZE_MAX on invalid/zero-mass input
  */
 size_t qihse_superposition_measure(
     const qihse_superposition_t* superposition,

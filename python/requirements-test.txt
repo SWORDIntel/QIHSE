@@ -1,0 +1,6 @@
+# Existing Python dependencies plus the full-suite client/browser fixtures.
+-r requirements.txt
+psycopg2-binary
+psycopg[binary]
+asyncpg
+fido2

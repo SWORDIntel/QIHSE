@@ -97,6 +97,10 @@ int main(void) {
     assert(qihse_cluster_key_is_node_local("t:7/aimem-forget:42:receipt"));
     assert(qihse_cluster_key_is_node_local("t:7/aimem-idem:42:request"));
     assert(qihse_cluster_key_is_node_local("aimem-idem:42:request"));
+    assert(qihse_cluster_key_is_node_local("fedstmt:sender:boot"));
+    assert(qihse_cluster_key_is_node_local("fedreplay:sender:boot"));
+    assert(!qihse_cluster_key_is_node_local("t:7/fedstmt:sender:boot"));
+    assert(!qihse_cluster_key_is_node_local("fedstmt-app:key"));
     assert(!qihse_cluster_key_is_node_local("t:7/app:new"));
     assert(!qihse_cluster_key_is_node_local("t:no/aimem:abc"));
     assert(!qihse_cluster_key_is_node_local("sabot/tool:key"));
@@ -117,8 +121,16 @@ int main(void) {
         assert(qihse_kv_set_user(s,key,"protected",5,9,op));}
     assert(qihse_kv_set_user(s,"t:7/app:key","shardable",0,0,op));
     assert(qihse_kv_set_user(s,"aimem-idem:legacy:request","local",0,0,op));
+    assert(qihse_kv_set_user(s,"fedstmt:sender:boot","local-statement",5,9,op));
+    assert(qihse_kv_set_user(s,"fedreplay:sender:boot","99",5,9,op));
     assert(qihse_cluster_reclaim_foreign_slots(s,topo,local,op)==1);
-    assert(qihse_kv_count_user(s,op)==11);
+    assert(qihse_kv_count_user(s,op)==13);
+    char* statement=qihse_kv_get_user(s,"fedstmt:sender:boot",op);
+    char* replay=qihse_kv_get_user(s,"fedreplay:sender:boot",op);
+    assert(statement && !strcmp(statement,"local-statement") && replay && !strcmp(replay,"99"));
+    free(statement);free(replay);
+    assert(!qihse_kv_get_user(s,"fedstmt:sender:boot",low));
+    assert(!qihse_kv_get_user(s,"fedreplay:sender:boot",low));
     qihse_cluster_topology_destroy(topo);qihse_kv_store_destroy(s);
     aimem_fixture_cleanup(dir);
     puts("PASS authenticated bounded backup merge, conflict preservation, scoped AIMEM reclaim");
