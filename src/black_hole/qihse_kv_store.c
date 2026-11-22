@@ -1309,6 +1309,23 @@ static bool ct_lane_marker_write(qihse_kv_store_t* store) {
     return atomic_file_commit(f, temp, path) && fsync_dir_path(get_qihse_data_dir());
 }
 
+static bool ct_lane_marker_write(qihse_kv_store_t* store) {
+    if (!store || !store->ct_lane_count || store->ct_mode != 0u || store->memory_snapshot)
+        { errno = EINVAL; return false; }
+    kv_ct_lane_marker_t marker;
+    memset(&marker, 0, sizeof(marker));
+    memcpy(marker.magic, "QCTST004", 8u);
+    marker.checksum = fnv1a64_update(14695981039346656037ULL, &marker,
+                                     offsetof(kv_ct_lane_marker_t, checksum));
+    char path[4096], temp[8192]; FILE* f = NULL;
+    if (!build_data_path(path, sizeof(path), "ct-state.bin") ||
+        !atomic_file_begin(path, temp, sizeof(temp), &f)) return false;
+    if (!fwrite_exact(&marker, 1u, sizeof(marker), f)) {
+        fclose(f); unlink(temp); return false;
+    }
+    return atomic_file_commit(f, temp, path) && fsync_dir_path(get_qihse_data_dir());
+}
+
 static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
                           bool legacy_bootstrap) {
     char path[4096];
