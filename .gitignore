@@ -209,3 +209,5 @@ rust/*/target/
 /tmp_repro/
 /.tmp_repro/
 /aimem_*/
+/ct1-*/
+/brain-ct*/
