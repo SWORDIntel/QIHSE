@@ -2705,6 +2705,7 @@ PUBLIC_API_HEADERS := qihse.h qihse_math_types.h qihse_auth.h qihse_auth_mainten
     qihse_resp_engine.h qihse_resp_wire.h qihse_resp_fts_namespace.h qihse_qkp.h qihse_resp_cluster.h \
     qihse_cluster_bus.h qihse_cluster_maintenance.h qihse_cluster_failover.h qihse_cluster_scatter.h \
     qihse_ct_codec.h qihse_ct_group_config.h qihse_cluster_ownership.h qihse_cluster_ownership_journal.h qihse_cluster_transfer.h qihse_ct_target.h \
+    qihse_ct1_recovery_manifest.h qihse_ct1_disposition.h \
     qihse_system_guard.h qihse_quota.h qihse_blob.h qihse_bundle.h \
     qihse_consensus.h qihse_consensus_blob.h qihse_consensus_blob_channel.h \
     qihse_consensus_channel.h qihse_consensus_mesh.h qihse_consensus_wire.h \

@@ -17,7 +17,12 @@ class ParallelSuiteTests(unittest.TestCase):
     def test_all_current_prerequisites_are_scheduled_exactly_once(self):
         makefile = (ROOT / "Makefile").read_text()
         self.assertEqual([line for line in makefile.splitlines()
-                          if re.match(r"^test\s*:", line)], ["test: test-parallel"])
+                          if re.match(r"^test\s*:", line)],
+                         ["test: test-parallel test-ct1-recovery-host-auth "
+                          "test-ct1-source-hold-resp test-ct-target-epoch-fence "
+                          "test-ct1-target-disposition "
+                          "test-ct1-target-disposition-resp test-ct-source-floor "
+                          "test-ct1-source-floor-resp"])
         targets = test_targets(makefile)
         parallel, serial = plan(targets)
         self.assertEqual(set(parallel) | set(serial), set(targets))
