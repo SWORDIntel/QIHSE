@@ -36,6 +36,7 @@ typedef struct {
     const char *admin_peer_node_id, *admin_peer_dsa_pub_path;
     const char *const *migration_peer_node_ids, *const *migration_peer_dsa_pub_paths;
     size_t migration_peer_count;
+    const char *recovery_peer_node_id, *recovery_peer_dsa_pub_path;
 } legacy_qkp_config_t;
 _Static_assert(sizeof(qihse_qkp_config_t) == sizeof(legacy_qkp_config_t), "old QKP ABI");
 _Static_assert(offsetof(qihse_qkp_config_t, migration_peer_count) ==

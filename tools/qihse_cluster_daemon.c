@@ -3311,6 +3311,8 @@ int main(int argc, char** argv) {
     const char* migration_peer_node_ids[16];
     const char* migration_peer_dsa_pub_paths[16];
     size_t migration_peer_count = 0u;
+    const char* recovery_peer_node_id = NULL;
+    const char* recovery_peer_dsa_pub = NULL;
     const char* data_dir = NULL;
     bool enable_scatter = false;
     bool failover_start_paused = false;
@@ -3538,6 +3540,13 @@ int main(int argc, char** argv) {
         } else if (strcmp(a, "--admin-peer-dsa-pub-2") == 0 && i + 1 < argc) {
             admin_peer_dsa_pub_2 = argv[++i];
             if (!*admin_peer_dsa_pub_2) return usage(argv[0]), 2;
+        } else if (strcmp(a, "--recovery-peer-node-id") == 0 && i + 1 < argc) {
+            recovery_peer_node_id = argv[++i];
+            if (!*recovery_peer_node_id || strlen(recovery_peer_node_id) > QIHSE_QKP_NODE_ID_LEN)
+                return usage(argv[0]), 2;
+        } else if (strcmp(a, "--recovery-peer-dsa-pub") == 0 && i + 1 < argc) {
+            recovery_peer_dsa_pub = argv[++i];
+            if (!*recovery_peer_dsa_pub) return usage(argv[0]), 2;
         } else if (strcmp(a, "--migration-peer") == 0 && i + 2 < argc) {
             if (migration_peer_count >= 16u) return usage(argv[0]), 2;
             const char* nid = argv[++i];
@@ -3856,6 +3865,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "qihse-cluster-daemon: --admin-peer-node-id-2 and --admin-peer-dsa-pub-2 must be configured together\n");
         return 2;
     }
+    if ((recovery_peer_node_id != NULL) != (recovery_peer_dsa_pub != NULL)) {
+        fprintf(stderr, "qihse-cluster-daemon: recovery peer node ID and DSA public key must be configured together\n");
+        return 2;
+    }
     if ((replication_source_host != NULL) != (replication_source_port != 0u)) {
         fprintf(stderr, "qihse-cluster-daemon: replication source host and port must be configured together\n");
         return 2;
@@ -4040,7 +4053,7 @@ int main(int argc, char** argv) {
     }
     if (replication_configured) pqc_require = true;
     if (admin_peer_configured) pqc_require = true;
-    if (migration_peer_count > 0u) pqc_require = true;
+    if (migration_peer_count > 0u || recovery_peer_node_id) pqc_require = true;
     if (consensus_configured) {
         const char* consensus_error = consensus_options_error(
             &consensus_options, data_dir, pqc_node_id, pqc_require,
@@ -4545,6 +4558,14 @@ int main(int argc, char** argv) {
     pqc.migration_peer_node_ids = migration_peer_node_ids;
     pqc.migration_peer_dsa_pub_paths = migration_peer_dsa_pub_paths;
     pqc.migration_peer_count = migration_peer_count;
+    pqc.recovery_peer_node_id = recovery_peer_node_id;
+    pqc.recovery_peer_dsa_pub_path = recovery_peer_dsa_pub;
+    if (!qihse_qkp_recovery_pin_valid(&pqc, admin_peer_node_id_2,
+        admin_peer_dsa_pub_2, replication_allowed_peers,
+        replication_allowed_peer_count)) {
+        fprintf(stderr, "qihse-cluster-daemon: recovery peer pin is invalid or overlaps an admin, migration or replication signer\n");
+        return 2;
+    }
     static char pqc_dsa_key[512], pqc_kem_key[512], pqc_kem_pub[512];
     const char* pqc_dir = pqc_identity_dir ? pqc_identity_dir : "/etc/qihse/keys";
     snprintf(pqc_dsa_key, sizeof(pqc_dsa_key), "%s/qihse_dsa_key.pem", pqc_dir);

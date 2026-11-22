@@ -81,6 +81,50 @@ static bool qkp_dsa_pub_fingerprint(const char* path, uint8_t out[32]) {
     return ok;
 }
 
+bool qihse_qkp_recovery_pin_valid(const qihse_qkp_config_t* config,
+    const char* second_admin_node_id, const char* second_admin_pub_path,
+    const qihse_qkp_replication_peer_t* peers, size_t peer_count) {
+    if (!config || peer_count > QIHSE_QKP_MAX_REPLICATION_PEERS ||
+        (peer_count && !peers)) return false;
+    const char* id = config->recovery_peer_node_id;
+    const char* path = config->recovery_peer_dsa_pub_path;
+    if (!id && !path) return true;
+    if (!id || !*id || strnlen(id, QIHSE_QKP_NODE_ID_LEN + 1u) > QIHSE_QKP_NODE_ID_LEN ||
+        !path || !*path || config->migration_peer_count > QIHSE_QKP_MAX_REPLICATION_PEERS ||
+        (config->migration_peer_count &&
+         (!config->migration_peer_node_ids || !config->migration_peer_dsa_pub_paths)))
+        return false;
+    uint8_t recovery[32] = {0}, other[32] = {0};
+    bool ok = qkp_dsa_pub_fingerprint(path, recovery);
+    const char* fixed_ids[] = {config->admin_peer_node_id,
+        second_admin_node_id, config->replication_peer_node_id};
+    const char* fixed[] = {config->admin_peer_dsa_pub_path,
+        second_admin_pub_path, config->replication_peer_dsa_pub_path};
+    for (size_t i = 0; ok && i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+        if (fixed_ids[i] && strcmp(id, fixed_ids[i]) == 0) {
+            ok = false;
+            break;
+        }
+        if (!fixed[i]) continue;
+        ok = qkp_dsa_pub_fingerprint(fixed[i], other) &&
+             CRYPTO_memcmp(recovery, other, sizeof(recovery)) != 0;
+    }
+    for (size_t i = 0; ok && i < config->migration_peer_count; i++) {
+        ok = config->migration_peer_node_ids[i] &&
+             strcmp(id, config->migration_peer_node_ids[i]) != 0 &&
+             qkp_dsa_pub_fingerprint(config->migration_peer_dsa_pub_paths[i], other) &&
+             CRYPTO_memcmp(recovery, other, sizeof(recovery)) != 0;
+    }
+    for (size_t i = 0; ok && i < peer_count; i++) {
+        ok = peers[i].node_id && strcmp(id, peers[i].node_id) != 0 &&
+             qkp_dsa_pub_fingerprint(peers[i].dsa_pub_path, other) &&
+             CRYPTO_memcmp(recovery, other, sizeof(recovery)) != 0;
+    }
+    OPENSSL_cleanse(other, sizeof(other));
+    OPENSSL_cleanse(recovery, sizeof(recovery));
+    return ok;
+}
+
 bool qihse_qkp_session_is_replication_peer(const qihse_qkp_session_t* s,
                                            const char* expected_node_id,
                                            const char* expected_dsa_pub_path) {
