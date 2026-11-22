@@ -5916,27 +5916,6 @@ static bool qihse_resp_handle_zrangebyscore(qihse_resp_session_t* session, const
 }
 
 /* ---- Key/generic commands ---- */
-static bool qihse_resp_tenant_key_allowed(uint32_t tenant, const qihse_resp_arg_t* key);
-
-/* AIMEM's canonical rows and control records are accessed through the typed
- * AIMEM API. Raw KV commands must not read, manufacture or mutate them. */
-static bool qihse_resp_key_is_aimem_internal(const void* data, size_t len) {
-    const unsigned char* p = data;
-    size_t off = 0u;
-    static const char* const prefixes[] = {"aimem:", "aimemv:", "aimem-"};
-    if (!p) return false;
-    if (len >= 2u && p[0] == 't' && p[1] == ':') {
-        off = 2u;
-        while (off < len && p[off] >= '0' && p[off] <= '9') off++;
-        if (off == 2u || off >= len || p[off] != '/') return false;
-        off++;
-    }
-    for (size_t i = 0u; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        size_t n = strlen(prefixes[i]);
-        if (len - off >= n && memcmp(p + off, prefixes[i], n) == 0) return true;
-    }
-    return false;
-}
 
 /* AIMEM's canonical rows and control records are accessed through the typed
  * AIMEM API. Raw KV commands must not read, manufacture or mutate them. */
@@ -21576,11 +21555,6 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
         return qihse_resp_error(session,
             "NOPERM command is outside the authenticated service capability");
     }
-
-    /* END only releases this session's already-held snapshot resources. It
-     * must remain callable after capability, auth, or CT admission changes. */
-    if (qihse_resp_command_is(request, "OWNER.SNAPSHOT.END"))
-        return qihse_resp_handle_owner_snapshot_end(session, request);
 
     /* END only releases this session's already-held snapshot resources. It
      * must remain callable after capability, auth, or CT admission changes. */
