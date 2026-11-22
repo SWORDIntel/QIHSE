@@ -536,16 +536,26 @@ keys. A separate public readiness record contains no generation or count.
 
 ## Native QH-05 through QH-08 contracts
 
-The C interface now exposes a bounded curated-knowledge projection without
-changing the existing RESP verbs. `qihse_ai_memory_query_begin()` materializes
-only rows visible to the explicit principal and requested scope, applies type,
-status, current-version, ingestion-time and text filters, then sorts by
-ingestion time and version UUID. `query_next()` pages that immutable result and
-rechecks the same actor, current project membership, classification and SCI on
-every row. A revoked grant therefore cannot continue draining already
-materialized content. Each hit includes a bounded lexical score and explicit
-text-match/current explanation flags. Snapshots are bounded to 4,096 rows and
-are process-local; callers must restart a query after process loss.
+`AIMEM QUERY V1` adds a typed RESP cursor without changing legacy verbs. BEGIN
+accepts exact scope, type/status/current filters, inclusive ingestion bounds,
+an exclusive changed-since watermark, an optional ingestion-time as-of view,
+ranking mode and a maximum of 4,096 rows. NEXT accepts 1..128 rows. Cursor
+tokens are random UUIDs bound to the active principal and server, expire after
+five minutes, and are removed when the server is destroyed. Cursor lookup
+errors do not distinguish an unknown token from a token owned by another
+principal. Results are process-local; restart requires a new query.
+
+The native query snapshot materializes only rows visible to the explicit
+principal and requested scope. BM25 builds a bounded FTS projection from that
+authorized materialization; semantic ranking embeds only those visible
+versions; hybrid ranking uses reciprocal-rank fusion over the same candidate
+set. Every page re-reads each version through the authenticated knowledge API
+and rechecks project membership, classification and SCI, so a revoked grant or
+raised label stops paging. Each result carries bounded BM25/cosine/fused scores,
+ranking-leg flags, and only relations whose targets the caller can currently
+read. As-of returns the version whose half-open ingestion interval contains the
+cutoff; it describes QIHSE's knowledge at that ingestion time, not world-time
+truth. Explain output exposes no hidden candidate count or content.
 
 One-lineage maintenance uses durable `QHM1` plans. Planning can be side-effect
 free; apply appends a normal `QHK1` successor and rollback appends another
