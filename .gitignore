@@ -191,3 +191,5 @@ tools/test_i2p_qkp_diag
 !/tests/test_codegraph_snapshot_xxh3.py
 
 !/tests/test_codegraph_retention_bound.py
+rust/*/target/
+*.writer.lock
