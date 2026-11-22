@@ -247,8 +247,13 @@ class ReindexTests(unittest.TestCase):
             os.close(master)
 
     def interrupt(self, signum, expected):
+        def reset_sigint():
+            if signum == signal.SIGINT:
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+
         proc=subprocess.Popen([sys.executable,str(self.wrapper),'--repo',str(self.repo)],
-            env=self.env|{'SLEEP_STAGE':'prepare-source','SLEEP_SECONDS':'30'},stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            env=self.env|{'SLEEP_STAGE':'prepare-source','SLEEP_SECONDS':'30'},
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,preexec_fn=reset_sigint)
         try:
             deadline=time.monotonic()+5
             while not self.events() and time.monotonic()<deadline: time.sleep(0.02)
