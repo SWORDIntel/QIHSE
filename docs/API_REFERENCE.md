@@ -74,7 +74,7 @@ above):
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 17 | 17 |
 | `include/qihse_shared_backup.h` | 3 | 3 |
-| `include/qihse_kv_store.h` | 157 | 154 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 161 | 158 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ### Native upgrade surfaces — current-source contracts
