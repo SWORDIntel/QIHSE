@@ -591,6 +591,43 @@ int main(void) {
     assert(!latest.source_ref.system[0]);
     qihse_ai_memory_knowledge_free(&latest);
 
+    qihse_ai_memory_maintenance_plan_t high_plan = {0};
+    assert(qihse_ai_memory_maintenance_plan_ex(server, high, secret.knowledge_id,
+        &scope, secret.content, QIHSE_AIMEM_RETENTION_PINNED,
+        QIHSE_AIMEM_MAINT_RETENTION_CHANGE, false, &high_plan) == QIHSE_AIMEM_WRITE_NEW);
+    char high_plan_key[128];
+    snprintf(high_plan_key, sizeof high_plan_key, "t:17/aimem-maint:%s", high_plan.plan_id);
+    qihse_kv_record_meta_t high_plan_meta;
+    assert(qihse_kv_meta_user(store, high_plan_key, high, &high_plan_meta));
+    assert(high_plan_meta.classification == 5u);
+    assert(!qihse_kv_meta_user(store, high_plan_key, reader, &high_plan_meta));
+    char* unauthorized_plan = qihse_kv_get_user(store, high_plan_key, reader);
+    assert(unauthorized_plan == NULL);
+
+    qihse_ai_memory_relation_t contradiction = {
+        .type = QIHSE_AIMEM_RELATION_CONTRADICTS,
+        .target_scope = scope
+    };
+    snprintf(contradiction.target_version_id,
+        sizeof contradiction.target_version_id, "%s", second.version_id);
+    qihse_ai_memory_knowledge_provenance_t contradiction_provenance = {
+        .relations = &contradiction, .relation_count = 1u
+    };
+    qihse_ai_memory_knowledge_version_t flagged = {0};
+    assert(qihse_ai_memory_knowledge_create_ex(server, owner, &scope,
+        QIHSE_AIMEM_KNOWLEDGE_DECISION, QIHSE_AIMEM_KNOWLEDGE_PROPOSED,
+        "explicitly contradictory item", &contradiction_provenance, &flagged) ==
+        QIHSE_AIMEM_WRITE_NEW);
+    qihse_ai_memory_maintenance_plan_t rejected_contradiction = {0};
+    assert(qihse_ai_memory_maintenance_plan_ex(server, owner, flagged.knowledge_id,
+        &scope, "explicitly contradictory item", QIHSE_AIMEM_RETENTION_SEMANTIC,
+        QIHSE_AIMEM_MAINT_EXTRACTIVE, true, &rejected_contradiction) ==
+        QIHSE_AIMEM_WRITE_FAILED);
+    assert(qihse_ai_memory_knowledge_latest(server, owner, flagged.knowledge_id,
+        &scope, &latest));
+    assert(strcmp(latest.content, "explicitly contradictory item") == 0);
+    qihse_ai_memory_knowledge_free(&latest);
+
     qihse_ai_memory_export_free(&low_export);
     qihse_ai_memory_export_free(&authenticated);
     free(streamed.data);
