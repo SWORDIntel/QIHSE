@@ -19,7 +19,9 @@
 > client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), the
 > incremental (delta) export ([§8.11](#811-incremental-export--includeqihse_exporth)),
 > and the native DIRECTEYE canonical/outbox path ([§6](#6-key-value-store--includeqihse_kv_storeh),
-> [§10.4](#104-directeye-authenticated-resp-commands)).
+> [§10.4](#104-directeye-authenticated-resp-commands)), and the codegraph tool
+> surface with its compact packed-record storage
+> ([§8.15](#815-codegraph-tool-surface--toolsqihse_codegraph-2026-11-22)).
 > The node-side CRL loaders joined the mTLS section
 > ([§5.1](#51-federation-ca--includeqihse_federation_mtlsh)), the signed backup
 > container joined [§2.3](#23-snapshot-backup--includeqihse_backuph), and the
@@ -2088,6 +2090,22 @@ make clean && make lib && make test TEST_JOBS=32
 This command is upgrade guidance, not a claim that the dependency-heavy full
 library suite has passed in the environment used for the source correction.
 
+### 8.15 Codegraph tool surface — `tools/qihse_codegraph*` (2026-11-22)
+
+The `qihse-codegraph` binary and its helper sources under `tools/` are a built,
+tested public surface (linked from the top-level `Makefile` via
+`CODEGRAPH_HELPERS`): chunked source ingestion, projections, generation
+publishing and checksums, and the KV-backed graph store. The compact storage
+layer (`tools/qihse_codegraph_packed.c` with its dictionary and CSR codecs)
+adds packed records with forward migration, deduplication and garbage
+collection; generation snapshots remain verifiable through the existing
+checksum helpers. Verified by `make test-codegraph`, which runs the reindex
+suite (`tests/test_codegraph_reindex.py`, 18 tests incl. the SIGTERM/SIGINT
+stop paths for backgrounded runners), the native compact-storage/migration
+tests, and the auto/query-index suites against the built binary. The packed
+record frame is a tool-wire format, not a libqihse.so ABI: it is reached
+through `qihse-codegraph`, never linked directly.
+
 ## 9. Python SDK — `python/qihse/`
 
 The embedded Python APIs are `ctypes` bindings over `libqihse.so`, not
@@ -2121,6 +2139,7 @@ authentication or row-level authorization.
 | `python/qihse/hardware.py` | `HardwareProfiler`, `HardwareProfile` | `get_profile()` |
 | `python/qihse/controller.py` | `Controller`, `Watch`, `Reply`, the `Controller*Error` hierarchy, and the `MAX_BULK_BYTES`/`MAX_ARRAY_ITEMS`/`MAX_DEPTH` bounds | A synchronous stdlib-only RESP client for the `FEDERATION.*` controller surface, with explicit authentication, a bounded exact parser using the same limits as the C client ([§8.10](#810-controller-c-client--includeqihse_controllerh)), and resumable watches. Verified by `python/tests/test_controller_sdk.py` (59 tests, run by CI's `unittest discover`) |
 | `python/qihse/thermal.py` | `get_fleet_telemetry`, `collect_local_telemetry`, `publish_telemetry` | Fleet and node telemetry collection, fan speed, thermal zones, and Redis publishing (re-exported by `python/qihse/__init__.py`) |
+| `python/qihse/aimem.py` | `Scope`, `MemoryHit`, `DurableReceipt`, `KnowledgeVersion`, `KnowledgeRelation`, `KnowledgeProvenance`, `DocumentSourceRef`, `ExtendedKnowledgeVersion`, `Handoff`, `QueryHit` | Authenticated, scoped client for the native AIMEM RESP protocol, layered on the §9 `Controller` transport: scoped memory CRUD with durable receipts, evidence-linked knowledge (`CREATE-EX`/`REVISE-EX` incl. the `-SOURCE` document-linked forms and `GET-SOURCE`), provenance fields, handoff claim/label flows, and BM25 cursor queries. Verified by `tests/test_python_aimem_sdk.py` (`make test-python-aimem-sdk`) |
 
 Selected method signatures:
 
