@@ -1124,6 +1124,72 @@ int main(void) {
     expect_contains(tenant7_reader, 6u, query_next, "cursor expired or unknown");
     free(cursor_id);
 
+    const char* knowledge_create_ex[] = { "AIMEM", "KNOWLEDGE", "CREATE-EX",
+        "1", "1", "evidence-linked candidate", "project-events", "checkout-a",
+        "stream-a", "session-1", "870000", "wire-create-ex-1", "1",
+        "placeholder", "1", "1", "placeholder", "project-events",
+        "checkout-a", "stream-a", "session-1" };
+    knowledge_create_ex[13] = event_doc_id;
+    knowledge_create_ex[16] = knowledge_v1;
+    reply = NULL;
+    reply_len = run(tenant7, 21u, knowledge_create_ex, &reply);
+    assert(reply_len > 0u && reply[0] == '*' &&
+           memmem(reply, reply_len, "evidence-linked candidate", 25u) &&
+           memmem(reply, reply_len, event_doc_id, strlen(event_doc_id)));
+    const char* ex_inner = strstr((const char*)reply, "\r\n") + 2u;
+    char* ex_knowledge_id = extract_array_bulk((const uint8_t*)ex_inner,
+        reply_len - (size_t)(ex_inner - (const char*)reply), 0u);
+    char* ex_version_id = extract_array_bulk((const uint8_t*)ex_inner,
+        reply_len - (size_t)(ex_inner - (const char*)reply), 1u);
+    uint8_t* first_ex_reply = malloc(reply_len);
+    assert(first_ex_reply);
+    memcpy(first_ex_reply, reply, reply_len);
+    size_t first_ex_len = reply_len;
+    free(reply);
+    reply = NULL;
+    reply_len = run(tenant7, 21u, knowledge_create_ex, &reply);
+    assert(reply_len == first_ex_len && memcmp(reply, first_ex_reply, reply_len) == 0);
+    free(first_ex_reply); free(reply);
+    const char* knowledge_create_ex_changed[21];
+    memcpy(knowledge_create_ex_changed, knowledge_create_ex, sizeof knowledge_create_ex_changed);
+    knowledge_create_ex_changed[5] = "changed candidate bytes";
+    expect_contains(tenant7, 21u, knowledge_create_ex_changed, "ERR CONFLICT");
+    const char* knowledge_create_ex_bad[21];
+    memcpy(knowledge_create_ex_bad, knowledge_create_ex, sizeof knowledge_create_ex_bad);
+    knowledge_create_ex_bad[11] = "wire-create-ex-bad";
+    knowledge_create_ex_bad[13] = "not-an-event-id";
+    expect_contains(tenant7, 21u, knowledge_create_ex_bad,
+                    "ERR invalid AIMEM knowledge provenance fields");
+    knowledge_create_ex_bad[13] = tenant8_id;
+    expect_contains(tenant7, 21u, knowledge_create_ex_bad,
+                    "NOPERM AIMEM knowledge creation denied");
+
+    const char* knowledge_revise_ex[] = { "AIMEM", "KNOWLEDGE", "REVISE-EX",
+        "placeholder", "placeholder", "1", "1", "reviewed candidate revision",
+        "920000", "wire-revise-ex-1", "1", "placeholder", "0" };
+    knowledge_revise_ex[3] = ex_knowledge_id;
+    knowledge_revise_ex[4] = ex_version_id;
+    knowledge_revise_ex[11] = event_doc_id;
+    reply = NULL;
+    reply_len = run(tenant7, 13u, knowledge_revise_ex, &reply);
+    assert(reply_len > 0u && reply[0] == '*' &&
+           memmem(reply, reply_len, "reviewed candidate revision", 27u));
+    uint8_t* first_revision_reply = malloc(reply_len);
+    assert(first_revision_reply);
+    memcpy(first_revision_reply, reply, reply_len);
+    size_t first_revision_len = reply_len;
+    free(reply);
+    reply = NULL;
+    reply_len = run(tenant7, 13u, knowledge_revise_ex, &reply);
+    assert(reply_len == first_revision_len &&
+           memcmp(reply, first_revision_reply, reply_len) == 0);
+    free(first_revision_reply); free(reply);
+    const char* knowledge_revise_ex_stale[13];
+    memcpy(knowledge_revise_ex_stale, knowledge_revise_ex, sizeof knowledge_revise_ex_stale);
+    knowledge_revise_ex_stale[9] = "wire-revise-ex-stale";
+    expect_contains(tenant7, 13u, knowledge_revise_ex_stale, "ERR CONFLICT");
+    free(ex_knowledge_id); free(ex_version_id);
+
     /* QH-05 V1 cursor is principal-bound and pages a stable authorized query. */
     const char* query_begin[] = { "AIMEM", "QUERY", "V1", "BEGIN", "project-events",
         "checkout-a", "stream-a", "session-1", "0", "0", "0", "0", "0", "0",
