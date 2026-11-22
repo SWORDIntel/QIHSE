@@ -208,3 +208,4 @@ rust/*/target/
 /brain-ct-pending-*/
 /tmp_repro/
 /.tmp_repro/
+/aimem_*/
