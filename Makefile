@@ -1710,6 +1710,8 @@ test-rust-pg-tls:
 test-machine-token-refresh: lib
 	python3 tests/test_machine_token_refresh.py
 
+test: test-aimem-scope-index
+
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
 # is data: adding a workload is a pack edit, not a Makefile edit.  The pack
