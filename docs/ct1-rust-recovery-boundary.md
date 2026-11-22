@@ -872,9 +872,10 @@ authentication/ledger mechanics, recovery-peer RESP admission for the
 disposition writer and the source floor/compensation, and the release
 protocol itself have concrete fail-closed formats proposed in the later
 "recovery executor formats" section (target epoch fence, disposition
-writer and source floor/compensation implemented and fixture-tested;
-the rest unimplemented); they must pass that validation before any
-executor or deployment is approved.
+writer and source floor/compensation implemented, fixture-tested and
+recovery-peer reachable; the release protocol remains unimplemented);
+they must pass that validation before any executor or deployment is
+approved.
 `CANDIDATE` is not permission to mutate or unstop B. No B restart has
 shipped, and none of the shipped store-level executors is a release or
 ACK authority.
@@ -932,9 +933,11 @@ hold.
 Concrete on-disk and admission formats for the four unresolved artifacts.
 Of these, the **target recovery epoch fence**, the **protected
 disposition writer with its exact-frame archive** and the **durable source
-floor with the pinned compensation** are implemented (store-level,
-fixture-tested, store-local); the release protocol remains design only,
-and the floor/compensation have no recovery-peer RESP admission yet. None is authority,
+floor with the pinned compensation** are implemented store-level and
+reachable end-to-end from the recovery peer (HOLD-V1, FLOOR-V1,
+COMPENSATE-V1 on a primary; TARGET DISPOSITION-V1 on a successor),
+fixture-tested on disposable stores; the release protocol remains design
+only. None is authority,
 and none may be provisioned for the production hosts: B's owner service
 stays stopped, the frozen originals stay untouched, and `CANDIDATE`
 remains a label, not permission. All fixed-width fields are little-endian;
@@ -1056,7 +1059,15 @@ retry succeeds idempotently. Covered by `make test-ct-source-floor`
 wrong-generation, wrong-principal, compensation-without-floor and
 wrong-floor refusals that leave the fixture operational, torn-install and
 tamper/delete/substitute fail-closed reopens, positive install with cold
-reopen, and the crash-cut roll-forward). The target later applies the
+reopen, and the crash-cut roll-forward). The recovery-peer RESP commands
+`REPL.CT1 SOURCE FLOOR-V1 <manifest-wire> <floor-le64 epoch-le64>` and
+`REPL.CT1 SOURCE COMPENSATE-V1 <manifest-wire> <floor-le64>` admit the
+two steps on a primary role through the exact HOLD-V1 chain (canonical
+manifest, live window, pins, principal attributes, frozen source roster;
+the store re-derives every binding under its own lock), covered by
+`make test-ct1-source-floor-resp` running the full peer chain HOLD-V1 →
+FLOOR-V1 → COMPENSATE-V1 with idempotent exact retries and a differing
+tuple never rebinding. The target later applies the
 compensating group through ordinary sequence and identity checks — the
 design deliberately creates no target-side deletion authority.
 
