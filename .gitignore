@@ -193,3 +193,18 @@ tools/test_i2p_qkp_diag
 !/tests/test_codegraph_retention_bound.py
 rust/*/target/
 *.writer.lock
+
+# transient CT/staging scratch created by mesh clients with cwd in the repo
+/ct_*/
+/lane_*/
+/ownership_*/
+/qihse-*/
+/qihse_*/
+/.qihse_*/
+/vector-*/
+/resp-*/
+/wal-*/
+/follower_*/
+/brain-ct-pending-*/
+/tmp_repro/
+/.tmp_repro/
