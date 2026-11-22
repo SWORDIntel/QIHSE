@@ -1292,6 +1292,23 @@ static bool ct_lane_marker_write(qihse_kv_store_t* store) {
     return ok;
 }
 
+static bool ct_lane_marker_write(qihse_kv_store_t* store) {
+    if (!store || !store->ct_lane_count || store->ct_mode != 0u || store->memory_snapshot)
+        { errno = EINVAL; return false; }
+    kv_ct_lane_marker_t marker;
+    memset(&marker, 0, sizeof(marker));
+    memcpy(marker.magic, "QCTST004", 8u);
+    marker.checksum = fnv1a64_update(14695981039346656037ULL, &marker,
+                                     offsetof(kv_ct_lane_marker_t, checksum));
+    char path[4096], temp[8192]; FILE* f = NULL;
+    if (!build_data_path(path, sizeof(path), "ct-state.bin") ||
+        !atomic_file_begin(path, temp, sizeof(temp), &f)) return false;
+    if (!fwrite_exact(&marker, 1u, sizeof(marker), f)) {
+        fclose(f); unlink(temp); return false;
+    }
+    return atomic_file_commit(f, temp, path) && fsync_dir_path(get_qihse_data_dir());
+}
+
 static bool ct_state_read(qihse_kv_store_t* store, qihse_user_t* user,
                           bool legacy_bootstrap) {
     char path[4096];
@@ -2449,6 +2466,34 @@ bool qihse_kv_ct_node_local_scope_enter(qihse_kv_store_t* store,
     scope->store = store;
     scope->principal = principal;
     scope->node_local = true;
+    kv_ct_scope = scope;
+    *out_scope = scope;
+    return true;
+}
+
+bool qihse_kv_ct_writer_scope_enter_lane(qihse_kv_store_t* store,
+    qihse_user_t* principal, const char* lane_id,
+    const unsigned char owner_token[QIHSE_KV_CT_TOKEN_BYTES],
+    qihse_kv_ct_writer_scope_t** out_scope) {
+    if (out_scope) *out_scope = NULL;
+    if (!store || !principal || !owner_token || !out_scope || kv_ct_scope ||
+        !qihse_auth_user_is_active(principal) || !ct_lane_id_valid(lane_id)) {
+        errno = EINVAL; return false;
+    }
+    kv_store_rdlock(store);
+    qihse_kv_ct_lane_t* lane = ct_lane_find(store, lane_id);
+    unsigned mismatch = 0u;
+    if (lane) for (size_t i = 0; i < QIHSE_KV_CT_TOKEN_BYTES; ++i)
+        mismatch |= owner_token[i] ^ lane->owner_token[i];
+    bool ok = lane && lane->status.mode == QIHSE_KV_CT_LANE_SOURCE &&
+        lane->status.admitted && !store->recovery_pending && mismatch == 0u;
+    kv_store_unlock(store);
+    if (!ok) { errno = EACCES; return false; }
+    qihse_kv_ct_writer_scope_t* scope = calloc(1u, sizeof(*scope));
+    if (!scope) return false;
+    scope->store = store;
+    scope->principal = principal;
+    snprintf(scope->lane_id, sizeof(scope->lane_id), "%s", lane_id);
     kv_ct_scope = scope;
     *out_scope = scope;
     return true;
@@ -4871,6 +4916,12 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
     if (ok) {
         for (size_t i = 0; i < group.count; i++) {
             qihse_kv_ct_record_t* r = &group.records[i];
+            if (lane_mode && (!ct_lane_bitmap_contains(lane, r->key) ||
+                (lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
+                 (lane->tenant_policy == QIHSE_KV_CT_TENANT_EXACT &&
+                  r->resource_tenant_id != lane->tenant_id)))) {
+                ok = false; break;
+            }
             kv_lookup_result_t old;
             kv_lookup_state_t state = logical_lookup(store, r->key, &old);
             if (state == KV_LOOKUP_ERROR) { ok = false; break; }
