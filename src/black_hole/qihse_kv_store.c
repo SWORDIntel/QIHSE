@@ -4933,7 +4933,7 @@ static int ct_replay_group(qihse_kv_store_t* store, FILE* f,
     if (ok) {
         for (size_t i = 0; i < group.count; i++) {
             qihse_kv_ct_record_t* r = &group.records[i];
-            if (lane_mode && (!ct_lane_bitmap_contains(lane, r->key) ||
+            if (current_lane && (!ct_lane_bitmap_contains(lane, r->key) ||
                 (lane->status.mode == QIHSE_KV_CT_LANE_RECEIVER &&
                  (lane->tenant_policy == QIHSE_KV_CT_TENANT_EXACT &&
                   r->resource_tenant_id != lane->tenant_id)))) {
