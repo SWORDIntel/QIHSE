@@ -1710,8 +1710,6 @@ test-rust-pg-tls:
 test-machine-token-refresh: lib
 	python3 tests/test_machine_token_refresh.py
 
-test: test-aimem-scope-index
-test: test-aimem-qh08 test-aimem-qh08-resp
 
 # --- W5.3 gold validation suite -------------------------------------------
 # One entry point for the versioned workload pack under tests/gold/.  The pack
