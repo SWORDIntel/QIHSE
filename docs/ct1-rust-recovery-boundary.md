@@ -1,15 +1,23 @@
 # Rust-first CT1 recovery boundary (design, not a recovery procedure)
 
+**STATUS UPDATE (2026-11-25):** The original B legacy CT1 source remains
+stopped; its pending group at 11111 was archived and never replayed, and the
+original target remains sealed at 11110. A **different, fresh** legacy CT1
+generation, sourced from authenticated acknowledged state at 11110, now serves
+B alongside the normal A and C owners; each owner has an off-host successor.
+This operational replacement does not deploy the Rust recovery design or
+authorize advancing either cursor of the original group.
+
 Status: **design only** beyond the structural `rust/ct1-recovery` `compare()`,
 its fixed-width `qihse_ct1_structural_evidence_evaluate_v1` ABI (linked only
 by an opt-in standalone C/Rust smoke, not by the production library), the
 structural frozen-file verifier, the pinned read-only TARGET HISTORY-V1 /
 SOURCE FRAME-V1 queries, and the SOURCE/TARGET QUOTE-V2 evidence-only
 endpoints below. Approval issuance/consumption, suppression and recovery
-execution remain disabled. B's legacy CT1
-source owner remains stopped, with its original pending SET group at position
-11111; the successor is sealed at cursor 11110. Its source-authored same-key
-tombstone is at 11103. The sample row sequences in the Rust fixture are
+execution remain disabled. At the 2026-11-16 design snapshot, B's original
+legacy CT1 source owner was stopped, with its pending SET group at position
+11111; the original successor was sealed at cursor 11110. Its source-authored
+same-key tombstone is at 11103. The sample row sequences in the Rust fixture are
 pending 5729448, tombstone 5729450, target high-water 5729457 and source
 high-water 5729448; stream positions are **not** row sequences. These fixture
 numbers illustrate the discrepancy, not a live read of B. Preserve the
@@ -28,11 +36,12 @@ further reboot troubleshooting. Dell's 13th-generation TPM modules bind to
 the motherboard after activation: a used module from another system would be
 unsuitable even if physically identical, though this module's history has not
 been independently verified. This is an operational decision, not hardware
-fault isolation or approval to recover B. Any replacement must be confirmed
+fault isolation or approval to recover B. Any TPM replacement must be confirmed
 new and compatible by Service Tag; until a trusted, independently
 verified QKP Operator one-use authority/rollback anchor is designed, do not
-substitute a same-UID local receipt, manifest or ledger for it. Keep the B
-ordinary owner stopped and its successor sealed.
+substitute a same-UID local receipt, manifest or ledger for it. The 2026-11-16
+decision kept the original B ordinary owner stopped and its original successor
+sealed.
 
 ### TPM-free approval path (design only)
 

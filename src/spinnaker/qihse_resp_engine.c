@@ -20925,6 +20925,17 @@ static bool qihse_resp_dispatch(qihse_resp_session_t* session,
         return qihse_resp_dispatch_unscoped(session, request, keep_open);
     } else if (server && server->ct_role && strcmp(server->ct_role, "primary") == 0 &&
         server->ct_owner_token_valid) {
+        /* Startup holds block replica reconciliation. The Operator must be able
+         * to inspect and release the hold before a CT writer scope can exist. */
+        if (request && request->argc >= 2u && qihse_resp_command_is(request, "CLUSTER") &&
+            ((request->argc == 2u && qihse_resp_arg_equal(&request->argv[1], "NODES")) ||
+             (qihse_resp_arg_equal(&request->argv[1], "MAINTENANCE") &&
+              ((request->argc == 3u && (qihse_resp_arg_equal(&request->argv[2], "STATUS") ||
+                                        qihse_resp_arg_equal(&request->argv[2], "STARTUP_TOKEN"))) ||
+               (request->argc == 5u && qihse_resp_arg_equal(&request->argv[2], "RELEASE"))))) &&
+            qihse_cluster_maintenance_startup_mode(server->maintenance_gate) &&
+            qihse_resp_session_is_system_operator(session))
+            return qihse_resp_dispatch_unscoped(session, request, keep_open);
         owner_token = server->ct_owner_token;
     }
     if (!server || !server->store || (!owner_token && !group_node_local_scope) || !session->user ||

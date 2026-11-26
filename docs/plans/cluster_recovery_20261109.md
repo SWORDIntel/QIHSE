@@ -1,6 +1,21 @@
 # Three-host cluster recovery and native upgrade
 
 Date: 2026-11-09 (updated 2026-11-10)
+
+**Superseding status (2026-11-25):** The three normally named owner services
+and their off-host CT1 successors are active and enabled; the six-node cluster
+agrees on a healthy 16,384-slot map. A (T420) owns 0-5039 and 5041-5460,
+C (T320) owns 5461-10921, and B (730xd) owns 5040 and 10922-16383.
+B's fresh legacy CT1 generation was restored from an authenticated projection
+of approximately 209,850 records. Slot-5040 and B main-range writes, reads,
+and deletes were tested; source, ACK, and target matched after a cold restart.
+The original B legacy CT1 generation's unacknowledged SET at position 11111,
+old journals, and protected backups remain archived, not replayed. The separate
+927-row legacy backup conflicts are also preserved. The projection count is
+not a current `DBSIZE` (live traffic subsequently yielded 209,851), and this
+recovery is not a full record-level cross-check of all three owners. The
+publication evidence and six recovery-named-unit claim below are historical.
+
 Status at publication: the live three-node cluster is functional. T420,
 T320 and 730xd answer authenticated data commands and report the same
 16,384-slot ownership map with `cluster_state:ok`. The nine original stores

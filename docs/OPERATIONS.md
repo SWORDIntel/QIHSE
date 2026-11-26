@@ -708,10 +708,24 @@ STARTUP_TOKEN`, then pass the returned generation/token directly to
 receipts, or persistent files. `STATUS` never includes it. During startup-pending
 and startup-held, `AUTH`/`HELLO` permit authenticated control-session setup;
 maintenance control remains available while the data-plane writer gate is held.
-Ordinary writes stay rejected. Existing finite-lease holds keep their prior
-command whitelist. Configure the flag in the owner service's
-`ExecStart` alongside the existing secure credential source. Without the flag,
-startup retains the OPEN behavior.
+Ordinary writes stay rejected. On a legacy CT1 primary starting held, only an
+active SYSTEM Operator can inspect `CLUSTER NODES`, maintenance `STATUS`, obtain
+`STARTUP_TOKEN`, and release it before CT reconciliation. This narrow startup
+exception does not change finite-lease holds. Release does not admit CT writes:
+the pinned successor must still seal the baseline and reconcile. If an older
+build returns `TRYAGAIN` on `STARTUP_TOKEN`, rebuild its matching library with
+`make lib` in a separate build directory; no disk or wire format changes are
+needed. Do not remove the fence to bypass the error. Configure the flag in the
+owner service's `ExecStart` alongside the existing secure credential source.
+Without the flag, startup retains the OPEN behavior.
+
+For a new acknowledged-state CT1 generation, use a fresh private primary data
+directory and an empty successor. Verify pinned authenticated status, start the
+primary with the startup fence, then obtain and release its token through the
+Operator control session; allow the pinned successor to seal and reconcile.
+After live writes, accept only when all three owner maps agree and source
+durable LSN, source ACK, and the successor's durable cursor align. Restore
+normal unit startup without a lasting `--startup-maintenance-held` flag.
 
 This fence is a cutover tool, not a standing posture: production units run
 without it, so a restart comes back serving writes immediately. Add the flag

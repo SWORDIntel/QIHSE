@@ -14,6 +14,7 @@ import stat
 import subprocess
 import unittest
 import time
+from unittest.mock import patch
 
 from ct_multigroup_drill import seed_classified_kv
 from ct_transport_drill import (
@@ -33,6 +34,105 @@ class Ct1RealDaemonTests(unittest.TestCase):
     def setUp(self):
         self.cluster = IsolatedCluster("ct1-real-")
         self.addCleanup(self.cluster.close)
+
+    def test_ct1_startup_maintenance_held(self):
+        cluster = self.cluster
+        topology = ("lead", "successor")
+        generation = new_generation()
+        host, port = cluster.reserve_endpoint("lead")
+        password = "Ct1Fixture9!" + new_generation()
+        cluster.env["QIHSE_OPERATOR_PASSWORD"] = password
+
+        # The fixture normally attaches raw daemon logs on startup/readiness
+        # failure. Never attach those logs to a test that handles credentials.
+        def fail_without_log(name, _reason):
+            raise self.failureException(
+                f"{name}: daemon startup/readiness failed (private log omitted)") from None
+
+        cluster.fail_with_log = fail_without_log
+        with patch("ct_transport_drill.OPERATOR_PASSWORD", password):
+            cluster.start_ct1_node(
+                "successor", 1, "successor", "lead", "ct-successor", "ct-primary",
+                generation, topology_names=topology)
+            self.primary_to_successor = cluster.replication_peer_client(
+                identity_name="lead", node_id="ct-primary", target_name="successor")
+            fresh = ct1_receiver_status(self.primary_to_successor)
+            self.assertFalse(fresh["baseline_sealed"])
+            self.assertEqual(fresh["durable_cursor"], 0)
+            _, self.primary_admin = cluster.start_ct1_node(
+                "lead", 0, "primary", "successor", "ct-primary", "ct-successor",
+                generation, topology_names=topology, service_clearance=0, service_sci=0,
+                extra_args=("--startup-maintenance-held",))
+
+        execute = self.primary_admin.execute_resp
+        maintenance = ("CLUSTER", "MAINTENANCE")
+        wire = execute(*maintenance, "STATUS")
+        held = parse_resp_frame(wire)
+        self.assertTrue(isinstance(held, list) and len(held) == 21 and held[0] == b"HELD",
+                        "Operator could not observe startup HELD")
+        self.assertTrue(held[2:4] == [0, 1] and held[4:15] == [0] * 11,
+                        "expected a non-expiring hold, complete coverage and no active writers")
+        self.assertTrue(len(held[20]) == 11 and all(reg == 1 for _, reg in held[20]),
+                        "not all writer classes registered")
+        nodes = parse_resp_frame(execute("CLUSTER", "NODES"))
+        self.assertTrue(isinstance(nodes, bytes) and any(
+            f"{host}:{port}".encode() in line and b"0-16383" in line.split()
+            for line in nodes.splitlines()), "Operator could not inspect assigned slots")
+
+        try:
+            capability = parse_resp_frame(execute(*maintenance, "STARTUP_TOKEN"))
+        except ValueError:
+            # A malformed RESP integer can include its input in the exception.
+            raise self.failureException("malformed startup token reply") from None
+        self.assertTrue(isinstance(capability, list) and len(capability) == 2,
+                        "expected a startup generation/token pair")
+        epoch, token = capability
+        self.assertTrue(isinstance(epoch, int) and epoch > 0 and epoch == held[1],
+                        "startup generation does not match HELD status")
+        self.assertTrue(isinstance(token, bytes) and len(token) == 64 and
+                        all(c in b"0123456789abcdef" for c in token), "invalid token shape")
+        self.assertFalse(token in wire, "STATUS disclosed the startup token")
+        bad = b"0" * 64 if token != b"0" * 64 else b"1" * 64
+        release = (*maintenance, "RELEASE", str(epoch))
+        self.assertTrue(execute(*release, bad) == b"-ERR maintenance release rejected\r\n",
+                        "wrong token was not rejected")
+
+        anonymous = cluster.replication_peer_client(
+            identity_name="forged", node_id="ct-forged", target_name="lead")
+        self.successor_to_primary = cluster.replication_peer_client(
+            identity_name="successor", node_id="ct-successor", target_name="lead")
+        for role, session in (("unauthenticated", anonymous),
+                              ("replication service", self.successor_to_primary)):
+            for args in (("STATUS",), ("STARTUP_TOKEN",), ("RELEASE", str(epoch), bad)):
+                with self.subTest(role=role, verb=args[0]):
+                    denied = session.execute_resp(*maintenance, *args)
+                    self.assertTrue(denied.startswith((b"-NOAUTH ", b"-NOPERM ")) and
+                                    token not in denied, "expected denial without a token")
+
+        key = "ct1:startup-held:probe"
+        blocked = execute("SET", key, "blocked")
+        self.assertTrue(blocked.startswith((b"-BUSY cluster maintenance",
+                                            b"-TRYAGAIN CT primary is fenced")),
+                        "ordinary write did not receive a fence rejection")
+        self.assertFalse(ct1_receiver_status(self.primary_to_successor)["baseline_sealed"])
+        self.assertTrue(execute(*release, token) == b"+OK\r\n", "startup release failed")
+
+        before, _ = self.wait_for_pair(generation)
+        self.assertTrue(parse_resp_frame(execute(*maintenance, "STATUS"))[0] == b"OPEN",
+                        "gate did not reopen after release and reconciliation")
+        self.assertTrue(execute("GET", key) == b"$-1\r\n", "held write was applied")
+        self.assertTrue(execute("SET", key, "admitted") == b"+OK\r\n", "write was not acknowledged")
+        source = ct1_source_status(self.successor_to_primary)
+        self.assertGreater(source["durable_lsn"], before["durable_lsn"])
+        self.assertEqual(source["acknowledged_lsn"], source["durable_lsn"])
+        self.assertEqual(ct1_receiver_status(self.primary_to_successor)["durable_cursor"],
+                         source["acknowledged_lsn"])
+        self.assertTrue(execute("DEL", key) == b":1\r\n", "rollback was not acknowledged")
+        self.assertTrue(execute("GET", key) == b"$-1\r\n", "rollback left the test key present")
+        for name in topology:
+            with (cluster.root / f"{name}.log").open("rb") as log:
+                self.assertFalse(any(token in line or password.encode() in line for line in log),
+                                 f"{name} daemon logged fixture credentials")
 
     def test_ct1_frozen_root_startup_rejects_untrusted_configuration(self):
         frozen = self.cluster.root / "frozen"
