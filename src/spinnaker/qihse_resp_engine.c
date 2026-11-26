@@ -13237,7 +13237,7 @@ static bool qihse_resp_ct1_source_recovery_admit(qihse_resp_session_t* s,
         !qihse_ct1_recovery_decode(r->argv[3].data, r->argv[3].len,
             false, manifest, NULL) ||
         !qihse_ct1_recovery_encode(manifest, false, false, canonical) ||
-        CRYPTO_memcmp(canonical, r->argv[3].data, sizeof(canonical)) ||
+        CRYPTO_memcmp(canonical, r->argv[3].data, QIHSE_CT1_RECOVERY_WIRE_SIZE) ||
         now < manifest->issued_ms || now >= manifest->expires_ms ||
         strcmp(manifest->issuer_qkp_id, pqc->admin_peer_node_id) ||
         CRYPTO_memcmp(manifest->issuer_operator_pin, issuer_pin, 32u) ||
