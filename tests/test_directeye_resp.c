@@ -88,7 +88,13 @@ int main(void) {
         7702u, 5u, UINT16_MAX, "DirecteyeRespIndexer123!");
     qihse_user_t* low_indexer = qihse_keystone_feed_identity_provision(op, 77u,
         7703u, 0u, 0u, "DirecteyeRespLowIndexer123!");
-    assert(writer && indexer && low_indexer);
+    qihse_user_t* other_tenant = qihse_auth_create_tenant_user(op, 78u, 7801u,
+        QIHSE_ROLE_ANALYST, 4u, 2u, "DirecteyeRespOtherTenant123!", false);
+    qihse_user_t* low_reader = qihse_auth_create_tenant_user(op, 77u, 7704u,
+        QIHSE_ROLE_ANALYST, 0u, 0u, "DirecteyeRespLowReader123!", false);
+    qihse_user_t* no_sci = qihse_auth_create_tenant_user(op, 77u, 7705u,
+        QIHSE_ROLE_ANALYST, 4u, 0u, "DirecteyeRespNoSci123!", false);
+    assert(writer && indexer && low_indexer && other_tenant && low_reader && no_sci);
     char server_keys[256], client_keys[256], server_pub[320], client_pub[320];
     snprintf(server_keys, sizeof(server_keys), "%s/qkp-server", root);
     snprintf(client_keys, sizeof(client_keys), "%s/qkp-client", root);
@@ -220,6 +226,56 @@ int main(void) {
     assert(strstr(reply, "\r\n$-1\r\n") && !strstr(reply, "typed fixture"));
     free(reply);
 
+    const char* second_record[] = {"DIRECTEYE.RECORD.MUTATE",
+        "77777777-7777-4777-8777-777777777777", "record-0", "UPSERT", "0",
+        "{\"name\":\"beta\"}"};
+    reply = call_text(writer, 6u, second_record);
+    assert(reply[0] == '*'); free(reply);
+    const char* foreign_record[] = {"DIRECTEYE.RECORD.MUTATE",
+        "88888888-8888-4888-8888-888888888888", "record-X", "UPSERT", "0",
+        "{\"name\":\"beta\",\"secret\":\"other-tenant\"}"};
+    reply = call_text(other_tenant, 6u, foreign_record);
+    assert(reply[0] == '*'); free(reply);
+    const char* search_first[] = {"DIRECTEYE.RECORD.SEARCH", "beta", "", "1"};
+    reply = call_text(writer, 4u, search_first);
+    assert(strstr(reply, "record-0") && !strstr(reply, "record-1") &&
+           !strstr(reply, "record-X") && !strstr(reply, "other-tenant") &&
+           strstr(reply, "$1\r\n1\r\n"));
+    free(reply);
+    const char* search_second[] = {"DIRECTEYE.RECORD.SEARCH", "beta", "record-0", "1"};
+    reply = call_text(writer, 4u, search_second);
+    assert(strstr(reply, "record-1") && !strstr(reply, "record-0") &&
+           !strstr(reply, "record-X")); free(reply);
+    reply = call_text(low_reader, 4u, search_first);
+    assert(strstr(reply, "$1\r\n0\r\n") && !strstr(reply, "record-0") &&
+           !strstr(reply, "record-1") && !strstr(reply, "beta")); free(reply);
+    reply = call_text(no_sci, 4u, search_first);
+    assert(strstr(reply, "$1\r\n0\r\n") && !strstr(reply, "record-0") &&
+           !strstr(reply, "record-1") && !strstr(reply, "beta")); free(reply);
+    expect_error(indexer, 4u, search_first);
+    expect_error(low_indexer, 4u, search_first);
+    reply = call_text(other_tenant, 4u, search_first);
+    assert(strstr(reply, "record-X") && !strstr(reply, "record-0") &&
+           !strstr(reply, "record-1") && !strstr(reply, "other-tenant")); free(reply);
+    const char* search_typed[] = {"DIRECTEYE.RECORD.SEARCH", "typed fixture", "", "32"};
+    reply = call_text(writer, 4u, search_typed);
+    assert(strstr(reply, "dq2_dataset_") && !strstr(reply, "schema_version")); free(reply);
+    const char* search_invalid[] = {"DIRECTEYE.RECORD.SEARCH", "beta", "", "33"};
+    expect_error(writer, 4u, search_invalid);
+    const char* search_invalid_cursor[] = {"DIRECTEYE.RECORD.SEARCH", "beta", "../bad", "1"};
+    expect_error(writer, 4u, search_invalid_cursor);
+    /* Exercise the RESP adapter against SST rows, not only the memtable:
+     * denied users must receive neither a matching ID nor protected JSON. */
+    assert(qihse_kv_sync_store(store));
+    reply = call_text(low_reader, 4u, search_first);
+    assert(strstr(reply, "$1\r\n0\r\n") && !strstr(reply, "record-0") &&
+           !strstr(reply, "beta")); free(reply);
+    reply = call_text(no_sci, 4u, search_first);
+    assert(strstr(reply, "$1\r\n0\r\n") && !strstr(reply, "record-0") &&
+           !strstr(reply, "beta")); free(reply);
+    reply = call_text(writer, 4u, search_first);
+    assert(strstr(reply, "record-0")); free(reply);
+
     const char* read[] = {"DIRECTEYE.FEED.READ", "0", "16"};
     reply = call_text(indexer, 3u, read);
     assert(reply[0] == '*' && strstr(reply, "record-1") && strstr(reply, "committed_at_ms") &&
@@ -255,6 +311,9 @@ int main(void) {
     free(reply);
     reply = call_text(writer, 2u, get_live);
     assert(strstr(reply, "$1\r\n1") && strstr(reply, "$-1\r\n") && !strstr(reply, "beta"));
+    free(reply);
+    reply = call_text(writer, 4u, search_second);
+    assert(strstr(reply, "$1\r\n0\r\n") && !strstr(reply, "record-1"));
     free(reply);
 
     char ack_text[32];
@@ -299,6 +358,13 @@ int main(void) {
     assert(reply_u64(&qkp_reply->items[1]) == 0u);
     assert(strstr(qihse_ctrl_reply_text(&qkp_reply->items[2]), "sealed"));
     qihse_ctrl_reply_free(qkp_reply);
+    const char* qkp_search[] = {"DIRECTEYE.RECORD.SEARCH", "sealed", "", "1"};
+    qkp_reply = qihse_ctrl_call(qkp_writer, 4u, qkp_search);
+    assert(qkp_reply && qkp_reply->kind == QIHSE_CTRL_ARRAY && qkp_reply->count == 3u &&
+           strcmp(qihse_ctrl_reply_text(&qkp_reply->items[0]), "qkp-record") == 0 &&
+           reply_u64(&qkp_reply->items[1]) == 1u &&
+           strcmp(qihse_ctrl_reply_text(&qkp_reply->items[2]), "qkp-record") == 0);
+    qihse_ctrl_reply_free(qkp_reply);
     qihse_controller_destroy(qkp_writer);
 
     client_cfg.qkp_identity_dir = NULL;
@@ -320,6 +386,9 @@ int main(void) {
         const char* text = qihse_ctrl_reply_text(&qkp_reply->items[i]);
         assert(!text || !strstr(text, "qkp-record"));
     }
+    qihse_ctrl_reply_free(qkp_reply);
+    qkp_reply = qihse_ctrl_call(qkp_low_indexer, 4u, qkp_search);
+    assert(qkp_reply && qkp_reply->kind == QIHSE_CTRL_ERROR);
     qihse_ctrl_reply_free(qkp_reply);
     qihse_controller_destroy(qkp_low_indexer);
 

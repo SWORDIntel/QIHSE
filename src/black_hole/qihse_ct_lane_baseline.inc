@@ -164,7 +164,7 @@ static bool ct_lane_baseline_collect_existing_locked(
         .ok = true,
         .authorized = true
     };
-    qihse_trinary_trie_foreach(store->trie, ct_lane_baseline_mem_cb, &context);
+    context.ok = qihse_trinary_trie_foreach(store->trie, ct_lane_baseline_mem_cb, &context) && context.ok;
     if (!context.ok || !context.authorized || !collected.ok ||
         !collected.authorized) goto failed;
     for (size_t i = 0u; i < store->sst_meta->cap; ++i) {

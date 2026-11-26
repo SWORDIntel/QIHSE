@@ -67,6 +67,7 @@ bool qihse_trinary_trie_delete(qihse_trinary_trie_t* trie, const char* key);
 typedef bool (*qihse_trinary_trie_iter_cb)(const char* key, void* value, size_t value_size, void* user_data);
 
 /* Iterate all key-value pairs in the trie, calling cb for each. */
-void qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data);
+/* False on invalid arguments or allocation failure; callback stop is successful. */
+bool qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data);
 
 #endif /* QIHSE_TRINARY_TRIE_H */

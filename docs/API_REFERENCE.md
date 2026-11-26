@@ -76,7 +76,7 @@ above):
 | `include/qihse_operations.h` | 23 | 23 |
 | `include/qihse_backup.h` | 17 | 17 |
 | `include/qihse_shared_backup.h` | 3 | 3 |
-| `include/qihse_kv_store.h` | 161 | 158 (3 `static inline`) |
+| `include/qihse_kv_store.h` | 163 | 160 (3 `static inline`) |
 | `include/qihse_auth.h` | 52 | 52 |
 
 ### Native upgrade surfaces — current-source contracts
@@ -2395,6 +2395,7 @@ are separate from `KEYSTONE.FEED.*`, which remains the analysis-artifact feed.
 
 ```text
 DIRECTEYE.RECORD.GET <record_id>
+DIRECTEYE.RECORD.SEARCH <literal-keyword> <after-record-id-or-empty> <limit>
 DIRECTEYE.RECORD.MUTATE <lowercase-operation-uuid> <record_id> UPSERT <expected-source-seq> <record-json-object>
 DIRECTEYE.RECORD.MUTATE <lowercase-operation-uuid> <record_id> DELETE <expected-source-seq>
 DIRECTEYE.FEED.READ <after-cursor> <limit>
@@ -2410,6 +2411,21 @@ GET returns `[source_sequence, tombstone, record_json_or_nil]`. Missing/expired
 and unauthorized rows are indistinguishable (`[0,0,nil]`); an authorized retained
 tombstone returns its source sequence, tombstone flag, and nil payload.
 
+SEARCH returns `[next_record_id, count, record_id, ...]`, sorted by ASCII
+record ID. The empty cursor starts from the beginning; subsequent calls pass
+the returned `next_record_id` (exclusive). An empty page retains the supplied
+cursor; fewer than `limit` IDs means the current traversal is exhausted. Limit
+is 1–32; the nonempty UTF-8 literal keyword is at most 128 bytes, matched
+case-sensitively as a substring of live canonical JSON, not tokenized or
+semantically ranked. Only the authenticated principal's tenant namespace and
+rows authorized by its classification/SCI are searched, and only IDs are
+returned; GET retrieves each authorized payload. Provisioned KEYSTONE feed
+index identities and the AIMEM service identity cannot use SEARCH; the new
+command does not expand either service's capabilities. Pagination is not a
+snapshot: concurrent mutations may change later pages. This is a key-index-assisted
+bounded-result scan of canonical QKV8 rows, **not** an inverted full-text or
+semantic index; see [DIRECTEYE search upgrade](DIRECTEYE_SEARCH_UPGRADE.md).
+
 FEED.READ is limited to the provisioned read-only index identity and returns
 `[next_cursor, count, cursor, event_json, ...]`, with at most 128 events per
 page. Each event carries the source generation, outbox cursor, commit time,
@@ -2420,7 +2436,8 @@ HTTP canonical-write facade or raw-store bypass in this contract.
 
 Focused tests: `make test-directeye-outbox` and `make test-directeye-resp`
 cover durable mutation/retry/conflict/tombstone/recovery, authenticated QKP
-record read/write, identity-filtered feed, ACK, and denial paths.
+record read/write, tenant-bound canonical search and its low-clearance and
+cross-tenant denial paths, identity-filtered feed, and ACK.
 
 ---
 

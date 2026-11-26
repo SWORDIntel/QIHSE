@@ -145,8 +145,8 @@ static bool ct_range_import_existing_locked(qihse_kv_store_t* store,
         .last_slot = last_slot,
         .authorized = true, .ok = true
     };
-    qihse_trinary_trie_foreach(store->trie, ct_range_export_mem_cb, &c);
-    if (!c.ok || !c.authorized) goto failed;
+    if (!qihse_trinary_trie_foreach(store->trie, ct_range_export_mem_cb, &c) ||
+        !c.ok || !c.authorized) goto failed;
     for (size_t i = 0u; i < store->sst_meta->cap; i++) {
         const sst_meta_entry_t* meta = &store->sst_meta->slots[i];
         if (!meta->key) continue;
@@ -281,8 +281,8 @@ int qihse_kv_ct_range_export(qihse_kv_store_t* store,
             generation, first_slot, last_slot, owner_token) ||
         !store->sst_meta || store->sst_meta->degraded) goto unlock;
     cut = store->ct_fence_cut_position;
-    qihse_trinary_trie_foreach(store->trie, ct_range_export_mem_cb, &c);
-    if (!c.ok || !c.authorized) goto unlock;
+    if (!qihse_trinary_trie_foreach(store->trie, ct_range_export_mem_cb, &c) ||
+        !c.ok || !c.authorized) goto unlock;
     const sst_meta_index_t* index = store->sst_meta;
     for (size_t i = 0u; i < index->cap; i++) {
         const sst_meta_entry_t* e = &index->slots[i];

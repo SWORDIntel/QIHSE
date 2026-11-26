@@ -2250,12 +2250,13 @@ bool qihse_kv_ct_lane_receiver_empty_baseline_seal(qihse_kv_store_t* store,
         mismatch == 0u;
     ct_lane_empty_ctx_t ctx = {.lane = lane, .found = false};
     if (empty) {
-        qihse_trinary_trie_foreach(store->trie, ct_lane_empty_trie_cb, &ctx);
-        for (size_t i = 0; !ctx.found && i < store->sst_meta->cap; ++i) {
+        if (!qihse_trinary_trie_foreach(store->trie, ct_lane_empty_trie_cb, &ctx))
+            empty = false;
+        for (size_t i = 0; empty && !ctx.found && i < store->sst_meta->cap; ++i) {
             const sst_meta_entry_t* entry = &store->sst_meta->slots[i];
             if (entry->key && ct_lane_bitmap_contains(lane, entry->key)) ctx.found = true;
         }
-        empty = !ctx.found;
+        empty = empty && !ctx.found;
     }
     unsigned char digest[32];
     static const char domain[] = "QCT-LANE-EMPTY-V1";
@@ -3403,7 +3404,7 @@ static int kv_save_memtable_only(qihse_kv_store_t* store, const char* filepath, 
     char tmp[8192]; FILE* f = NULL;
     if (!atomic_file_begin(filepath, tmp, sizeof(tmp), &f)) return -1;
     memtable_save_ctx_t ctx = { .f = f, .ok = true, .store = store, .sstable_id = sstable_id };
-    qihse_trinary_trie_foreach(store->trie, write_memtable_cb, &ctx);
+    ctx.ok = qihse_trinary_trie_foreach(store->trie, write_memtable_cb, &ctx) && ctx.ok;
     if (!ctx.ok || ferror(f)) { fclose(f); unlink(tmp); return -1; }
     if (!atomic_file_commit(f, tmp, filepath)) return -1;
     return 0;
@@ -3971,11 +3972,25 @@ static int sst_fd_get(qihse_kv_store_t* store, const char* dir, int32_t sid) {
 /* pread()-based sibling of disk_record_read: identical on-disk format and
  * return contract (1 ok, 0 EOF-before-header, -1 malformed/truncated), but
  * position-independent so concurrent readers can share the fd. */
-static int disk_record_read_at(int fd, uint64_t offset, kv_disk_record_t* r) {
+static int disk_record_read_at_limit(int fd, uint64_t offset, kv_disk_record_t* r,
+                                     size_t max_val_len, qihse_user_t* search_user,
+                                     const char* search_key) {
     if (fd < 0 || !r) return -1;
     memset(r, 0, sizeof(*r));
     char hbuf[KV_HEADER_LINE_MAX + 1u];
-    ssize_t hn = pread(fd, hbuf, KV_HEADER_LINE_MAX, (off_t)offset);
+    ssize_t hn;
+    if (search_user) {
+        /* Do not prefetch value bytes into the header buffer before ACL. */
+        size_t used = 0u;
+        for (; used < KV_HEADER_LINE_MAX; ++used) {
+            hn = pread(fd, hbuf + used, 1u, (off_t)offset + (off_t)used);
+            if (hn != 1) return -1;
+            if (hbuf[used] == '\n') { ++used; break; }
+        }
+        hn = (ssize_t)used;
+    } else {
+        hn = pread(fd, hbuf, KV_HEADER_LINE_MAX, (off_t)offset);
+    }
     if (hn <= 0) return (hn == 0) ? 0 : -1;
     const char* nl = (const char*)memchr(hbuf, '\n', (size_t)hn);
     if (!nl) return -1;
@@ -3991,14 +4006,27 @@ static int disk_record_read_at(int fd, uint64_t offset, kv_disk_record_t* r) {
     if (fields < 6) flags = 0u;
     if (fields < KV_SEQ_FIELDS_V4) seq = 0u;
     if (key_len == 0u || key_len > KV_MAX_KEY_LEN || val_len > KV_MAX_VALUE_LEN ||
-        classif > UINT16_MAX || sci > UINT16_MAX || (flags & ~KV_ALLOWED_FLAGS) != 0u) return -1;
+        val_len > max_val_len || classif > UINT16_MAX || sci > UINT16_MAX ||
+        (flags & ~KV_ALLOWED_FLAGS) != 0u) return -1;
     if ((flags & KV_FLAG_TOMBSTONE) != 0u && val_len != 0u) return -1;
+    /* Search must authorize the authoritative record header before allocating
+     * or reading any classified payload; index labels are not authoritative. */
+    if (search_user && (!qihse_auth_user_is_active(search_user) ||
+        !qihse_auth_can_access(search_user, (uint16_t)classif, (uint16_t)sci)))
+        return 0;
     r->key = (char*)malloc(key_len + 1u);
     r->val = (char*)malloc(val_len + 1u);
     if (!r->key || !r->val) { disk_record_free(r); return -1; }
     off_t pos = (off_t)offset + (off_t)hlen;
     if (pread(fd, r->key, key_len, pos) != (ssize_t)key_len) { disk_record_free(r); return -1; }
     pos += (off_t)key_len;
+    if (search_key && (strlen(search_key) != key_len ||
+        memcmp(r->key, search_key, key_len) != 0)) {
+        disk_record_free(r); return 0;
+    }
+    if (search_user && aimem_durability_test_fail_once("directeye-search-payload")) {
+        disk_record_free(r); return -1;
+    }
     if (pread(fd, r->val, val_len, pos) != (ssize_t)val_len) { disk_record_free(r); return -1; }
     pos += (off_t)val_len;
     char term = 0;
@@ -4015,12 +4043,18 @@ static int disk_record_read_at(int fd, uint64_t offset, kv_disk_record_t* r) {
     return 1;
 }
 
+static int disk_record_read_at(int fd, uint64_t offset, kv_disk_record_t* r) {
+    return disk_record_read_at_limit(fd, offset, r, KV_MAX_VALUE_LEN, NULL, NULL);
+}
+
 /* Read a single record by (file id, byte offset) as pinpointed by the
  * metadata index.  sst_fd_lock only guards the cache lookup — the read
  * itself is pread()-based and position-independent. */
-static kv_lookup_state_t lookup_one_sstable(qihse_kv_store_t* store, const char* dir,
+static kv_lookup_state_t lookup_one_sstable_limit(qihse_kv_store_t* store, const char* dir,
                                             const char* key, int32_t sstable_id,
-                                            uint64_t offset, kv_lookup_result_t* out) {
+                                            uint64_t offset, kv_lookup_result_t* out,
+                                            size_t max_val_len,
+                                            qihse_user_t* search_user) {
     pthread_mutex_lock(&store->sst_fd_lock);
     int fd = sst_fd_get(store, dir, sstable_id);
     int e = errno;
@@ -4028,7 +4062,8 @@ static kv_lookup_state_t lookup_one_sstable(qihse_kv_store_t* store, const char*
     if (fd < 0) return (e == ENOENT) ? KV_LOOKUP_MISS : KV_LOOKUP_ERROR;
     uint64_t now = current_time_ms();
     kv_disk_record_t r;
-    int rc = disk_record_read_at(fd, offset, &r);
+    int rc = disk_record_read_at_limit(fd, offset, &r, max_val_len,
+                                       search_user, search_user ? key : NULL);
     if (rc != 1) return (rc < 0) ? KV_LOOKUP_ERROR : KV_LOOKUP_MISS;
     if (strcmp(r.key, key) != 0) { disk_record_free(&r); return KV_LOOKUP_MISS; }
     out->classification = r.classification;
@@ -4042,6 +4077,13 @@ static kv_lookup_state_t lookup_one_sstable(qihse_kv_store_t* store, const char*
     disk_record_free(&r);
     out->state = dead ? KV_LOOKUP_DEAD : KV_LOOKUP_LIVE;
     return out->state;
+}
+
+static kv_lookup_state_t lookup_one_sstable(qihse_kv_store_t* store, const char* dir,
+                                            const char* key, int32_t sstable_id,
+                                            uint64_t offset, kv_lookup_result_t* out) {
+    return lookup_one_sstable_limit(store, dir, key, sstable_id, offset, out,
+                                    KV_MAX_VALUE_LEN, NULL);
 }
 
 static kv_lookup_state_t lookup_sstables(qihse_kv_store_t* store, const char* key,
@@ -4234,7 +4276,7 @@ static bool compact_sstables_into_memtable(qihse_kv_store_t* store) {
      * reflected if this runs before the index pass raised the high-water. */
     kv_change_seq_floor(store, max_seq);
     copy_trie_ctx_t copy_ctx = { .dst = merged, .ok = true, .mem_usage = merged_usage };
-    qihse_trinary_trie_foreach(store->trie, copy_payload_cb, &copy_ctx);
+    copy_ctx.ok = qihse_trinary_trie_foreach(store->trie, copy_payload_cb, &copy_ctx) && copy_ctx.ok;
     if (!copy_ctx.ok) { qihse_trinary_trie_destroy(merged); return false; }
     qihse_trinary_trie_t* old = store->trie;
     store->trie = merged; store->mem_usage = copy_ctx.mem_usage;
@@ -10535,7 +10577,7 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
          * so keep the original merge-everything-then-sweep semantics. */
         if (!compact_sstables_into_memtable(store)) { kv_store_unlock(store); return; }
         expired_collect_ctx_t ctx = { .now = now, .ok = true };
-        qihse_trinary_trie_foreach(store->trie, collect_expired_cb, &ctx);
+        ctx.ok = qihse_trinary_trie_foreach(store->trie, collect_expired_cb, &ctx) && ctx.ok;
         if (ctx.ok) tombstone_expired_keys(store, ctx.keys, ctx.count);
         for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
         free(ctx.keys);
@@ -10547,7 +10589,7 @@ void qihse_kv_sweep_expired(qihse_kv_store_t* store) {
      * (or the file count needs bounding).  A sweep with nothing to expire no
      * longer reads a single byte of SSTable data. */
     expired_collect_ctx_t ctx = { .now = now, .ok = true };
-    qihse_trinary_trie_foreach(store->trie, collect_expired_cb, &ctx);
+    ctx.ok = qihse_trinary_trie_foreach(store->trie, collect_expired_cb, &ctx) && ctx.ok;
         if (ctx.ok) tombstone_expired_keys(store, ctx.keys, ctx.count);
     for (size_t i = 0; i < ctx.count; i++) free(ctx.keys[i]);
     free(ctx.keys);
@@ -10586,6 +10628,8 @@ typedef struct {
     uint16_t max_classification;
     uint16_t allowed_sci;
     bool ok;
+    size_t* search_remaining; /* NULL outside bounded DIRECTEYE search */
+    size_t search_max_value;
 } foreach_user_ctx_t;
 static bool foreach_label_allowed(const foreach_user_ctx_t* ctx,
                                   uint16_t classification, uint16_t sci) {
@@ -10610,6 +10654,10 @@ static bool foreach_user_cb(const char* key, void* value, size_t value_size, voi
     (void)value_size; foreach_user_ctx_t* ctx = (foreach_user_ctx_t*)user_data; kv_payload_t* p = (kv_payload_t*)value;
     if (!ctx || !ctx->ok || !key || !p) return false;
     if (ctx->prefix && strncmp(key, ctx->prefix, ctx->prefix_len) != 0) return true;
+    if (ctx->search_remaining) {
+        if (!*ctx->search_remaining) { ctx->ok = false; return false; }
+        --*ctx->search_remaining;
+    }
     if (payload_is_dead(p, ctx->now)) return true;
     if (!foreach_label_allowed(ctx, p->classification, p->sci_compartment)) return true;
     if (!qihse_auth_can_access(ctx->user, p->classification, p->sci_compartment)) return true;
@@ -10642,11 +10690,18 @@ static int sst_foreach_prefix_indexed(qihse_kv_store_t* store,
             continue;
         if (qihse_trinary_trie_search(store->trie, e->key, NULL) != NULL)
             continue;
+        if (ctx->search_remaining) {
+            if (!*ctx->search_remaining) { ctx->ok = false; return -1; }
+            --*ctx->search_remaining;
+        }
         kv_lookup_result_t record;
         memset(&record, 0, sizeof(record));
-        kv_lookup_state_t state = lookup_one_sstable(store, dir, e->key,
-                                                      e->sstable_id,
-                                                      e->sst_offset, &record);
+        kv_lookup_state_t state = ctx->search_remaining
+            ? lookup_one_sstable_limit(store, dir, e->key, e->sstable_id,
+                                       e->sst_offset, &record, ctx->search_max_value,
+                                       ctx->user)
+            : lookup_one_sstable(store, dir, e->key, e->sstable_id,
+                                 e->sst_offset, &record);
         if (state == KV_LOOKUP_ERROR) {
             lookup_result_free(&record);
             return -1;
@@ -10712,15 +10767,15 @@ static bool foreach_user_filtered(qihse_kv_store_t* store, const char* prefix,
         .max_classification = max_classification, .allowed_sci = allowed_sci,
         .ok = true
     };
-    qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx);
+    bool traversed = qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &ctx);
     int rc = 0;
-    if (store->sstable_counter > 0) {
+    if (traversed && ctx.ok && store->sstable_counter > 0) {
         rc = prefix && *prefix
            ? sst_foreach_prefix_indexed(store, &ctx)
            : sst_foreach_newest(store, false, false, foreach_sst_emit_cb, &ctx);
     }
     kv_store_unlock(store);
-    return rc >= 0;
+    return traversed && ctx.ok && rc >= 0;
 }
 bool qihse_kv_foreach_user(qihse_kv_store_t* store, qihse_user_t* user,
                            qihse_kv_iter_cb cb, void* user_data) {
@@ -10758,6 +10813,115 @@ bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
     if (!prefix) return false;
     return foreach_user_filtered(store, prefix, user, cb, NULL, user_data,
                                  false, 0u, 0u);
+}
+
+/* shortcut: 512 KiB resident memtable, 1,048,576 global SST slots,
+ * 64 candidate keys and 256 KiB per SST value; upgrade to a tenant/label-aware
+ * index when the global store exceeds the slot ceiling or tenant work exceeds
+ * the candidate ceiling. The slot scan is bounded even under the read lock. */
+#define DIRECTEYE_SEARCH_MAX_MEM_USAGE (512u * 1024u)
+#define DIRECTEYE_SEARCH_MAX_SST_SLOTS 1048576u
+#define DIRECTEYE_SEARCH_MAX_KEYS 64u
+
+typedef struct {
+    size_t prefix_len;
+    const char* keyword;
+    const char* after_id;
+    char** ids;
+    size_t count;
+    size_t limit;
+    bool oom;
+} directeye_search_ctx_t;
+
+static bool directeye_search_cb(const char* key, const char* value, void* opaque) {
+    directeye_search_ctx_t* ctx = (directeye_search_ctx_t*)opaque;
+    const char* id = key + ctx->prefix_len;
+    size_t len = strlen(id);
+    if (!len || len > 128u || strcmp(id, ctx->after_id) <= 0 ||
+        !strstr(value, ctx->keyword)) return true;
+    for (size_t i = 0u; i < len; ++i) {
+        unsigned char c = (unsigned char)id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return true;
+    }
+    size_t pos = 0u;
+    while (pos < ctx->count && strcmp(ctx->ids[pos], id) < 0) pos++;
+    if (pos == ctx->limit) return true;
+    char* copy = strdup(id);
+    if (!copy) { ctx->oom = true; return false; }
+    if (ctx->count == ctx->limit) free(ctx->ids[--ctx->count]);
+    for (size_t i = ctx->count; i > pos; --i) ctx->ids[i] = ctx->ids[i - 1u];
+    ctx->ids[pos] = copy;
+    ctx->count++;
+    return true;
+}
+
+void qihse_kv_directeye_search_free(char** ids, size_t count) {
+    for (size_t i = 0u; i < count; ++i) free(ids[i]);
+    free(ids);
+}
+
+bool qihse_kv_directeye_search_user(qihse_kv_store_t* store, qihse_user_t* user,
+    const char* keyword, const char* after_id, size_t limit,
+    char*** out_ids, size_t* out_count) {
+    if (!out_ids || !out_count) return false;
+    *out_ids = NULL;
+    *out_count = 0u;
+    if (!store || !user || !qihse_auth_user_is_active(user) ||
+        qihse_keystone_feed_identity_is_indexer(user) || !keyword ||
+        !after_id || !*keyword || strlen(keyword) > 128u ||
+        strlen(after_id) > 128u || !limit ||
+        limit > QIHSE_KV_DIRECTEYE_SEARCH_MAX_PAGE) return false;
+    char prefix[64];
+    int n = snprintf(prefix, sizeof(prefix), "t:%u/directeye/canonical/v1/",
+                     qihse_user_get_tenant_id(user));
+    if (n <= 0 || (size_t)n >= sizeof(prefix)) return false;
+    char** ids = calloc(limit, sizeof(*ids));
+    if (!ids) return false;
+    directeye_search_ctx_t ctx = {
+        .prefix_len = (size_t)n, .keyword = keyword,
+        .after_id = after_id, .ids = ids, .limit = limit
+    };
+    size_t remaining = DIRECTEYE_SEARCH_MAX_KEYS;
+    size_t max_sst_slots = DIRECTEYE_SEARCH_MAX_SST_SLOTS;
+#ifdef QIHSE_AIMEM_DURABILITY_TEST
+    /* Test-only lower ceiling exercises rejection without creating a million rows. */
+    const char* test_slots = getenv("QIHSE_DIRECTEYE_TEST_MAX_SST_SLOTS");
+    if (test_slots && *test_slots) {
+        char* end = NULL;
+        unsigned long parsed = strtoul(test_slots, &end, 10);
+        if (end && !*end && parsed > 0u && parsed < max_sst_slots)
+            max_sst_slots = (size_t)parsed;
+    }
+#endif
+    kv_store_rdlock(store);
+    bool ok = !store->recovery_pending && ct_read_ready(store) &&
+        store->trie && store->mem_usage <= DIRECTEYE_SEARCH_MAX_MEM_USAGE &&
+        (store->sstable_counter == 0 ||
+         (store->sst_meta && !store->sst_meta->degraded &&
+          store->sst_meta->cap <= max_sst_slots));
+    if (ok) {
+        foreach_user_ctx_t iter = {
+            .store = store, .user = user, .cb = directeye_search_cb,
+            .user_data = &ctx, .prefix = prefix, .prefix_len = (size_t)n,
+            .now = current_time_ms(), .ok = true,
+            .search_remaining = &remaining,
+            .search_max_value = QIHSE_KV_DIRECTEYE_MAX_EVENT
+        };
+        iter.ok = qihse_trinary_trie_foreach(store->trie, foreach_user_cb, &iter) && iter.ok;
+        if (iter.ok && !ctx.oom && store->sstable_counter > 0)
+            ok = sst_foreach_prefix_indexed(store, &iter) >= 0;
+        ok = ok && iter.ok && !ctx.oom;
+    }
+    kv_store_unlock(store);
+    if (!ok) {
+        qihse_kv_directeye_search_free(ids, ctx.count);
+        return false;
+    }
+    *out_ids = ids;
+    *out_count = ctx.count;
+    return true;
 }
 
 typedef struct {
@@ -10800,8 +10964,8 @@ bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,
     }
     key_iter_ctx_t ctx = { .store = store, .user = user, .cb = cb, .user_data = user_data,
                            .now = current_time_ms(), .stopped = false };
-    qihse_trinary_trie_foreach(store->trie, key_iter_mem_cb, &ctx);
-    if (!ctx.stopped && store->sstable_counter > 0) {
+    bool traversed = qihse_trinary_trie_foreach(store->trie, key_iter_mem_cb, &ctx);
+    if (traversed && !ctx.stopped && store->sstable_counter > 0) {
         const sst_meta_index_t* idx = store->sst_meta;
         for (size_t i = 0; i < idx->cap; i++) {
             const sst_meta_entry_t* e = &idx->slots[i];
@@ -10815,7 +10979,7 @@ bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,
         }
     }
     kv_store_unlock(store);
-    return true;
+    return traversed;
 }
 void qihse_kv_foreach(qihse_kv_store_t* store, qihse_kv_iter_cb cb, void* user_data) {
     (void)qihse_kv_foreach_user(store, NULL, cb, user_data);
@@ -10858,7 +11022,11 @@ size_t qihse_kv_count_user(qihse_kv_store_t* store, qihse_user_t* user) {
     uint64_t now = current_time_ms();
     count_ctx_t ctx = { .store = store, .user = user,
                         .count = 0u, .now = now };
-    qihse_trinary_trie_foreach(store->trie, count_cb, &ctx);
+    if (!qihse_trinary_trie_foreach(store->trie, count_cb, &ctx)) {
+        kv_store_unlock(store);
+        errno = ENOMEM;
+        return 0u;
+    }
     const sst_meta_index_t* idx = store->sst_meta;
     for (size_t i = 0; idx && i < idx->cap; i++) {
         const sst_meta_entry_t* e = &idx->slots[i];
@@ -10948,7 +11116,7 @@ size_t qihse_kv_clear_user(qihse_kv_store_t* store, qihse_user_t* user) {
     clear_collect_ctx_t ctx = { .user = user, .now = now, .ok = true };
     bool fast = store->sst_meta && !store->sst_meta->degraded;
     if (!fast && !compact_sstables_into_memtable(store)) { kv_store_unlock(store); return 0u; }
-    qihse_trinary_trie_foreach(store->trie, clear_collect_cb, &ctx);
+    ctx.ok = qihse_trinary_trie_foreach(store->trie, clear_collect_cb, &ctx) && ctx.ok;
     if (fast) {
         /* Enumerate SSTable keys from the index instead of merging files. */
         const sst_meta_index_t* idx = store->sst_meta;

@@ -1254,6 +1254,21 @@ bool qihse_kv_sstable_stats(qihse_kv_store_t* store, qihse_kv_sstable_stats_t* o
 bool qihse_kv_foreach_prefix_user(qihse_kv_store_t* store, const char* prefix,
                                   qihse_user_t* user, qihse_kv_iter_cb cb,
                                   void* user_data);
+
+/* Tenant-bound DIRECTEYE canonical JSON substring search using the SST key
+ * metadata index and the authorized prefix enumerator. Returns sorted record
+ * IDs strictly after after_id (empty string starts at the beginning). No
+ * snapshot guarantee across pages. Only live, authorized canonical rows match.
+ * Returns false, with no IDs, if the store or scan exceeds the documented
+ * DIRECTEYE search work ceiling; never returns a partial page as complete.
+ * Requires an active record principal, not a provisioned feed index identity;
+ * keyword must be a nonempty, at-most-128-byte literal string. The caller
+ * frees each ID and the array via qihse_kv_directeye_search_free. */
+#define QIHSE_KV_DIRECTEYE_SEARCH_MAX_PAGE 32u
+bool qihse_kv_directeye_search_user(qihse_kv_store_t* store, qihse_user_t* user,
+    const char* keyword, const char* after_id, size_t limit,
+    char*** out_ids, size_t* out_count);
+void qihse_kv_directeye_search_free(char** ids, size_t count);
 /* Authorization-aware key-only iteration. Does not read SSTable values. The
  * callback runs under the store read lock and must not mutate this store. */
 bool qihse_kv_foreach_key_user(qihse_kv_store_t* store, qihse_user_t* user,

@@ -253,22 +253,57 @@ bool qihse_trinary_trie_delete(qihse_trinary_trie_t* trie, const char* key) {
     return deleted;
 }
 
-static bool foreach_recursive(qihse_tst_node_t* node, char* buf, int depth, int buf_size,
-                              qihse_trinary_trie_iter_cb cb, void* user_data) {
-    if (!node) return true;
-    if (!foreach_recursive(node->left, buf, depth, buf_size, cb, user_data)) return false;
-    buf[depth] = node->c;
-    if (node->is_end) {
-        buf[depth + 1] = '\0';
-        if (!cb(buf, node->value, node->value_size, user_data)) return false;
-    }
-    if (!foreach_recursive(node->mid, buf, depth + 1, buf_size, cb, user_data)) return false;
-    if (!foreach_recursive(node->right, buf, depth, buf_size, cb, user_data)) return false;
-    return true;
-}
+typedef struct {
+    qihse_tst_node_t* node;
+    size_t depth;
+    unsigned char stage;
+} foreach_frame_t;
 
-void qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data) {
-    if (!trie || !trie->root || !cb) return;
-    char buf[512];
-    foreach_recursive(trie->root, buf, 0, sizeof(buf) - 1, cb, user_data);
+bool qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data) {
+    if (!trie || !cb) return false;
+    if (!trie->root) return true;
+
+    /* Reserve enough space for every live path before exposing any key to cb. */
+    size_t nodes = 0;
+    for (qihse_node_chunk_t* chunk = trie->chunks; chunk; chunk = chunk->next) {
+        size_t used = chunk == trie->chunks ? trie->chunk_used : NODE_CHUNK_SIZE;
+        if (used > SIZE_MAX - nodes) return false;
+        nodes += used;
+    }
+    if (nodes == SIZE_MAX || nodes > SIZE_MAX / sizeof(foreach_frame_t)) return false;
+    foreach_frame_t* stack = malloc(nodes * sizeof(*stack));
+    if (!stack) return false;
+    char* key = malloc(nodes + 1);
+    if (!key) {
+        free(stack);
+        return false;
+    }
+
+    size_t top = 1;
+    stack[0] = (foreach_frame_t){trie->root, 0, 0};
+    while (top) {
+        foreach_frame_t* frame = &stack[top - 1];
+        qihse_tst_node_t* node = frame->node;
+        if (frame->stage == 0) {
+            frame->stage = 1;
+            if (node->left) stack[top++] = (foreach_frame_t){node->left, frame->depth, 0};
+        } else if (frame->stage == 1) {
+            frame->stage = 2;
+            key[frame->depth] = node->c;
+            if (node->is_end) {
+                key[frame->depth + 1] = '\0';
+                if (!cb(key, node->value, node->value_size, user_data)) break;
+            }
+        } else if (frame->stage == 2) {
+            frame->stage = 3;
+            if (node->mid) stack[top++] = (foreach_frame_t){node->mid, frame->depth + 1, 0};
+        } else {
+            size_t depth = frame->depth;
+            --top;
+            if (node->right) stack[top++] = (foreach_frame_t){node->right, depth, 0};
+        }
+    }
+    free(key);
+    free(stack);
+    return true;
 }

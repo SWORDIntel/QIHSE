@@ -58,6 +58,20 @@ def _register_teardown():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, f: (sys.exit(1)))
 
+def _wait_ready(process, addr):
+    deadline = time.monotonic() + 60
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError(f"hermetic node exited before listening: {process.returncode}")
+        try:
+            with socket.create_connection(addr, timeout=0.25):
+                return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"hermetic node did not listen on {addr}")
+            time.sleep(0.1)
+
+
 def _spawn_hermetic():
     """Seed owns the full ring; the joiner knows only the seed's bus."""
     bin_path = os.environ.get("QIHSE_BIN", "./qihse-cluster-daemon")
@@ -82,7 +96,7 @@ def _spawn_hermetic():
          "--operator-password", PW, "--no-replicate", "--dir", d0],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _daemons.append(seed)
-    time.sleep(2)
+    _wait_ready(seed, NODE0)
     joiner = subprocess.Popen(
         [bin_path, "--index", "1", "--bind", "127.0.0.1",
          "--port", str(NODE1[1]), "--bus-port",
@@ -91,6 +105,7 @@ def _spawn_hermetic():
          "--operator-password", PW, "--no-replicate", "--dir", d1],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _daemons.append(joiner)
+    _wait_ready(joiner, NODE1)
 
 def _teardown_hermetic():
     # leak-proof: a killed drill (pack timeout) still tears its daemons down

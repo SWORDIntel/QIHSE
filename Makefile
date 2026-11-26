@@ -1681,7 +1681,12 @@ test: test-parallel test-ct1-recovery-host-auth test-ct1-source-hold-resp test-c
 test-parallel-runner:
 	PYTHONPATH=tests python3 -m unittest -v test_parallel_suite test_gold_parallel
 
-test-serial: test-parallel-runner
+test-serial: test-parallel-runner test-trinary-trie-foreach
+.PHONY: test-trinary-trie-foreach
+test-trinary-trie-foreach:
+	$(CC) $(CFLAGS) -UNDEBUG -Wl,--wrap=malloc -o tests/test_trinary_trie_foreach tests/test_trinary_trie_foreach.c algorithms/qihse_trinary_trie.c
+	./tests/test_trinary_trie_foreach
+
 test-serial: test-public-api-install test-sql-cpp-headers test-python-pg-tls test-rust-pg-tls test-machine-token-refresh
 test-parallel: lib admin-cli redis-server cluster-daemon tests/gold/gold_runner $(GOLD_WORKLOAD_BINS)
 	GOLD_PACK='$(GOLD_PACK)' python3 tests/run_parallel_suite.py $(if $(TEST_JOBS),--jobs $(TEST_JOBS))

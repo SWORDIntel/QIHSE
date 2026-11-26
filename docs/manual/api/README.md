@@ -669,8 +669,8 @@ The trinary trie supports a recursive callback iterator for efficient bulk trave
 // Callback type — return true to continue, false to stop iteration
 typedef bool (*qihse_trinary_trie_iter_cb)(const char* key, void* value, size_t value_size, void* user_data);
 
-// Iterate all key-value pairs in the trie, calling cb for each
-void qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data);
+// Return false on invalid arguments or allocation failure; callback stop returns true
+bool qihse_trinary_trie_foreach(qihse_trinary_trie_t* trie, qihse_trinary_trie_iter_cb cb, void* user_data);
 ```
 
 **Usage Example:**
@@ -683,7 +683,10 @@ static bool count_cb(const char* key, void* value, size_t value_size, void* user
 }
 
 size_t total = 0;
-qihse_trinary_trie_foreach(trie, count_cb, &total);
+if (!qihse_trinary_trie_foreach(trie, count_cb, &total)) {
+    // Handle incomplete enumeration (e.g. allocation failure).
+    return false;
+}
 printf("Total keys: %zu\n", total);
 ```
 

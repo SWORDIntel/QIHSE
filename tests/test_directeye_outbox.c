@@ -204,9 +204,32 @@ static void scenario(const char* temp) {
     assert(qihse_kv_directeye_mutate_user(store, tenant_record_key,
         tenant_event.record_json, 0u, tenant_event_key, 4u, 2u, build_event,
         &tenant_event, writer, &tenant_generation, &tenant_cursor));
+    char** ids = NULL;
+    size_t found = 0u;
+    assert(qihse_kv_directeye_search_user(store, writer, "\"tenant\":77", "", 1u,
+        &ids, &found) && found == 1u && strcmp(ids[0], "tenant-record") == 0);
+    qihse_kv_directeye_search_free(ids, found);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, writer, "\"tenant\":77",
+        "tenant-record", 1u, &ids, &found) && found == 0u);
+    qihse_kv_directeye_search_free(ids, found);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, operator, "\"tenant\":77", "", 1u,
+        &ids, &found) && found == 0u);
+    qihse_kv_directeye_search_free(ids, found);
+    qihse_user_t* limited = qihse_auth_create_tenant_user(operator, 77u, 79u,
+        QIHSE_ROLE_ANALYST, 0u, 0u, PASSWORD, false);
+    assert(limited);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, limited, "\"tenant\":77", "", 1u,
+        &ids, &found) && found == 0u);
+    qihse_kv_directeye_search_free(ids, found);
     qihse_user_t* indexer = qihse_keystone_feed_identity_provision(
         operator, 77u, 78u, 5u, UINT16_MAX, PASSWORD);
     assert(indexer);
+    ids = NULL; found = 0u;
+    assert(!qihse_kv_directeye_search_user(store, indexer, "\"tenant\":77", "", 1u,
+        &ids, &found) && ids == NULL && found == 0u);
     qihse_kv_directeye_event_t* events = NULL;
     size_t event_count = 0u;
     uint64_t next_cursor = 0u;
@@ -229,6 +252,10 @@ static void scenario(const char* temp) {
     qihse_kv_store_destroy(store);
     store = qihse_kv_store_create_user(operator);
     assert(store);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, writer, "\"tenant\":77", "", 1u,
+        &ids, &found) && found == 1u && strcmp(ids[0], "tenant-record") == 0);
+    qihse_kv_directeye_search_free(ids, found);
     assert(qihse_kv_directeye_feed_ack_user(store, indexer, feed_next_cursor, &ack_cursor));
     assert(ack_cursor == feed_next_cursor);
     assert(qihse_keystone_feed_identity_revoke(operator, 78u));
@@ -272,6 +299,78 @@ static void scenario(const char* temp) {
     assert(store);
     value_is(store, operator, header_record_key, NULL);
     value_is(store, operator, header_event_key, NULL);
+    /* The first matching ID must not escape as an apparently complete page
+     * when a later key exceeds the search work ceiling. */
+    const char* budget_record_key = "t:0/directeye/canonical/v1/budget-record";
+    const char* budget_event_key =
+        "t:0/directeye/outbox/v1/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    event_context_t budget_event = {
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "budget-record",
+        budget_record_key, "upsert", 0u, 0u, 0u, "{\"name\":\"budget\"}", 0u
+    };
+    assert(qihse_kv_directeye_mutate_user(store, budget_record_key,
+        budget_event.record_json, 0u, budget_event_key, 0u, 0u,
+        build_event, &budget_event, operator, NULL, NULL));
+    /* Grow the global SST index beyond 4096 slots with unrelated tenant-0
+     * rows; tenant-77 search must still return its authorized page. */
+    for (unsigned int i = 0u; i < 3200u; ++i) {
+        char key[80];
+        int n = snprintf(key, sizeof(key), "capacity-%04u", i);
+        assert(n > 0 && (size_t)n < sizeof(key));
+        assert(qihse_kv_set_user(store, key, "other", 0u, 0u, operator));
+    }
+    char* flush_value = malloc(512u * 1024u + 1u);
+    assert(flush_value);
+    memset(flush_value, 'x', 512u * 1024u);
+    flush_value[512u * 1024u] = '\0';
+    assert(qihse_kv_set_user(store, "test-flush", flush_value, 0u, 0u, operator));
+    free(flush_value);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, operator, "budget", "", 1u,
+        &ids, &found) && found == 1u && strcmp(ids[0], "budget-record") == 0);
+    qihse_kv_directeye_search_free(ids, found);
+    qihse_user_t* search_writer = qihse_auth_create_tenant_user(operator, 77u, 92u,
+        QIHSE_ROLE_ANALYST, 5u, UINT16_MAX, PASSWORD, false);
+    assert(search_writer);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, search_writer, "\"tenant\":77", "", 1u,
+        &ids, &found) && found == 1u && strcmp(ids[0], "tenant-record") == 0);
+    qihse_kv_directeye_search_free(ids, found);
+    assert(setenv("QIHSE_DIRECTEYE_TEST_MAX_SST_SLOTS", "4096", 1) == 0);
+    ids = NULL; found = 0u;
+    assert(!qihse_kv_directeye_search_user(store, search_writer, "\"tenant\":77", "", 1u,
+        &ids, &found) && ids == NULL && found == 0u);
+    assert(unsetenv("QIHSE_DIRECTEYE_TEST_MAX_SST_SLOTS") == 0);
+    /* The test-only payload read failure fires for the authorized reader,
+     * not the denied reader: no high payload is touched before label ACL. */
+    assert(setenv("QIHSE_AIMEM_FAIL_AT", "directeye-search-payload", 1) == 0);
+    ids = NULL; found = 0u;
+    assert(qihse_kv_directeye_search_user(store, limited, "\"tenant\":77", "", 1u,
+        &ids, &found) && found == 0u);
+    qihse_kv_directeye_search_free(ids, found);
+    ids = NULL; found = 0u;
+    assert(!qihse_kv_directeye_search_user(store, search_writer, "\"tenant\":77", "", 1u,
+        &ids, &found) && ids == NULL && found == 0u);
+    assert(unsetenv("QIHSE_AIMEM_FAIL_AT") == 0);
+    assert(qihse_auth_destroy_user(operator, 92u));
+    for (unsigned int i = 0u; i < 65u; ++i) {
+        char record_id[32], record_key[96], event_id[48], event_key[96];
+        assert(snprintf(record_id, sizeof(record_id), "test-budget-%03u", i) > 0);
+        assert(snprintf(record_key, sizeof(record_key),
+                        "t:0/directeye/canonical/v1/%s", record_id) > 0);
+        assert(snprintf(event_id, sizeof(event_id),
+                        "bbbbbbbb-bbbb-4bbb-8bbb-%012u", i) > 0);
+        assert(snprintf(event_key, sizeof(event_key),
+                        "t:0/directeye/outbox/v1/%s", event_id) > 0);
+        event_context_t event = {event_id, record_id, record_key, "upsert",
+                                 0u, 0u, 0u, "{\"name\":\"other\"}", 0u};
+        assert(qihse_kv_directeye_mutate_user(store, record_key,
+            event.record_json, 0u, event_key, 0u, 0u,
+            build_event, &event, operator, NULL, NULL));
+    }
+    ids = NULL; found = 0u;
+    assert(!qihse_kv_directeye_search_user(store, operator, "budget", "", 1u,
+        &ids, &found) && ids == NULL && found == 0u);
     qihse_kv_store_destroy(store);
     puts("DIRECTEYE durable outbox: mutation, retry, conflict, tombstone, denial and recovery passed");
 }

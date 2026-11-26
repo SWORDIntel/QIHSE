@@ -335,8 +335,8 @@ static bool ct_lane_transfer_local_image_locked(qihse_kv_store_t* store,
     x.collect.last_slot = (uint16_t)(QIHSE_CLUSTER_SLOT_COUNT - 1u);
     x.collect.authorized = true;
     x.collect.ok = true;
-    qihse_trinary_trie_foreach(store->trie, ct_lane_transfer_mem_cb, &x);
-    if (!x.collect.ok || !x.collect.authorized) goto failed;
+    if (!qihse_trinary_trie_foreach(store->trie, ct_lane_transfer_mem_cb, &x) ||
+        !x.collect.ok || !x.collect.authorized) goto failed;
     for (size_t i = 0; i < store->sst_meta->cap; ++i) {
         const sst_meta_entry_t* m = &store->sst_meta->slots[i];
         if (!m->key || !ct_lane_transfer_slot_selected(bitmap, m->key) ||
@@ -447,7 +447,7 @@ int qihse_kv_ct_lane_transfer_source_export(qihse_kv_store_t* store,
         claim->source_cut == state->source_cut &&
         (ct_digest_zero(state->image_digest) ||
          state->claim.target_cursor == claim->target_cursor);
-    if (ok) qihse_trinary_trie_foreach(store->trie, ct_lane_transfer_mem_cb, &x);
+    if (ok) ok = qihse_trinary_trie_foreach(store->trie, ct_lane_transfer_mem_cb, &x);
     if (!ok || !x.collect.ok || !x.collect.authorized) goto export_done;
     for (size_t i = 0; i < store->sst_meta->cap; ++i) {
         const sst_meta_entry_t* meta = &store->sst_meta->slots[i];

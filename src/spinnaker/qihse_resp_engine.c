@@ -21413,6 +21413,38 @@ static bool qihse_resp_handle_directeye(qihse_resp_session_t* session,
         !qihse_auth_user_is_active(session->user))
         return qihse_resp_error(session, "NOAUTH authenticated session required");
     qihse_kv_store_t* store = session->server->store;
+    if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.SEARCH")) {
+        if (qihse_resp_session_is_aimem_service(session) ||
+            qihse_keystone_feed_identity_is_indexer(session->user))
+            return qihse_resp_error(session, "NOPERM DIRECTEYE search requires a tenant record principal");
+        if (request->argc != 4u) return qihse_resp_wrong_arity(session, "directeye.record.search");
+        const qihse_resp_arg_t* term = &request->argv[1];
+        const qihse_resp_arg_t* cursor = &request->argv[2];
+        uint64_t limit = 0u;
+        if (!term->len || term->len > 128u || memchr(term->data, 0, term->len) ||
+            !qihse_directeye_json_utf8_valid(term->data, term->len) ||
+            (cursor->len && !qihse_resp_directeye_id(cursor, false)) ||
+            !qihse_resp_parse_u64_arg(&request->argv[3], &limit) || !limit ||
+            limit > QIHSE_KV_DIRECTEYE_SEARCH_MAX_PAGE)
+            return qihse_resp_error(session, "ERR invalid DIRECTEYE search term, cursor or page size");
+        char keyword[129], after_id[129];
+        memcpy(keyword, term->data, term->len); keyword[term->len] = '\0';
+        memcpy(after_id, cursor->data, cursor->len); after_id[cursor->len] = '\0';
+        char** ids = NULL;
+        size_t count = 0u;
+        pthread_rwlock_rdlock(&session->server->kv_lock);
+        bool ok = qihse_kv_directeye_search_user(store, session->user, keyword,
+            after_id, (size_t)limit, &ids, &count);
+        pthread_rwlock_unlock(&session->server->kv_lock);
+        if (!ok) return qihse_resp_error(session, "ERR DIRECTEYE search unavailable");
+        const char* next = count ? ids[count - 1u] : after_id;
+        bool emitted = qihse_resp_array(session, 2u + count) &&
+            qihse_resp_bulk_text(session, next) && qihse_resp_bulk_u64(session, count);
+        for (size_t i = 0u; emitted && i < count; ++i)
+            emitted = qihse_resp_bulk_text(session, ids[i]);
+        qihse_kv_directeye_search_free(ids, count);
+        return emitted;
+    }
     if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.GET")) {
         if (request->argc != 2u) return qihse_resp_wrong_arity(session, "directeye.record.get");
         if (!qihse_resp_directeye_id(&request->argv[1], false))
@@ -21629,6 +21661,7 @@ static bool qihse_resp_dispatch_inner(qihse_resp_session_t* session, const qihse
     }
 
     if (qihse_resp_command_is(request, "DIRECTEYE.RECORD.GET") ||
+        qihse_resp_command_is(request, "DIRECTEYE.RECORD.SEARCH") ||
         qihse_resp_command_is(request, "DIRECTEYE.RECORD.MUTATE") ||
         qihse_resp_command_is(request, "DIRECTEYE.FEED.READ") ||
         qihse_resp_command_is(request, "DIRECTEYE.FEED.ACK"))
