@@ -410,12 +410,16 @@ test-backup-cli: backup-cli
 test-owner-snapshot-sdk:
 	python3 tests/test_owner_snapshot_sdk.py -v
 
+.PHONY: test-owner-only-unit
+test-owner-only-unit:
+	python3 -m unittest discover -s tests -p 'test_owner_only_unit.py' -v
+
 .PHONY: test-ops-scripts
 test-ops-scripts:
 	bash tests/ops/test_build_native.sh
 	bash tests/ops/test_cluster_rolling_restart.sh
 
-test-serial: test-owner-snapshot-sdk test-ops-scripts
+test-serial: test-owner-snapshot-sdk test-owner-only-unit test-ops-scripts
 
 .PHONY: test-kv-durable-batch test-kv-restore-durability test-directeye-outbox test-directeye-resp
 test-kv-durable-batch: lib

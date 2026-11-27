@@ -25,6 +25,7 @@ lib/
 !/tests/test_codegraph_projection.py
 !/tests/test_codegraph_ids128.py
 !/tests/test_admin_cli.py
+!/tests/test_owner_only_unit.py
 !/tests/test_aimem_projection_qkp.py
 !/tests/test_pgwire_app_compat.py
 !/tests/test_pgwire_client_fixture.py
