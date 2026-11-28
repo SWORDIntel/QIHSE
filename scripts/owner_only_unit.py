@@ -63,8 +63,9 @@ def render(label, args, data_root):
     if daemon is None or Path(daemon).parents[1].name != "QIHSE":
         raise ValueError("effective unit must use the canonical QIHSE runtime")
     env_executable = shutil.which("env")
+    library_path = "LD_LIBRARY_PATH=" + str(Path(daemon).parents[1] / "lib")
     if env_executable and args[0] == env_executable:
-        if args[:3] != [env_executable, "LD_LIBRARY_PATH=" + str(Path(daemon).parents[1] / "lib"), daemon]:
+        if args[:3] != [env_executable, library_path, daemon]:
             raise ValueError("unexpected daemon environment wrapper")
     elif args[0] != daemon:
         raise ValueError("unexpected daemon prefix")
@@ -75,15 +76,17 @@ def render(label, args, data_root):
             raise ValueError("owner endpoint differs from the three-host manifest: " + flag)
 
     output = []
+    one_value_flags = ONE | REMOVE_ONE
+    owner_hosts = {owner[2] for owner in OWNERS.values()}
     i = 0
     while i < len(args):
         flag = args[i]
         if not flag.startswith("--"):
-            if i >= 3 or flag not in (env_executable, daemon, "LD_LIBRARY_PATH=" + str(Path(daemon).parents[1] / "lib")):
+            if i >= 3 or flag not in (env_executable, daemon, library_path):
                 raise ValueError("unreviewed positional daemon argument")
             output.append(flag)
             i += 1
-        elif flag in ONE | REMOVE_ONE:
+        elif flag in one_value_flags:
             if i + 1 >= len(args) or args[i + 1].startswith("--"):
                 raise ValueError("invalid value for " + flag)
             if flag == "--dir":
@@ -97,7 +100,7 @@ def render(label, args, data_root):
             identity = args[i + 2] if flag == "--topology-qkp-map" else args[i + 1]
             if identity.startswith("recovery-"):
                 pass
-            elif identity in {owner[2] for owner in OWNERS.values()}:
+            elif identity in owner_hosts:
                 output.extend(args[i:i + 3])
             else:
                 raise ValueError("unrecognized owner peer identity for " + flag)

@@ -55,6 +55,24 @@ class OwnerOnlyUnitTest(unittest.TestCase):
                 self.assertNotIn("--replica-of", config)
                 self.assertNotIn("recovery-a-successor", config)
                 self.assertIn("192.168.1.90", config)
+                _, index, host, port, bus, suffix, slots = units.OWNERS[label]
+                prefix = [self.daemon] if label != "b" else [
+                    shutil.which("env"), "LD_LIBRARY_PATH=" + str(self.runtime / "lib"), self.daemon]
+                expected = prefix + ["--index", str(index), "--bind", host, "--port", str(port),
+                                     "--bus-port", str(bus), "--dir", str(self.data / suffix),
+                                     "--pqc-require", "--pqc-trusted-pub", str(self.root / "trusted.pem"),
+                                     "--migration-peer", "192.168.1.90", "owner-pin",
+                                     "--topology-qkp-map", "owner-id", "192.168.1.90"]
+                for peer in ("a", "b", "c"):
+                    _, peer_index, peer_host, peer_port, peer_bus, _, peer_slots = units.OWNERS[peer]
+                    expected += ["--node", f"{peer_index}:{peer_host}:{peer_port}:{peer_bus}"]
+                    if peer != label:
+                        expected += ["--slot-range-of", f"{peer_index}:{peer_slots}"]
+                expected += ["--node", "7:192.168.1.91:7100:17100", "--slot-range-of", "7:5041-5460",
+                             "--node", "6:192.168.1.90:7115:17115", "--slot-range-of", "6:5040-5040",
+                             "--slot-range", slots]
+                self.assertEqual(config, "[Service]\nExecStart=\nExecStart=" +
+                                 " ".join(shlex.quote(arg) for arg in expected) + "\n")
                 self.assertEqual(config, units.render(label, shlex.split(config.splitlines()[-1][10:]), self.data))
 
     def test_rejects_unreviewed_flags_and_ct_markers(self):

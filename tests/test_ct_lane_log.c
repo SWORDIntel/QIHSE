@@ -413,8 +413,6 @@ static pid_t ack_exec(const char* mode, const char* dir, int fd) {
 }
 static void ack_regression(const char* mutation) {
     char dir[] = "./ct_lane_ack_crash_XXXXXX"; assert(mkdtemp(dir));
-    fprintf(stderr, "ACK crash fixture: %s mode=%s (preserved)\n", dir,
-        mutation ? mutation : "native");
     int pipefd[2]; assert(pipe(pipefd) == 0);
     pid_t child = ack_exec("--ack-crash", dir, pipefd[1]); assert(close(pipefd[1]) == 0);
     char bytes[sizeof ack_witness]; size_t used = 0;
@@ -448,6 +446,7 @@ static void ack_regression(const char* mutation) {
     f = fopen(path, "rb");
     assert(f && fread(after, 1u, sizeof after, f) == sizeof after && fgetc(f) == EOF && fclose(f) == 0);
     assert(!memcmp(before, after, sizeof before));
+    cleanup(dir);
 }
 
 static int stale_receiver_admission(const char* dir) {

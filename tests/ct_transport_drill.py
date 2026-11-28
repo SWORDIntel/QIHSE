@@ -552,7 +552,8 @@ class IsolatedCluster:
                 address[0], address[1],
                 str(self.identity_file(name, "qihse_dsa_pub.pem")),
                 user="GODMODE_OP", password=OPERATOR_PASSWORD,
-                timeout_ms=5000,
+                # Outlast the CT ack deadline so unresolved writes return their reply.
+                timeout_ms=15000,
             )
         except BaseException as exc:
             self.fail_with_log(name, f"admin QKP/AUTH failed: {exc}")

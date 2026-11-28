@@ -3141,6 +3141,7 @@ int main(int argc, char** argv) {
     aimem_fixture_cleanup(highwater_dir);
     aimem_fixture_cleanup(retained_dir);
     aimem_fixture_cleanup(stale_dir);
+    aimem_fixture_cleanup(stale_expired_dir);
     aimem_fixture_cleanup(dir);
     puts("ct storage: PASS");
     return 0;
